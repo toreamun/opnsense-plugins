@@ -64,7 +64,10 @@ pyver="$(python3 -c 'import sys; print("py3%d" % sys.version_info.minor)' 2>/dev
 pkg install -y "${pyver}-scapy"
 
 echo ">>> Installing ${PLUGIN}..."
-pkg add "${WORK}/${pkgfile}"
+# -f so the verified release is (re)installed even when an older/other build is
+# already present -- i.e. the one-liner also upgrades. The Scapy dependency was
+# installed just above (set -e aborts otherwise), so it is present.
+pkg add -f "${WORK}/${pkgfile}"
 
 echo ">>> Done. ${PLUGIN} installed and signature-verified."
 echo "    (os-carp-vip-dhcp: find it in the GUI under Interfaces > Virtual IPs DHCP.)"

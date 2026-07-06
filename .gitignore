@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+*.swp
+*.orig
+build/
+work/
+dist/
+
+# release signing: never commit a private key
+*.key
+*.sec

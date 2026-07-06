@@ -1,0 +1,21 @@
+# Run locally before every commit:  pre-commit install && pre-commit run --all-files
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: mixed-line-ending
+  - repo: https://github.com/pycqa/flake8
+    rev: 7.1.1
+    hooks:
+      - id: flake8            # PEP 8 + pyflakes (F-codes) via setup.cfg
+  # PHP PSR-12 (requires phpcs available on PATH):
+  - repo: local
+    hooks:
+      - id: phpcs-psr12
+        name: PHP PSR-12 (phpcs)
+        entry: phpcs --standard=PSR12
+        language: system
+        files: \.php$

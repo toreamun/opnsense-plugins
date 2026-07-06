@@ -1,0 +1,83 @@
+<model>
+    <mount>//OPNsense/CarpVipDhcp</mount>
+    <version>1.0.0</version>
+    <description>CARP-VIP DHCP lease keeper</description>
+    <items>
+        <keepers>
+            <keeper type="ArrayField">
+                <enabled type="BooleanField">
+                    <default>0</default>
+                    <Required>Y</Required>
+                </enabled>
+
+                <!--
+                    Reference an existing CARP VirtualIP (value = the VIP address).
+                    Interface (physical device), VHID->chaddr (00:00:5e:00:01:VHID)
+                    and request-IP are derived from it when the config is rendered.
+                -->
+                <carpVip type="VirtualIPField">
+                    <Type>carp</Type>
+                    <Required>Y</Required>
+                    <ValidationMessage>Select a CARP virtual IP.</ValidationMessage>
+                </carpVip>
+
+                <!-- Override the chaddr when the ISP reservation MAC differs from the CARP MAC. -->
+                <chaddrOverride type="MacAddressField">
+                    <Required>N</Required>
+                </chaddrOverride>
+
+                <!-- Demote this node (hand the CARP VIP to the peer) if this keeper stops holding the correct lease. Default: off. -->
+                <demoteOnLeaseLoss type="BooleanField">
+                    <default>0</default>
+                </demoteOnLeaseLoss>
+
+                <!-- Only send DHCP (hold the lease) while this node is CARP master for the VIP; stand by (idle) on backup. Niche: adds a failover DORA gap. Default: off (hold on both nodes). -->
+                <runOnlyOnMaster type="BooleanField">
+                    <default>0</default>
+                </runOnlyOnMaster>
+
+                <!-- Dynamic DHCP: if the server hands out a DIFFERENT address, update the CARP VIP to match instead of alarming, so the VIP stays online. Default: on. Unset to enforce a fixed reservation (alarm on mismatch). -->
+                <followIp type="BooleanField">
+                    <default>1</default>
+                </followIp>
+
+                <!--
+                    Optional: name of a firewall Host alias the plugin creates and
+                    keeps set to this VIP's current address. Point outbound NAT (and
+                    any rules that must follow a dynamic address) at it. Empty = off.
+                -->
+                <aliasName type="TextField">
+                    <Mask>/^([a-zA-Z][a-zA-Z0-9_]{0,30})?$/u</Mask>
+                    <ValidationMessage>Alias name must start with a letter and contain only letters, digits and underscore (max 31).</ValidationMessage>
+                    <Required>N</Required>
+                </aliasName>
+
+                <!--
+                    Optional DHCP request options for ISPs that only lease when they
+                    see a specific vendor-class / client-id / hostname. Empty = the
+                    option is not sent. These identify the KEEPER's own DHCP client
+                    (its own chaddr); do not copy the WAN interface's client-id
+                    verbatim or the server may treat them as the same client. The
+                    masks forbid a pipe so the rendered keeper.conf line stays parseable.
+                -->
+                <vendorClass type="TextField">
+                    <Mask>/^[A-Za-z0-9 ._\/+-]{0,64}$/u</Mask>
+                    <ValidationMessage>Vendor class: letters, digits, space and . _ / + - only (max 64).</ValidationMessage>
+                    <Required>N</Required>
+                </vendorClass>
+                <clientId type="TextField">
+                    <Mask>/^[A-Za-z0-9:._-]{0,128}$/u</Mask>
+                    <ValidationMessage>Client-id: letters, digits and : . _ - only (max 128).</ValidationMessage>
+                    <Required>N</Required>
+                </clientId>
+                <hostname type="TextField">
+                    <Mask>/^[A-Za-z0-9.-]{0,63}$/u</Mask>
+                    <ValidationMessage>Hostname: letters, digits, dot and dash only (max 63).</ValidationMessage>
+                    <Required>N</Required>
+                </hostname>
+
+                <description type="DescriptionField"/>
+            </keeper>
+        </keepers>
+    </items>
+</model>

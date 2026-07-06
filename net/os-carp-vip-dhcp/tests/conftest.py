@@ -1,0 +1,59 @@
+"""Pytest bootstrap: make the plugin's configd scripts importable and stub scapy.
+
+lease-keeper.py imports scapy at module load, but the daemon logic under test
+never touches the network, so a lightweight stub lets the suite run without the
+dependency (and without root or a live interface). status.py / logparse.py are
+plain-stdlib and import directly once their directory is on sys.path.
+"""
+import importlib.util
+import os
+import sys
+import types
+
+import pytest
+
+SCRIPT_DIR = os.path.abspath(os.path.join(
+    os.path.dirname(__file__), "..",
+    "src", "opnsense", "scripts", "OPNsense", "CarpVipDhcp"))
+sys.path.insert(0, SCRIPT_DIR)
+
+
+def _stub_scapy():
+    if "scapy.all" in sys.modules:
+        return
+    scapy = types.ModuleType("scapy")
+    allmod = types.ModuleType("scapy.all")
+
+    class _Sniffer:
+        def __init__(self, *args, **kwargs):
+            self.thread = types.SimpleNamespace(is_alive=lambda: True)
+
+        def start(self):
+            pass
+
+        def stop(self):
+            pass
+
+    for _name in ("Ether", "IP", "UDP", "BOOTP", "DHCP", "sendp"):
+        setattr(allmod, _name, lambda *a, **k: None)
+    allmod.AsyncSniffer = _Sniffer
+    scapy.all = allmod
+    sys.modules["scapy"] = scapy
+    sys.modules["scapy.all"] = allmod
+
+
+_stub_scapy()
+
+
+def _load(filename, modname):
+    path = os.path.join(SCRIPT_DIR, filename)
+    spec = importlib.util.spec_from_file_location(modname, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.fixture(scope="session")
+def lk():
+    """The lease-keeper daemon module (loaded via importlib -- hyphenated name)."""
+    return _load("lease-keeper.py", "lease_keeper")

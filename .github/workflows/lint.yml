@@ -1,0 +1,76 @@
+name: lint
+on: [push, pull_request]
+
+jobs:
+  python:
+    name: Python (PEP 8 @ 120 + syntax)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install flake8
+      # PEP 8 (max-line-length 120 via setup.cfg) + pyflakes (unused/undefined)
+      - run: flake8 .
+      # byte-compile every script as a syntax safety net
+      - run: python -m compileall -q net
+
+  pytest:
+    name: Python unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install pytest
+      # Daemon/status/logparse unit tests (scapy is stubbed in tests/conftest.py,
+      # so no dependency, root or interface is needed).
+      - run: pytest -q net/os-carp-vip-dhcp/tests
+
+  php:
+    name: PHP (PSR-12 + syntax)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.2'
+          tools: composer
+      - run: composer global require squizlabs/php_codesniffer
+      - name: PSR-12
+        run: $(composer global config bin-dir --absolute)/phpcs --standard=PSR12 net/*/src/opnsense/mvc
+      - name: php -l (syntax)
+        run: find net -name '*.php' -print0 | xargs -0 -n1 php -l
+
+  shell:
+    name: Shell (shellcheck)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y shellcheck
+      # rc.subr scripts source an external file (SC1091) and set rc vars such as
+      # name/rcvar/*_cmd that shellcheck sees as unused (SC2034).
+      - name: shellcheck
+        run: |
+          files=$(git ls-files 'build.sh' 'sign-release.sh' 'install.sh' \
+            'net/*/src/etc/rc.d/*' \
+            'net/*/src/etc/rc.carp_service_status.d/*' \
+            'net/*/src/etc/rc.syshook.d/start/*' \
+            'net/*/src/opnsense/scripts/**/*.sh')
+          echo "$files"
+          shellcheck -s sh -e SC1091,SC2034 $files
+
+  xml:
+    name: XML well-formedness
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y libxml2-utils
+      - run: |
+          fail=0
+          for f in $(git ls-files '*.xml'); do
+            xmllint --noout "$f" || fail=1
+          done
+          exit $fail

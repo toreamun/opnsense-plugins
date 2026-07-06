@@ -1,0 +1,13 @@
+Keep a DHCP lease alive for a CARP virtual IP.
+
+On a DHCP-assigned WAN the ISP only routes an address while it has an active DHCP
+lease bound to a MAC, so a static CARP VIP receives no traffic. This plugin runs a
+small daemon that keeps a DHCP lease alive for a chosen chaddr (normally the CARP
+virtual MAC of an existing CARP VirtualIP), so the VIP address is routed and can
+fail over between two OPNsense nodes.
+
+An HA CARP setup needs several concurrent DHCP addresses on the line (one per node
+plus the shared VIP). That is typically feasible on CGNAT links (abundant RFC 6598
+shared space) but rare on public IPv4.
+
+WWW: https://github.com/toreamun/opnsense-plugins

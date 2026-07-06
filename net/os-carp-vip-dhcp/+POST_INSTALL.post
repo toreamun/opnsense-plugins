@@ -1,0 +1,8 @@
+# os-carp-vip-dhcp: clean (re)start after install/upgrade.
+# The keeper daemons are supervised by daemon(8) and are NOT stopped by pkg, so
+# restart here to sweep any stray daemons left by a previous version and run the
+# current code. On a fresh install there is no keeper config yet, so this is a
+# no-op ("no config").
+if [ -x /usr/local/etc/rc.d/carpvipdhcp ]; then
+    /usr/local/etc/rc.d/carpvipdhcp restart || true
+fi

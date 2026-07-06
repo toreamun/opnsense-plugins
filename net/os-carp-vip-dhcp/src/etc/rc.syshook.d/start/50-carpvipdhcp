@@ -1,0 +1,4 @@
+#!/bin/sh
+
+# Boot-start the CARP-VIP DHCP lease keeper regardless of monit/service state.
+/usr/local/etc/rc.d/carpvipdhcp onestart >/dev/null 2>&1 &

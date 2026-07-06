@@ -1,0 +1,11 @@
+# os-carp-vip-dhcp: stop all keeper daemons before removal.
+# Otherwise a keeper is left orphaned (still renewing a DHCP lease) after the
+# plugin is gone, and the node could be left CARP-demoted by the
+# rc.carp_service_status hook that is about to be removed.
+if [ -x /usr/local/etc/rc.d/carpvipdhcp ]; then
+    /usr/local/etc/rc.d/carpvipdhcp stop || true
+fi
+# Remove the Python bytecode cache BEFORE pkg deletes the scripts, so pkg can
+# then remove the now-empty script directory cleanly. The daemon is stopped
+# above, so nothing recreates it.
+rm -rf /usr/local/opnsense/scripts/OPNsense/CarpVipDhcp/__pycache__

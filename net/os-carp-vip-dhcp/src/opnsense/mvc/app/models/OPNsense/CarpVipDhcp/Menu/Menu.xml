@@ -1,0 +1,9 @@
+<menu>
+    <Interfaces>
+        <VIPDHCP order="251" VisibleName="Virtual IPs DHCP" cssClass="fa fa-id-card-o">
+            <Settings order="10" VisibleName="Settings" url="/ui/carpvipdhcp/"/>
+            <Status order="20" VisibleName="Status" url="/ui/carpvipdhcp/status"/>
+            <Log order="30" VisibleName="Log" url="/ui/carpvipdhcp/log"/>
+        </VIPDHCP>
+    </Interfaces>
+</menu>

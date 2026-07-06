@@ -1,0 +1,9 @@
+# os-carp-vip-dhcp: remove generated files that pkg does not track, so an
+# uninstall leaves no trace. Runs AFTER the packaged files are deleted. The
+# rendered config, heartbeats and follow-state are all recreated on a reinstall.
+# Per-keeper logs are kept for post-mortem (remove them by hand). The script
+# directory + its __pycache__ are handled in +PRE_DEINSTALL so pkg removes the
+# empty directory itself.
+rm -rf /usr/local/etc/carpvipdhcp
+rm -f /var/run/carpvipdhcp-*.hb /var/run/carpvipdhcp-follow-* \
+      /var/run/carpvipdhcp-follow_update.lock

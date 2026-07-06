@@ -1,0 +1,10 @@
+<acl>
+    <page-user-carpvipdhcp>
+        <name>WebCfg - Interfaces: Virtual IPs DHCP</name>
+        <description>Allow access to the CARP-VIP DHCP lease keeper</description>
+        <patterns>
+            <pattern>ui/carpvipdhcp/*</pattern>
+            <pattern>api/carpvipdhcp/*</pattern>
+        </patterns>
+    </page-user-carpvipdhcp>
+</acl>

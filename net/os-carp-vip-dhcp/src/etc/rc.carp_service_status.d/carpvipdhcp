@@ -1,0 +1,48 @@
+#!/bin/sh
+
+# CARP service-status hook for the CARP-VIP DHCP lease keepers.
+#
+# Exit 0  = all gated keepers hold the correct lease -> node eligible.
+# Exit !0 = at least one gated keeper is NOT holding its lease   -> node demoted,
+#           so the CARP VIP(s) move to the peer that DOES hold them.
+#
+# Only keepers with DEMOTE_ON_LEASE_LOSS=1 influence CARP. If none are set the
+# check always passes. Keep this test lightweight (it may run often).
+
+CONF="/usr/local/etc/carpvipdhcp/keeper.conf"
+RUN_DIR="/var/run"
+# A fresh heartbeat is written on every (re)bind/renew. The daemon renews at
+# T1 = 0.5 x lease, so a heartbeat can legitimately age up to ~T1 between writes.
+# Use a full typical lease (3600s) as the ceiling to avoid demoting a healthy
+# keeper mid-cycle; only a truly stalled keeper exceeds this.
+MAX_AGE=3600
+
+[ -f "${CONF}" ] || exit 0
+
+_id()
+{
+    printf '%s' "$1" | tr -c 'A-Za-z0-9' '_'
+}
+
+now=$(date +%s)
+while IFS='|' read -r request iface chaddr demote vhid runmaster follow vendorclass clientid hostname || [ -n "${request}" ]; do
+    [ -n "${request}" ] || continue
+    case "${request}" in \#*) continue ;; esac
+    [ "${demote}" = "1" ] || continue
+    hb="${RUN_DIR}/carpvipdhcp-$(_id "${request}").hb"
+    [ -f "${hb}" ] || exit 1
+    mtime=$(stat -f %m "${hb}" 2>/dev/null || echo 0)
+    age=$(( now - mtime ))
+    [ "${age}" -le "${MAX_AGE}" ] || exit 1
+    # Freshness alone is not enough: a fresh heartbeat is written even on
+    # MISMATCH (ISP handed a different IP). Demote unless the keeper actually
+    # holds the requested VIP lease.
+    content=$(cat "${hb}" 2>/dev/null)
+    case "${content}" in
+        *STANDBY*) continue ;;
+        *MISMATCH*) exit 1 ;;
+        *"bound=${request} "*) : ;;
+        *) exit 1 ;;
+    esac
+done < "${CONF}"
+exit 0

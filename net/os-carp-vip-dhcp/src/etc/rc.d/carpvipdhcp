@@ -1,0 +1,184 @@
+#!/bin/sh
+
+# PROVIDE: carpvipdhcp
+# REQUIRE: LOGIN
+# KEYWORD: shutdown
+#
+# rc(8) wrapper for the CARP-VIP DHCP lease keepers (lease-keeper.py).
+# Reads /usr/local/etc/carpvipdhcp/keeper.conf (rendered by the configd template):
+# one line per enabled keeper ->
+#   REQUEST_IP|IFACE|CHADDR|DEMOTE_ON_LEASE_LOSS|VHID|RUN_ONLY_ON_MASTER|FOLLOW_IP.
+# Starts one supervised daemon per line, keyed by a filesystem-safe request-IP id.
+
+. /etc/rc.subr
+
+name="carpvipdhcp"
+rcvar="carpvipdhcp_enable"
+keeper="/usr/local/opnsense/scripts/OPNsense/CarpVipDhcp/lease-keeper.py"
+conf="/usr/local/etc/carpvipdhcp/keeper.conf"
+run_dir="/var/run"
+log_dir="/var/log"
+
+start_cmd="carpvipdhcp_start"
+stop_cmd="carpvipdhcp_stop"
+status_cmd="carpvipdhcp_status"
+restart_cmd="carpvipdhcp_restart"
+
+# Map a request IP to a filesystem-safe id (dots etc. -> underscore).
+# Use printf (not echo) so no trailing newline is turned into a '_'.
+_id()
+{
+    printf '%s' "$1" | tr -c 'A-Za-z0-9' '_'
+}
+
+carpvipdhcp_start()
+{
+    [ -f "${conf}" ] || { echo "no config"; return 0; }
+    count=0
+    while IFS='|' read -r request iface chaddr demote vhid runmaster follow vendorclass clientid hostname || [ -n "${request}" ]; do
+        [ -n "${request}" ] || continue
+        case "${request}" in \#*) continue ;; esac
+        if [ -z "${iface}" ] || [ -z "${chaddr}" ]; then
+            continue
+        fi
+        id=$(_id "${request}")
+        pidfile="${run_dir}/carpvipdhcp-${id}.pid"
+        if [ -f "${pidfile}" ] && kill -0 "$(cat "${pidfile}")" 2>/dev/null; then
+            continue
+        fi
+        set -- --iface "${iface}" --chaddr "${chaddr}" --request "${request}" \
+            --pidfile "${run_dir}/carpvipdhcp-${id}.child.pid" \
+            --hbfile "${run_dir}/carpvipdhcp-${id}.hb" \
+            --logfile "${log_dir}/carpvipdhcp-${id}.log"
+        # Run-only-on-master keepers self-gate: the daemon runs on both nodes but
+        # only sends DHCP while this node is CARP master for the vhid (else stands by).
+        if [ "${runmaster}" = "1" ]; then
+            set -- "$@" --vhid "${vhid}" --only-when-master
+        fi
+        # Follow mode: accept a changed ISP address and rewrite the CARP VIP to match.
+        if [ "${follow}" = "1" ]; then
+            set -- "$@" --follow
+        fi
+        # Optional DHCP request options -- only passed when the operator set them.
+        [ -n "${vendorclass}" ] && set -- "$@" --vendor-class "${vendorclass}"
+        [ -n "${clientid}" ] && set -- "$@" --client-id "${clientid}"
+        [ -n "${hostname}" ] && set -- "$@" --hostname "${hostname}"
+        # -f detach; -r supervise/restart on crash; -R 5 restart delay; -P supervisor pidfile.
+        /usr/sbin/daemon -f -r -R 5 -P "${pidfile}" -t "${name}-${id}" "${keeper}" "$@"
+        count=$((count + 1))
+    done < "${conf}"
+    echo "Started ${count} keeper(s)."
+}
+
+# List the python child processes of all keeper daemons (not their daemon(8)
+# supervisors, whose proctitle can also contain the script path).
+_keeper_children()
+{
+    pgrep -f "python3.*OPNsense/CarpVipDhcp/lease-keeper.py" 2>/dev/null
+}
+
+# Signal every keeper child and its daemon(8) supervisor (the child's parent, so
+# it does not respawn the child). $1 = signal (e.g. -TERM, -KILL).
+_signal_keepers()
+{
+    for child in $(_keeper_children); do
+        sup=$(ps -o ppid= -p "${child}" 2>/dev/null | tr -d ' ')
+        case "${sup}" in
+            ''|0|1|*[!0-9]*) : ;;    # missing/init/non-numeric parent -> only the child
+            *) kill "$1" "${sup}" 2>/dev/null ;;
+        esac
+        kill "$1" "${child}" 2>/dev/null
+    done
+}
+
+carpvipdhcp_stop()
+{
+    # Stop every keeper daemon, including strays whose pidfile was lost across an
+    # upgrade. TERM first, wait for exit, then escalate to KILL for stragglers.
+    stopped=$(_keeper_children | wc -l | tr -d ' ')
+    _signal_keepers -TERM
+    n=0
+    while [ "${n}" -lt 10 ] && [ -n "$(_keeper_children)" ]; do
+        sleep 1
+        n=$((n + 1))
+    done
+    if [ -n "$(_keeper_children)" ]; then
+        _signal_keepers -KILL
+    fi
+    rm -f "${run_dir}"/carpvipdhcp-*.pid "${run_dir}"/carpvipdhcp-*.child.pid
+    echo "Stopped ${stopped} keeper(s)."
+}
+
+carpvipdhcp_restart()
+{
+    if [ -n "${restart_id}" ]; then
+        carpvipdhcp_stop_id "${restart_id}"
+    else
+        carpvipdhcp_stop
+    fi
+    carpvipdhcp_start
+}
+
+# Stop only the keeper with the given filesystem-safe id (the daemon(8)
+# supervisor first, so it does not respawn the child, then the child). Used by a
+# follow to replace just the affected keeper without bouncing the others; the
+# following carpvipdhcp_start brings up the renamed line from the new keeper.conf.
+carpvipdhcp_stop_id()
+{
+    tid="$1"
+    [ -n "${tid}" ] || return 0
+    sup_pf="${run_dir}/carpvipdhcp-${tid}.pid"
+    child_pf="${run_dir}/carpvipdhcp-${tid}.child.pid"
+    for pf in "${sup_pf}" "${child_pf}"; do
+        [ -f "${pf}" ] || continue
+        p=$(cat "${pf}" 2>/dev/null)
+        case "${p}" in ''|*[!0-9]*) continue ;; esac
+        kill -TERM "${p}" 2>/dev/null
+    done
+    n=0
+    while [ "${n}" -lt 10 ]; do
+        alive=0
+        for pf in "${sup_pf}" "${child_pf}"; do
+            [ -f "${pf}" ] || continue
+            p=$(cat "${pf}" 2>/dev/null)
+            case "${p}" in ''|*[!0-9]*) continue ;; esac
+            kill -0 "${p}" 2>/dev/null && alive=1
+        done
+        [ "${alive}" = "0" ] && break
+        sleep 1
+        n=$((n + 1))
+    done
+    for pf in "${sup_pf}" "${child_pf}"; do
+        [ -f "${pf}" ] || continue
+        p=$(cat "${pf}" 2>/dev/null)
+        case "${p}" in ''|*[!0-9]*) continue ;; esac
+        kill -0 "${p}" 2>/dev/null && kill -KILL "${p}" 2>/dev/null
+    done
+    rm -f "${sup_pf}" "${child_pf}"
+}
+
+carpvipdhcp_status()
+{
+    running=0
+    for pidfile in "${run_dir}"/carpvipdhcp-*.pid; do
+        [ -f "${pidfile}" ] || continue
+        case "${pidfile}" in *.child.pid) continue ;; esac
+        if kill -0 "$(cat "${pidfile}")" 2>/dev/null; then
+            running=$((running + 1))
+        fi
+    done
+    # Wording matches what ApiMutableServiceControllerBase parses.
+    if [ "${running}" -gt 0 ]; then
+        echo "${name} is running (${running} keeper(s))."
+        return 0
+    fi
+    echo "${name} is not running."
+    return 1
+}
+
+load_rc_config "${name}"
+: "${carpvipdhcp_enable:=YES}"
+# Optional 2nd arg to `restart` = a keeper id to bounce on its own (see
+# carpvipdhcp_stop_id); without it, restart stops every keeper as before.
+restart_id="$2"
+run_rc_command "$1"

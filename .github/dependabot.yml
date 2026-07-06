@@ -1,0 +1,10 @@
+version: 2
+updates:
+  # Keep the GitHub Actions used by the workflows (checkout, setup-python, ...)
+  # current. Dependabot opens a PR when a newer major/minor tag is available.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: ci

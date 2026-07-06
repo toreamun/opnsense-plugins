@@ -1,0 +1,59 @@
+name: sign-release
+# When a release is published with one or more *.pkg assets attached, sign them:
+# download the packages, run sign-release.sh with the RELEASE_KEY secret, verify
+# the signature against the committed public key, and attach SHA256SUMS +
+# SHA256SUMS.sig back to the release.
+#
+# The package itself is built on an OPNsense/FreeBSD box (GitHub has no such
+# runner) and attached when you create the release, e.g.:
+#   gh release create v1.1 os-carp-vip-dhcp-1.1.pkg --title v1.1 --notes "..."
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write   # upload the manifest + signature as release assets
+
+jobs:
+  sign:
+    name: Sign release packages
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download .pkg assets from the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          mkdir -p dist
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern '*.pkg' --dir dist
+          echo "Downloaded:"; ls -l dist
+
+      - name: Sign the manifest
+        env:
+          RELEASE_KEY_PEM: ${{ secrets.RELEASE_KEY }}
+        run: |
+          if [ -z "$RELEASE_KEY_PEM" ]; then
+            echo "error: RELEASE_KEY secret is not set" >&2; exit 1
+          fi
+          umask 077
+          printf '%s\n' "$RELEASE_KEY_PEM" > /tmp/release.key
+          RELEASE_KEY=/tmp/release.key ./sign-release.sh
+          rm -f /tmp/release.key
+
+      - name: Self-verify against the committed public key
+        run: |
+          openssl base64 -d -in dist/SHA256SUMS.sig -out /tmp/sig.bin
+          openssl dgst -sha256 -verify keys/release.pub \
+            -signature /tmp/sig.bin dist/SHA256SUMS
+          echo "Signature OK"
+
+      - name: Attach manifest + signature to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          gh release upload "$TAG" dist/SHA256SUMS dist/SHA256SUMS.sig \
+            --repo "$GITHUB_REPOSITORY" --clobber

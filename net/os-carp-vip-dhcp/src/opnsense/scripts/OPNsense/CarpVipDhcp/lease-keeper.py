@@ -22,6 +22,19 @@ Robustness:
   * RELEASE is NOT sent on a normal stop (SIGTERM) -- only with
     --once/--release-on-exit -- so the address is not given up needlessly.
 
+Security posture (this daemon parses untrusted WAN traffic as root):
+  * The BPF filter is the outer boundary: only DHCP traffic (udp port 67/68)
+    ever reaches Python; everything else is dropped in the kernel.
+  * A reply must carry our current xid and the BOOTREPLY op before any field
+    is read (see _on) -- unsolicited or replayed packets are discarded early.
+  * Only the handful of DHCP options the keeper needs is extracted; there is
+    no full dissection of attacker-controlled option data.
+  * Follow mode never rewrites the CARP VIP from a single ACK: the new address
+    is validated for plausibility, routability class and expected server, and
+    rate-throttled against flap/spoof storms (see _handle_changed_address).
+  * A parse error in the sniffer callback is dropped (debug-logged); malformed
+    input can never take the main loop down.
+
 Usage:
   lease-keeper.py --iface <if> --chaddr <mac> --request <ip>
   lease-keeper.py ... --once            # one-shot claim+verify+release (test)
@@ -184,6 +197,9 @@ class Keeper:
                     self._sniffer.stop()
                 except Exception:
                     pass
+            # The BPF filter is a security boundary, not an optimization: the
+            # callback runs as root on a promiscuous WAN socket, so nothing but
+            # DHCP is allowed to reach the Python parser at all.
             self._sniffer = AsyncSniffer(
                 iface=self.iface, filter="udp and (port 67 or port 68)",
                 prn=self._on, store=0)
@@ -208,8 +224,13 @@ class Keeper:
             if not (p.haslayer(BOOTP) and p.haslayer(DHCP)):
                 return
             b = p[BOOTP]
+            # Trust gate: only a reply to OUR in-flight exchange (random xid,
+            # regenerated per DORA) is parsed further; anything else on the
+            # segment -- other clients' traffic, replays, junk -- stops here.
             if b.xid != self.xid or b.op != BOOTREPLY:
                 return
+            # Extract only the fields the keeper acts on; attacker-controlled
+            # option data is otherwise left untouched.
             mt = sid = lt = rt = bt = ro = None
             for o in p[DHCP].options:
                 if isinstance(o, tuple):

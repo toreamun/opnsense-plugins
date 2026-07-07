@@ -54,7 +54,8 @@ Then find it under **Interfaces → Virtual IPs DHCP**.
 After installing, the plugin lives under **Interfaces → Virtual IPs DHCP**, with three pages:
 
 - **Settings** — the keeper table (add / edit / enable keepers).
-- **Status** — effective configuration + runtime (bound lease, heartbeat age, CARP demotion), and per-keeper mode.
+- **Status** — effective configuration + runtime (bound lease, heartbeat age, ARP nudge age/target,
+  CARP demotion), per-keeper mode, and a ⚡ button to send a manual ARP nudge (on the CARP master).
 - **Log** — the keeper log (searchable/filterable, with a clear button).
 
 The privilege that grants access is **“Interfaces: Virtual IPs DHCP”**.
@@ -136,9 +137,9 @@ OPNsense CARP answers ARP + egresses data as usual. The VIP becomes failover-cap
   taken from DHCP option 3 (fallback: the DHCP server address). Set 0 to disable.
   **Becoming master** (failover, or a link flap re-electing CARP) triggers an immediate nudge *and* an
   early lease RENEW — upstream ARP and DHCP-snooping state may just have been disturbed, so neither
-  waits for its normal timer (the early renew applies even with the nudge disabled). A **manual nudge** is available for troubleshooting: the ⚡ button on the
-  status page (shown on the CARP master), or `kill -USR1` on the keeper daemon — it fires within a
-  second and shows up in the log.
+  waits for its normal timer (the early renew applies even with the nudge disabled). A **manual
+  nudge** is available for troubleshooting: the ⚡ button on the status page (shown on the CARP
+  master), or `kill -USR1` on the keeper daemon — it fires within a second and shows up in the log.
 - **Self-healing:** the daemon never exits on a transient DHCP/interface fault — it catches errors, keeps
   its heartbeat fresh (so CARP does not falsely demote the node) and retries.
 

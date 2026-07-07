@@ -98,14 +98,22 @@
         }
         let tip = "{{ lang._('every') }}" + ' ' + k.arp_nudge + ' s'
             + (k.gw ? ' → ' + k.gw : ' (' + "{{ lang._('gateway unknown') }}" + ')');
+        let cell;
         if (k.nudge_age === null || k.nudge_age === undefined) {
             // Enabled but never sent: expected on a CARP backup, suspicious on a
             // bound master (no gateway known, or the daemon predates the setting).
             let style = (k.carp_state === 'MASTER' && k.bound) ? 'label-warning' : 'label-default';
-            return '<span class="label ' + style + '" title="' + tip + '">'
+            cell = '<span class="label ' + style + '" title="' + tip + '">'
                 + "{{ lang._('never') }}" + '</span>';
+        } else {
+            cell = '<span title="' + tip + '">' + fmtAge(k.nudge_age) + '</span>';
         }
-        return '<span title="' + tip + '">' + fmtAge(k.nudge_age) + '</span>';
+        if (k.running === true && k.carp_state === 'MASTER') {
+            cell += ' <button class="btn btn-xs btn-default nudge_now" data-id="' + k.request
+                + '" title="' + "{{ lang._('Send an ARP nudge now') }}" + '">'
+                + '<i class="fa fa-bolt fa-fw"></i></button>';
+        }
+        return cell;
     }
 
     function refreshStatus() {
@@ -140,6 +148,17 @@
             $('#keeper_rows').html(rows);
         });
     }
+
+    $(document).on('click', '.nudge_now', function () {
+        let btn = $(this);
+        btn.prop('disabled', true);
+        ajaxCall('/api/carpvipdhcp/diagnostics/nudge/' + btn.data('id'), {}, function () {
+            // The nudge age refreshes on the next heartbeat write (<= 30 s);
+            // poll a little sooner for quicker feedback.
+            setTimeout(refreshStatus, 2000);
+            btn.prop('disabled', false);
+        });
+    });
 
     $(document).ready(function () {
         updateServiceControlUI('carpvipdhcp');

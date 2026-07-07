@@ -216,11 +216,32 @@ def test_nudge_fires_immediately_on_master_transition(lk):
     keeper._carp_master_now = lambda: next(states)
     keeper._arp_nudge()                  # now backup -> no send, remembers the role
     assert keeper._last_nudge == first
+    assert keeper._renew_asap is False
     keeper._arp_nudge()                  # backup -> master: forced despite the interval
     assert keeper._last_nudge > first
+    assert keeper._renew_asap is True    # and the lease renews early too
     second = keeper._last_nudge
+    keeper._renew_asap = False
     keeper._arp_nudge()                  # still master -> interval applies again
     assert keeper._last_nudge == second
+
+
+def test_hold_returns_early_for_asap_renew(lk):
+    import time
+    keeper = _nudge_keeper(lk)
+    keeper._renew_asap = True
+    start = time.time()
+    assert keeper._hold(60) is True      # returns as if T1 elapsed -> caller renews
+    assert time.time() - start < 2
+    assert keeper._renew_asap is False
+
+
+def test_sigusr1_flag_services_nudge_within_a_second(lk):
+    keeper = _nudge_keeper(lk)
+    keeper._nudge_now = True             # what the SIGUSR1 handler sets
+    keeper._sleep_gated(1)
+    assert keeper._nudge_now is False
+    assert keeper._last_nudge > 0
 
 
 def test_nudge_missing_gateway_warns_once(lk, caplog):

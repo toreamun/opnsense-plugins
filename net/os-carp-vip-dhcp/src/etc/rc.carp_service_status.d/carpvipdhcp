@@ -11,10 +11,11 @@
 
 CONF="/usr/local/etc/carpvipdhcp/keeper.conf"
 RUN_DIR="/var/run"
-# A fresh heartbeat is written on every (re)bind/renew. The daemon renews at
-# T1 = 0.5 x lease, so a heartbeat can legitimately age up to ~T1 between writes.
-# Use a full typical lease (3600s) as the ceiling to avoid demoting a healthy
-# keeper mid-cycle; only a truly stalled keeper exceeds this.
+# The daemon refreshes the heartbeat every ~30s while holding a lease; the
+# largest legitimate gap is a failed-acquire backoff (~300s). 3600s is therefore
+# a deliberately generous ceiling: demotion is drastic, so we only act on a
+# truly stalled keeper, never a mid-cycle one. (The health *banner* uses a
+# tighter 600s ceiling -- a notice is cheap, so it can be more responsive.)
 MAX_AGE=3600
 
 [ -f "${CONF}" ] || exit 0

@@ -207,6 +207,22 @@ def test_hb_no_nudge_tokens_when_off(lk, tmp_path):
     assert "nudge=" not in hb.read_text()
 
 
+def test_nudge_fires_immediately_on_master_transition(lk):
+    keeper = _nudge_keeper(lk)
+    keeper._arp_nudge()                  # master from the start -> sends
+    first = keeper._last_nudge
+    assert first > 0
+    states = iter([False, True, True])
+    keeper._carp_master_now = lambda: next(states)
+    keeper._arp_nudge()                  # now backup -> no send, remembers the role
+    assert keeper._last_nudge == first
+    keeper._arp_nudge()                  # backup -> master: forced despite the interval
+    assert keeper._last_nudge > first
+    second = keeper._last_nudge
+    keeper._arp_nudge()                  # still master -> interval applies again
+    assert keeper._last_nudge == second
+
+
 def test_nudge_missing_gateway_warns_once(lk, caplog):
     keeper = _nudge_keeper(lk)
     keeper.server = None             # enabled + bound, but no target

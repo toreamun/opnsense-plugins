@@ -242,12 +242,15 @@ def test_hold_returns_early_for_asap_renew(lk):
     assert keeper._renew_asap is False
 
 
-def test_sigusr1_flag_services_nudge_within_a_second(lk):
+def test_sigusr1_flag_services_nudge_within_a_second(lk, caplog):
     keeper = _nudge_keeper(lk)
     keeper._nudge_now = True             # what the SIGUSR1 handler sets
-    keeper._sleep_gated(1)
+    with caplog.at_level("INFO", logger="lease-keeper"):
+        keeper._sleep_gated(1)
     assert keeper._nudge_now is False
     assert keeper._last_nudge > 0
+    # Operator-triggered nudges must be visible in the log (the README says so).
+    assert any("manual ARP nudge" in r.getMessage() for r in caplog.records)
 
 
 def test_nudge_missing_gateway_warns_once(lk, caplog):

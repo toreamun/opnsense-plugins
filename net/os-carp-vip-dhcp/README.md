@@ -136,7 +136,7 @@ OPNsense CARP answers ARP + egresses data as usual. The VIP becomes failover-cap
   taken from DHCP option 3 (fallback: the DHCP server address). Set 0 to disable.
   **Becoming master** (failover, or a link flap re-electing CARP) triggers an immediate nudge *and* an
   early lease RENEW — upstream ARP and DHCP-snooping state may just have been disturbed, so neither
-  waits for its normal timer. A **manual nudge** is available for troubleshooting: the ⚡ button on the
+  waits for its normal timer (the early renew applies even with the nudge disabled). A **manual nudge** is available for troubleshooting: the ⚡ button on the
   status page (shown on the CARP master), or `kill -USR1` on the keeper daemon — it fires within a
   second and shows up in the log.
 - **Self-healing:** the daemon never exits on a transient DHCP/interface fault — it catches errors, keeps

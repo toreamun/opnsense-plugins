@@ -53,14 +53,11 @@
                 </aliasName>
 
                 <!--
-                    Periodically broadcast an ARP request from (VIP, chaddr) for the
-                    upstream gateway, refreshing its ARP entry for the VIP. Needed for
-                    gateways that ignore gratuitous ARP and never re-ARP an expired
-                    entry (traffic to the VIP silently blackholes when it expires).
-                    Only sent while this node is CARP master for the VIP. On by
-                    default (240 s): one broadcast ARP per interval is negligible
-                    next to CARP's one advertisement per second, and the failure it
-                    prevents is silent. 0 = off.
+                    Interval for broadcasting an ARP request from (VIP, chaddr) for
+                    the upstream gateway, keeping its ARP entry for the VIP fresh.
+                    Needed when the gateway ignores gratuitous ARP and never re-ARPs
+                    an expired entry; see the README's "ARP nudge" section. Only
+                    sent while CARP master. 0 = off.
                 -->
                 <arpNudgeInterval type="IntegerField">
                     <Default>240</Default>

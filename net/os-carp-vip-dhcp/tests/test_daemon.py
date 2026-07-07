@@ -1,4 +1,5 @@
 """Unit tests for the lease-keeper daemon's pure helpers and follow decision."""
+import time
 
 
 def test_sane_ipv4(lk):
@@ -48,7 +49,7 @@ def _follow_keeper(lk, tmp_path):
 
 
 def _ack(lk, yiaddr, server="100.64.4.1"):
-    return lk.DhcpReply(5, yiaddr, server, 1800, None, None)
+    return lk.DhcpReply(5, yiaddr, server, 1800, None, None, None)
 
 
 def test_follow_accepts_same_class(lk, tmp_path):
@@ -99,12 +100,12 @@ def test_id_opts_built_from_args(lk):
     assert ("hostname", "vip") in keeper._id_opts
 
 
-def _nudge_keeper(lk, **kwargs):
-    keeper = lk.Keeper("eth0", "00:00:5e:00:01:fe", "100.64.4.7", hbfile=None,
-                       arp_nudge=kwargs.pop("arp_nudge", 240), **kwargs)
+def _nudge_keeper(lk, arp_nudge=240, hbfile=None, **kwargs):
+    keeper = lk.Keeper("eth0", "00:00:5e:00:01:fe", "100.64.4.7",
+                       hbfile=hbfile, arp_nudge=arp_nudge, **kwargs)
     keeper.yiaddr = "100.64.4.7"
     keeper.server = "100.64.4.1"
-    keeper._carp_master_now = lambda: True   # not under test here (needs ifconfig)
+    keeper._probe_carp_master = lambda: True   # the real probe needs ifconfig
     return keeper
 
 
@@ -152,36 +153,35 @@ def test_nudge_works_from_router_option_alone(lk):
 
 def test_nudge_gated_to_carp_master(lk):
     keeper = _nudge_keeper(lk, vhid=199)
-    keeper._carp_master_now = lambda: False
+    keeper._probe_carp_master = lambda: False
     keeper._arp_nudge(force=True)
     assert keeper._last_nudge == 0.0   # never nudge from a CARP backup
 
 
-def test_carp_master_now_true_without_vhid(lk):
+def test_probe_carp_master_true_without_vhid(lk):
     keeper = lk.Keeper("eth0", "00:00:5e:00:01:fe", "100.64.4.7", hbfile=None)
-    assert keeper._carp_master_now() is True
+    assert keeper._probe_carp_master() is True
 
 
-def test_carp_master_now_fails_closed(lk, monkeypatch):
-    keeper = lk.Keeper("eth0", "00:00:5e:00:01:fe", "100.64.4.7", hbfile=None, vhid=199)
+def test_probe_failure_skips_nudge(lk, monkeypatch):
+    # A failed probe reports None, and the nudge fails closed on anything but
+    # a confirmed MASTER.
+    keeper = lk.Keeper("eth0", "00:00:5e:00:01:fe", "100.64.4.7", hbfile=None,
+                       vhid=199, arp_nudge=240)
+    keeper.yiaddr = "100.64.4.7"
+    keeper.server = "100.64.4.1"
 
     def boom(*a, **k):
         raise OSError("ifconfig unavailable")
     monkeypatch.setattr(lk.subprocess, "check_output", boom)
-    assert keeper._carp_master_now() is False
-
-
-def test_ack_router_option_defaulted(lk):
-    # Existing 6-arg constructions (and old pickled replies) must keep working.
-    reply = lk.DhcpReply(5, "100.64.4.7", "100.64.4.1", 1800, None, None)
-    assert reply.router is None
+    assert keeper._probe_carp_master() is None
+    keeper._arp_nudge(force=True)
+    assert keeper._last_nudge == 0.0
 
 
 def test_hb_includes_nudge_state(lk, tmp_path):
     hb = tmp_path / "hb"
-    keeper = lk.Keeper("eth0", "00:00:5e:00:01:fe", "100.64.4.7",
-                       hbfile=str(hb), arp_nudge=240)
-    keeper.yiaddr = "100.64.4.7"
+    keeper = _nudge_keeper(lk, hbfile=str(hb))
     keeper.router = "100.64.4.1"
     keeper._last_nudge = 1783350000.0
     keeper._hb()
@@ -192,8 +192,8 @@ def test_hb_includes_nudge_state(lk, tmp_path):
 
 def test_hb_nudge_never_and_no_gateway(lk, tmp_path):
     hb = tmp_path / "hb"
-    keeper = lk.Keeper("eth0", "00:00:5e:00:01:fe", "100.64.4.7",
-                       hbfile=str(hb), arp_nudge=240)
+    keeper = _nudge_keeper(lk, hbfile=str(hb))
+    keeper.server = None
     keeper._hb()
     content = hb.read_text()
     assert " nudge=0" in content     # enabled but never sent
@@ -202,32 +202,38 @@ def test_hb_nudge_never_and_no_gateway(lk, tmp_path):
 
 def test_hb_no_nudge_tokens_when_off(lk, tmp_path):
     hb = tmp_path / "hb"
-    keeper = lk.Keeper("eth0", "00:00:5e:00:01:fe", "100.64.4.7", hbfile=str(hb))
+    keeper = _nudge_keeper(lk, arp_nudge=0, hbfile=str(hb))
     keeper._hb()
     assert "nudge=" not in hb.read_text()
 
 
-def test_nudge_fires_immediately_on_master_transition(lk):
-    keeper = _nudge_keeper(lk)
-    keeper._arp_nudge()                  # master from the start -> sends
+def test_master_transition_renews_early_and_nudges(lk):
+    keeper = _nudge_keeper(lk, vhid=199)
+    states = iter([True, False, True, True, True])
+    keeper._probe_carp_master = lambda: next(states)
+    keeper._poll_carp_role()             # master from the start -> no transition
+    assert keeper._renew_asap is False
+    assert keeper._last_nudge == 0.0
+    keeper._poll_carp_role()             # backup -> remembers the role
+    keeper._poll_carp_role()             # backup -> master (the forced nudge probes again)
+    assert keeper._renew_asap is True
     first = keeper._last_nudge
     assert first > 0
-    states = iter([False, True, True])
-    keeper._carp_master_now = lambda: next(states)
-    keeper._arp_nudge()                  # now backup -> no send, remembers the role
+    keeper._poll_carp_role()             # still master -> nothing new
     assert keeper._last_nudge == first
-    assert keeper._renew_asap is False
-    keeper._arp_nudge()                  # backup -> master: forced despite the interval
-    assert keeper._last_nudge > first
-    assert keeper._renew_asap is True    # and the lease renews early too
-    second = keeper._last_nudge
-    keeper._renew_asap = False
-    keeper._arp_nudge()                  # still master -> interval applies again
-    assert keeper._last_nudge == second
+
+
+def test_master_transition_renews_even_with_nudge_off(lk):
+    keeper = _nudge_keeper(lk, arp_nudge=0, vhid=199)
+    states = iter([False, True])
+    keeper._probe_carp_master = lambda: next(states)
+    keeper._poll_carp_role()
+    keeper._poll_carp_role()
+    assert keeper._renew_asap is True    # the early renew is not tied to the nudge
+    assert keeper._last_nudge == 0.0     # but no nudge was sent
 
 
 def test_hold_returns_early_for_asap_renew(lk):
-    import time
     keeper = _nudge_keeper(lk)
     keeper._renew_asap = True
     start = time.time()

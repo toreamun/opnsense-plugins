@@ -99,7 +99,7 @@
         let tip = "{{ lang._('every') }}" + ' ' + k.arp_nudge + ' s'
             + (k.gw ? ' → ' + k.gw : ' (' + "{{ lang._('gateway unknown') }}" + ')');
         let cell;
-        if (k.nudge_age === null || k.nudge_age === undefined) {
+        if (k.nudge_age == null) {
             // Enabled but never sent: expected on a CARP backup, suspicious on a
             // bound master (no gateway known, or the daemon predates the setting).
             let style = (k.carp_state === 'MASTER' && k.bound) ? 'label-warning' : 'label-default';

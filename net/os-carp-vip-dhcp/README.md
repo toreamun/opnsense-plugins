@@ -179,9 +179,33 @@ keeper follows. (The CARP VIP itself is intentionally *not* synced, because `adv
 The keeper *configuration* itself can optionally be synced too: tick **CARP-VIP DHCP lease keepers**
 under System → High Availability → Settings (off by default) to replicate it to the backup.
 
+## Playing nicely with ISP access-network security
+
+Carrier access equipment (BNG / access switches / OLTs) polices subscribers with a family of
+mechanisms that all key off the DHCP exchange. The plugin's strategy — a real DHCP lease held on the
+CARP virtual MAC, plus an ARP nudge that repeats exactly that binding — is designed to satisfy each
+of them:
+
+| ISP mechanism | What it does | How the plugin cooperates |
+|---|---|---|
+| **DHCP snooping** | builds the trusted IP↔MAC binding table from DHCP exchanges seen on the subscriber port | the lease is acquired and renewed *through the subscriber port* with `chaddr` = CARP MAC, so the binding matches what CARP presents on the wire |
+| **Dynamic ARP Inspection (DAI)** | drops ARP whose sender (IP, MAC) does not match the snooped binding | the nudge's sender is (leased IP, `chaddr`) — exactly the snooped binding, so it passes inspection |
+| **Gratuitous-ARP filtering** | ignores unsolicited ARP announcements (ARP-spoofing defence) — CARP's own gratuitous ARP on failover is silently dropped | the nudge is a normal ARP **request**, which the gateway must process in order to answer; that is the one ARP path such gear reliably learns from |
+| **No re-ARP on expiry** ("secured ARP") | the gateway never broadcasts who-has for a subscriber address; an expired entry silently blackholes all downstream traffic | the periodic nudge (default 240 s, well under typical 15–20 min ARP timeouts) keeps the entry permanently fresh; becoming CARP master triggers an immediate nudge so a failover or link flap never waits out the interval |
+| **IP Source Guard (IP-only)** | drops upstream packets whose source IP is not in the binding table | the leased VIP *is* in the table — fine |
+| **IP Source Guard (strict IP+MAC)** | additionally requires the source *MAC* to match the binding | ⚠ **known limitation**: FreeBSD egresses data from a CARP VIP with the interface's *physical* MAC, not the CARP MAC. Under strict IPSG, outbound VIP traffic is dropped even though the lease and ARP are healthy. Symptom: the gateway answers ARP/pings *to* the VIP, but anything *sourced from* it never gets a reply, fresh nudge or not. There is no clean per-packet fix; the workaround is spoofing the interface MAC to equal the lease MAC (see the single-IP scenario doc) |
+| **Client identity checks** | the server only leases to a known vendor-class (opt 60), client-id (61) or hostname (12) | per-keeper DHCP request options (advanced fields) |
+| **Per-subscriber MAC / session limits** | the port accepts a limited number of source MACs or DHCP sessions | mind the budget: each node's own MAC plus the CARP MAC all appear on the ISP-facing segment. With a strict one-IP/one-MAC ISP, see [docs/single-ip-wan-carp.md](docs/single-ip-wan-carp.md) |
+
+Failover interplay: because the ISP binds the lease to the CARP **virtual** MAC, a CARP failover does
+not invalidate anything upstream — the same MAC simply starts answering from the new master (CARP's
+advertisements re-teach the switch fabric within a second, and the new master sends an immediate
+ARP nudge). This is the core reason the lease lives on the CARP MAC rather than either node's own.
+
 ## Scope / caveats
 
-- **IPv4 DHCP only** (DHCPv6 out of scope for now).
+- **IPv4 DHCP only** (DHCPv6/ND out of scope for now — the ARP nudge has no IPv6 equivalent here
+  either; IPv6 neighbor discovery is a separate mechanism).
 - WAN is the typical — but not required — placement.
 - You must own the MAC/reservation you keep a lease for; holding a foreign lease is an ISP violation.
 - Requires **root** (raw L2/BPF socket) and depends on **Scapy**.

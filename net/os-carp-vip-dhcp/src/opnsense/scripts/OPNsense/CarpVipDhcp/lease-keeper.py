@@ -148,6 +148,7 @@ class Keeper:
         self._last_nudge = 0.0
         self._nudge_gw = None          # last nudge target we logged (log again on change)
         self._nudge_warned = False     # warned once about a missing nudge target
+        self._was_master = None        # CARP role at the last nudge check (None = unknown yet)
         # Optional DHCP request options (empty -> not sent); built once and added to
         # every DISCOVER/REQUEST/RENEW so the server sees a consistent client identity.
         self._id_opts = []
@@ -553,9 +554,18 @@ class Keeper:
     def _arp_nudge(self, force=False):
         """Refresh the upstream gateway's ARP entry for the leased address by
         broadcasting an ARP request from (yiaddr, chaddr). No-op unless enabled,
-        bound, due (or forced) and CARP master (see _carp_master_now)."""
+        bound, due (or forced) and CARP master (see _carp_master_now). Becoming
+        master forces an immediate nudge: a failover (or a link flap, which
+        re-elects CARP) must not wait out the interval clock while upstream
+        state may just have been disturbed."""
         if not self.arp_nudge or not self.yiaddr:
             return
+        master = self._carp_master_now()
+        if master and self._was_master is False:
+            LOG.info("became CARP master for vhid %s -- sending an immediate ARP nudge",
+                     self.vhid or "-")
+            force = True
+        self._was_master = master
         if not force and time.time() - self._last_nudge < self.arp_nudge:
             return
         gw = self.router or self.server
@@ -567,7 +577,7 @@ class Keeper:
                             "(no DHCP router option or server-id) -- cannot nudge")
                 self._nudge_warned = True
             return
-        if not self._carp_master_now():
+        if not master:
             return
         try:
             sendp(Ether(src=self.chaddr, dst="ff:ff:ff:ff:ff:ff") /

@@ -1,0 +1,24 @@
+<metadata>
+    <carpvipdhcp>
+        <filename>CarpVipDhcp.js</filename>
+        <endpoints>
+            <endpoint>/api/carpvipdhcp/diagnostics/status</endpoint>
+        </endpoints>
+        <translations>
+            <title>CARP-VIP DHCP</title>
+            <vip>VIP</vip>
+            <carp>CARP</carp>
+            <lease>Lease</lease>
+            <nudge>ARP nudge</nudge>
+            <held>held</held>
+            <notheld>not held</notheld>
+            <standby>standby</standby>
+            <mismatch>mismatch</mismatch>
+            <stopped>stopped</stopped>
+            <off>off</off>
+            <never>never</never>
+            <none>No keepers configured</none>
+            <error>Unable to load keeper status</error>
+        </translations>
+    </carpvipdhcp>
+</metadata>

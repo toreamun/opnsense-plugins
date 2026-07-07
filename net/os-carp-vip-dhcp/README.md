@@ -134,6 +134,11 @@ OPNsense CARP answers ARP + egresses data as usual. The VIP becomes failover-cap
   behave normally, so it is **on by default**. The nudge is only sent while this node is CARP **master**
   for the VIP (never from a backup, which would steal the VIP's traffic), and the gateway address is
   taken from DHCP option 3 (fallback: the DHCP server address). Set 0 to disable.
+  **Becoming master** (failover, or a link flap re-electing CARP) triggers an immediate nudge *and* an
+  early lease RENEW — upstream ARP and DHCP-snooping state may just have been disturbed, so neither
+  waits for its normal timer. A **manual nudge** is available for troubleshooting: the ⚡ button on the
+  status page (shown on the CARP master), or `kill -USR1` on the keeper daemon — it fires within a
+  second and shows up in the log.
 - **Self-healing:** the daemon never exits on a transient DHCP/interface fault — it catches errors, keeps
   its heartbeat fresh (so CARP does not falsely demote the node) and retries.
 
@@ -209,6 +214,18 @@ ARP nudge). This is the core reason the lease lives on the CARP MAC rather than 
 - WAN is the typical — but not required — placement.
 - You must own the MAC/reservation you keep a lease for; holding a foreign lease is an ISP violation.
 - Requires **root** (raw L2/BPF socket) and depends on **Scapy**.
+
+### Design notes — considered and deliberately not included
+
+- **DHCP option 82 (relay/circuit-id):** inserted by the ISP's access node, not by the client —
+  nothing for a DHCP client to support.
+- **RFC 5227 address-conflict detection:** CARP already arbitrates the VIP between our own nodes; a
+  rogue host on the ISP segment claiming the address is beyond what a subscriber device can police.
+- **DAI/ARP rate-limit accommodation:** access gear typically rate-limits ARP at ≥15 pps; one nudge
+  per 240 s is four orders of magnitude below — no pacing logic needed.
+- **Unicast DHCP RENEW:** the keeper renews by broadcast with the broadcast flag set, and the
+  promiscuous sniffer also captures unicast replies — both server behaviours are covered without a
+  unicast sending mode.
 
 ## License
 

@@ -149,6 +149,8 @@ class Keeper:
         self._nudge_gw = None          # last nudge target we logged (log again on change)
         self._nudge_warned = False     # warned once about a missing nudge target
         self._was_master = None        # CARP role at the last nudge check (None = unknown yet)
+        self._nudge_now = False        # operator asked for an immediate nudge (SIGUSR1)
+        self._renew_asap = False       # renew at the next _hold tick instead of waiting for T1
         # Optional DHCP request options (empty -> not sent); built once and added to
         # every DISCOVER/REQUEST/RENEW so the server sees a consistent client identity.
         self._id_opts = []
@@ -562,9 +564,13 @@ class Keeper:
             return
         master = self._carp_master_now()
         if master and self._was_master is False:
-            LOG.info("became CARP master for vhid %s -- sending an immediate ARP nudge",
+            LOG.info("became CARP master for vhid %s -- immediate ARP nudge and early lease renew",
                      self.vhid or "-")
             force = True
+            # A failover or link flap may also have disturbed the access node's
+            # DHCP-snooping binding; an early RENEW re-teaches it. Handled by the
+            # next _hold tick instead of waiting out T1.
+            self._renew_asap = True
         self._was_master = master
         if not force and time.time() - self._last_nudge < self.arp_nudge:
             return
@@ -601,9 +607,15 @@ class Keeper:
 
     def _sleep_gated(self, secs):
         """Sleep up to secs (1s steps). Return False early on stop or, when
-        run-only-on-master is set, on CARP-master loss (checked every GATE_POLL)."""
+        run-only-on-master is set, on CARP-master loss (checked every GATE_POLL).
+        Also services an operator-requested immediate nudge (SIGUSR1) so it fires
+        within a second instead of at the next heartbeat tick."""
         slept = 0
         while slept < secs and not self.stop:
+            if self._nudge_now:
+                self._nudge_now = False
+                self._arp_nudge(force=True)
+                self._hb()   # publish the new nudge age right away for the status page
             if self.only_when_master and slept % GATE_POLL == 0 and not self._is_master():
                 return False
             time.sleep(1)
@@ -617,6 +629,11 @@ class Keeper:
         on stop or CARP-master loss."""
         remaining = secs
         while remaining > 0 and not self.stop:
+            if self._renew_asap:
+                # Return as if T1 elapsed: the caller renews right away, which
+                # re-teaches upstream DHCP-snooping state after a master change.
+                self._renew_asap = False
+                return not self.stop
             chunk = min(HB_REFRESH, remaining)
             if not self._sleep_gated(chunk):
                 return False
@@ -802,6 +819,13 @@ def main():
         k.stop = True
     signal.signal(signal.SIGINT, _sig)
     signal.signal(signal.SIGTERM, _sig)
+
+    def _sig_nudge(*_):
+        # Operator-requested immediate ARP nudge (configd action / kill -USR1).
+        # Only sets a flag; the sleep loops service it within a second, so no
+        # network I/O happens inside the signal handler itself.
+        k._nudge_now = True
+    signal.signal(signal.SIGUSR1, _sig_nudge)
 
     if a.once:
         if not k._start_sniffer():

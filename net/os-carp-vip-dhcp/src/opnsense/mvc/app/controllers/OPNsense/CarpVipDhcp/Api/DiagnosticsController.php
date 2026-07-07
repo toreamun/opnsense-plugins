@@ -63,4 +63,26 @@ class DiagnosticsController extends ApiControllerBase
         (new Backend())->configdRun('carpvipdhcp clear_log');
         return ['status' => 'ok'];
     }
+
+    /**
+     * Ask a keeper to send an immediate ARP nudge (POST-only, state-changing).
+     * Useful when troubleshooting a suspected stale gateway ARP entry: the
+     * daemon fires within a second and the result shows up in the log page.
+     * @param string $id the keeper's request address (IPv4)
+     * @return array
+     */
+    public function nudgeAction($id = '')
+    {
+        if (!$this->request->isPost()) {
+            return ['status' => 'failed'];
+        }
+        // Constrain to an address shape before handing it to configd; the shell
+        // script re-sanitizes to [A-Za-z0-9_] as a second line of defence.
+        if (!preg_match('/^[0-9A-Fa-f:.]{1,45}$/', (string)$id)) {
+            return ['status' => 'invalid'];
+        }
+        $raw = trim((string)(new Backend())->configdpRun('carpvipdhcp nudge', [$id]));
+        $data = json_decode($raw, true);
+        return is_array($data) ? $data : ['status' => 'failed'];
+    }
 }

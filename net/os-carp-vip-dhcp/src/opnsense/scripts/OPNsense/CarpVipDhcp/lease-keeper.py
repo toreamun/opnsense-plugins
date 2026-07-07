@@ -618,6 +618,10 @@ class Keeper:
         while slept < secs and not self.stop:
             if self._nudge_now:
                 self._nudge_now = False
+                # Operator actions are rare and intentional -- always log them,
+                # unlike the periodic nudges (whose freshness the status page
+                # already shows without flooding the log every interval).
+                LOG.info("manual ARP nudge requested (SIGUSR1)")
                 self._arp_nudge(force=True)
                 self._hb()   # publish the new nudge age right away for the status page
             if self.only_when_master and slept % GATE_POLL == 0 and not self._is_master():

@@ -73,8 +73,10 @@ class CarpVipDhcpStatus extends AbstractStatus
 
         // Debounce against the wall clock (survives irregular polling): record
         // when the problem was first seen, alert only once it outlasts GRACE.
+        // This also rides out the normal acquire/re-acquire window, where the
+        // keeper legitimately publishes bound=- (which reads as "not holding").
         $now = time();
-        $since = is_readable(self::STATE_FILE) ? (int)trim((string)@file_get_contents(self::STATE_FILE)) : 0;
+        $since = (int)@file_get_contents(self::STATE_FILE);   // missing file -> 0
         if ($since <= 0) {
             @file_put_contents(self::STATE_FILE, (string)$now);
             return;
@@ -97,10 +99,11 @@ class CarpVipDhcpStatus extends AbstractStatus
     private function keeperAddresses(): array
     {
         $out = [];
-        if (!is_readable(self::CONF)) {
+        $lines = @file(self::CONF, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+        if ($lines === false) {
             return $out;
         }
-        foreach (file(self::CONF, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) as $line) {
+        foreach ($lines as $line) {
             $line = trim($line);
             if ($line === '' || $line[0] === '#' || strpos($line, '|') === false) {
                 continue;
@@ -118,7 +121,7 @@ class CarpVipDhcpStatus extends AbstractStatus
     private function unhealthyReason(string $request): ?string
     {
         $hb = self::RUN_DIR . '/carpvipdhcp-' . preg_replace('/[^A-Za-z0-9]/', '_', $request) . '.hb';
-        $content = is_readable($hb) ? trim((string)@file_get_contents($hb)) : '';
+        $content = trim((string)@file_get_contents($hb));   // missing file -> ''
         if ($content === '') {
             return gettext('no heartbeat');
         }

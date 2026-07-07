@@ -22,21 +22,34 @@
 
 // Dashboard widget: one row per CARP-VIP DHCP keeper (VIP, CARP role, lease
 // state, ARP-nudge age). Reuses the diagnostics status API the plugin's Status
-// page already polls; no widget-specific backend.
+// page already polls; no widget-specific backend. The cell classification below
+// mirrors the Status page (status.volt leaseCell/carpStatus/nudgeCell) in a
+// simpler form -- keep the two in sync when the health rules change.
 export default class CarpVipDhcp extends BaseTableWidget {
     constructor() {
         super();
-        this.tickTimeout = 10;
+        // Keeper state moves at CARP/DHCP-lease timescales; a slower tick keeps
+        // the backend (status.py forks ifconfig/sysctl + parses config.xml) off
+        // a tight loop. The health banner, not this widget, is the alert path.
+        this.tickTimeout = 30;
+    }
+
+    getGridOptions() {
+        // Scroll inside the widget once many keepers push it past this height,
+        // instead of growing the dashboard cell unbounded.
+        return {
+            sizeToContent: 650,
+        };
     }
 
     getMarkup() {
         const $container = $('<div></div>');
         $container.append(this.createTable('carpvipdhcp-widget-table', {
             headers: [
-                this.translations.vip || 'VIP',
-                this.translations.carp || 'CARP',
-                this.translations.lease || 'Lease',
-                this.translations.nudge || 'ARP nudge',
+                this.translations.vip,
+                this.translations.carp,
+                this.translations.lease,
+                this.translations.nudge,
             ],
         }));
         return $container;
@@ -45,12 +58,12 @@ export default class CarpVipDhcp extends BaseTableWidget {
     async onWidgetTick() {
         const data = await this.ajaxCall('/api/carpvipdhcp/diagnostics/status');
         if (!data || !Array.isArray(data.keepers)) {
-            this.displayError(this.translations.error || 'Unable to load keeper status');
+            this.displayError(this.translations.error);
             return;
         }
         if (data.keepers.length === 0) {
             super.updateTable('carpvipdhcp-widget-table', [
-                [this._cell(this.translations.none || 'No keepers configured', 'text-muted'), '', '', ''],
+                [this._cell(this.translations.none, 'text-muted'), '', '', ''],
             ]);
             return;
         }
@@ -61,6 +74,10 @@ export default class CarpVipDhcp extends BaseTableWidget {
             this._nudgeCell(k),
         ]);
         super.updateTable('carpvipdhcp-widget-table', rows);
+    }
+
+    displayError(message) {
+        $('#carpvipdhcp-widget-table').empty().append($('<div></div>').text(message));
     }
 
     // ---- cell builders (return outerHTML strings, as updateTable expects) ----
@@ -91,26 +108,26 @@ export default class CarpVipDhcp extends BaseTableWidget {
 
     _leaseCell(k) {
         if (!k.running) {
-            return this._cell(this.translations.stopped || 'stopped', 'text-danger');
+            return this._cell(this.translations.stopped, 'text-danger');
         }
         if (k.mismatch) {
-            return this._cell(this.translations.mismatch || 'mismatch', 'text-danger');
+            return this._cell(this.translations.mismatch, 'text-danger');
         }
         if (k.standby) {
-            return this._cell(this.translations.standby || 'standby', 'text-muted');
+            return this._cell(this.translations.standby, 'text-muted');
         }
         if (k.bound && k.bound === k.request) {
-            return this._cell(this.translations.held || 'held', 'text-success');
+            return this._cell(this.translations.held, 'text-success');
         }
-        return this._cell(this.translations.notheld || 'not held', 'text-warning');
+        return this._cell(this.translations.notheld, 'text-warning');
     }
 
     _nudgeCell(k) {
         if (!k.arp_nudge) {
-            return this._cell(this.translations.off || 'off', 'text-muted');
+            return this._cell(this.translations.off, 'text-muted');
         }
         if (k.nudge_age === null || k.nudge_age === undefined) {
-            return this._cell(this.translations.never || 'never', 'text-warning');
+            return this._cell(this.translations.never, 'text-warning');
         }
         return this._cell(this._fmtAge(k.nudge_age));
     }

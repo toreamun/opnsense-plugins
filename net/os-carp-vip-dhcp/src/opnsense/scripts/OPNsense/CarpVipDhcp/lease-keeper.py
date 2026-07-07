@@ -190,7 +190,7 @@ class Keeper:
             self._sniffer.start()
             return True
         except Exception as e:
-            LOG.error("sniffer start failed: %s", e)
+            LOG.error("DHCP-reply sniffer start failed: %s", e)
             return False
 
     def _sniffer_alive(self):
@@ -199,7 +199,7 @@ class Keeper:
 
     def _ensure_sniffer(self):
         if not self._sniffer_alive():
-            LOG.warning("sniffer down -- (re)starting")
+            LOG.warning("DHCP-reply sniffer down -- (re)starting")
             self._start_sniffer()
             time.sleep(1)
 
@@ -228,7 +228,7 @@ class Keeper:
             self._rx = DhcpReply(mt, b.yiaddr, sid, lt, rt, bt, ro)
             self._ev.set()
         except Exception as e:
-            LOG.debug("rx parse error: %s", e)
+            LOG.debug("DHCP reply parse error: %s", e)
 
     def _send(self, mtype, extra, ciaddr="0.0.0.0"):
         # ciaddr is set for RENEW/REBIND (the client already owns the address);
@@ -278,7 +278,7 @@ class Keeper:
             try:
                 self._send("discover", extra)
             except Exception as e:
-                LOG.error("DISCOVER send failed: %s", e)
+                LOG.error("DHCP DISCOVER send failed: %s", e)
                 time.sleep(SEND_RETRY_DELAY)
                 continue
             rx = self._await(OFFER, REPLY_TIMEOUT)
@@ -288,7 +288,7 @@ class Keeper:
                 self.yiaddr, self.server = rx.yiaddr, rx.server_id
                 break
             # xid included so the exchange can be matched against a packet capture.
-            LOG.info("no OFFER (attempt %d, xid 0x%08x)", attempt, self.xid)
+            LOG.info("no DHCP OFFER (attempt %d, xid 0x%08x)", attempt, self.xid)
             time.sleep(min(2 * attempt, ATTEMPT_BACKOFF_CAP))
         else:
             return False
@@ -302,7 +302,7 @@ class Keeper:
                 self._send("request", [("server_id", self.server),
                                        ("requested_addr", self.yiaddr)])
             except Exception as e:
-                LOG.error("REQUEST send failed: %s", e)
+                LOG.error("DHCP REQUEST send failed: %s", e)
                 time.sleep(SEND_RETRY_DELAY)
                 continue
             rx = self._await(ACK, REPLY_TIMEOUT)
@@ -315,7 +315,7 @@ class Keeper:
                 self.yiaddr = got
                 self._absorb_reply(rx, DEFAULT_LEASE)
                 return True
-            LOG.info("no ACK from %s for %s (attempt %d, xid 0x%08x)",
+            LOG.info("no DHCP ACK from %s for %s (attempt %d, xid 0x%08x)",
                      self.server, self.yiaddr, attempt, self.xid)
             time.sleep(min(2 * attempt, ATTEMPT_BACKOFF_CAP))
         return False
@@ -333,7 +333,7 @@ class Keeper:
             try:
                 self._send("request", opts, ciaddr=self.yiaddr)
             except Exception as e:
-                LOG.error("%s send failed: %s", "REBIND" if rebind else "RENEW", e)
+                LOG.error("DHCP %s send failed: %s", "REBIND" if rebind else "RENEW", e)
                 return False
             rx = self._await(ACK, RENEW_TIMEOUT)
             if rx == "NAK":
@@ -361,7 +361,7 @@ class Keeper:
                    DHCP(options=[("message-type", "release"),
                                  ("server_id", self.server), "end"]))
             sendp(pkt, iface=self.iface, verbose=0)
-            LOG.info("RELEASE %s sent (server %s)", self.yiaddr, self.server or "broadcast")
+            LOG.info("DHCP RELEASE of lease %s sent (server %s)", self.yiaddr, self.server or "broadcast")
         except Exception as e:
             LOG.error("RELEASE failed: %s", e)
 
@@ -722,27 +722,27 @@ class Keeper:
             self._ensure_sniffer()  # a dead sniffer would silently fail every DORA
             self._hb()  # active but not holding yet -> publish bound=- (not STANDBY)
             if self.dora():
-                LOG.info("BOUND %s (lease=%ss, server=%s)", self.yiaddr, self.lease, self.server)
+                LOG.info("DHCP BOUND %s (lease=%ss, server=%s)", self.yiaddr, self.lease, self.server)
                 self._hb()
                 self._arp_nudge(force=True)
                 self.redora_wait = REDORA_MIN
             else:
-                LOG.warning("acquire failed -- waiting %ds", self.redora_wait)
+                LOG.warning("DHCP acquire (DISCOVER/REQUEST) failed -- retrying in %ds", self.redora_wait)
                 self._sleep_gated(self.redora_wait)
                 self.redora_wait = min(self.redora_wait * 2, REDORA_MAX)
             return
         # Maintain: wait until T1, then RENEW; bail early on stop or master loss.
         t1, t2, src = self._timing()
-        LOG.info("lease %ds; renew at T1=%ds, rebind by T2=%ds (timing source: %s)",
+        LOG.info("DHCP lease %ds; renew at T1=%ds, rebind by T2=%ds (timing source: %s)",
                  self.lease, t1, t2, src)
         if not self._hold(t1):
             return
         if self.renew():
-            LOG.info("RENEW ok %s (lease=%ss)", self.yiaddr, self.lease)
+            LOG.info("DHCP RENEW ok %s (lease=%ss)", self.yiaddr, self.lease)
             self._hb()
             self._arp_nudge(force=True)
             return
-        LOG.warning("RENEW failed at T1 -- trying REBIND until T2")
+        LOG.warning("DHCP RENEW failed at T1 -- trying REBIND until T2")
         elapsed = t1
         ok = False
         while elapsed < t2 and not self.stop:
@@ -755,13 +755,13 @@ class Keeper:
                 ok = True
                 break
         if ok:
-            LOG.info("REBIND ok %s", self.yiaddr)
+            LOG.info("DHCP REBIND ok %s", self.yiaddr)
             self._hb()
             self._arp_nudge(force=True)
             return
         if self.only_when_master and not self._is_master():
             return  # lost master -> top of loop releases and stands by
-        LOG.error("lease expired -- re-acquiring")
+        LOG.error("DHCP lease expired -- re-acquiring (back to DISCOVER)")
         self.yiaddr = None
 
 
@@ -853,7 +853,7 @@ def main():
             return 3
         time.sleep(0.5)
         ok = k.dora()
-        LOG.info("CLAIM %s -> %s", k.chaddr, k.yiaddr if ok else "FAIL")
+        LOG.info("DHCP claim %s -> %s", k.chaddr, k.yiaddr if ok else "FAIL")
         if ok:
             k.release()
         try:

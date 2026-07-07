@@ -19,22 +19,30 @@ reviews are static.
 
 ## Cutting a release
 
+Versioning (semver-ish, package and git tag always in lockstep):
+
+- `PLUGIN_VERSION=<X.Y.Z>` — bump **Y** for new functionality, **Z** for fixes,
+  docs/help and logging tweaks. This is the release number.
+- The **model** `<version>` (`CarpVipDhcp.xml`) is a separate three-part number
+  that only changes when the **config schema** changes (new fields / changed
+  defaults) — it drives OPNsense config migrations, not releases.
+
 ```sh
 # 1. Bump the version and commit.
-#    net/<cat>/<plugin>/Makefile: PLUGIN_VERSION=<X.Y>
+#    net/<cat>/<plugin>/Makefile: PLUGIN_VERSION=<X.Y.Z>
 
 # 2. Build from a CLEAN checkout (never the working tree -- bytecode caches and
 #    other ignored files must not leak into the package).
 git archive HEAD | tar -x -C /tmp/rc && cd /tmp/rc
-sudo sh build.sh net/<cat>/<plugin>          # -> dist/<plugin>-<X.Y>.pkg
+sudo sh build.sh net/<cat>/<plugin>          # -> dist/<plugin>-<X.Y.Z>.pkg
 
 # 3. Sign the built package(s).
 RELEASE_KEY=/path/to/release.key ./sign-release.sh   # -> dist/SHA256SUMS(.sig)
 
 # 4. Tag and publish.
-git tag -a v<X.Y> -m "<plugin> v<X.Y>"
-git push origin v<X.Y>
-gh release create v<X.Y> dist/*.pkg dist/SHA256SUMS dist/SHA256SUMS.sig
+git tag -a v<X.Y.Z> -m "<plugin> v<X.Y.Z>"
+git push origin v<X.Y.Z>
+gh release create v<X.Y.Z> dist/*.pkg dist/SHA256SUMS dist/SHA256SUMS.sig
 ```
 
 See [`keys/README.md`](keys/README.md) for key handling and the repository README

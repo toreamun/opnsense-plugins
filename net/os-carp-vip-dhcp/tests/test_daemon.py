@@ -223,6 +223,17 @@ def test_master_transition_renews_early_and_nudges(lk):
     assert keeper._last_nudge == first
 
 
+def test_losing_master_is_logged(lk, caplog):
+    keeper = _nudge_keeper(lk, vhid=199)
+    states = iter([True, False])
+    keeper._probe_carp_master = lambda: next(states)
+    with caplog.at_level("INFO", logger="lease-keeper"):
+        keeper._poll_carp_role()         # master
+        keeper._poll_carp_role()         # master -> backup
+    assert any("lost CARP master" in r.getMessage() for r in caplog.records)
+    assert keeper._renew_asap is False   # losing master triggers nothing else
+
+
 def test_master_transition_renews_even_with_nudge_off(lk):
     keeper = _nudge_keeper(lk, arp_nudge=0, vhid=199)
     states = iter([False, True])

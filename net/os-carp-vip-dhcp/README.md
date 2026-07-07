@@ -207,7 +207,7 @@ of them:
 | **Gratuitous-ARP filtering** | ignores unsolicited ARP announcements (ARP-spoofing defence) — CARP's own gratuitous ARP on failover is silently dropped | the nudge is a normal ARP **request**, which the gateway must process in order to answer; that is the one ARP path such gear reliably learns from |
 | **No re-ARP on expiry** ("secured ARP") | the gateway never broadcasts who-has for a subscriber address; an expired entry silently blackholes all downstream traffic | the periodic nudge (default 240 s, well under typical 15–20 min ARP timeouts) keeps the entry permanently fresh; becoming CARP master triggers an immediate nudge so a failover or link flap never waits out the interval |
 | **IP Source Guard (IP-only)** | drops upstream packets whose source IP is not in the binding table | the leased VIP *is* in the table — fine |
-| **IP Source Guard (strict IP+MAC)** | additionally requires the source *MAC* to match the binding | ⚠ **known limitation**: FreeBSD egresses data from a CARP VIP with the interface's *physical* MAC, not the CARP MAC. Under strict IPSG, outbound VIP traffic is dropped even though the lease and ARP are healthy. Symptom: the gateway answers ARP/pings *to* the VIP, but anything *sourced from* it never gets a reply, fresh nudge or not. There is no clean per-packet fix; the workaround is spoofing the interface MAC to equal the lease MAC (see the single-IP scenario doc) |
+| **IP Source Guard (strict IP+MAC)** | additionally requires the source *MAC* to match the binding | ⚠ **known limitation**: FreeBSD egresses data from a CARP VIP with the interface's *physical* MAC, not the CARP MAC. Under strict IPSG, outbound VIP traffic is dropped even though the lease and ARP are healthy. Symptom: the gateway answers ARP/pings *to* the VIP, but anything *sourced from* it never gets a reply, fresh nudge or not. There is no clean per-packet fix; the workaround is to spoof the WAN interface's MAC to the CARP virtual MAC (OPNsense: *Interfaces → [WAN] → Spoof MAC*) so egress uses it — messy and topology-dependent |
 | **Client identity checks** | the server only leases to a known vendor-class (opt 60), client-id (61) or hostname (12) | per-keeper DHCP request options (advanced fields) |
 | **Per-subscriber MAC / session limits** | the port accepts a limited number of source MACs or DHCP sessions | mind the budget: each node's own MAC plus the CARP MAC all appear on the ISP-facing segment. With a strict one-IP/one-MAC ISP, see [docs/single-ip-wan-carp.md](docs/single-ip-wan-carp.md) |
 
@@ -221,7 +221,6 @@ ARP nudge). This is the core reason the lease lives on the CARP MAC rather than 
 - **IPv4 DHCP only** (DHCPv6/ND out of scope for now — the ARP nudge has no IPv6 equivalent here
   either; IPv6 neighbor discovery is a separate mechanism).
 - WAN is the typical — but not required — placement.
-- You must own the MAC/reservation you keep a lease for; holding a foreign lease is an ISP violation.
 - Requires **root** (raw L2/BPF socket) and depends on **Scapy**.
 
 ### Design notes — considered and deliberately not included
@@ -232,9 +231,10 @@ ARP nudge). This is the core reason the lease lives on the CARP MAC rather than 
   rogue host on the ISP segment claiming the address is beyond what a subscriber device can police.
 - **DAI/ARP rate-limit accommodation:** access gear typically rate-limits ARP at ≥15 pps; one nudge
   per 240 s is four orders of magnitude below — no pacing logic needed.
-- **Unicast DHCP RENEW:** the keeper renews by broadcast with the broadcast flag set, and the
-  promiscuous sniffer also captures unicast replies — both server behaviours are covered without a
-  unicast sending mode.
+- **Unicast DHCP RENEW:** the keeper always sets the broadcast flag, so an RFC 2131-compliant server
+  broadcasts OFFER/ACK — which a non-promiscuous socket receives (verified on a fiber ISP). A server
+  that instead unicasts to the CARP MAC is still received on the master, whose interface accepts the
+  virtual MAC natively. Either way, no unicast sending mode is needed.
 
 ## License
 

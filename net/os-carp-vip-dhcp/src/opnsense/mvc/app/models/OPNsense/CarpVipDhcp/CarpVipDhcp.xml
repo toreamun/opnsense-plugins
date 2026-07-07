@@ -1,6 +1,6 @@
 <model>
     <mount>//OPNsense/CarpVipDhcp</mount>
-    <version>1.0.0</version>
+    <version>1.1.0</version>
     <description>CARP-VIP DHCP lease keeper</description>
     <items>
         <keepers>
@@ -51,6 +51,21 @@
                     <ValidationMessage>Alias name must start with a letter and contain only letters, digits and underscore (max 31).</ValidationMessage>
                     <Required>N</Required>
                 </aliasName>
+
+                <!--
+                    Periodically broadcast an ARP request from (VIP, chaddr) for the
+                    upstream gateway, refreshing its ARP entry for the VIP. Needed for
+                    gateways that ignore gratuitous ARP and never re-ARP an expired
+                    entry (traffic to the VIP silently blackholes when it expires).
+                    Only sent while this node is CARP master for the VIP. 0 = off.
+                -->
+                <arpNudgeInterval type="IntegerField">
+                    <Default>0</Default>
+                    <MinimumValue>0</MinimumValue>
+                    <MaximumValue>3600</MaximumValue>
+                    <ValidationMessage>ARP nudge interval must be 0 (off) or 30-3600 seconds.</ValidationMessage>
+                    <Required>N</Required>
+                </arpNudgeInterval>
 
                 <!--
                     Optional DHCP request options for ISPs that only lease when they

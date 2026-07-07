@@ -38,6 +38,13 @@
         <help><![CDATA[Optional. The plugin creates and maintains a firewall Host alias with this name, always set to this CARP VIP's current address. Point your outbound NAT translation address (and any firewall rules that must follow the address) at this alias, so they follow automatically when "Follow dynamic DHCP address" changes it (applied by a state-preserving filter reload). NOTE: inbound port-forwards cannot follow a dynamic address (the upstream only routes inbound to a reserved address). The plugin never deletes the alias. See the plugin README.]]></help>
     </field>
     <field>
+        <id>keeper.arpNudgeInterval</id>
+        <label>ARP nudge interval (s)</label>
+        <type>text</type>
+        <advanced>true</advanced>
+        <help><![CDATA[Periodically broadcast an ARP request from the VIP (with its CARP MAC) for the upstream gateway, so the gateway's ARP entry for the VIP never expires. Use when the upstream ignores gratuitous ARP and never re-ARPs an expired entry — the symptom is that traffic NATed to the VIP works right after a CARP event or DHCP exchange, then silently blackholes some minutes later (outbound packets leave, nothing returns). Suggested: 240. Only sent while this node is CARP master for the VIP. 0 = off.]]></help>
+    </field>
+    <field>
         <id>keeper.chaddrOverride</id>
         <label>chaddr override</label>
         <type>text</type>

@@ -80,6 +80,11 @@ This plugin fetches and continuously renews a DHCP lease **for the VIP address**
 MAC), so the shared IP is actually routed and can fail over. If your WAN uses a static/PPPoE assignment instead
 of DHCP, you do **not** need this plugin.
 
+> **Only a single ISP address?** A single-address line cannot use the straightforward setup above (it needs
+> several concurrent leases). There is a **theoretical, untested** design that works around it — private
+> per-node WAN IPs used only for CARP advertisements, plus one floating VIP that holds the single public lease.
+> See [docs/single-ip-wan-carp.md](docs/single-ip-wan-carp.md).
+
 ## The problem
 
 On a DHCP-assigned WAN (a CGNAT link is the typical example), the ISP/DHCP server only routes an address

@@ -253,7 +253,8 @@ class Keeper:
             if rx and rx.mtype == want:
                 return rx
             if rx and rx.mtype == NAK:
-                LOG.warning("DHCPNAK received")
+                LOG.warning("DHCPNAK received (server %s, xid 0x%08x)",
+                            rx.server_id or "unknown", self.xid)
                 return "NAK"
         return None
 
@@ -286,7 +287,8 @@ class Keeper:
             if rx:
                 self.yiaddr, self.server = rx.yiaddr, rx.server_id
                 break
-            LOG.info("no OFFER (attempt %d)", attempt)
+            # xid included so the exchange can be matched against a packet capture.
+            LOG.info("no OFFER (attempt %d, xid 0x%08x)", attempt, self.xid)
             time.sleep(min(2 * attempt, ATTEMPT_BACKOFF_CAP))
         else:
             return False
@@ -313,6 +315,8 @@ class Keeper:
                 self.yiaddr = got
                 self._absorb_reply(rx, DEFAULT_LEASE)
                 return True
+            LOG.info("no ACK from %s for %s (attempt %d, xid 0x%08x)",
+                     self.server, self.yiaddr, attempt, self.xid)
             time.sleep(min(2 * attempt, ATTEMPT_BACKOFF_CAP))
         return False
 
@@ -357,7 +361,7 @@ class Keeper:
                    DHCP(options=[("message-type", "release"),
                                  ("server_id", self.server), "end"]))
             sendp(pkt, iface=self.iface, verbose=0)
-            LOG.info("RELEASE %s sent", self.yiaddr)
+            LOG.info("RELEASE %s sent (server %s)", self.yiaddr, self.server or "broadcast")
         except Exception as e:
             LOG.error("RELEASE failed: %s", e)
 
@@ -437,11 +441,13 @@ class Keeper:
         """
         if self.follow:
             if not _sane_ipv4(got):
-                LOG.error("%s: ACK yiaddr %r implausible -- not following", phase, got)
+                LOG.error("%s: ACK yiaddr %r from server %s implausible -- not following",
+                          phase, got, rx.server_id)
                 return False
             if not _same_ip_class(self.request_ip, got):
                 LOG.error("%s: refusing to follow %s -> %s across address class "
-                          "(possible spoofed ACK)", phase, self.request_ip, got)
+                          "(possible spoofed ACK from %s)", phase, self.request_ip, got,
+                          rx.server_id)
                 return False
             if phase != "REBIND" and rx.server_id and self.server and rx.server_id != self.server:
                 LOG.error("%s: ACK from unexpected server %s (leased from %s) -- not following",
@@ -464,8 +470,8 @@ class Keeper:
             self._absorb_reply(rx, DEFAULT_LEASE)
             return True
         # Enforce: a fixed reservation must always return request_ip.
-        LOG.error("%s: IP mismatch -- ISP gave %s, requested %s (reservation problem?)",
-                  phase, got, self.request_ip)
+        LOG.error("%s: IP mismatch -- server %s gave %s, requested %s (reservation problem?)",
+                  phase, rx.server_id, got, self.request_ip)
         self._hb_mismatch(got)
         if release_on_enforce:
             self.yiaddr, self.server = got, rx.server_id
@@ -561,6 +567,10 @@ class Keeper:
                      self.vhid)
             self._renew_asap = True
             self._arp_nudge(force=True)
+        elif not master and self._was_master:
+            # The symmetric event: without it, "why did the nudges stop?" needs
+            # ifconfig instead of the log.
+            LOG.info("lost CARP master for vhid %s -- ARP nudges pause on this node", self.vhid)
         self._was_master = master
 
     def _nudge_target(self):
@@ -600,7 +610,7 @@ class Keeper:
                          gw, self.yiaddr, self.chaddr, self.arp_nudge)
                 self._nudge_gw = gw
         except Exception as e:
-            LOG.warning("ARP nudge failed: %s", e)
+            LOG.warning("ARP nudge failed (target %s): %s", gw, e)
 
     def _sleep(self, secs):
         slept = 0
@@ -659,8 +669,10 @@ class Keeper:
             LOG.warning("sniffer start failed -- retrying in %ds", SNIFFER_RETRY)
             self._sleep(SNIFFER_RETRY)
         gate = (" (only when CARP master, vhid %s)" % self.vhid) if self.only_when_master else ""
-        LOG.info("lease-keeper active on %s: chaddr=%s request=%s%s",
-                 self.iface, self.chaddr, self.request_ip or "any", gate)
+        # eth-src matters for L2 debugging but only when it differs from the chaddr.
+        ethsrc = (" eth-src=%s" % self.eth_src) if self.eth_src != self.chaddr else ""
+        LOG.info("lease-keeper active on %s: chaddr=%s%s request=%s%s",
+                 self.iface, self.chaddr, ethsrc, self.request_ip or "any", gate)
         time.sleep(0.5)
         while not self.stop:
             # The keeper must NEVER die on a bad DHCP state: catch any unexpected

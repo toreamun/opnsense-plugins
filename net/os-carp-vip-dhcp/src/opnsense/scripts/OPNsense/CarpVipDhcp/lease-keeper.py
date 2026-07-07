@@ -23,7 +23,10 @@ Robustness:
     --once/--release-on-exit -- so the address is not given up needlessly.
 
 Security posture (this daemon parses untrusted WAN traffic as root):
-  * The BPF filter is the outer boundary: only DHCP traffic (udp port 67/68)
+  * The sniffer is NOT promiscuous: requests carry the BOOTP broadcast flag so
+    the server broadcasts its replies, which reach a non-promiscuous socket --
+    the daemon never sees a neighbour's unicast traffic.
+  * The BPF filter is the next boundary: only DHCP traffic (udp port 67/68)
     ever reaches Python; everything else is dropped in the kernel.
   * A reply must carry our current xid and the BOOTREPLY op before any field
     is read (see _on) -- unsolicited or replayed packets are discarded early.
@@ -197,12 +200,15 @@ class Keeper:
                     self._sniffer.stop()
                 except Exception:
                     pass
-            # The BPF filter is a security boundary, not an optimization: the
-            # callback runs as root on a promiscuous WAN socket, so nothing but
-            # DHCP is allowed to reach the Python parser at all.
+            # promisc=False: we set the BOOTP broadcast flag on every request, so
+            # an RFC 2131-compliant server broadcasts OFFER/ACK -- and broadcast
+            # frames reach a non-promiscuous socket. Not listening promiscuously on
+            # a WAN interface keeps this root daemon off every neighbour's traffic.
+            # The BPF filter is a second boundary, not an optimization: only DHCP
+            # reaches the Python parser at all.
             self._sniffer = AsyncSniffer(
                 iface=self.iface, filter="udp and (port 67 or port 68)",
-                prn=self._on, store=0)
+                prn=self._on, store=0, promisc=False)
             self._sniffer.start()
             return True
         except Exception as e:

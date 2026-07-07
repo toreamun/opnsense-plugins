@@ -5,7 +5,11 @@ Keeps a DHCP lease alive for a given ``chaddr`` WITHOUT binding it to the
 interface's hardware MAC, so the leased address (typically a CARP virtual IP)
 stays routed by the ISP. The broadcast flag is set so OFFER/ACK are broadcast.
 This does lease maintenance ONLY; ARP for the address and data traffic are
-handled by CARP. By default it is ungated and runs on both HA nodes for
+handled by CARP. Optionally (--arp-nudge) it also refreshes the upstream
+gateway's ARP entry for the leased address, for gateways that ignore
+gratuitous ARP and never re-ARP an expired entry (traffic to the address
+silently blackholes until the gateway receives an ARP *request* from it).
+By default it is ungated and runs on both HA nodes for
 redundancy; opt-in run-only-on-master gating restricts it to the CARP master.
 
 Robustness:
@@ -36,7 +40,7 @@ import time
 from collections import namedtuple
 from logging.handlers import RotatingFileHandler
 
-from scapy.all import Ether, IP, UDP, BOOTP, DHCP, AsyncSniffer, sendp
+from scapy.all import ARP, Ether, IP, UDP, BOOTP, DHCP, AsyncSniffer, sendp
 
 LOG = logging.getLogger("lease-keeper")
 
@@ -66,11 +70,13 @@ T2_FACTOR = 0.875          # rebind by this fraction of the lease (RFC default)
 MIN_T1 = 30                # floor for the renew timer (very short leases)
 REBIND_MARGIN = 15         # ensure T2 is at least this far past T1
 BROADCAST_FLAG = 0x8000    # BOOTP flags: ask the server to broadcast OFFER/ACK
+ARP_NUDGE_MIN = 30         # floor for --arp-nudge so a typo cannot flood the segment
 LOG_MAX_BYTES = 512 * 1024
 LOG_BACKUPS = 3
 
 # A parsed DHCP reply, snapshotted from the sniffer thread.
-DhcpReply = namedtuple("DhcpReply", "mtype yiaddr server_id lease t1 t2")
+DhcpReply = namedtuple("DhcpReply", "mtype yiaddr server_id lease t1 t2 router",
+                       defaults=(None,))
 MAC_RE = re.compile(r"^([0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}$")
 
 
@@ -119,7 +125,8 @@ def mac2raw(m):
 class Keeper:
     def __init__(self, iface, chaddr, request_ip=None, eth_src=None,
                  hbfile=None, release_on_exit=False, only_when_master=False, vhid=None,
-                 follow=False, vendor_class=None, client_id=None, hostname=None):
+                 follow=False, vendor_class=None, client_id=None, hostname=None,
+                 arp_nudge=0):
         self.iface = iface
         self.chaddr = chaddr.lower()
         self.chraw = mac2raw(chaddr)
@@ -130,6 +137,16 @@ class Keeper:
         self.only_when_master = only_when_master
         self.vhid = str(vhid) if vhid else None
         self.follow = follow
+        # ARP nudge: some ISP gateways ignore gratuitous ARP and never re-ARP an
+        # expired entry for the leased address (observed in the field: replies
+        # silently blackhole ~20 min after the last cache update), but they DO
+        # refresh the cache from a received ARP *request*. When enabled,
+        # periodically broadcast an ARP request from (leased IP, chaddr) for the
+        # gateway so its entry never expires.
+        self.arp_nudge = max(ARP_NUDGE_MIN, arp_nudge) if arp_nudge else 0
+        self.router = None             # default gateway (DHCP opt 3, fallback: server_id)
+        self._last_nudge = 0.0
+        self._nudge_logged = False
         # Optional DHCP request options (empty -> not sent); built once and added to
         # every DISCOVER/REQUEST/RENEW so the server sees a consistent client identity.
         self._id_opts = []
@@ -193,7 +210,7 @@ class Keeper:
             b = p[BOOTP]
             if b.xid != self.xid or b.op != BOOTREPLY:
                 return
-            mt = sid = lt = rt = bt = None
+            mt = sid = lt = rt = bt = ro = None
             for o in p[DHCP].options:
                 if isinstance(o, tuple):
                     if o[0] == "message-type":
@@ -206,7 +223,9 @@ class Keeper:
                         rt = o[1]
                     elif o[0] == "rebinding_time":
                         bt = o[1]
-            self._rx = DhcpReply(mt, b.yiaddr, sid, lt, rt, bt)
+                    elif o[0] == "router":
+                        ro = o[1]
+            self._rx = DhcpReply(mt, b.yiaddr, sid, lt, rt, bt, ro)
             self._ev.set()
         except Exception as e:
             LOG.debug("rx parse error: %s", e)
@@ -287,6 +306,7 @@ class Keeper:
                 self.yiaddr = got
                 self.lease = rx.lease or DEFAULT_LEASE
                 self.t1_server, self.t2_server = rx.t1, rx.t2
+                self.router = rx.router or self.router
                 return True
             time.sleep(min(2 * attempt, ATTEMPT_BACKOFF_CAP))
         return False
@@ -319,6 +339,7 @@ class Keeper:
                     return self._handle_changed_address(got, rx, phase, release_on_enforce=False)
                 self.lease = rx.lease or self.lease
                 self.t1_server, self.t2_server = rx.t1, rx.t2
+                self.router = rx.router or self.router
                 return True
         return False
 
@@ -431,6 +452,7 @@ class Keeper:
             self.yiaddr, self.server = got, rx.server_id or self.server
             self.lease = rx.lease or DEFAULT_LEASE
             self.t1_server, self.t2_server = rx.t1, rx.t2
+            self.router = rx.router or self.router
             return True
         # Enforce: a fixed reservation must always return request_ip.
         LOG.error("%s: IP mismatch -- ISP gave %s, requested %s (reservation problem?)",
@@ -502,6 +524,47 @@ class Keeper:
             pass
         return self._last_master
 
+    def _carp_master_now(self):
+        """True if this node currently holds CARP MASTER for our vhid (or no vhid
+        is configured). Unlike _is_master() this ignores the run-only-on-master
+        gating flag: it protects the ARP nudge, which must NEVER be sent from a
+        CARP backup (a nudge steers the switch/gateway toward this node's port).
+        Fails CLOSED: a skipped nudge is retried next interval, a wrong one
+        steals the VIP's traffic."""
+        if not self.vhid:
+            return True
+        try:
+            out = subprocess.check_output(["/sbin/ifconfig", self.iface], errors="replace")
+            if isinstance(out, bytes):
+                out = out.decode(errors="replace")
+            return ("carp: MASTER vhid %s " % self.vhid) in out
+        except (OSError, subprocess.SubprocessError):
+            return False
+
+    def _arp_nudge(self, force=False):
+        """Refresh the upstream gateway's ARP entry for the leased address by
+        broadcasting an ARP request from (yiaddr, chaddr). No-op unless enabled,
+        bound, due (or forced) and CARP master (see _carp_master_now)."""
+        if not self.arp_nudge or not self.yiaddr:
+            return
+        if not force and time.time() - self._last_nudge < self.arp_nudge:
+            return
+        gw = self.router or self.server
+        if not gw or not self._carp_master_now():
+            return
+        try:
+            sendp(Ether(src=self.chaddr, dst="ff:ff:ff:ff:ff:ff") /
+                  ARP(op=1, hwsrc=self.chaddr, psrc=self.yiaddr,
+                      hwdst="00:00:00:00:00:00", pdst=gw),
+                  iface=self.iface, verbose=0)
+            self._last_nudge = time.time()
+            if not self._nudge_logged:
+                LOG.info("ARP nudge active: who-has %s tell %s (src %s) every %ds",
+                         gw, self.yiaddr, self.chaddr, self.arp_nudge)
+                self._nudge_logged = True
+        except Exception as e:
+            LOG.warning("ARP nudge failed: %s", e)
+
     def _sleep(self, secs):
         slept = 0
         while slept < secs and not self.stop:
@@ -533,6 +596,7 @@ class Keeper:
             remaining -= chunk
             self._hb()
             self._follow_watchdog()   # re-drive a follow whose apply stalled
+            self._arp_nudge()         # keep the gateway's ARP entry for the VIP fresh
         return not self.stop
 
     def run(self):
@@ -595,6 +659,7 @@ class Keeper:
             if self.dora():
                 LOG.info("BOUND %s (lease=%ss, server=%s)", self.yiaddr, self.lease, self.server)
                 self._hb()
+                self._arp_nudge(force=True)
                 self.redora_wait = REDORA_MIN
             else:
                 LOG.warning("acquire failed -- waiting %ds", self.redora_wait)
@@ -610,6 +675,7 @@ class Keeper:
         if self.renew():
             LOG.info("RENEW ok %s (lease=%ss)", self.yiaddr, self.lease)
             self._hb()
+            self._arp_nudge(force=True)
             return
         LOG.warning("RENEW failed at T1 -- trying REBIND until T2")
         elapsed = t1
@@ -626,6 +692,7 @@ class Keeper:
         if ok:
             LOG.info("REBIND ok %s", self.yiaddr)
             self._hb()
+            self._arp_nudge(force=True)
             return
         if self.only_when_master and not self._is_master():
             return  # lost master -> top of loop releases and stands by
@@ -675,6 +742,10 @@ def main():
     ap.add_argument("--vendor-class", default=None)
     ap.add_argument("--client-id", default=None)
     ap.add_argument("--hostname", default=None)
+    ap.add_argument("--arp-nudge", type=int, default=0, metavar="SECS",
+                    help="periodically broadcast an ARP request from the leased IP "
+                         "for the gateway, so upstream gear that never re-ARPs keeps "
+                         "a fresh entry (0 = off, suggested 240)")
     ap.add_argument("--once", action="store_true")
     ap.add_argument("--release-on-exit", action="store_true")
     a = ap.parse_args()
@@ -696,7 +767,8 @@ def main():
     k = Keeper(a.iface, a.chaddr, a.request, a.eth_src,
                hbfile=a.hbfile, release_on_exit=a.release_on_exit or a.once,
                only_when_master=a.only_when_master, vhid=a.vhid, follow=a.follow,
-               vendor_class=a.vendor_class, client_id=a.client_id, hostname=a.hostname)
+               vendor_class=a.vendor_class, client_id=a.client_id, hostname=a.hostname,
+               arp_nudge=a.arp_nudge)
 
     def _sig(*_):
         LOG.info("signal received -- stopping")

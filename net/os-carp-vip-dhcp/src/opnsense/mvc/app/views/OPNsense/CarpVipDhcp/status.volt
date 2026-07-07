@@ -18,6 +18,18 @@
         return (value === null || value === undefined || value === '') ? '-' : value;
     }
 
+    // Matches the health banner's staleness ceiling: a keeper rewrites its
+    // heartbeat every ~30s, so an age past this means a stalled/dead daemon.
+    const STALE_MAX_AGE = 600;
+
+    function hbAgeCell(age) {
+        if (age === null || age === undefined) {
+            return '<span class="text-muted">-</span>';
+        }
+        let cls = age > STALE_MAX_AGE ? ' class="text-danger"' : '';
+        return '<span' + cls + '>' + fmtAge(age) + '</span>';
+    }
+
     function vhidBadge(k) {
         if (!k.vhid) {
             return '';
@@ -139,7 +151,7 @@
                     + '<td>' + carpStatus(k.carp_state) + '</td>'
                     + '<td>' + badge(k.running === true) + '</td>'
                     + '<td>' + leaseCell(k) + '</td>'
-                    + '<td>' + fmtAge(k.hb_age) + '</td>'
+                    + '<td>' + hbAgeCell(k.hb_age) + '</td>'
                     + '<td>' + leaseTimeCell(k) + '</td>'
                     + '<td>' + nudgeCell(k) + '</td>'
                     + '<td>' + dash(k.chaddr) + '</td>'

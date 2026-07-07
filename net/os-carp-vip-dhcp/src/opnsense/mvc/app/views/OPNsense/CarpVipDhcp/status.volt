@@ -92,6 +92,30 @@
         return txt;
     }
 
+    function nudgeCell(k) {
+        if (!k.arp_nudge) {
+            return '<span class="text-muted">' + "{{ lang._('off') }}" + '</span>';
+        }
+        let tip = "{{ lang._('every') }}" + ' ' + k.arp_nudge + ' s'
+            + (k.gw ? ' → ' + k.gw : ' (' + "{{ lang._('gateway unknown') }}" + ')');
+        let cell;
+        if (k.nudge_age == null) {
+            // Enabled but never sent: expected on a CARP backup, suspicious on a
+            // bound master (no gateway known, or the daemon predates the setting).
+            let style = (k.carp_state === 'MASTER' && k.bound) ? 'label-warning' : 'label-default';
+            cell = '<span class="label ' + style + '" title="' + tip + '">'
+                + "{{ lang._('never') }}" + '</span>';
+        } else {
+            cell = '<span title="' + tip + '">' + fmtAge(k.nudge_age) + '</span>';
+        }
+        if (k.running === true && k.carp_state === 'MASTER') {
+            cell += ' <button class="btn btn-xs btn-default nudge_now" data-id="' + k.request
+                + '" title="' + "{{ lang._('Send an ARP nudge now') }}" + '">'
+                + '<i class="fa fa-bolt fa-fw"></i></button>';
+        }
+        return cell;
+    }
+
     function refreshStatus() {
         ajaxGet('/api/carpvipdhcp/diagnostics/status', {}, function (data) {
             if (data === undefined) {
@@ -104,7 +128,7 @@
             let keepers = data.keepers || [];
             let rows = '';
             if (keepers.length === 0) {
-                rows = '<tr><td colspan="9" class="text-muted">'
+                rows = '<tr><td colspan="10" class="text-muted">'
                     + "{{ lang._('No keepers configured.') }}" + '</td></tr>';
             }
             keepers.forEach(function (k) {
@@ -117,12 +141,24 @@
                     + '<td>' + leaseCell(k) + '</td>'
                     + '<td>' + fmtAge(k.hb_age) + '</td>'
                     + '<td>' + leaseTimeCell(k) + '</td>'
+                    + '<td>' + nudgeCell(k) + '</td>'
                     + '<td>' + dash(k.chaddr) + '</td>'
                     + '</tr>';
             });
             $('#keeper_rows').html(rows);
         });
     }
+
+    $(document).on('click', '.nudge_now', function () {
+        let btn = $(this);
+        btn.prop('disabled', true);
+        ajaxCall('/api/carpvipdhcp/diagnostics/nudge/' + btn.data('id'), {}, function () {
+            // The nudge age refreshes on the next heartbeat write (<= 30 s);
+            // poll a little sooner for quicker feedback.
+            setTimeout(refreshStatus, 2000);
+            btn.prop('disabled', false);
+        });
+    });
 
     $(document).ready(function () {
         updateServiceControlUI('carpvipdhcp');
@@ -144,6 +180,7 @@
                     <th>{{ lang._('Lease') }}</th>
                     <th>{{ lang._('Heartbeat age') }}</th>
                     <th>{{ lang._('Lease time') }}</th>
+                    <th>{{ lang._('ARP nudge') }}</th>
                     <th>{{ lang._('Lease MAC') }}</th>
                 </tr>
             </thead>

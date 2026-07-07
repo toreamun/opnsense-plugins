@@ -175,3 +175,43 @@ def test_ack_router_option_defaulted(lk):
     # Existing 6-arg constructions (and old pickled replies) must keep working.
     reply = lk.DhcpReply(5, "100.64.4.7", "100.64.4.1", 1800, None, None)
     assert reply.router is None
+
+
+def test_hb_includes_nudge_state(lk, tmp_path):
+    hb = tmp_path / "hb"
+    keeper = lk.Keeper("eth0", "00:00:5e:00:01:fe", "100.64.4.7",
+                       hbfile=str(hb), arp_nudge=240)
+    keeper.yiaddr = "100.64.4.7"
+    keeper.router = "100.64.4.1"
+    keeper._last_nudge = 1783350000.0
+    keeper._hb()
+    content = hb.read_text()
+    assert " nudge=1783350000" in content
+    assert " gw=100.64.4.1" in content
+
+
+def test_hb_nudge_never_and_no_gateway(lk, tmp_path):
+    hb = tmp_path / "hb"
+    keeper = lk.Keeper("eth0", "00:00:5e:00:01:fe", "100.64.4.7",
+                       hbfile=str(hb), arp_nudge=240)
+    keeper._hb()
+    content = hb.read_text()
+    assert " nudge=0" in content     # enabled but never sent
+    assert "gw=" not in content      # no target known yet
+
+
+def test_hb_no_nudge_tokens_when_off(lk, tmp_path):
+    hb = tmp_path / "hb"
+    keeper = lk.Keeper("eth0", "00:00:5e:00:01:fe", "100.64.4.7", hbfile=str(hb))
+    keeper._hb()
+    assert "nudge=" not in hb.read_text()
+
+
+def test_nudge_missing_gateway_warns_once(lk, caplog):
+    keeper = _nudge_keeper(lk)
+    keeper.server = None             # enabled + bound, but no target
+    with caplog.at_level("WARNING", logger="lease-keeper"):
+        keeper._arp_nudge(force=True)
+        keeper._arp_nudge(force=True)
+    warnings = [r for r in caplog.records if "no gateway known" in r.getMessage()]
+    assert len(warnings) == 1        # warned, but only once

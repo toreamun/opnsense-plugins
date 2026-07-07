@@ -43,3 +43,42 @@ def test_parse_heartbeat_mismatch(tmp_path):
 
 def test_parse_heartbeat_missing(tmp_path):
     assert status.parse_heartbeat(str(tmp_path / "absent"))["bound"] is None
+
+
+def test_parse_heartbeat_nudge(tmp_path):
+    hb = tmp_path / "hb"
+    hb.write_text("1783350773 bound=100.64.4.7 lease=1800 t1=900 t2=1575 src=derived"
+                  " nudge=1783350700 gw=100.64.4.1\n")
+    result = status.parse_heartbeat(str(hb))
+    assert result["nudge_epoch"] == 1783350700
+    assert isinstance(result["nudge_age"], int) and result["nudge_age"] > 0
+    assert result["gw"] == "100.64.4.1"
+
+
+def test_parse_heartbeat_nudge_never(tmp_path):
+    hb = tmp_path / "hb"
+    hb.write_text("1783350773 bound=100.64.4.7 lease=1800 t1=900 t2=1575 src=derived nudge=0\n")
+    result = status.parse_heartbeat(str(hb))
+    assert result["nudge_epoch"] == 0
+    assert result["nudge_age"] is None
+    assert result["gw"] is None
+
+
+def test_parse_heartbeat_without_nudge_tokens(tmp_path):
+    hb = tmp_path / "hb"
+    hb.write_text("1783350773 bound=100.64.4.7 lease=1800 t1=900 t2=1575 src=derived\n")
+    result = status.parse_heartbeat(str(hb))
+    assert result["nudge_epoch"] is None
+    assert result["nudge_age"] is None
+
+
+def test_read_keepers_arp_nudge_field(tmp_path, monkeypatch):
+    conf = tmp_path / "keeper.conf"
+    conf.write_text(
+        "100.64.4.7|eth0|00:00:5e:00:01:fe|0|254|0|1||||240\n"
+        "100.64.4.8|eth0|00:00:5e:00:01:fd|0|253|0|1|||\n")   # old 10-field line
+    monkeypatch.setattr(status, "CONFFILE", str(conf))
+    monkeypatch.setattr(status, "RUN_DIR", str(tmp_path))
+    keepers = status.read_keepers({}, {})
+    assert keepers[0]["arp_nudge"] == 240
+    assert keepers[1]["arp_nudge"] == 0

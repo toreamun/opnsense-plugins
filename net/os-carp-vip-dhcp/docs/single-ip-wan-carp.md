@@ -196,6 +196,16 @@ flowchart LR
     class B2 warn
 ```
 
+> **The linchpin is dpinger's source address.** The "no hook" claim holds only if the
+> monitor probe to `123.123.123.1` is sourced from the VIP on the master (which owns
+> it) and from the private `10.1.1.x` on the backup (which cannot use the
+> backup-state VIP as a source), so the ISP drops only the backup's probe. This is
+> plausible on FreeBSD but **not** something this document has verified — check it in
+> the lab (§11). If instead both nodes source the probe from the same address, they
+> report the gateway identically (both UP or both DOWN) and the tiering never
+> engages; you would then have to pin the monitor source per node, or fall back to a
+> devd/CARP-event hook that toggles the route on role change.
+
 ### 6.3  What the master needs to terminate the backup's traffic
 
 | Element | Rule |
@@ -235,7 +245,11 @@ sequenceDiagram
 > dead after ~3 missed advertisements, so with `advbase 1` the switch is ~1–3 s
 > (lower `advbase` = faster, at the cost of more advertisement chatter). The ISP
 > only has to relearn the VIP's MAC on the new port (gratuitous ARP), which is
-> near-instant.
+> near-instant. This covers the *failover* relearn: the virtual MAC is identical on
+> both nodes, so the gateway's ARP entry stays valid and only the switch relearns the
+> port. A separate, steady-state hazard — the gateway letting the VIP's ARP entry
+> **expire** and never re-querying it — is independent of failover and is covered in
+> §8.
 
 ---
 
@@ -265,13 +279,27 @@ sequenceDiagram
 - **Failover transient:** connection states not covered by pfsync are lost across
   the switch. (In the niche run-only-on-master mode the new master must also re-DORA
   the lease, adding a few seconds.)
-- **DHCP behaviour (must be tested):** does the ISP hand a lease to the virtual MAC,
-  and does it restrict you to one active MAC? Some ISPs will happily lease a second
-  address to a second MAC (in which case you do **not** need this single-IP design
-  at all — just give each node its own lease). Others bind one lease per line.
-  **Test safely** with a DHCP `DISCOVER`-only probe (e.g. a small Scapy script from
-  the virtual MAC) before committing — a DISCOVER does not take a lease, so it will
-  not disturb the live line.
+- **Gateway that never re-ARPs the VIP (steady-state blackhole) — verify this:** some
+  ISP gateways ignore gratuitous ARP *and* never re-query an ARP entry once it
+  expires. A few minutes after the last refresh, return traffic to the VIP then
+  blackholes silently even with a stable master — outbound leaves, nothing comes
+  back, and the gateway stops answering pings sourced from the VIP. This is not
+  hypothetical; it bit a real deployment on this kind of fiber ISP. **Mitigation:**
+  the plugin's **ARP nudge** (on by default) periodically re-teaches the gateway the
+  VIP→virtual-MAC binding, keeping the entry fresh. Leave it enabled for this
+  topology; see the *ARP nudge* section in the [README](../README.md). Symptom to
+  recognize in the lab: everything works right after a CARP event or DHCP exchange,
+  then dies ~15–20 min later.
+- **DHCP behaviour (test before committing):** does the ISP hand a lease to the
+  virtual MAC, and does it restrict you to one active MAC? Some ISPs will happily
+  lease a second address to a second MAC (in which case you do **not** need this
+  single-IP design at all — just give each node its own lease). Others bind one lease
+  per line. **Test safely** with a DHCP `DISCOVER`-only probe before committing — a
+  `DISCOVER` does not take a lease, so it does not disturb the live line. (Verified on
+  a fiber ISP: a small Scapy `DISCOVER` from a throwaway MAC drew a normal `OFFER`
+  with no effect on the live lease. Use a **throwaway** locally-administered MAC, not
+  the real virtual MAC, so a lease-binding ISP cannot associate the probe with your
+  VIP.)
 - **Lab failure modes to watch:** return-path routing for the backup's SYNC-sourced
   traffic, dpinger flapping during role changes, and whether the ISP's DHCP server
   tolerates the virtual MAC.
@@ -298,7 +326,9 @@ skip it entirely and pull NTP/DNS/config from the master over SYNC, dropping §6
    Ungated gives seamless failover, but both nodes then periodically source the
    virtual MAC (DHCP renewals) on the shared WAN-front switch → MAC-table flap;
    **run-only-on-master** avoids that (only the master sources it) at the cost of a
-   small DORA gap on failover. Choose per how your ISP/switch tolerates the MAC.
+   small DORA gap on failover. Choose per how your ISP/switch tolerates the MAC. (The
+   ARP nudge is master-gated regardless of this choice, so it never adds to the flap —
+   only the DHCP renewals in ungated mode do.)
 5. **SYNC if:** `10.2.2.1/30` / `.2/30`; pfsync + XMLRPC config-sync →
    _System → High Availability_.
 6. **Gateways:** `WAN_ISP` (123.123.123.1, on WAN), `PEER_SYNC` (peer's SYNC IP, on
@@ -318,7 +348,10 @@ skip it entirely and pull NTP/DNS/config from the master over SYNC, dropping §6
 |-------|--------|
 | Keeping a DHCP lease alive on a CARP virtual MAC (this plugin) | **Proven** in a two-node CGNAT setup |
 | A CARP VIP whose address is DHCP-assigned, failing over between nodes | **Proven** (same setup) |
+| A `DISCOVER`-only probe leaves the live lease untouched | **Proven** — verified on a fiber ISP (throwaway-MAC `DISCOVER` drew an `OFFER`, no lease change) |
+| ARP nudge keeps a non-re-ARPing gateway from blackholing the VIP | **Proven** — required on a real fiber ISP; on by default (see README) |
 | Private per-node WAN IP as CARP-advertisement source only | Spec-valid per `carp(4)`; **not** validated in this exact topology |
+| dpinger sources the gateway probe from the VIP (master) vs private IP (backup) | **Unproven** — the linchpin of §6; verify in a lab |
 | Gateway group routing the backup's own internet through the master | **Unproven** — design only |
 | The whole single-IP topology, end to end | **Unproven** — validate in a lab |
 

@@ -8,6 +8,7 @@ pidfile and heartbeat file. Output:
 
 The heartbeat file is written by lease-keeper.py in one of two forms:
     <epoch> bound=<ip> lease=<seconds> t1=<seconds> t2=<seconds> src=<server|derived>
+            [nudge=<epoch|0> [gw=<ip>]]
     <epoch> MISMATCH got=<ip> want=<ip>
 """
 import json
@@ -38,7 +39,7 @@ def pid_alive(path):
 def parse_heartbeat(path):
     result = {"bound": None, "lease": None, "t1": None, "t2": None, "timing_source": None,
               "standby": False, "mismatch": False, "mismatch_got": None, "mismatch_want": None,
-              "hb_epoch": None, "hb_age": None}
+              "hb_epoch": None, "hb_age": None, "nudge_epoch": None, "nudge_age": None, "gw": None}
     try:
         raw = open(path).read().strip()
     except OSError:
@@ -72,6 +73,16 @@ def parse_heartbeat(path):
                 pass
         elif part.startswith("src="):
             result["timing_source"] = part.split("=", 1)[1]
+        elif part.startswith("nudge="):
+            # nudge=0 means "enabled but never sent yet" -> age stays None.
+            try:
+                result["nudge_epoch"] = int(part.split("=", 1)[1])
+                if result["nudge_epoch"]:
+                    result["nudge_age"] = int(time.time()) - result["nudge_epoch"]
+            except ValueError:
+                pass
+        elif part.startswith("gw="):
+            result["gw"] = part.split("=", 1)[1]
         elif part == "STANDBY":
             result["standby"] = True
         elif part == "MISMATCH":
@@ -132,6 +143,10 @@ def read_keepers(states, names):
         vhid = parts[4] if len(parts) > 4 else ""
         run_only = parts[5] if len(parts) > 5 else "0"
         follow = parts[6] if len(parts) > 6 else "0"
+        try:
+            arp_nudge = int(parts[10]) if len(parts) > 10 and parts[10] else 0
+        except ValueError:
+            arp_nudge = 0
         kid = keeper_id(request)
         pid = pid_alive("%s/carpvipdhcp-%s.pid" % (RUN_DIR, kid))
         entry = {
@@ -144,6 +159,7 @@ def read_keepers(states, names):
             "demote_on_lease_loss": demote == "1",
             "run_only_on_master": run_only == "1",
             "follow_ip": follow == "1",
+            "arp_nudge": arp_nudge,
             "running": pid is not None,
             "pid": pid,
         }

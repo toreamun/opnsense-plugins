@@ -34,8 +34,17 @@ def _stub_scapy():
         def stop(self):
             pass
 
-    for _name in ("Ether", "IP", "UDP", "BOOTP", "DHCP", "sendp"):
-        setattr(allmod, _name, lambda *a, **k: None)
+    class _Layer:
+        """Composable no-op protocol layer: Ether(...) / IP(...) / ... works."""
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __truediv__(self, other):
+            return self
+
+    for _name in ("ARP", "Ether", "IP", "UDP", "BOOTP", "DHCP"):
+        setattr(allmod, _name, _Layer)
+    allmod.sendp = lambda *a, **k: None
     allmod.AsyncSniffer = _Sniffer
     scapy.all = allmod
     sys.modules["scapy"] = scapy

@@ -58,6 +58,9 @@ After installing, the plugin lives under **Interfaces → Virtual IPs DHCP**, wi
   CARP demotion), per-keeper mode, and a ⚡ button to send a manual ARP nudge (on the CARP master).
 - **Log** — the keeper log (searchable/filterable, with a clear button).
 
+There is also a **Dashboard widget** ("CARP-VIP DHCP") showing one row per keeper — VIP, CARP role,
+lease state and ARP-nudge age — for an at-a-glance view without opening the Status page.
+
 The privilege that grants access is **“Interfaces: Virtual IPs DHCP”**.
 
 ## When is this relevant?

@@ -50,8 +50,8 @@ carpvipdhcp_start()
             --pidfile "${run_dir}/carpvipdhcp-${id}.child.pid" \
             --hbfile "${run_dir}/carpvipdhcp-${id}.hb" \
             --logfile "${log_dir}/carpvipdhcp-${id}.log"
-        # Always pass the vhid: the daemon needs it to gate the ARP nudge to the
-        # CARP master even when run-only-on-master (DHCP gating) is off.
+        # The vhid identifies the keeper's CARP VIP; individual daemon features
+        # (DHCP gating, the ARP-nudge master check) decide whether to gate on it.
         [ -n "${vhid}" ] && set -- "$@" --vhid "${vhid}"
         # Run-only-on-master keepers self-gate: the daemon runs on both nodes but
         # only sends DHCP while this node is CARP master for the vhid (else stands by).
@@ -66,10 +66,7 @@ carpvipdhcp_start()
         [ -n "${vendorclass}" ] && set -- "$@" --vendor-class "${vendorclass}"
         [ -n "${clientid}" ] && set -- "$@" --client-id "${clientid}"
         [ -n "${hostname}" ] && set -- "$@" --hostname "${hostname}"
-        # ARP nudge: keep the upstream gateway's ARP entry for the VIP fresh (0/empty = off).
-        if [ -n "${arpnudge}" ] && [ "${arpnudge}" != "0" ]; then
-            set -- "$@" --arp-nudge "${arpnudge}"
-        fi
+        [ -n "${arpnudge}" ] && set -- "$@" --arp-nudge "${arpnudge}"
         # -f detach; -r supervise/restart on crash; -R 5 restart delay; -P supervisor pidfile.
         /usr/sbin/daemon -f -r -R 5 -P "${pidfile}" -t "${name}-${id}" "${keeper}" "$@"
         count=$((count + 1))

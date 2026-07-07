@@ -75,8 +75,7 @@ LOG_MAX_BYTES = 512 * 1024
 LOG_BACKUPS = 3
 
 # A parsed DHCP reply, snapshotted from the sniffer thread.
-DhcpReply = namedtuple("DhcpReply", "mtype yiaddr server_id lease t1 t2 router",
-                       defaults=(None,))
+DhcpReply = namedtuple("DhcpReply", "mtype yiaddr server_id lease t1 t2 router")
 MAC_RE = re.compile(r"^([0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}$")
 
 
@@ -137,12 +136,9 @@ class Keeper:
         self.only_when_master = only_when_master
         self.vhid = str(vhid) if vhid else None
         self.follow = follow
-        # ARP nudge: some ISP gateways ignore gratuitous ARP and never re-ARP an
-        # expired entry for the leased address (observed in the field: replies
-        # silently blackhole ~20 min after the last cache update), but they DO
-        # refresh the cache from a received ARP *request*. When enabled,
-        # periodically broadcast an ARP request from (leased IP, chaddr) for the
-        # gateway so its entry never expires.
+        # ARP nudge: keep the upstream gateway's ARP entry for the leased address
+        # fresh, for gateways that ignore gratuitous ARP and never re-ARP an
+        # expired entry (see the README's "ARP nudge" section for the full story).
         self.arp_nudge = max(ARP_NUDGE_MIN, arp_nudge) if arp_nudge else 0
         self.router = None             # default gateway (DHCP opt 3, fallback: server_id)
         self._last_nudge = 0.0
@@ -261,6 +257,13 @@ class Keeper:
                 return "NAK"
         return None
 
+    def _absorb_reply(self, rx, default_lease):
+        """Adopt lease timing and gateway (DHCP option 3) from an ACK -- the one
+        place that knows which DhcpReply fields carry keeper state."""
+        self.lease = rx.lease or default_lease
+        self.t1_server, self.t2_server = rx.t1, rx.t2
+        self.router = rx.router or self.router
+
     def dora(self):
         self.xid = random.randint(1, 0xFFFFFFFF)
         extra = [("requested_addr", self.request_ip)] if self.request_ip else []
@@ -308,9 +311,7 @@ class Keeper:
                 if self.request_ip and got != self.request_ip:
                     return self._handle_changed_address(got, rx, "DORA", release_on_enforce=True)
                 self.yiaddr = got
-                self.lease = rx.lease or DEFAULT_LEASE
-                self.t1_server, self.t2_server = rx.t1, rx.t2
-                self.router = rx.router or self.router
+                self._absorb_reply(rx, DEFAULT_LEASE)
                 return True
             time.sleep(min(2 * attempt, ATTEMPT_BACKOFF_CAP))
         return False
@@ -341,9 +342,7 @@ class Keeper:
                     # follow / enforce decision (and hardening) as the initial DORA.
                     phase = "REBIND" if rebind else "RENEW"
                     return self._handle_changed_address(got, rx, phase, release_on_enforce=False)
-                self.lease = rx.lease or self.lease
-                self.t1_server, self.t2_server = rx.t1, rx.t2
-                self.router = rx.router or self.router
+                self._absorb_reply(rx, self.lease)
                 return True
         return False
 
@@ -400,7 +399,7 @@ class Keeper:
         extra = ""
         if self.arp_nudge:
             extra = " nudge=%d" % int(self._last_nudge)
-            gw = self.router or self.server
+            gw = self._nudge_target()
             if gw:
                 extra += " gw=%s" % gw
         self._write_hb("%d bound=%s lease=%d t1=%d t2=%d src=%s%s\n"
@@ -462,9 +461,7 @@ class Keeper:
             self._follow_update(got)
             self.request_ip = got
             self.yiaddr, self.server = got, rx.server_id or self.server
-            self.lease = rx.lease or DEFAULT_LEASE
-            self.t1_server, self.t2_server = rx.t1, rx.t2
-            self.router = rx.router or self.router
+            self._absorb_reply(rx, DEFAULT_LEASE)
             return True
         # Enforce: a fixed reservation must always return request_ip.
         LOG.error("%s: IP mismatch -- ISP gave %s, requested %s (reservation problem?)",
@@ -520,29 +517,11 @@ class Keeper:
         # Run-only-on-master: we are CARP backup and intentionally hold no lease.
         self._write_hb("%d STANDBY\n" % int(time.time()))
 
-    def _is_master(self):
-        """True if we should act as a DHCP client now: gating off, or this node is
-        CARP master for our vhid. Fails open (act normally) if state is unknown."""
-        if not self.only_when_master or not self.vhid:
-            return True
-        try:
-            out = subprocess.check_output(["/sbin/ifconfig", self.iface], errors="replace")
-            if isinstance(out, bytes):
-                out = out.decode(errors="replace")
-            self._last_master = ("carp: MASTER vhid %s " % self.vhid) in out
-        except (OSError, subprocess.SubprocessError):
-            # Can't read CARP state: keep the last known decision so a transient
-            # ifconfig failure does not flap both nodes to master at once.
-            pass
-        return self._last_master
-
-    def _carp_master_now(self):
-        """True if this node currently holds CARP MASTER for our vhid (or no vhid
-        is configured). Unlike _is_master() this ignores the run-only-on-master
-        gating flag: it protects the ARP nudge, which must NEVER be sent from a
-        CARP backup (a nudge steers the switch/gateway toward this node's port).
-        Fails CLOSED: a skipped nudge is retried next interval, a wrong one
-        steals the VIP's traffic."""
+    def _probe_carp_master(self):
+        """Raw CARP-role probe for our vhid: True/False from ifconfig, None when
+        the probe itself fails; no vhid configured -> True (nothing to gate on).
+        Callers apply their own failure policy: _is_master fails open with the
+        last known role, the ARP nudge fails closed."""
         if not self.vhid:
             return True
         try:
@@ -551,30 +530,57 @@ class Keeper:
                 out = out.decode(errors="replace")
             return ("carp: MASTER vhid %s " % self.vhid) in out
         except (OSError, subprocess.SubprocessError):
-            return False
+            return None
+
+    def _is_master(self):
+        """True if we should act as a DHCP client now: gating off, or this node is
+        CARP master for our vhid. On a failed probe, keep the last known decision
+        (fail open) so a transient ifconfig failure does not flap both nodes to
+        master at once."""
+        if not self.only_when_master or not self.vhid:
+            return True
+        probed = self._probe_carp_master()
+        if probed is not None:
+            self._last_master = probed
+        return self._last_master
+
+    def _poll_carp_role(self):
+        """Watch for a backup->master transition (called on the heartbeat
+        cadence). Becoming master renews the lease early and, when enabled,
+        nudges immediately: the failover -- or the link flap that re-elected
+        CARP -- may just have disturbed the upstream gateway's ARP entry and the
+        access node's DHCP-snooping binding, so neither should wait out its
+        normal timer. Independent of the ARP nudge setting."""
+        if not self.vhid:
+            return
+        master = self._probe_carp_master()
+        if master is None:
+            return
+        if master and self._was_master is False:
+            LOG.info("became CARP master for vhid %s -- immediate ARP nudge and early lease renew",
+                     self.vhid)
+            self._renew_asap = True
+            self._arp_nudge(force=True)
+        self._was_master = master
+
+    def _nudge_target(self):
+        """The gateway whose ARP cache the nudge maintains: DHCP option 3 from
+        the last ACK, falling back to the leasing server's address."""
+        return self.router or self.server
 
     def _arp_nudge(self, force=False):
         """Refresh the upstream gateway's ARP entry for the leased address by
         broadcasting an ARP request from (yiaddr, chaddr). No-op unless enabled,
-        bound, due (or forced) and CARP master (see _carp_master_now). Becoming
-        master forces an immediate nudge: a failover (or a link flap, which
-        re-elects CARP) must not wait out the interval clock while upstream
-        state may just have been disturbed."""
+        bound, due (or forced) and CARP master -- never nudge from a backup (it
+        would steal the VIP's traffic), so a failed role probe skips the nudge
+        (fails closed; the next interval retries)."""
         if not self.arp_nudge or not self.yiaddr:
             return
-        master = self._carp_master_now()
-        if master and self._was_master is False:
-            LOG.info("became CARP master for vhid %s -- immediate ARP nudge and early lease renew",
-                     self.vhid or "-")
-            force = True
-            # A failover or link flap may also have disturbed the access node's
-            # DHCP-snooping binding; an early RENEW re-teaches it. Handled by the
-            # next _hold tick instead of waiting out T1.
-            self._renew_asap = True
-        self._was_master = master
         if not force and time.time() - self._last_nudge < self.arp_nudge:
             return
-        gw = self.router or self.server
+        if self._probe_carp_master() is not True:
+            return
+        gw = self._nudge_target()
         if not gw:
             # Enabled but no target: without this warning the nudge would be a
             # silent no-op and the operator would believe they are protected.
@@ -582,8 +588,6 @@ class Keeper:
                 LOG.warning("ARP nudge enabled but no gateway known "
                             "(no DHCP router option or server-id) -- cannot nudge")
                 self._nudge_warned = True
-            return
-        if not master:
             return
         try:
             sendp(Ether(src=self.chaddr, dst="ff:ff:ff:ff:ff:ff") /
@@ -640,7 +644,8 @@ class Keeper:
             remaining -= chunk
             self._hb()
             self._follow_watchdog()   # re-drive a follow whose apply stalled
-            self._arp_nudge()         # keep the gateway's ARP entry for the VIP fresh
+            self._poll_carp_role()    # backup->master? renew early + nudge now
+            self._arp_nudge()
         return not self.stop
 
     def run(self):

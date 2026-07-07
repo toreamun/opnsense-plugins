@@ -76,9 +76,10 @@ class DiagnosticsController extends ApiControllerBase
         if (!$this->request->isPost()) {
             return ['status' => 'failed'];
         }
-        // Constrain to an address shape before handing it to configd; the shell
-        // script re-sanitizes to [A-Za-z0-9_] as a second line of defence.
-        if (!preg_match('/^[0-9A-Fa-f:.]{1,45}$/', (string)$id)) {
+        // Keeper ids are IPv4 request addresses (same validation as the model
+        // and follow_update.php); the shell script re-sanitizes to [A-Za-z0-9_]
+        // as a second line of defence.
+        if (filter_var((string)$id, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) === false) {
             return ['status' => 'invalid'];
         }
         $raw = trim((string)(new Backend())->configdpRun('carpvipdhcp nudge', [$id]));

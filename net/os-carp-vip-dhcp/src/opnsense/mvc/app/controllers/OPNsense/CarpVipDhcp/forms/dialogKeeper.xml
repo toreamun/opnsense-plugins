@@ -42,7 +42,7 @@
         <label>ARP nudge interval (s)</label>
         <type>text</type>
         <advanced>true</advanced>
-        <help><![CDATA[Periodically broadcast an ARP request from the VIP (with its CARP MAC) for the upstream gateway, so the gateway's ARP entry for the VIP never expires. Use when the upstream ignores gratuitous ARP and never re-ARPs an expired entry — the symptom is that traffic NATed to the VIP works right after a CARP event or DHCP exchange, then silently blackholes some minutes later (outbound packets leave, nothing returns). Only sent while this node is CARP master for the VIP. Default: 240 (on) — one broadcast ARP per interval, harmless on gateways that behave normally. Set 0 to disable.]]></help>
+        <help><![CDATA[Periodically broadcast an ARP request from the VIP (with its CARP MAC) for the upstream gateway, so the gateway's ARP entry for the VIP never expires. Use when the upstream ignores gratuitous ARP and never re-ARPs an expired entry — the symptom is that traffic NATed to the VIP works right after a CARP event or DHCP exchange, then silently blackholes some minutes later (outbound packets leave, nothing returns). Only sent while this node is CARP master for the VIP. Default: 240 (on) — one broadcast ARP per interval, harmless on gateways that behave normally. Setting 0 disables the nudge entirely: the periodic nudge, the automatic nudge on CARP failover AND the manual nudge button on the status page (the early lease renew on failover is unaffected).]]></help>
     </field>
     <field>
         <id>keeper.chaddrOverride</id>

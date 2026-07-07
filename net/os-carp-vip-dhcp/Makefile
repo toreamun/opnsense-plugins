@@ -1,5 +1,5 @@
 PLUGIN_NAME=		carp-vip-dhcp
-PLUGIN_VERSION=         1.1
+PLUGIN_VERSION=         1.1.1
 PLUGIN_COMMENT=		Keep a DHCP lease alive for a CARP virtual IP (DHCP/CGNAT WAN failover)
 PLUGIN_MAINTAINER=	tore@amundsen.org
 # NOTE: the py<XY>-scapy version MUST match the OPNsense base Python of your target release.

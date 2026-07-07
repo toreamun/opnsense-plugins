@@ -123,16 +123,17 @@ OPNsense CARP answers ARP + egresses data as usual. The VIP becomes failover-cap
   **hostname (12)** per keeper (advanced) for ISPs that only lease when they see a specific value. Empty
   = not sent. Give the keeper its *own* client-id — do not copy the WAN interface's, or the server may
   treat them as one client.
-- **ARP nudge (optional, advanced):** periodically broadcast an ARP *request* from the VIP (with its CARP
+- **ARP nudge (on by default, advanced):** periodically broadcast an ARP *request* from the VIP (with its CARP
   MAC) for the upstream gateway, refreshing the gateway's ARP entry for the VIP. Some ISP gateways/BNGs
   ignore gratuitous ARP (spoofing protection) and **never re-ARP an expired entry** — the symptom is that
   traffic NATed to the VIP works right after a CARP event or DHCP exchange, then **silently blackholes
   some minutes later** (outbound packets leave, nothing returns; even the gateway stops answering pings
   from the VIP). A DHCP RENEW does *not* refresh such a gateway's ARP cache, but a received ARP request
-  does. Suggested interval: 240 s (well under typical 15–20 min ARP timeouts). The nudge is only sent
-  while this node is CARP **master** for the VIP (never from a backup, which would steal the VIP's
-  traffic), and the gateway address is taken from DHCP option 3 (fallback: the DHCP server address).
-  0 = off (default).
+  does. Default interval: 240 s (well under typical 15–20 min ARP timeouts) — one broadcast ARP per
+  interval is negligible next to CARP's one advertisement per second, and harmless on gateways that
+  behave normally, so it is **on by default**. The nudge is only sent while this node is CARP **master**
+  for the VIP (never from a backup, which would steal the VIP's traffic), and the gateway address is
+  taken from DHCP option 3 (fallback: the DHCP server address). Set 0 to disable.
 - **Self-healing:** the daemon never exits on a transient DHCP/interface fault — it catches errors, keeps
   its heartbeat fresh (so CARP does not falsely demote the node) and retries.
 

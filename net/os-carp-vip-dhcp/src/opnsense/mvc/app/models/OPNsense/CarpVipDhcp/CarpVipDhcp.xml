@@ -57,10 +57,13 @@
                     upstream gateway, refreshing its ARP entry for the VIP. Needed for
                     gateways that ignore gratuitous ARP and never re-ARP an expired
                     entry (traffic to the VIP silently blackholes when it expires).
-                    Only sent while this node is CARP master for the VIP. 0 = off.
+                    Only sent while this node is CARP master for the VIP. On by
+                    default (240 s) -- one broadcast ARP per interval is negligible
+                    next to CARP's one advertisement per second, and the failure it
+                    prevents is silent. 0 = off.
                 -->
                 <arpNudgeInterval type="IntegerField">
-                    <Default>0</Default>
+                    <Default>240</Default>
                     <MinimumValue>0</MinimumValue>
                     <MaximumValue>3600</MaximumValue>
                     <ValidationMessage>ARP nudge interval must be 0 (off) or 30-3600 seconds.</ValidationMessage>

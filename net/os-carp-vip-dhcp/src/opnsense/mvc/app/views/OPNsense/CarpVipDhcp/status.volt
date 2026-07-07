@@ -92,6 +92,22 @@
         return txt;
     }
 
+    function nudgeCell(k) {
+        if (!k.arp_nudge) {
+            return '<span class="text-muted">' + "{{ lang._('off') }}" + '</span>';
+        }
+        let tip = "{{ lang._('every') }}" + ' ' + k.arp_nudge + ' s'
+            + (k.gw ? ' → ' + k.gw : ' (' + "{{ lang._('gateway unknown') }}" + ')');
+        if (k.nudge_age === null || k.nudge_age === undefined) {
+            // Enabled but never sent: expected on a CARP backup, suspicious on a
+            // bound master (no gateway known, or the daemon predates the setting).
+            let style = (k.carp_state === 'MASTER' && k.bound) ? 'label-warning' : 'label-default';
+            return '<span class="label ' + style + '" title="' + tip + '">'
+                + "{{ lang._('never') }}" + '</span>';
+        }
+        return '<span title="' + tip + '">' + fmtAge(k.nudge_age) + '</span>';
+    }
+
     function refreshStatus() {
         ajaxGet('/api/carpvipdhcp/diagnostics/status', {}, function (data) {
             if (data === undefined) {
@@ -104,7 +120,7 @@
             let keepers = data.keepers || [];
             let rows = '';
             if (keepers.length === 0) {
-                rows = '<tr><td colspan="9" class="text-muted">'
+                rows = '<tr><td colspan="10" class="text-muted">'
                     + "{{ lang._('No keepers configured.') }}" + '</td></tr>';
             }
             keepers.forEach(function (k) {
@@ -117,6 +133,7 @@
                     + '<td>' + leaseCell(k) + '</td>'
                     + '<td>' + fmtAge(k.hb_age) + '</td>'
                     + '<td>' + leaseTimeCell(k) + '</td>'
+                    + '<td>' + nudgeCell(k) + '</td>'
                     + '<td>' + dash(k.chaddr) + '</td>'
                     + '</tr>';
             });
@@ -144,6 +161,7 @@
                     <th>{{ lang._('Lease') }}</th>
                     <th>{{ lang._('Heartbeat age') }}</th>
                     <th>{{ lang._('Lease time') }}</th>
+                    <th>{{ lang._('ARP nudge') }}</th>
                     <th>{{ lang._('Lease MAC') }}</th>
                 </tr>
             </thead>

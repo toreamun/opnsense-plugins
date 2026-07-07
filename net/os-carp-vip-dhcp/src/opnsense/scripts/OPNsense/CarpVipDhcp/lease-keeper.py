@@ -146,7 +146,8 @@ class Keeper:
         self.arp_nudge = max(ARP_NUDGE_MIN, arp_nudge) if arp_nudge else 0
         self.router = None             # default gateway (DHCP opt 3, fallback: server_id)
         self._last_nudge = 0.0
-        self._nudge_logged = False
+        self._nudge_gw = None          # last nudge target we logged (log again on change)
+        self._nudge_warned = False     # warned once about a missing nudge target
         # Optional DHCP request options (empty -> not sent); built once and added to
         # every DISCOVER/REQUEST/RENEW so the server sees a consistent client identity.
         self._id_opts = []
@@ -391,8 +392,16 @@ class Keeper:
 
     def _hb(self):
         t1, t2, src = self._timing()
-        self._write_hb("%d bound=%s lease=%d t1=%d t2=%d src=%s\n"
-                       % (int(time.time()), self.yiaddr or "-", self.lease, t1, t2, src))
+        # Publish nudge state so the status page can show it: nudge=<epoch of the
+        # last sent nudge, 0 = never> and the current target gateway (if known).
+        extra = ""
+        if self.arp_nudge:
+            extra = " nudge=%d" % int(self._last_nudge)
+            gw = self.router or self.server
+            if gw:
+                extra += " gw=%s" % gw
+        self._write_hb("%d bound=%s lease=%d t1=%d t2=%d src=%s%s\n"
+                       % (int(time.time()), self.yiaddr or "-", self.lease, t1, t2, src, extra))
 
     def _hb_mismatch(self, got):
         # Write a clear marker into the heartbeat file so a supervisor/human sees the mismatch.
@@ -550,7 +559,15 @@ class Keeper:
         if not force and time.time() - self._last_nudge < self.arp_nudge:
             return
         gw = self.router or self.server
-        if not gw or not self._carp_master_now():
+        if not gw:
+            # Enabled but no target: without this warning the nudge would be a
+            # silent no-op and the operator would believe they are protected.
+            if not self._nudge_warned:
+                LOG.warning("ARP nudge enabled but no gateway known "
+                            "(no DHCP router option or server-id) -- cannot nudge")
+                self._nudge_warned = True
+            return
+        if not self._carp_master_now():
             return
         try:
             sendp(Ether(src=self.chaddr, dst="ff:ff:ff:ff:ff:ff") /
@@ -558,10 +575,10 @@ class Keeper:
                       hwdst="00:00:00:00:00:00", pdst=gw),
                   iface=self.iface, verbose=0)
             self._last_nudge = time.time()
-            if not self._nudge_logged:
+            if gw != self._nudge_gw:
                 LOG.info("ARP nudge active: who-has %s tell %s (src %s) every %ds",
                          gw, self.yiaddr, self.chaddr, self.arp_nudge)
-                self._nudge_logged = True
+                self._nudge_gw = gw
         except Exception as e:
             LOG.warning("ARP nudge failed: %s", e)
 

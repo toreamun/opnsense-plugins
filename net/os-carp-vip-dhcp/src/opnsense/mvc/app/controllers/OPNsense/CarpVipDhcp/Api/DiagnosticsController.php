@@ -43,10 +43,14 @@ class DiagnosticsController extends ApiControllerBase
                 return isset($record['level']) && $record['level'] === $level;
             };
         }
+        // No default sort key: searchRecordsetBase only ever sorts ascending on
+        // its default, which would show the log oldest-first until the user
+        // clicks a header. Passing null keeps logparse.py's newest-first order on
+        // the first load; a header click still sorts either way.
         return $this->searchRecordsetBase(
             $records,
             ['timestamp', 'keeper', 'vhid', 'level', 'message'],
-            'timestamp',
+            null,
             $filter_funct
         );
     }

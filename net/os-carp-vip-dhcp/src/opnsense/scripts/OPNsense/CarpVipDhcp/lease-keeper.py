@@ -410,6 +410,12 @@ class Keeper:
         src = "server" if (self.t1_server or self.t2_server) else "derived"
         return t1, t2, src
 
+    def _clock(self, offset):
+        """Local wall-clock HH:MM of a moment `offset` seconds from now. Log
+        lines state future moments (renew/rebind/lease expiry) as relative
+        durations; the clock time saves the reader the mental arithmetic."""
+        return time.strftime("%H:%M", time.localtime(time.time() + offset))
+
     def _write_hb(self, content):
         # Write atomically (temp + rename) so a crash mid-write can't leave a partial file.
         if not self.hbfile:
@@ -749,7 +755,8 @@ class Keeper:
             self._ensure_sniffer()  # a dead sniffer would silently fail every DORA
             self._hb()  # active but not holding yet -> publish bound=- (not STANDBY)
             if self.dora():
-                LOG.info("DHCP BOUND %s (lease=%ss, server=%s)", self.yiaddr, self.lease, self.server)
+                LOG.info("DHCP BOUND %s (lease=%ss, expires ~%s, server=%s)",
+                         self.yiaddr, self.lease, self._clock(self.lease), self.server)
                 self._hb()
                 self._arp_nudge(force=True)
                 self.redora_wait = REDORA_MIN
@@ -760,12 +767,13 @@ class Keeper:
             return
         # Maintain: wait until T1, then RENEW; bail early on stop or master loss.
         t1, t2, src = self._timing()
-        LOG.info("DHCP lease %ds; renew at T1=%ds, rebind by T2=%ds (timing source: %s)",
-                 self.lease, t1, t2, src)
+        LOG.info("DHCP lease %ds; renew at T1=%ds (~%s), rebind by T2=%ds (~%s) (timing source: %s)",
+                 self.lease, t1, self._clock(t1), t2, self._clock(t2), src)
         if not self._hold(t1):
             return
         if self.renew():
-            LOG.info("DHCP RENEW ok %s (lease=%ss)", self.yiaddr, self.lease)
+            LOG.info("DHCP RENEW ok %s (lease=%ss, expires ~%s)",
+                     self.yiaddr, self.lease, self._clock(self.lease))
             self._hb()
             self._arp_nudge(force=True)
             return
@@ -782,7 +790,8 @@ class Keeper:
                 ok = True
                 break
         if ok:
-            LOG.info("DHCP REBIND ok %s", self.yiaddr)
+            LOG.info("DHCP REBIND ok %s (lease=%ss, expires ~%s)",
+                     self.yiaddr, self.lease, self._clock(self.lease))
             self._hb()
             self._arp_nudge(force=True)
             return

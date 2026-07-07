@@ -142,6 +142,11 @@ OPNsense CARP answers ARP + egresses data as usual. The VIP becomes failover-cap
   master), or `kill -USR1` on the keeper daemon — it fires within a second and shows up in the log.
 - **Self-healing:** the daemon never exits on a transient DHCP/interface fault — it catches errors, keeps
   its heartbeat fresh (so CARP does not falsely demote the node) and retries.
+- **Health banner:** if an enabled keeper stops holding its lease — mismatch, a stalled daemon, or a
+  spare that cannot acquire its redundant lease — a warning banner appears across the GUI (auto-clearing
+  once healthy). A short grace period rides out reboots and restarts. This closes the silent-failure gap:
+  the redundant spare's keeper can fail without any outage, so without the banner you would not know HA
+  is degraded until a failover actually needed it. (It is a logged-in GUI banner, not an email push.)
 
 ## Prerequisites
 

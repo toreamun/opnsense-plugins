@@ -243,10 +243,12 @@ class Keeper:
         # drives the hardened follow -- see _on_dhcp_reply / _check_observed_follow.
         self._observed_change = None
         self._ev = threading.Event()
-        # Wakes the main thread's maintain-loop sleep the instant the sniffer
-        # records an observed address change, so the follow fires in
-        # milliseconds instead of waiting out the 1s tick. Set only by the
-        # sniffer thread; waited/cleared only by the main thread.
+        # General early-wake for the maintain-loop sleep (_sleep_gated): lets it
+        # return before the 1s tick when there is pending work. Currently the
+        # sniffer sets it on an observed address change so the follow fires in
+        # milliseconds; a future fast-wake need should reuse this rather than mint
+        # a second event. Set only by the sniffer thread; waited/cleared only by
+        # the main thread.
         self._wake = threading.Event()
         self._sniffer = None
 
@@ -948,12 +950,8 @@ class Keeper:
                 self._arp_nudge(force=True)
                 self._hb()   # publish the new nudge age right away for the status page
             if self._observed_change is not None:
-                # The peer's ACK revealed a changed ISP address -> follow now
-                # instead of at our own renewal timer, so the two nodes converge
-                # before CARP's ~3s timeout can dual-master us. The sniffer wakes
-                # us the instant it records one (self._wake, below), so this fires
-                # within milliseconds; the 1s timeout still drives the periodic
-                # checks when nothing signals.
+                # A peer-ACK observation is pending -> follow now (rationale +
+                # the dual-master window it closes are in _check_observed_follow).
                 self._check_observed_follow()
             if self.only_when_master and slept % GATE_POLL == 0 and not self._is_master():
                 return False

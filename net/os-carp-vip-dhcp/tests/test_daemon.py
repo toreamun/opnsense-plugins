@@ -141,11 +141,11 @@ def test_enforce_mismatch_refused(lk, tmp_path):
 # ---- observed peer ACK: converge follow from the peer's exchange (single-ip s.3) ----
 
 def _observe_keeper(lk, tmp_path):
-    keeper = lk.Keeper("eth0", "00:00:5e:00:01:fe", "100.64.4.7", hbfile=None, follow=True)
-    keeper._follow_state = str(tmp_path / "follow_state")
-    keeper.server = "100.64.4.1"
-    keeper.yiaddr = "100.64.4.7"
-    keeper.xid = 0x11111111          # OUR in-flight xid
+    # Same fixture as _follow_keeper (server / yiaddr / _follow_state / fired +
+    # _follow_update stubs), plus a known in-flight xid so a peer ACK (different
+    # xid) takes the observed path.
+    keeper = _follow_keeper(lk, tmp_path)
+    keeper.xid = 0x11111111
     return keeper
 
 
@@ -221,8 +221,6 @@ def test_observed_latest_wins(lk, tmp_path):
     # the handler acts on the LATEST address -- the older one is superseded (the
     # shared lease is now the newer address), so dropping it is correct.
     keeper = _observe_keeper(lk, tmp_path)
-    keeper.fired = []
-    keeper._follow_update = keeper.fired.append
     keeper._on_dhcp_reply(_peer_ack(lk, "100.64.4.60"))
     keeper._on_dhcp_reply(_peer_ack(lk, "100.64.4.61"))
     assert keeper._observed_change.yiaddr == "100.64.4.61"
@@ -235,8 +233,6 @@ def test_observed_same_address_after_follow_is_dropped(lk, tmp_path):
     # After we've followed to the new address, a lingering observation for that
     # same address is a no-op (the == self.yiaddr guard), never a double-follow.
     keeper = _observe_keeper(lk, tmp_path)
-    keeper.fired = []
-    keeper._follow_update = keeper.fired.append
     keeper.yiaddr = "100.64.4.61"                 # we already hold the new address
     keeper._observed_change = _ack(lk, "100.64.4.61")
     keeper._check_observed_follow()
@@ -246,8 +242,6 @@ def test_observed_same_address_after_follow_is_dropped(lk, tmp_path):
 
 def test_check_observed_follow_drives_hardened_follow(lk, tmp_path):
     keeper = _observe_keeper(lk, tmp_path)
-    keeper.fired = []
-    keeper._follow_update = keeper.fired.append
     keeper._observed_change = _ack(lk, "100.64.4.60")
     keeper._check_observed_follow()
     assert keeper.fired == ["100.64.4.60"]
@@ -257,8 +251,6 @@ def test_check_observed_follow_drives_hardened_follow(lk, tmp_path):
 
 def test_check_observed_follow_rejects_wrong_server(lk, tmp_path):
     keeper = _observe_keeper(lk, tmp_path)
-    keeper.fired = []
-    keeper._follow_update = keeper.fired.append
     keeper._observed_change = _ack(lk, "100.64.4.60", server="100.64.4.9")  # not our server
     keeper._check_observed_follow()
     assert keeper.fired == []          # same hardening as a first-party ACK
@@ -266,8 +258,6 @@ def test_check_observed_follow_rejects_wrong_server(lk, tmp_path):
 
 def test_observed_serviced_by_maintain_loop(lk, tmp_path):
     keeper = _observe_keeper(lk, tmp_path)
-    keeper.fired = []
-    keeper._follow_update = keeper.fired.append
     keeper._observed_change = _ack(lk, "100.64.4.60")
     keeper._wake.set()                 # as the sniffer would -> loop returns at once
     keeper._sleep_gated(1)

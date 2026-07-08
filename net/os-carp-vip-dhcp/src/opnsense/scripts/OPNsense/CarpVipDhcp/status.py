@@ -8,7 +8,7 @@ pidfile and heartbeat file. Output:
 
 The heartbeat file is written by lease-keeper.py in one of two forms:
     <epoch> bound=<ip> lease=<seconds> t1=<seconds> t2=<seconds> src=<server|derived>
-            [nudge=<epoch|0> [gw=<ip>]]
+            [nudge=<epoch|0> arpok=<epoch|0> [gw=<ip>]]
     <epoch> MISMATCH got=<ip> want=<ip>
 """
 import json
@@ -39,7 +39,8 @@ def pid_alive(path):
 def parse_heartbeat(path):
     result = {"bound": None, "lease": None, "t1": None, "t2": None, "timing_source": None,
               "standby": False, "mismatch": False, "mismatch_got": None, "mismatch_want": None,
-              "hb_epoch": None, "hb_age": None, "nudge_epoch": None, "nudge_age": None, "gw": None}
+              "hb_epoch": None, "hb_age": None, "nudge_epoch": None, "nudge_age": None, "gw": None,
+              "arp_reply_epoch": None, "arp_reply_age": None}
     try:
         raw = open(path).read().strip()
     except OSError:
@@ -79,6 +80,14 @@ def parse_heartbeat(path):
                 result["nudge_epoch"] = int(part.split("=", 1)[1])
                 if result["nudge_epoch"]:
                     result["nudge_age"] = int(time.time()) - result["nudge_epoch"]
+            except ValueError:
+                pass
+        elif part.startswith("arpok="):
+            # arpok=0 means "no gateway ARP reply seen yet" -> age stays None.
+            try:
+                result["arp_reply_epoch"] = int(part.split("=", 1)[1])
+                if result["arp_reply_epoch"]:
+                    result["arp_reply_age"] = int(time.time()) - result["arp_reply_epoch"]
             except ValueError:
                 pass
         elif part.startswith("gw="):

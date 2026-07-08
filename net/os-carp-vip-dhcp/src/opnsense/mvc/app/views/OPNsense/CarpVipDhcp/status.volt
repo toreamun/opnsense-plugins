@@ -120,6 +120,21 @@
         } else {
             cell = '<span title="' + tip + '">' + fmtAge(k.nudge_age) + '</span>';
         }
+        // Reachability: did the gateway answer the nudge? Only meaningful once we
+        // have actually nudged. A reply is the healthy signal; nudging on a bound
+        // master with no reply is the ISP-dropping symptom the daemon also warns on.
+        if (k.nudge_age != null) {
+            if (k.arp_reply_age != null) {
+                cell += ' <span class="text-success" title="'
+                    + "{{ lang._('Gateway confirmed reachable (replied to the ARP nudge)') }}"
+                    + '"><i class="fa fa-check fa-fw"></i>' + fmtAge(k.arp_reply_age) + '</span>';
+            } else if (k.carp_state === 'MASTER' && k.bound) {
+                cell += ' <span class="text-warning" title="'
+                    + "{{ lang._('No ARP reply from the gateway yet — it may be dropping the nudge') }}"
+                    + '"><i class="fa fa-exclamation-triangle fa-fw"></i>'
+                    + "{{ lang._('no reply') }}" + '</span>';
+            }
+        }
         if (k.running === true && k.carp_state === 'MASTER') {
             cell += ' <button class="btn btn-xs btn-default nudge_now" data-id="' + k.request
                 + '" title="' + "{{ lang._('Send an ARP nudge now') }}" + '">'

@@ -8,8 +8,10 @@ This does lease maintenance ONLY; ARP for the address and data traffic are
 handled by CARP. Optionally (--arp-nudge) it also refreshes the upstream
 gateway's ARP entry for the leased address, for gateways that ignore
 gratuitous ARP and never re-ARP an expired entry (traffic to the address
-silently blackholes until the gateway receives an ARP *request* from it).
-By default it is ungated and runs on both HA nodes for
+silently blackholes until the gateway receives an ARP *request* from it). It
+also watches for the gateway's ARP reply to that nudge as a reachability
+signal, and warns if repeated nudges go unanswered (a likely sign the carrier
+is dropping them). By default it is ungated and runs on both HA nodes for
 redundancy; opt-in run-only-on-master gating restricts it to the CARP master.
 
 Robustness:
@@ -23,13 +25,18 @@ Robustness:
     --once/--release-on-exit -- so the address is not given up needlessly.
 
 Security posture (this daemon parses untrusted WAN traffic as root):
-  * The sniffer is NOT promiscuous: requests carry the BOOTP broadcast flag so
-    the server broadcasts its replies, which reach a non-promiscuous socket --
-    the daemon never sees a neighbour's unicast traffic.
-  * The BPF filter is the next boundary: only DHCP traffic (udp port 67/68)
-    ever reaches Python; everything else is dropped in the kernel.
-  * A reply must carry our current xid and the BOOTREPLY op before any field
-    is read (see _on_dhcp_reply) -- unsolicited or replayed packets are discarded early.
+  * The sniffer is NOT promiscuous by default: DHCP requests carry the BOOTP
+    broadcast flag so the server broadcasts its replies to a non-promiscuous
+    socket, and the gateway's unicast ARP reply to a nudge reaches us because
+    the CARP master already accepts the VIP's virtual MAC (its own traffic).
+    --arp-listen-promisc is an opt-in fallback (default off) for NICs that drop
+    non-primary unicast; it widens capture to the whole segment, so it warns
+    when enabled.
+  * The BPF filter is the next boundary: only DHCP (udp port 67/68) and ARP
+    *replies* reach Python; everything else is dropped in the kernel.
+  * A DHCP reply must carry our current xid and the BOOTREPLY op before any
+    field is read (see _on_dhcp_reply); an ARP reply must come from the nudge
+    target for our leased IP (see _on_arp_reply) -- other packets are dropped early.
   * Only the handful of DHCP options the keeper needs is extracted; there is
     no full dissection of the reply's other option data (untrusted network
     input -- it came from whatever answered on the wire, e.g. a rogue or
@@ -97,6 +104,7 @@ MIN_T1 = 30                # floor for the renew timer (very short leases)
 REBIND_MARGIN = 15         # ensure T2 is at least this far past T1
 BROADCAST_FLAG = 0x8000    # BOOTP flags: ask the server to broadcast OFFER/ACK
 ARP_NUDGE_MIN = 30         # floor for --arp-nudge so a typo cannot flood the segment
+ARP_UNANSWERED_WARN = 3    # warn after this many consecutive nudges with no gateway reply
 LOG_MAX_BYTES = 512 * 1024
 LOG_BACKUPS = 3
 
@@ -151,7 +159,7 @@ class Keeper:
     def __init__(self, iface, chaddr, request_ip=None, eth_src=None,
                  hbfile=None, release_on_exit=False, only_when_master=False, vhid=None,
                  follow=False, vendor_class=None, client_id=None, hostname=None,
-                 arp_nudge=0):
+                 arp_nudge=0, arp_listen_promisc=False):
         self.iface = iface
         self.chaddr = chaddr.lower()
         self.chraw = mac2raw(chaddr)
@@ -166,10 +174,17 @@ class Keeper:
         # fresh, for gateways that ignore gratuitous ARP and never re-ARP an
         # expired entry (see the README's "ARP nudge" section for the full story).
         self.arp_nudge = max(ARP_NUDGE_MIN, arp_nudge) if arp_nudge else 0
+        # Promiscuous ARP capture: off by default (the CARP master already
+        # accepts the VIP MAC, so the unicast reply reaches a normal socket).
+        # Opt-in fallback for NICs that drop non-primary unicast MACs.
+        self.arp_listen_promisc = arp_listen_promisc
         self.router = None             # default gateway (DHCP opt 3, fallback: server_id)
         self._last_nudge = 0.0
         self._nudge_gw = None          # last nudge target we logged (log again on change)
         self._nudge_warned = False     # warned once about a missing nudge target
+        self._last_arp_reply = 0.0     # epoch of the gateway's last ARP reply to our nudge (0 = none)
+        self._nudges_since_reply = 0   # nudges sent since the last reply (unanswered-nudge detector)
+        self._arp_unanswered_warned = False  # warned once about unanswered nudges (reset on a reply)
         self._was_master = None        # CARP role at the last nudge check (None = unknown yet)
         self._nudge_now = False        # operator asked for an immediate nudge (SIGUSR1)
         self._poll_role_now = False    # a CARP transition fired -> re-check role now (SIGUSR2)
@@ -214,15 +229,17 @@ class Keeper:
                     self._sniffer.stop()
                 except Exception:
                     pass
-            # promisc=False: we set the BOOTP broadcast flag on every request, so
-            # an RFC 2131-compliant server broadcasts OFFER/ACK -- and broadcast
-            # frames reach a non-promiscuous socket. Not listening promiscuously on
-            # a WAN interface keeps this root daemon off every neighbour's traffic.
-            # The BPF filter is a second boundary, not an optimization: only DHCP
-            # reaches the Python parser at all.
+            # Non-promiscuous by default: the BOOTP broadcast flag makes the
+            # server broadcast OFFER/ACK, and the gateway's unicast ARP reply to a
+            # nudge reaches us because the CARP master already accepts the VIP's
+            # virtual MAC. arp_listen_promisc is the opt-in fallback for NICs that
+            # drop non-primary unicast (widens capture -- warned at startup).
+            # The BPF filter is a boundary, not an optimization: only DHCP and ARP
+            # *replies* (arp[6:2]=2) reach the Python parser at all.
             self._sniffer = AsyncSniffer(
-                iface=self.iface, filter="udp and (port 67 or port 68)",
-                prn=self._on_dhcp_reply, store=0, promisc=False)
+                iface=self.iface,
+                filter="(udp and (port 67 or port 68)) or (arp and arp[6:2] = 2)",
+                prn=self._on_sniff, store=0, promisc=self.arp_listen_promisc)
             self._sniffer.start()
             return True
         except Exception as e:
@@ -238,6 +255,35 @@ class Keeper:
             LOG.warning("DHCP-reply sniffer down -- (re)starting")
             self._start_sniffer()
             time.sleep(1)
+
+    def _on_sniff(self, p):
+        # One sniffer feeds two parsers; keep the DHCP and ARP concerns separate.
+        # The BPF filter already narrowed traffic to DHCP + ARP replies, so this
+        # only routes by layer -- each handler does its own validation/guarding.
+        if p.haslayer(BOOTP):
+            self._on_dhcp_reply(p)
+        elif p.haslayer(ARP):
+            self._on_arp_reply(p)
+
+    def _on_arp_reply(self, p):
+        """Record the gateway's ARP reply to our nudge as a reachability signal.
+        Only the reply to OUR who-has counts: op=2 (is-at), sender = the nudge
+        target gateway, target protocol address = our leased IP. Anything else on
+        the segment is ignored. Runs on the sniffer thread; sets simple fields the
+        main loop reads (int/float assignment is atomic enough for this heuristic)."""
+        try:
+            arp = p[ARP]
+            if arp.op != 2:                     # 2 = is-at (reply); requests are filtered out in BPF
+                return
+            gw = self._nudge_target()
+            if not gw or not self.yiaddr:
+                return
+            if arp.psrc == gw and arp.pdst == self.yiaddr:
+                self._last_arp_reply = time.time()
+                self._nudges_since_reply = 0
+                self._arp_unanswered_warned = False
+        except Exception as e:
+            LOG.debug("ARP reply parse error: %s", e)
 
     def _on_dhcp_reply(self, p):
         try:
@@ -457,10 +503,11 @@ class Keeper:
     def _hb(self):
         t1, t2, src = self._timing()
         # Publish nudge state so the status page can show it: nudge=<epoch of the
-        # last sent nudge, 0 = never> and the current target gateway (if known).
+        # last sent nudge, 0 = never>, arpok=<epoch of the gateway's last ARP reply,
+        # 0 = none seen> and the current target gateway (if known).
         extra = ""
         if self.arp_nudge:
-            extra = " nudge=%d" % int(self._last_nudge)
+            extra = " nudge=%d arpok=%d" % (int(self._last_nudge), int(self._last_arp_reply))
             gw = self._nudge_target()
             if gw:
                 extra += " gw=%s" % gw
@@ -679,6 +726,26 @@ class Keeper:
                       hwdst="00:00:00:00:00:00", pdst=gw),
                   iface=self.iface, verbose=0)
             self._last_nudge = time.time()
+            # Reachability: _on_arp_reply zeroes this when the gateway answers. If
+            # it keeps climbing, no reply is coming back. The likely cause -- and
+            # so the hint -- depends on whether we are already listening
+            # promiscuously: if we are, promisc is not the fix (the carrier is
+            # dropping it); if we are not, that NIC may simply not surface the
+            # unicast reply. Warn once, reset on the next reply.
+            self._nudges_since_reply += 1
+            if (self._nudges_since_reply >= ARP_UNANSWERED_WARN
+                    and not self._arp_unanswered_warned):
+                if self.arp_listen_promisc:
+                    hint = ("the gateway is not answering -- with promiscuous "
+                            "listening already on, the carrier is likely dropping "
+                            "the nudge (DAI/DHCP snooping)")
+                else:
+                    hint = ("the gateway may be dropping it (DAI/DHCP snooping), or "
+                            "this NIC may not surface the unicast reply without "
+                            "'ARP listen in promiscuous mode'")
+                LOG.warning("ARP nudge unanswered: %d sent to %s for %s with no reply "
+                            "-- %s", self._nudges_since_reply, gw, self.yiaddr, hint)
+                self._arp_unanswered_warned = True
             # Every fire is logged, but at the right level: the first one (and any
             # target change) at INFO so the default log shows the nudge is active;
             # the routine repeats at DEBUG, so they are there in "Debug (all)"
@@ -908,6 +975,10 @@ def main():
                     help="periodically broadcast an ARP request from the leased IP "
                          "for the gateway, so upstream gear that never re-ARPs keeps "
                          "a fresh entry (0 = off, suggested 240)")
+    ap.add_argument("--arp-listen-promisc", action="store_true",
+                    help="put the capture socket in promiscuous mode so the gateway's "
+                         "unicast ARP reply is seen on NICs that filter non-primary "
+                         "unicast MACs (default off; only needed if replies aren't seen)")
     ap.add_argument("--once", action="store_true")
     ap.add_argument("--release-on-exit", action="store_true")
     a = ap.parse_args()
@@ -934,7 +1005,12 @@ def main():
                hbfile=a.hbfile, release_on_exit=a.release_on_exit or a.once,
                only_when_master=a.only_when_master, vhid=a.vhid, follow=a.follow,
                vendor_class=a.vendor_class, client_id=a.client_id, hostname=a.hostname,
-               arp_nudge=a.arp_nudge)
+               arp_nudge=a.arp_nudge, arp_listen_promisc=a.arp_listen_promisc)
+
+    if a.arp_listen_promisc:
+        LOG.warning("ARP listen: PROMISCUOUS capture enabled on %s -- the daemon now "
+                    "sees all traffic on the segment (opt-in fallback for NICs that "
+                    "drop the gateway's unicast ARP reply otherwise)", a.iface)
 
     def _sig(*_):
         LOG.info("signal received -- stopping")

@@ -64,6 +64,24 @@ def test_parse_heartbeat_nudge_never(tmp_path):
     assert result["gw"] is None
 
 
+def test_parse_heartbeat_arpok(tmp_path):
+    hb = tmp_path / "hb"
+    hb.write_text("1783350773 bound=100.64.4.7 lease=1800 t1=900 t2=1575 src=derived"
+                  " nudge=1783350700 arpok=1783350710 gw=100.64.4.1\n")
+    result = status.parse_heartbeat(str(hb))
+    assert result["arp_reply_epoch"] == 1783350710
+    assert isinstance(result["arp_reply_age"], int) and result["arp_reply_age"] > 0
+
+
+def test_parse_heartbeat_arpok_never(tmp_path):
+    hb = tmp_path / "hb"
+    hb.write_text("1783350773 bound=100.64.4.7 lease=1800 t1=900 t2=1575 src=derived"
+                  " nudge=1783350700 arpok=0 gw=100.64.4.1\n")
+    result = status.parse_heartbeat(str(hb))
+    assert result["arp_reply_epoch"] == 0
+    assert result["arp_reply_age"] is None
+
+
 def test_parse_heartbeat_without_nudge_tokens(tmp_path):
     hb = tmp_path / "hb"
     hb.write_text("1783350773 bound=100.64.4.7 lease=1800 t1=900 t2=1575 src=derived\n")

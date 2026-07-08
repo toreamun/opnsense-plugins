@@ -130,9 +130,28 @@ export default class CarpVipDhcp extends BaseTableWidget {
         return this._cell(this.translations.nudge + ' ' + val, 'text-muted');
     }
 
+    // Compact reachability glyph next to the nudge age: a check once the gateway
+    // has replied to a nudge, a warning when a bound master's nudges go
+    // unanswered. Mirrors the Status page; icon-only to keep the widget row narrow.
+    _arpReplyGlyph(k) {
+        if (!k.arp_nudge || k.nudge_age === null || k.nudge_age === undefined) {
+            return '';
+        }
+        if (k.arp_reply_age !== null && k.arp_reply_age !== undefined) {
+            return ' <i class="fa fa-check text-success" title="'
+                + this.translations.arpok + '"></i>';
+        }
+        if (k.carp_state === 'MASTER' && k.bound) {
+            return ' <i class="fa fa-exclamation-triangle text-warning" title="'
+                + this.translations.arpnoreply + '"></i>';
+        }
+        return '';
+    }
+
     _statusValue(k) {
         const sep = ' <span class="text-muted">·</span> ';
-        return this._carpBadge(k) + ' ' + this._leaseText(k) + sep + this._nudgeText(k);
+        return this._carpBadge(k) + ' ' + this._leaseText(k) + sep
+            + this._nudgeText(k) + this._arpReplyGlyph(k);
     }
 
     _fmtAge(sec) {

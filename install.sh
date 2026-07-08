@@ -82,10 +82,11 @@ pkg add -f "${WORK}/${pkgfile}"
 new="$(pkg query '%v' "${PLUGIN}" 2>/dev/null || true)"
 
 if [ -z "${prev}" ]; then
-    echo ">>> Done. ${PLUGIN} ${new:+${new} }installed and signature-verified."
+    detail="installed"
 elif [ "${prev}" = "${new}" ]; then
-    echo ">>> Done. ${PLUGIN} reinstalled at ${new} (signature-verified)."
+    detail="reinstalled at ${new}"
 else
-    echo ">>> Done. ${PLUGIN} updated ${prev} -> ${new} (signature-verified)."
+    detail="updated ${prev} -> ${new}"
 fi
+echo ">>> Done. ${PLUGIN} ${detail} and signature-verified."
 echo "    (os-carp-vip-dhcp: find it in the GUI under Interfaces > Virtual IPs DHCP.)"

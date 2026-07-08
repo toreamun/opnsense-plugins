@@ -124,11 +124,9 @@ carpvipdhcp_stop()
 
 carpvipdhcp_restart()
 {
-    if [ -n "${svc_id}" ]; then
-        carpvipdhcp_stop_id "${svc_id}"
-    else
-        carpvipdhcp_stop
-    fi
+    # Both stop and start already honour svc_id (one keeper vs. all), so there is
+    # no need to re-branch here.
+    carpvipdhcp_stop
     carpvipdhcp_start
 }
 

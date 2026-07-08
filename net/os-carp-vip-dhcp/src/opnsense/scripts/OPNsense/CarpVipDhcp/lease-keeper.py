@@ -10,9 +10,10 @@ gateway's ARP entry for the leased address, for gateways that ignore
 gratuitous ARP and never re-ARP an expired entry (traffic to the address
 silently blackholes until the gateway receives an ARP *request* from it). It
 also watches for the gateway's ARP reply to that nudge as a reachability
-signal, and warns if repeated nudges go unanswered (a likely sign the carrier
-is dropping them). By default it is ungated and runs on both HA nodes for
-redundancy; opt-in run-only-on-master gating restricts it to the CARP master.
+signal, warns if repeated nudges go unanswered (a likely sign the carrier is
+dropping them), and flags an ARP conflict if another MAC claims the leased
+address. By default it is ungated and runs on both HA nodes for redundancy;
+opt-in run-only-on-master gating restricts it to the CARP master.
 
 Robustness:
   * Full DHCP lifecycle: DORA (Discover / Offer / Request / Ack, the lease
@@ -32,8 +33,10 @@ Security posture (this daemon parses untrusted WAN traffic as root):
     --arp-listen-promisc is an opt-in fallback (default off) for NICs that drop
     non-primary unicast; it widens capture to the whole segment, so it warns
     when enabled.
-  * The BPF filter is the next boundary: only DHCP (udp port 67/68) and ARP
-    *replies* reach Python; everything else is dropped in the kernel.
+  * The BPF filter is the next boundary: only DHCP (udp port 67/68), ARP
+    *replies*, and (once bound) ARP claiming our leased IP reach Python;
+    everything else -- including the segment's broadcast who-has flood -- is
+    dropped in the kernel.
   * A DHCP reply must carry our current xid and the BOOTREPLY op before any
     field is read (see _on_dhcp_reply); an ARP reply must come from the nudge
     target for our leased IP (see _on_arp_reply) -- other packets are dropped early.
@@ -105,6 +108,7 @@ REBIND_MARGIN = 15         # ensure T2 is at least this far past T1
 BROADCAST_FLAG = 0x8000    # BOOTP flags: ask the server to broadcast OFFER/ACK
 ARP_NUDGE_MIN = 30         # floor for --arp-nudge so a typo cannot flood the segment
 ARP_UNANSWERED_WARN = 3    # warn after this many consecutive nudges with no gateway reply
+ARP_CONFLICT_REWARN = 3600  # re-warn about a persistent ARP conflict at most this often
 LOG_MAX_BYTES = 512 * 1024
 LOG_BACKUPS = 3
 
@@ -189,6 +193,11 @@ class Keeper:
         self._last_arp_reply = 0.0     # epoch of the gateway's last ARP reply (sniffer-written, 0 = none)
         self._reply_seen_at = 0.0      # last _last_arp_reply the main thread has accounted for
         self._nudges_since_reply = 0   # consecutive nudges with no new reply (unanswered detector)
+        # ARP conflict (another MAC claiming our leased IP). Detected + throttled
+        # entirely on the sniffer thread, so these are single-owner too.
+        self._sniffer_yiaddr = None    # leased IP the current sniffer filter was built for
+        self._last_conflict_warn = 0.0  # throttle for the conflict warning
+        self._conflict_mac = None       # last foreign MAC seen using our IP
         self._was_master = None        # CARP role at the last nudge check (None = unknown yet)
         self._nudge_now = False        # operator asked for an immediate nudge (SIGUSR1)
         self._poll_role_now = False    # a CARP transition fired -> re-check role now (SIGUSR2)
@@ -226,6 +235,20 @@ class Keeper:
         self._sniffer = None
 
     # ---- sniffer (resilient) ----
+    def _sniffer_filter(self):
+        # DHCP (broadcast OFFER/ACK) + ARP replies to our nudge (arp[6:2]=2). Once
+        # we hold a lease, also capture ARP whose SENDER protocol address is our
+        # leased IP (arp[14:4]) -- to spot another MAC claiming our address. The
+        # BPF filter is a boundary, not an optimization: it keeps everything else
+        # (incl. the segment's broadcast who-has flood) out of the Python parser.
+        f = "(udp and (port 67 or port 68)) or (arp and arp[6:2] = 2)"
+        try:
+            if self.yiaddr:
+                f += " or (arp and arp[14:4] = %d)" % int(ipaddress.IPv4Address(self.yiaddr))
+        except ValueError:
+            pass
+        return f
+
     def _start_sniffer(self):
         try:
             if self._sniffer:
@@ -238,11 +261,9 @@ class Keeper:
             # nudge reaches us because the CARP master already accepts the VIP's
             # virtual MAC. arp_listen_promisc is the opt-in fallback for NICs that
             # drop non-primary unicast (widens capture -- warned at startup).
-            # The BPF filter is a boundary, not an optimization: only DHCP and ARP
-            # *replies* (arp[6:2]=2) reach the Python parser at all.
+            self._sniffer_yiaddr = self.yiaddr   # what the filter below is built for
             self._sniffer = AsyncSniffer(
-                iface=self.iface,
-                filter="(udp and (port 67 or port 68)) or (arp and arp[6:2] = 2)",
+                iface=self.iface, filter=self._sniffer_filter(),
                 prn=self._on_sniff, store=0, promisc=self.arp_listen_promisc)
             self._sniffer.start()
             return True
@@ -259,6 +280,11 @@ class Keeper:
             LOG.warning("DHCP-reply sniffer down -- (re)starting")
             self._start_sniffer()
             time.sleep(1)
+        elif self.yiaddr != self._sniffer_yiaddr:
+            # Our leased IP became known (or changed) -> rebuild the filter so the
+            # conflict clause (ARP sender == our IP) tracks the current address.
+            LOG.debug("rebuilding sniffer filter for leased IP %s", self.yiaddr)
+            self._start_sniffer()
 
     def _on_sniff(self, p):
         # One sniffer feeds two parsers; keep the DHCP and ARP concerns separate.
@@ -267,7 +293,8 @@ class Keeper:
         if p.haslayer(BOOTP):
             self._on_dhcp_reply(p)
         elif p.haslayer(ARP):
-            self._on_arp_reply(p)
+            self._on_arp_reply(p)      # gateway answering our nudge (reachability)
+            self._on_arp_conflict(p)   # someone else claiming our leased IP
 
     def _on_arp_reply(self, p):
         """Record the gateway's ARP reply to our nudge as a reachability signal.
@@ -294,6 +321,35 @@ class Keeper:
                 LOG.debug("ARP reply from %s (is-at) for %s", gw, self.yiaddr)
         except Exception as e:
             LOG.debug("ARP reply parse error: %s", e)
+
+    def _on_arp_conflict(self, p):
+        """Warn if another MAC claims our leased IP -- an ARP whose sender IP is
+        ours but whose sender MAC is not our CARP MAC (the peer node shares that
+        MAC, so it is excluded). Signals a duplicate address / ISP reassignment.
+        Passive and advisory (spoofable); it only logs, never acts. Throttled so a
+        persistent conflict does not flood the log: re-warns only when the
+        offending MAC changes or after ARP_CONFLICT_REWARN (a new impostor thus
+        surfaces at once). Detection and throttle state are touched only here
+        (sniffer thread) -> single-owner."""
+        try:
+            if not self.yiaddr:
+                return
+            arp = p[ARP]
+            if arp.psrc != self.yiaddr:
+                return
+            mac = (arp.hwsrc or "").lower()
+            if not mac or mac == self.chaddr:   # our own / peer's CARP MAC -> not a conflict
+                return
+            now = time.time()
+            if mac == self._conflict_mac and now - self._last_conflict_warn < ARP_CONFLICT_REWARN:
+                return
+            self._conflict_mac = mac
+            self._last_conflict_warn = now
+            LOG.warning("ARP conflict: %s is using our leased IP %s (our MAC is %s) "
+                        "-- possible duplicate address or ISP reassignment",
+                        mac, self.yiaddr, self.chaddr)
+        except Exception as e:
+            LOG.debug("ARP conflict parse error: %s", e)
 
     def _on_dhcp_reply(self, p):
         try:

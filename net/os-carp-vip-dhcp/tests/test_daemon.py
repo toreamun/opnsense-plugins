@@ -216,6 +216,34 @@ def test_own_xid_reply_uses_first_party_path(lk, tmp_path):
     assert keeper._rx is not None and keeper._rx.yiaddr == "100.64.4.60"
 
 
+def test_observed_latest_wins(lk, tmp_path):
+    # Two peer ACKs in quick succession (the sniffer overwrites _observed_change):
+    # the handler acts on the LATEST address -- the older one is superseded (the
+    # shared lease is now the newer address), so dropping it is correct.
+    keeper = _observe_keeper(lk, tmp_path)
+    keeper.fired = []
+    keeper._follow_update = keeper.fired.append
+    keeper._on_dhcp_reply(_peer_ack(lk, "100.64.4.60"))
+    keeper._on_dhcp_reply(_peer_ack(lk, "100.64.4.61"))
+    assert keeper._observed_change.yiaddr == "100.64.4.61"
+    keeper._check_observed_follow()
+    assert keeper.fired == ["100.64.4.61"]
+    assert keeper._observed_change is None
+
+
+def test_observed_same_address_after_follow_is_dropped(lk, tmp_path):
+    # After we've followed to the new address, a lingering observation for that
+    # same address is a no-op (the == self.yiaddr guard), never a double-follow.
+    keeper = _observe_keeper(lk, tmp_path)
+    keeper.fired = []
+    keeper._follow_update = keeper.fired.append
+    keeper.yiaddr = "100.64.4.61"                 # we already hold the new address
+    keeper._observed_change = _ack(lk, "100.64.4.61")
+    keeper._check_observed_follow()
+    assert keeper.fired == []                     # no redundant follow
+    assert keeper._observed_change is None
+
+
 def test_check_observed_follow_drives_hardened_follow(lk, tmp_path):
     keeper = _observe_keeper(lk, tmp_path)
     keeper.fired = []

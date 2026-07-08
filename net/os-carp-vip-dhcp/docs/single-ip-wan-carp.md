@@ -32,6 +32,15 @@ handing out more than one IP.
 Most ISPs give you **one** DHCP address (here: gateway `123.123.123.1`, one leased
 public IP). That leaves you two short. This document works around that.
 
+> **A small *static* block (e.g. a `/30`) has the same shortage.** A `/30` gives two
+> usable IPs — still one short of three. The topology below applies unchanged, with
+> one simplification: a static public IP needs no lease-keeping, so you **skip the
+> DHCP/plugin part** (§3 step 1 / §10 step 4) and simply assign the public address to
+> the CARP VIP (or bind it as an IP-alias VIP to the CARP VIP). Everything else —
+> private per-node WAN IPs for CARP, and the gateway group for the backup's internet
+> (§6) — is identical. The plugin is only needed when that single public address is
+> handed out by **DHCP**.
+
 ---
 
 ## 2  CARP mechanics (from `carp(4)`, FreeBSD + OpenBSD)

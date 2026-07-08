@@ -308,14 +308,21 @@ class _ArpPkt:
         return self._arp
 
 
-def test_arp_reply_records_reachability(lk):
+def test_arp_reply_stamped_by_sniffer_consumed_on_next_nudge(lk):
     keeper = _nudge_keeper(lk)
     keeper.router = "100.64.4.254"           # nudge target = router (opt 3)
+    # Simulate a prior unanswered streak.
     keeper._nudges_since_reply = 5
     keeper._arp_unanswered_warned = True
     assert keeper._last_arp_reply == 0.0
+    # The sniffer thread only stamps the reply time -- it must NOT touch the
+    # main-thread-owned counter/warn flag (that is what keeps them race-free).
     keeper._on_arp_reply(_ArpPkt(lk, 2, "100.64.4.254", "100.64.4.7"))
     assert keeper._last_arp_reply > 0
+    assert keeper._nudges_since_reply == 5
+    assert keeper._arp_unanswered_warned is True
+    # The next nudge (main thread) consumes the reply and clears the streak.
+    keeper._arp_nudge(force=True)
     assert keeper._nudges_since_reply == 0
     assert keeper._arp_unanswered_warned is False
 
@@ -365,7 +372,9 @@ def test_reply_resets_unanswered_warning(lk):
     for _ in range(lk.ARP_UNANSWERED_WARN):
         keeper._arp_nudge(force=True)
     assert keeper._arp_unanswered_warned is True
+    # A reply lands (stamped by the sniffer); the next nudge consumes it and clears.
     keeper._on_arp_reply(_ArpPkt(lk, 2, "100.64.4.1", "100.64.4.7"))
+    keeper._arp_nudge(force=True)
     assert keeper._nudges_since_reply == 0
     assert keeper._arp_unanswered_warned is False
 

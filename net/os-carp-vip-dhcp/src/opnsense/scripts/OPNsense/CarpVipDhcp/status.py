@@ -22,6 +22,13 @@ CONFFILE = "/usr/local/etc/carpvipdhcp/keeper.conf"
 CONFIG_XML = "/conf/config.xml"
 RUN_DIR = "/var/run"
 
+# A gateway ARP reply counts as reachability confirmation only while fresh: within
+# this many nudge intervals (matching the daemon's unanswered-nudge threshold), but
+# never less than the floor (guards very short intervals). Older = stale -> the GUI
+# flags it, mirroring the daemon's "ARP nudge unanswered" warning.
+ARP_CONFIRM_INTERVALS = 3
+ARP_CONFIRM_FLOOR = 90
+
 
 def keeper_id(request_ip):
     return re.sub(r"[^A-Za-z0-9]", "_", request_ip)
@@ -173,6 +180,9 @@ def read_keepers(states, names):
             "pid": pid,
         }
         entry.update(parse_heartbeat("%s/carpvipdhcp-%s.hb" % (RUN_DIR, kid)))
+        age = entry.get("arp_reply_age")
+        entry["arp_confirmed"] = (
+            age is not None and age <= max(ARP_CONFIRM_FLOOR, arp_nudge * ARP_CONFIRM_INTERVALS))
         keepers.append(entry)
     return keepers
 

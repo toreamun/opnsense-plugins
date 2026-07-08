@@ -182,8 +182,14 @@ class Keeper:
         self._last_nudge = 0.0
         self._nudge_gw = None          # last nudge target we logged (log again on change)
         self._nudge_warned = False     # warned once about a missing nudge target
-        self._last_arp_reply = 0.0     # epoch of the gateway's last ARP reply to our nudge (0 = none)
-        self._nudges_since_reply = 0   # nudges sent since the last reply (unanswered-nudge detector)
+        # ARP-reply reachability, split cleanly across threads: the sniffer thread
+        # only stamps _last_arp_reply (a lone atomic float write); everything that
+        # follows -- the "consumed up to here" bookmark, the unanswered counter and
+        # the warn latch -- is touched ONLY by the main thread (in _arp_nudge), so
+        # there is no cross-thread read-modify-write to race.
+        self._last_arp_reply = 0.0     # epoch of the gateway's last ARP reply (sniffer-written, 0 = none)
+        self._reply_seen_at = 0.0      # last _last_arp_reply the main thread has accounted for
+        self._nudges_since_reply = 0   # consecutive nudges with no new reply (unanswered detector)
         self._arp_unanswered_warned = False  # warned once about unanswered nudges (reset on a reply)
         self._was_master = None        # CARP role at the last nudge check (None = unknown yet)
         self._nudge_now = False        # operator asked for an immediate nudge (SIGUSR1)
@@ -269,8 +275,13 @@ class Keeper:
         """Record the gateway's ARP reply to our nudge as a reachability signal.
         Only the reply to OUR who-has counts: op=2 (is-at), sender = the nudge
         target gateway, target protocol address = our leased IP. Anything else on
-        the segment is ignored. Runs on the sniffer thread; sets simple fields the
-        main loop reads (int/float assignment is atomic enough for this heuristic)."""
+        the segment is ignored. Runs on the sniffer thread and does ONE thing --
+        stamp _last_arp_reply (a lone atomic write); the main thread consumes it
+        in _arp_nudge, so the counter/warn state is single-owner (no race).
+
+        The signal is advisory: an on-segment attacker could forge a reply (or
+        withhold one), so a green "reachable" is not proof. It only drives a
+        diagnostic; nothing here feeds lease/CARP/follow decisions."""
         try:
             arp = p[ARP]
             if arp.op != 2:                     # 2 = is-at (reply); requests are filtered out in BPF
@@ -280,8 +291,6 @@ class Keeper:
                 return
             if arp.psrc == gw and arp.pdst == self.yiaddr:
                 self._last_arp_reply = time.time()
-                self._nudges_since_reply = 0
-                self._arp_unanswered_warned = False
         except Exception as e:
             LOG.debug("ARP reply parse error: %s", e)
 
@@ -726,13 +735,19 @@ class Keeper:
                       hwdst="00:00:00:00:00:00", pdst=gw),
                   iface=self.iface, verbose=0)
             self._last_nudge = time.time()
-            # Reachability: _on_arp_reply zeroes this when the gateway answers. If
-            # it keeps climbing, no reply is coming back. The likely cause -- and
-            # so the hint -- depends on whether we are already listening
-            # promiscuously: if we are, promisc is not the fix (the carrier is
-            # dropping it); if we are not, that NIC may simply not surface the
-            # unicast reply. Warn once, reset on the next reply.
-            self._nudges_since_reply += 1
+            # Reachability accounting (main-thread-only; the sniffer just stamps
+            # _last_arp_reply). If a reply landed since we last looked, we are
+            # reachable -> clear the counter; otherwise this nudge went unanswered.
+            # When the count reaches the threshold, warn once. The hint depends on
+            # whether we are already promiscuous: if we are, promisc is not the fix
+            # (the carrier is dropping it); if not, that NIC may simply not surface
+            # the unicast reply.
+            if self._last_arp_reply > self._reply_seen_at:
+                self._reply_seen_at = self._last_arp_reply
+                self._nudges_since_reply = 0
+                self._arp_unanswered_warned = False
+            else:
+                self._nudges_since_reply += 1
             if (self._nudges_since_reply >= ARP_UNANSWERED_WARN
                     and not self._arp_unanswered_warned):
                 if self.arp_listen_promisc:

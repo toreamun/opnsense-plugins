@@ -45,6 +45,13 @@
         <help><![CDATA[Periodically broadcast an ARP request from the VIP (with its CARP MAC) for the upstream gateway, so the gateway's ARP entry for the VIP never expires. Use when the upstream ignores gratuitous ARP and never re-ARPs an expired entry — the symptom is that traffic NATed to the VIP works right after a CARP event or DHCP exchange, then silently blackholes some minutes later (outbound packets leave, nothing returns). Only sent while this node is CARP master for the VIP. Default: 240 (on) — one broadcast ARP per interval, harmless on gateways that behave normally. Setting 0 disables the nudge entirely: the periodic nudge, the automatic nudge on CARP failover AND the manual nudge button on the status page (the early lease renew on failover is unaffected).]]></help>
     </field>
     <field>
+        <id>keeper.arpListenPromisc</id>
+        <label>ARP listen in promiscuous mode</label>
+        <type>checkbox</type>
+        <advanced>true</advanced>
+        <help><![CDATA[Fallback, default OFF. The keeper listens for the gateway's ARP reply to each nudge and shows on the Status page when the gateway last confirmed reachability; if nudges go unanswered it logs a warning. Normally the reply is captured without promiscuous mode (the CARP master already accepts the VIP's MAC). Enable this ONLY if the Status page shows the nudge is never confirmed on a bound master — some NICs drop frames addressed to a non-primary unicast MAC unless the interface is promiscuous. WARNING: promiscuous mode makes this root daemon receive ALL traffic on the segment, not just its own; leave it off unless you need it.]]></help>
+    </field>
+    <field>
         <id>keeper.chaddrOverride</id>
         <label>chaddr override</label>
         <type>text</type>

@@ -1,4 +1,6 @@
 """Unit tests for status.py heartbeat / keeper-id parsing."""
+import time
+
 import status
 
 
@@ -64,6 +66,24 @@ def test_parse_heartbeat_nudge_never(tmp_path):
     assert result["gw"] is None
 
 
+def test_parse_heartbeat_arpok(tmp_path):
+    hb = tmp_path / "hb"
+    hb.write_text("1783350773 bound=100.64.4.7 lease=1800 t1=900 t2=1575 src=derived"
+                  " nudge=1783350700 arpok=1783350710 gw=100.64.4.1\n")
+    result = status.parse_heartbeat(str(hb))
+    assert result["arp_reply_epoch"] == 1783350710
+    assert isinstance(result["arp_reply_age"], int) and result["arp_reply_age"] > 0
+
+
+def test_parse_heartbeat_arpok_never(tmp_path):
+    hb = tmp_path / "hb"
+    hb.write_text("1783350773 bound=100.64.4.7 lease=1800 t1=900 t2=1575 src=derived"
+                  " nudge=1783350700 arpok=0 gw=100.64.4.1\n")
+    result = status.parse_heartbeat(str(hb))
+    assert result["arp_reply_epoch"] == 0
+    assert result["arp_reply_age"] is None
+
+
 def test_parse_heartbeat_without_nudge_tokens(tmp_path):
     hb = tmp_path / "hb"
     hb.write_text("1783350773 bound=100.64.4.7 lease=1800 t1=900 t2=1575 src=derived\n")
@@ -75,10 +95,36 @@ def test_parse_heartbeat_without_nudge_tokens(tmp_path):
 def test_read_keepers_arp_nudge_field(tmp_path, monkeypatch):
     conf = tmp_path / "keeper.conf"
     conf.write_text(
-        "100.64.4.7|eth0|00:00:5e:00:01:fe|0|254|0|1||||240\n"
+        "100.64.4.7|eth0|00:00:5e:00:01:fe|0|254|0|1||||240|0\n"
         "100.64.4.8|eth0|00:00:5e:00:01:fd|0|253|0|1|||\n")   # old 10-field line
     monkeypatch.setattr(status, "CONFFILE", str(conf))
     monkeypatch.setattr(status, "RUN_DIR", str(tmp_path))
     keepers = status.read_keepers({}, {})
     assert keepers[0]["arp_nudge"] == 240
     assert keepers[1]["arp_nudge"] == 0
+
+
+def _write_hb(path, arpok_age, now, arp_nudge=240):
+    path.write_text(
+        "%d bound=100.64.4.7 lease=1800 t1=900 t2=1575 src=derived nudge=%d arpok=%d gw=100.64.4.1\n"
+        % (now, now - 5, now - arpok_age))
+
+
+def test_read_keepers_arp_confirmed_fresh_and_stale(tmp_path, monkeypatch):
+    now = int(time.time())
+    conf = tmp_path / "keeper.conf"
+    conf.write_text(
+        "100.64.4.7|eth0|00:00:5e:00:01:fe|0|254|0|1||||240|0\n"    # fresh reply
+        "100.64.4.8|eth0|00:00:5e:00:01:fd|0|253|0|1||||240|0\n"    # stale reply
+        "100.64.4.9|eth0|00:00:5e:00:01:fc|0|252|0|1||||240|0\n")   # no reply seen
+    monkeypatch.setattr(status, "CONFFILE", str(conf))
+    monkeypatch.setattr(status, "RUN_DIR", str(tmp_path))
+    _write_hb(tmp_path / "carpvipdhcp-100_64_4_7.hb", 5, now)       # 5s ago -> fresh
+    _write_hb(tmp_path / "carpvipdhcp-100_64_4_8.hb", 5000, now)    # 5000s ago -> stale
+    (tmp_path / "carpvipdhcp-100_64_4_9.hb").write_text(
+        "%d bound=100.64.4.9 lease=1800 t1=900 t2=1575 src=derived nudge=%d arpok=0 gw=100.64.4.1\n"
+        % (now, now - 5))                                          # arpok=0 -> never
+    by_ip = {k["request"]: k for k in status.read_keepers({}, {})}
+    assert by_ip["100.64.4.7"]["arp_confirmed"] is True
+    assert by_ip["100.64.4.8"]["arp_confirmed"] is False
+    assert by_ip["100.64.4.9"]["arp_confirmed"] is False

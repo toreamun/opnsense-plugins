@@ -68,6 +68,19 @@
                 </arpNudgeInterval>
 
                 <!--
+                    Fallback: put the capture socket in promiscuous mode so the
+                    gateway's unicast ARP reply to a nudge is seen on NICs that
+                    drop frames for non-primary unicast MACs. Off by default (the
+                    CARP master already accepts the VIP MAC, so the reply normally
+                    arrives without it). Only enable if the status page shows the
+                    nudge is never confirmed; it makes the daemon see all segment
+                    traffic.
+                -->
+                <arpListenPromisc type="BooleanField">
+                    <Default>0</Default>
+                </arpListenPromisc>
+
+                <!--
                     Optional DHCP request options for ISPs that only lease when they
                     see a specific vendor-class / client-id / hostname. Empty = the
                     option is not sent. These identify the KEEPER's own DHCP client

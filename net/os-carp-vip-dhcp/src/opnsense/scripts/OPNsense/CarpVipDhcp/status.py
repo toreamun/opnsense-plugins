@@ -8,7 +8,7 @@ pidfile and heartbeat file. Output:
 
 The heartbeat file is written by lease-keeper.py in one of two forms:
     <epoch> bound=<ip> lease=<seconds> t1=<seconds> t2=<seconds> src=<server|derived>
-            [nudge=<epoch|0> [gw=<ip>]]
+            [nudge=<epoch|0> arpok=<epoch|0> [gw=<ip>]]
     <epoch> MISMATCH got=<ip> want=<ip>
 """
 import json
@@ -21,6 +21,13 @@ import xml.etree.ElementTree as ET
 CONFFILE = "/usr/local/etc/carpvipdhcp/keeper.conf"
 CONFIG_XML = "/conf/config.xml"
 RUN_DIR = "/var/run"
+
+# A gateway ARP reply counts as reachability confirmation only while fresh: within
+# this many nudge intervals (matching the daemon's unanswered-nudge threshold), but
+# never less than the floor (guards very short intervals). Older = stale -> the GUI
+# flags it, mirroring the daemon's "ARP nudge unanswered" warning.
+ARP_CONFIRM_INTERVALS = 3
+ARP_CONFIRM_FLOOR = 90
 
 
 def keeper_id(request_ip):
@@ -36,10 +43,18 @@ def pid_alive(path):
         return None
 
 
+def _epoch_and_age(value):
+    """Parse a heartbeat epoch token into (epoch, age): age = now - epoch, or None
+    when the epoch is 0 ('never'). Raises ValueError on a non-integer value."""
+    epoch = int(value)
+    return epoch, (int(time.time()) - epoch if epoch else None)
+
+
 def parse_heartbeat(path):
     result = {"bound": None, "lease": None, "t1": None, "t2": None, "timing_source": None,
               "standby": False, "mismatch": False, "mismatch_got": None, "mismatch_want": None,
-              "hb_epoch": None, "hb_age": None, "nudge_epoch": None, "nudge_age": None, "gw": None}
+              "hb_epoch": None, "hb_age": None, "nudge_epoch": None, "nudge_age": None, "gw": None,
+              "arp_reply_epoch": None, "arp_reply_age": None}
     try:
         raw = open(path).read().strip()
     except OSError:
@@ -76,9 +91,13 @@ def parse_heartbeat(path):
         elif part.startswith("nudge="):
             # nudge=0 means "enabled but never sent yet" -> age stays None.
             try:
-                result["nudge_epoch"] = int(part.split("=", 1)[1])
-                if result["nudge_epoch"]:
-                    result["nudge_age"] = int(time.time()) - result["nudge_epoch"]
+                result["nudge_epoch"], result["nudge_age"] = _epoch_and_age(part.split("=", 1)[1])
+            except ValueError:
+                pass
+        elif part.startswith("arpok="):
+            # arpok=0 means "no gateway ARP reply seen yet" -> age stays None.
+            try:
+                result["arp_reply_epoch"], result["arp_reply_age"] = _epoch_and_age(part.split("=", 1)[1])
             except ValueError:
                 pass
         elif part.startswith("gw="):
@@ -164,6 +183,9 @@ def read_keepers(states, names):
             "pid": pid,
         }
         entry.update(parse_heartbeat("%s/carpvipdhcp-%s.hb" % (RUN_DIR, kid)))
+        age = entry.get("arp_reply_age")
+        entry["arp_confirmed"] = (
+            age is not None and age <= max(ARP_CONFIRM_FLOOR, arp_nudge * ARP_CONFIRM_INTERVALS))
         keepers.append(entry)
     return keepers
 

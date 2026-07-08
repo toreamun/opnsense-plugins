@@ -6,7 +6,7 @@
 [![License: BSD-2-Clause](https://img.shields.io/badge/license-BSD--2--Clause-blue)](../../LICENSE)
 [![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-donate-ffdd00?logo=buymeacoffee&logoColor=black)](https://buymeacoffee.com/toreamun)
 
-## Installing
+## Installing &amp; updating
 
 On the OPNsense box, as **root**, run the installer. It resolves the latest signed
 release, **verifies its maintainer signature**, installs the Scapy dependency for
@@ -16,8 +16,28 @@ your box's Python, and installs the plugin:
 fetch -o - https://raw.githubusercontent.com/toreamun/opnsense-plugins/main/install.sh | sh
 ```
 
-The plugin then appears under **Interfaces → Virtual IPs DHCP**. Remove it with
-`pkg delete os-carp-vip-dhcp` (the Scapy dependency is left in place).
+**Re-run the exact same command to update.** It never hard-codes a version — it
+always fetches the current latest signed release and reinstalls over whatever is
+present, so install and in-place upgrade are the same one-liner. Your settings
+live in `config.xml` and are preserved, and the keeper daemons are restarted onto
+the new code automatically. The command prints whether it installed or updated
+(e.g. `updated 1.3.3 -> 1.3.4`).
+
+The plugin then appears under **Interfaces → Virtual IPs DHCP**.
+
+### Uninstalling
+
+Remove it with `pkg delete`:
+
+```sh
+pkg delete os-carp-vip-dhcp
+```
+
+That is all you need — the package's deinstall hooks stop the keeper daemons
+(so none is left orphaned renewing a lease or holding the node CARP-demoted) and
+remove the files it generated. The Scapy dependency is left in place, since other
+things may use it; remove it by hand with `pkg delete py313-scapy` if you want.
+Per-keeper log files are kept for post-mortem.
 
 <details>
 <summary>Manual install (step by step, no script)</summary>

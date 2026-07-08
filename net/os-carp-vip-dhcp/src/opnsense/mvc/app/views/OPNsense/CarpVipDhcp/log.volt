@@ -36,10 +36,14 @@
             }
         });
 
-        // Move the clear-log button into the grid's action bar so it sits on the
-        // same row as the refresh / rowcount / columns / export icons instead of
-        // on a line of its own (core Diagnostics/log.volt pattern).
-        $("#command-wrapper").detach().appendTo("#grid-log-header .actionBar");
+        // Move the level filter and clear-log button into the grid's action bar
+        // so they share the row with the search / refresh / rowcount / columns /
+        // export icons instead of sitting on a line of their own (core
+        // Diagnostics/log.volt pattern). The level filter goes to the left of the
+        // bar, the clear button to the right with the other command icons.
+        let actionBar = $("#grid-log-header .actionBar");
+        $("#level-wrapper").detach().prependTo(actionBar);
+        $("#command-wrapper").detach().appendTo(actionBar);
 
         $("#level_filter").change(function () {
             $("#grid-log").bootgrid('reload');
@@ -62,8 +66,10 @@
 </script>
 
 <div class="content-box">
-    <div class="col-sm-12" style="padding: 1em 1em 0 1em;">
-        <label for="level_filter">
+    <!-- Action-bar controls. Hidden here to avoid a flash on their own line; the
+         script relocates them into the bootgrid action bar once it is built. -->
+    <div id="log-controls" style="display: none;">
+        <label id="level-wrapper" for="level_filter" style="margin: 0 1em 0 0;">
             <strong>{{ lang._('Level') }}:</strong>
             <select id="level_filter" class="form-control" style="display: inline-block; width: auto;">
                 <option value="DEBUG">{{ lang._('Debug (all)') }}</option>

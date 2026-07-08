@@ -121,15 +121,16 @@
             cell = '<span title="' + tip + '">' + fmtAge(k.nudge_age) + '</span>';
         }
         // Reachability: did the gateway answer the nudge? Only meaningful once we
-        // have actually nudged. A reply counts as confirmation only while it is
-        // fresh (within a few nudge intervals, matching the daemon's unanswered
-        // threshold); a reply that then stops coming goes stale and flips to the
-        // warning, which is the ISP-dropping symptom the daemon also logs.
+        // have actually nudged. When confirmed, show just a check (the reply age
+        // tracks the nudge age, so a second duration here would be redundant) with
+        // the age in the tooltip. A reply that stops coming goes stale and flips to
+        // the warning -- the ISP-dropping symptom the daemon also logs.
         if (k.nudge_age != null) {
             if (k.arp_confirmed === true) {
                 cell += ' <span class="text-success" title="'
-                    + "{{ lang._('Gateway confirmed reachable (replied to the ARP nudge)') }}"
-                    + '"><i class="fa fa-check fa-fw"></i>' + fmtAge(k.arp_reply_age) + '</span>';
+                    + "{{ lang._('Gateway confirmed reachable — last ARP reply') }}"
+                    + ' ' + fmtAge(k.arp_reply_age)
+                    + '"><i class="fa fa-check fa-fw"></i></span>';
             } else if (k.carp_state === 'MASTER' && k.bound) {
                 cell += ' <span class="text-warning" title="'
                     + "{{ lang._('No recent ARP reply from the gateway — it may be dropping the nudge') }}"

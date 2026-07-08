@@ -36,6 +36,11 @@
             }
         });
 
+        // Move the clear-log button into the grid's action bar so it sits on the
+        // same row as the refresh / rowcount / columns / export icons instead of
+        // on a line of its own (core Diagnostics/log.volt pattern).
+        $("#command-wrapper").detach().appendTo("#grid-log-header .actionBar");
+
         $("#level_filter").change(function () {
             $("#grid-log").bootgrid('reload');
         });
@@ -61,22 +66,24 @@
         <label for="level_filter">
             <strong>{{ lang._('Level') }}:</strong>
             <select id="level_filter" class="form-control" style="display: inline-block; width: auto;">
-                <option value="">{{ lang._('All') }}</option>
-                <option value="INFO">INFO</option>
+                <option value="DEBUG">{{ lang._('Debug (all)') }}</option>
+                <option value="INFO" selected="selected">INFO</option>
                 <option value="WARNING">WARNING</option>
                 <option value="ERROR">ERROR</option>
             </select>
         </label>
-        <button id="clear_log" class="btn btn-default pull-right" title="{{ lang._('Clear log') }}">
-            <i class="fa fa-trash fa-fw"></i>
-        </button>
+        <div id="command-wrapper" class="btn-group">
+            <button id="clear_log" class="btn btn-default" title="{{ lang._('Clear log') }}">
+                <i class="fa fa-trash fa-fw"></i>
+            </button>
+        </div>
     </div>
     <table id="grid-log" class="table table-condensed table-hover table-striped">
         <thead>
             <tr>
                 <th data-column-id="timestamp" data-type="string" data-width="12em">{{ lang._('Time') }}</th>
-                <th data-column-id="keeper" data-type="string" data-formatter="keeper" data-width="13em">{{ lang._('CARP virtual IP') }}</th>
-                <th data-column-id="level" data-type="string" data-formatter="level" data-width="7em">{{ lang._('Level') }}</th>
+                <th data-column-id="keeper" data-type="string" data-formatter="keeper" data-width="12em">{{ lang._('CARP virtual IP') }}</th>
+                <th data-column-id="level" data-type="string" data-formatter="level" data-width="5em">{{ lang._('Level') }}</th>
                 <th data-column-id="message" data-type="string">{{ lang._('Message') }}</th>
             </tr>
         </thead>

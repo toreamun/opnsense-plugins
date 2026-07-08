@@ -678,10 +678,17 @@ class Keeper:
                       hwdst="00:00:00:00:00:00", pdst=gw),
                   iface=self.iface, verbose=0)
             self._last_nudge = time.time()
+            # Every fire is logged, but at the right level: the first one (and any
+            # target change) at INFO so the default log shows the nudge is active;
+            # the routine repeats at DEBUG, so they are there in "Debug (all)"
+            # without flooding INFO (nudges fire every arp_nudge seconds, oftener
+            # than DHCP renews).
             if gw != self._nudge_gw:
                 LOG.info("ARP nudge active: who-has %s tell %s (src %s) every %ds",
                          gw, self.yiaddr, self.chaddr, self.arp_nudge)
                 self._nudge_gw = gw
+            else:
+                LOG.debug("ARP nudge sent: who-has %s tell %s", gw, self.yiaddr)
         except Exception as e:
             LOG.warning("ARP nudge failed (target %s): %s", gw, e)
 
@@ -809,8 +816,12 @@ class Keeper:
             return
         # Maintain: wait until T1, then RENEW; bail early on stop or master loss.
         t1, t2, src = self._timing()
-        LOG.info("DHCP lease %ds; renew at T1=%ds (~%s), rebind by T2=%ds (~%s) (timing source: %s)",
-                 self.lease, t1, self._clock_at(t1), t2, self._clock_at(t2), src)
+        # The renew/rebind plan is verbose and identical every cycle for a stable
+        # lease, so log it at DEBUG -- the default (INFO) log stays clean and
+        # "RENEW ok" already carries the lease + expiry. Raise the keeper's log
+        # level to see it.
+        LOG.debug("DHCP lease %ds; renew at T1=%ds (~%s), rebind by T2=%ds (~%s) (timing source: %s)",
+                  self.lease, t1, self._clock_at(t1), t2, self._clock_at(t2), src)
         if not self._hold_lease(t1):
             return
         if self.renew():
@@ -899,7 +910,11 @@ def main():
             handlers.append(RotatingFileHandler(a.logfile, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUPS))
         except Exception:
             pass
-    logging.basicConfig(level=logging.INFO, handlers=handlers,
+    # Write DEBUG too (routine detail like the renew/rebind plan). The volume is
+    # low here, and the log page defaults to hiding DEBUG -- selecting a lower
+    # level in its filter reveals it, so "turning up the log level" needs no
+    # daemon restart.
+    logging.basicConfig(level=logging.DEBUG, handlers=handlers,
                         format="%(asctime)s %(levelname)s %(message)s")
 
     for label, mac in (("chaddr", a.chaddr), ("eth-src", a.eth_src)):

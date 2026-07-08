@@ -264,6 +264,23 @@ def test_sigusr1_flag_services_nudge_within_a_second(lk, caplog):
     assert any("manual ARP nudge" in r.getMessage() for r in caplog.records)
 
 
+def test_sigusr2_flag_rechecks_carp_role_within_a_second(lk):
+    keeper = _nudge_keeper(lk, vhid=199)
+    calls = {"n": 0}
+
+    def probe():                          # backup on the first probe, master after
+        calls["n"] += 1
+        return calls["n"] > 1
+    keeper._probe_carp_master = probe
+    keeper._poll_carp_role()              # first observation: records backup
+    assert keeper._renew_asap is False
+    keeper._poll_role_now = True          # what the SIGUSR2 handler sets on a CARP event
+    keeper._sleep_gated(1)                # services the flag -> re-check -> transition
+    assert keeper._poll_role_now is False
+    assert keeper._renew_asap is True     # backup->master: renew early
+    assert keeper._last_nudge > 0         # and nudge immediately
+
+
 def test_nudge_missing_gateway_warns_once(lk, caplog):
     keeper = _nudge_keeper(lk)
     keeper.server = None             # enabled + bound, but no target

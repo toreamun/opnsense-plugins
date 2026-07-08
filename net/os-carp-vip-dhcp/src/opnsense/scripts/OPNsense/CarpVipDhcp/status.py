@@ -43,6 +43,13 @@ def pid_alive(path):
         return None
 
 
+def _epoch_and_age(value):
+    """Parse a heartbeat epoch token into (epoch, age): age = now - epoch, or None
+    when the epoch is 0 ('never'). Raises ValueError on a non-integer value."""
+    epoch = int(value)
+    return epoch, (int(time.time()) - epoch if epoch else None)
+
+
 def parse_heartbeat(path):
     result = {"bound": None, "lease": None, "t1": None, "t2": None, "timing_source": None,
               "standby": False, "mismatch": False, "mismatch_got": None, "mismatch_want": None,
@@ -84,17 +91,13 @@ def parse_heartbeat(path):
         elif part.startswith("nudge="):
             # nudge=0 means "enabled but never sent yet" -> age stays None.
             try:
-                result["nudge_epoch"] = int(part.split("=", 1)[1])
-                if result["nudge_epoch"]:
-                    result["nudge_age"] = int(time.time()) - result["nudge_epoch"]
+                result["nudge_epoch"], result["nudge_age"] = _epoch_and_age(part.split("=", 1)[1])
             except ValueError:
                 pass
         elif part.startswith("arpok="):
             # arpok=0 means "no gateway ARP reply seen yet" -> age stays None.
             try:
-                result["arp_reply_epoch"] = int(part.split("=", 1)[1])
-                if result["arp_reply_epoch"]:
-                    result["arp_reply_age"] = int(time.time()) - result["arp_reply_epoch"]
+                result["arp_reply_epoch"], result["arp_reply_age"] = _epoch_and_age(part.split("=", 1)[1])
             except ValueError:
                 pass
         elif part.startswith("gw="):

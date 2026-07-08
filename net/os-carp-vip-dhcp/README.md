@@ -10,7 +10,7 @@
 
 ## What it does
 
-On a DHCP-assigned WAN (typically **CGNAT**), the ISP only routes an address while it holds a **live DHCP lease** bound to a MAC. A plain CARP virtual IP is *static* — it never gets a lease, so it never receives traffic.
+On a **DHCP-assigned WAN**, the ISP only routes an address while it holds a **live DHCP lease** bound to a MAC. A plain CARP virtual IP is *static* — it never gets a lease, so it never receives traffic.
 
 This plugin runs a small daemon that keeps a DHCP lease alive **for the CARP VIP's virtual MAC**. The ISP then routes the VIP to that MAC, native OPNsense CARP handles ARP and failover as usual, and the shared IP works — and fails over between two nodes — on a dynamic line.
 
@@ -27,7 +27,7 @@ You need it only if **all** of these are true:
 - ✅ The WAN is addressed by the **ISP's DHCP** (not static, not PPPoE).
 - ✅ The line hands out **several concurrent leases** — one for each node's WAN, plus one for the VIP.
 
-The third point is why it fits **CGNAT** best: carrier shared space (`100.64.0.0/10`) is abundant, so CGNAT ISPs readily lease several addresses per line. If your WAN is static or PPPoE, you don't need this plugin.
+Any DHCP line that hands out several addresses works — tested both on a plain public-DHCP WAN and behind CGNAT. (CGNAT is a common case because carrier shared space, `100.64.0.0/10`, is abundant, so those ISPs readily lease several addresses per line.) If your WAN is static or PPPoE, you don't need this plugin.
 
 > **Only one ISP address?** The standard setup needs several leases. A **theoretical, untested** single-address design exists — see [docs/single-ip-wan-carp.md](docs/single-ip-wan-carp.md).
 

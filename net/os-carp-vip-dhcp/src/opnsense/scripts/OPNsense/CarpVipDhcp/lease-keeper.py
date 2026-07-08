@@ -13,8 +13,8 @@ By default it is ungated and runs on both HA nodes for
 redundancy; opt-in run-only-on-master gating restricts it to the CARP master.
 
 Robustness:
-  * Full DHCP lifecycle: DISCOVER/REQUEST -> BOUND, RENEW at T1, REBIND at T2,
-    re-DORA at expiry.
+  * Full DHCP lifecycle: DORA (Discover / Offer / Request / Ack, the lease
+    acquisition handshake) -> BOUND, RENEW at T1, REBIND at T2, re-DORA at expiry.
   * Single instance via pidfile; heartbeat file (fresh = the lease is renewing).
   * Resilient sniffer: restarted if its thread dies (e.g. the interface flaps).
   * All I/O wrapped in try/except so the main loop never crashes; a non-zero
@@ -29,14 +29,24 @@ Security posture (this daemon parses untrusted WAN traffic as root):
   * The BPF filter is the next boundary: only DHCP traffic (udp port 67/68)
     ever reaches Python; everything else is dropped in the kernel.
   * A reply must carry our current xid and the BOOTREPLY op before any field
-    is read (see _on) -- unsolicited or replayed packets are discarded early.
+    is read (see _on_dhcp_reply) -- unsolicited or replayed packets are discarded early.
   * Only the handful of DHCP options the keeper needs is extracted; there is
-    no full dissection of attacker-controlled option data.
+    no full dissection of the reply's other option data (untrusted network
+    input -- it came from whatever answered on the wire, e.g. a rogue or
+    spoofed DHCP server).
   * Follow mode never rewrites the CARP VIP from a single ACK: the new address
     is validated for plausibility, routability class and expected server, and
     rate-throttled against flap/spoof storms (see _handle_changed_address).
   * A parse error in the sniffer callback is dropped (debug-logged); malformed
     input can never take the main loop down.
+
+Cooperating with ISP access-network policing (DHCP snooping, Dynamic ARP
+Inspection, gratuitous-ARP filtering, IP source guard, per-subscriber MAC
+limits): the design keeps the lease on the CARP virtual MAC and shapes the ARP
+nudge to match the snooped binding, so the carrier's guards see legitimate,
+consistent state. The README's "Playing nicely with ISP access-network
+security" section is the full map from each mechanism to how this code
+satisfies it; the load-bearing spots below point back to it.
 
 Usage:
   lease-keeper.py --iface <if> --chaddr <mac> --request <ip>
@@ -162,9 +172,12 @@ class Keeper:
         self._nudge_warned = False     # warned once about a missing nudge target
         self._was_master = None        # CARP role at the last nudge check (None = unknown yet)
         self._nudge_now = False        # operator asked for an immediate nudge (SIGUSR1)
-        self._renew_asap = False       # renew at the next _hold tick instead of waiting for T1
+        self._renew_asap = False       # renew at the next _hold_lease tick instead of waiting for T1
         # Optional DHCP request options (empty -> not sent); built once and added to
         # every DISCOVER/REQUEST/RENEW so the server sees a consistent client identity.
+        # ISP interplay: satisfies servers that only lease to a known vendor-class
+        # (opt 60), client-id (61) or hostname (12) -- the "client identity checks"
+        # row of the README's ISP-security section.
         self._id_opts = []
         if vendor_class:
             self._id_opts.append(("vendor_class_id", vendor_class))
@@ -208,7 +221,7 @@ class Keeper:
             # reaches the Python parser at all.
             self._sniffer = AsyncSniffer(
                 iface=self.iface, filter="udp and (port 67 or port 68)",
-                prn=self._on, store=0, promisc=False)
+                prn=self._on_dhcp_reply, store=0, promisc=False)
             self._sniffer.start()
             return True
         except Exception as e:
@@ -225,7 +238,7 @@ class Keeper:
             self._start_sniffer()
             time.sleep(1)
 
-    def _on(self, p):
+    def _on_dhcp_reply(self, p):
         try:
             if not (p.haslayer(BOOTP) and p.haslayer(DHCP)):
                 return
@@ -235,8 +248,9 @@ class Keeper:
             # segment -- other clients' traffic, replays, junk -- stops here.
             if b.xid != self.xid or b.op != BOOTREPLY:
                 return
-            # Extract only the fields the keeper acts on; attacker-controlled
-            # option data is otherwise left untouched.
+            # Extract only the fields the keeper acts on; the rest of the reply's
+            # option data -- untrusted, from whatever answered on the wire -- is
+            # left untouched.
             mt = sid = lt = rt = bt = ro = None
             for o in p[DHCP].options:
                 if isinstance(o, tuple):
@@ -257,7 +271,9 @@ class Keeper:
         except Exception as e:
             LOG.debug("DHCP reply parse error: %s", e)
 
-    def _send(self, mtype, extra, ciaddr="0.0.0.0"):
+    # ---- DHCP protocol (send / await reply / DORA / renew / release) ----
+
+    def _send_dhcp(self, mtype, extra, ciaddr="0.0.0.0"):
         # ciaddr is set for RENEW/REBIND (the client already owns the address);
         # the broadcast flag stays on so the reply is reliably captured by the sniffer.
         pkt = (Ether(src=self.eth_src, dst="ff:ff:ff:ff:ff:ff") /
@@ -267,7 +283,7 @@ class Keeper:
                DHCP(options=[("message-type", mtype)] + self._id_opts + extra + ["end"]))
         sendp(pkt, iface=self.iface, verbose=0)
 
-    def _await(self, want, timeout):
+    def _wait_for_dhcp_reply(self, want, timeout):
         """Wait up to timeout for a reply of message-type `want`. Returns the
         DhcpReply on match, the string "NAK" on DHCPNAK, or None on timeout.
         Returning the snapshot avoids re-reading self._rx (set by the sniffer
@@ -293,6 +309,8 @@ class Keeper:
         self.router = rx.router or self.router
 
     def dora(self):
+        """Acquire a lease via the DHCP DORA handshake -- Discover, Offer,
+        Request, Ack. Returns True once BOUND, False on failure/NAK."""
         self.xid = random.randint(1, 0xFFFFFFFF)
         extra = [("requested_addr", self.request_ip)] if self.request_ip else []
         for attempt in range(1, DORA_ATTEMPTS + 1):
@@ -303,12 +321,12 @@ class Keeper:
             self._ensure_sniffer()
             self._rx = None
             try:
-                self._send("discover", extra)
+                self._send_dhcp("discover", extra)
             except Exception as e:
                 LOG.error("DHCP DISCOVER send failed: %s", e)
                 time.sleep(SEND_RETRY_DELAY)
                 continue
-            rx = self._await(OFFER, REPLY_TIMEOUT)
+            rx = self._wait_for_dhcp_reply(OFFER, REPLY_TIMEOUT)
             if rx == "NAK":
                 return False
             if rx:
@@ -326,13 +344,15 @@ class Keeper:
                 return False
             self._rx = None
             try:
-                self._send("request", [("server_id", self.server),
-                                       ("requested_addr", self.yiaddr)])
+                self._send_dhcp(
+                    "request",
+                    [("server_id", self.server), ("requested_addr", self.yiaddr)],
+                )
             except Exception as e:
                 LOG.error("DHCP REQUEST send failed: %s", e)
                 time.sleep(SEND_RETRY_DELAY)
                 continue
-            rx = self._await(ACK, REPLY_TIMEOUT)
+            rx = self._wait_for_dhcp_reply(ACK, REPLY_TIMEOUT)
             if rx == "NAK":
                 return False   # NAK -> back to INIT; the run loop re-acquires (DISCOVER)
             if rx:
@@ -358,11 +378,11 @@ class Keeper:
             self._ensure_sniffer()
             self._rx = None
             try:
-                self._send("request", opts, ciaddr=self.yiaddr)
+                self._send_dhcp("request", opts, ciaddr=self.yiaddr)
             except Exception as e:
                 LOG.error("DHCP %s send failed: %s", "REBIND" if rebind else "RENEW", e)
                 return False
-            rx = self._await(ACK, RENEW_TIMEOUT)
+            rx = self._wait_for_dhcp_reply(ACK, RENEW_TIMEOUT)
             if rx == "NAK":
                 return False   # NAK -> re-DORA
             if rx:
@@ -392,6 +412,8 @@ class Keeper:
         except Exception as e:
             LOG.error("RELEASE failed: %s", e)
 
+    # ---- lease timing ----
+
     def _timing(self):
         """Effective renew (T1) / rebind (T2) seconds and where they came from.
 
@@ -410,11 +432,13 @@ class Keeper:
         src = "server" if (self.t1_server or self.t2_server) else "derived"
         return t1, t2, src
 
-    def _clock(self, offset):
+    def _clock_at(self, offset):
         """Local wall-clock HH:MM of a moment `offset` seconds from now. Log
         lines state future moments (renew/rebind/lease expiry) as relative
         durations; the clock time saves the reader the mental arithmetic."""
         return time.strftime("%H:%M", time.localtime(time.time() + offset))
+
+    # ---- heartbeat / status file ----
 
     def _write_hb(self, content):
         # Write atomically (temp + rename) so a crash mid-write can't leave a partial file.
@@ -445,6 +469,8 @@ class Keeper:
     def _hb_mismatch(self, got):
         # Write a clear marker into the heartbeat file so a supervisor/human sees the mismatch.
         self._write_hb("%d MISMATCH got=%s want=%s\n" % (int(time.time()), got, self.request_ip))
+
+    # ---- follow mode (adopt a changed ISP address, with spoof hardening) ----
 
     def _last_follow_time(self):
         """Epoch of this chaddr's last follow (persisted so the throttle survives
@@ -552,6 +578,8 @@ class Keeper:
         except Exception as e:
             LOG.error("follow_update retry failed: %s", e)
 
+    # ---- CARP role, gating & standby ----
+
     def _hb_standby(self):
         # Run-only-on-master: we are CARP backup and intentionally hold no lease.
         self._write_hb("%d STANDBY\n" % int(time.time()))
@@ -606,6 +634,8 @@ class Keeper:
             LOG.info("lost CARP master for vhid %s -- ARP nudges pause on this node", self.vhid)
         self._was_master = master
 
+    # ---- ARP nudge ----
+
     def _nudge_target(self):
         """The gateway whose ARP cache the nudge maintains: DHCP option 3 from
         the last ACK, falling back to the leasing server's address."""
@@ -633,6 +663,16 @@ class Keeper:
                 self._nudge_warned = True
             return
         try:
+            # This frame is shaped to satisfy three ISP access-network guards at
+            # once (README "Playing nicely" section):
+            #   * op=1 (a REQUEST, not a gratuitous announcement) -- gear that
+            #     filters unsolicited/gratuitous ARP still processes a request,
+            #     which is what refreshes the entry;
+            #   * sender (psrc=leased IP, hwsrc=chaddr=CARP MAC) is exactly the
+            #     DHCP-snooped IP<->MAC binding, so Dynamic ARP Inspection passes it;
+            #   * sending it at all exists for gateways that never re-ARP an
+            #     expired entry ("secured ARP") and would otherwise blackhole the
+            #     VIP. Only the CARP master sends it (gated above).
             sendp(Ether(src=self.chaddr, dst="ff:ff:ff:ff:ff:ff") /
                   ARP(op=1, hwsrc=self.chaddr, psrc=self.yiaddr,
                       hwdst="00:00:00:00:00:00", pdst=gw),
@@ -644,6 +684,8 @@ class Keeper:
                 self._nudge_gw = gw
         except Exception as e:
             LOG.warning("ARP nudge failed (target %s): %s", gw, e)
+
+    # ---- main loop / sleeps ----
 
     def _sleep(self, secs):
         slept = 0
@@ -673,7 +715,7 @@ class Keeper:
             slept += 1
         return not self.stop
 
-    def _hold(self, secs):
+    def _hold_lease(self, secs):
         """Sleep up to secs while holding a lease, rewriting the heartbeat every
         HB_REFRESH so a healthy keeper never looks stale (leases can be hours and
         the CARP demotion hook only sees heartbeat freshness). Returns False early
@@ -756,7 +798,7 @@ class Keeper:
             self._hb()  # active but not holding yet -> publish bound=- (not STANDBY)
             if self.dora():
                 LOG.info("DHCP BOUND %s (lease=%ss, expires ~%s, server=%s)",
-                         self.yiaddr, self.lease, self._clock(self.lease), self.server)
+                         self.yiaddr, self.lease, self._clock_at(self.lease), self.server)
                 self._hb()
                 self._arp_nudge(force=True)
                 self.redora_wait = REDORA_MIN
@@ -768,12 +810,12 @@ class Keeper:
         # Maintain: wait until T1, then RENEW; bail early on stop or master loss.
         t1, t2, src = self._timing()
         LOG.info("DHCP lease %ds; renew at T1=%ds (~%s), rebind by T2=%ds (~%s) (timing source: %s)",
-                 self.lease, t1, self._clock(t1), t2, self._clock(t2), src)
-        if not self._hold(t1):
+                 self.lease, t1, self._clock_at(t1), t2, self._clock_at(t2), src)
+        if not self._hold_lease(t1):
             return
         if self.renew():
             LOG.info("DHCP RENEW ok %s (lease=%ss, expires ~%s)",
-                     self.yiaddr, self.lease, self._clock(self.lease))
+                     self.yiaddr, self.lease, self._clock_at(self.lease))
             self._hb()
             self._arp_nudge(force=True)
             return
@@ -791,7 +833,7 @@ class Keeper:
                 break
         if ok:
             LOG.info("DHCP REBIND ok %s (lease=%ss, expires ~%s)",
-                     self.yiaddr, self.lease, self._clock(self.lease))
+                     self.yiaddr, self.lease, self._clock_at(self.lease))
             self._hb()
             self._arp_nudge(force=True)
             return
@@ -877,12 +919,12 @@ def main():
     signal.signal(signal.SIGINT, _sig)
     signal.signal(signal.SIGTERM, _sig)
 
-    def _sig_nudge(*_):
+    def _sig_arp_nudge(*_):
         # Operator-requested immediate ARP nudge (configd action / kill -USR1).
         # Only sets a flag; the sleep loops service it within a second, so no
         # network I/O happens inside the signal handler itself.
         k._nudge_now = True
-    signal.signal(signal.SIGUSR1, _sig_nudge)
+    signal.signal(signal.SIGUSR1, _sig_arp_nudge)
 
     if a.once:
         if not k._start_sniffer():

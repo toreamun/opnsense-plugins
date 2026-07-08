@@ -313,7 +313,9 @@ sequenceDiagram
 - **The CARP `pass` secures the *election*, not the *segment*.** The `pass` (a SHA-1
   HMAC) stops a stranger from injecting CARP advertisements to hijack the VIP — but it
   does nothing about a hostile on-segment neighbour **ARP-spoofing** the VIP or the
-  gateway directly (a plain L2 attack, independent of CARP). On a genuinely shared L2 you
+  gateway directly — a **general untrusted-shared-L2 exposure** that a plain, non-CARP
+  firewall on the same segment shares equally. CARP does not *create* that risk; it only
+  *adds* the election as one more thing to authenticate. On a genuinely shared L2 you
   can additionally set CARP to **unicast** (`ifconfig <if> vhid <n> … peer <peer-node-IP>`;
   FreeBSD 14 `carp(4)`) so advertisements go only to the peer instead of flooding the
   segment — hardening the election against on-segment observation/injection. Caveats: it

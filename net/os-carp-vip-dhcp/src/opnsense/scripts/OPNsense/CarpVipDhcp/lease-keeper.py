@@ -326,9 +326,11 @@ class Keeper:
         """Warn if another MAC claims our leased IP -- an ARP whose sender IP is
         ours but whose sender MAC is not our CARP MAC (the peer node shares that
         MAC, so it is excluded). Signals a duplicate address / ISP reassignment.
-        Passive and advisory (spoofable); it only logs, never acts. Throttled per
-        offending MAC so a persistent conflict does not flood the log. Detection
-        and throttle state are touched only here (sniffer thread) -> single-owner."""
+        Passive and advisory (spoofable); it only logs, never acts. Throttled so a
+        persistent conflict does not flood the log: re-warns only when the
+        offending MAC changes or after ARP_CONFLICT_REWARN (a new impostor thus
+        surfaces at once). Detection and throttle state are touched only here
+        (sniffer thread) -> single-owner."""
         try:
             if not self.yiaddr:
                 return

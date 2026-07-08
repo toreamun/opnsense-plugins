@@ -187,9 +187,9 @@ OPNsense CARP answers ARP + egresses data as usual. The VIP becomes failover-cap
   advanced **“ARP listen in promiscuous mode”** toggle (default off) is the fallback — it makes the
   daemon receive all traffic on the segment, so it warns when enabled and should stay off unless needed.
   While listening it also **flags an ARP conflict**: if another MAC is seen using the leased IP (a
-  duplicate address, or the ISP having reassigned it), the keeper logs a warning (throttled per
-  offending MAC). This is a passive, advisory check — it only warns, never acts; the peer HA node shares
-  the CARP MAC and so is never mistaken for a conflict.
+  duplicate address, or the ISP having reassigned it), the keeper logs a warning (throttled — it
+  re-warns when the offending MAC changes or at most hourly). This is a passive, advisory check — it
+  only warns, never acts; the peer HA node shares the CARP MAC and so is never mistaken for a conflict.
 - **Self-healing:** the daemon never exits on a transient DHCP/interface fault — it catches errors, keeps
   its heartbeat fresh (so CARP does not falsely demote the node) and retries.
 - **Health banner:** if an enabled keeper stops holding its lease — mismatch, a stalled daemon, or a

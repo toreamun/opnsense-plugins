@@ -14,6 +14,11 @@ On a DHCP-assigned WAN (typically **CGNAT**), the ISP only routes an address whi
 
 This plugin runs a small daemon that keeps a DHCP lease alive **for the CARP VIP's virtual MAC**. The ISP then routes the VIP to that MAC, native OPNsense CARP handles ARP and failover as usual, and the shared IP works — and fails over between two nodes — on a dynamic line.
 
+<p align="center">
+  <img src="docs/img/status.png" alt="Status page: the CARP VIP holding its DHCP lease as CARP master, with the ARP nudge confirmed by the gateway" width="900"><br>
+  <sub><i>The Status page — the VIP holding its lease as CARP <b>master</b>, with gateway reachability confirmed (green check).</i></sub>
+</p>
+
 ## Is this for you?
 
 You need it only if **all** of these are true:
@@ -53,6 +58,13 @@ Everything is under **Interfaces → Virtual IPs DHCP**:
 | **Log** | the keeper log (searchable, with a level filter) |
 
 A **“CARP-VIP DHCP” dashboard widget** shows one row per keeper for an at-a-glance view. Access is granted by the **“Interfaces: Virtual IPs DHCP”** privilege.
+
+<p align="center">
+  <img src="docs/img/settings.png" alt="Add or edit a keeper: pick a CARP VIP, follow-mode, and an optional firewall alias" width="560">
+  &nbsp;&nbsp;
+  <img src="docs/img/widget.png" alt="Dashboard widget: one compact row per keeper" width="300"><br>
+  <sub><i>Adding a keeper (left) and the dashboard widget (right).</i></sub>
+</p>
 
 ## How it works
 

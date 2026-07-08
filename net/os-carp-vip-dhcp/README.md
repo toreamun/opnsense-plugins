@@ -85,8 +85,9 @@ Then find it under **Interfaces → Virtual IPs DHCP**.
 After installing, the plugin lives under **Interfaces → Virtual IPs DHCP**, with three pages:
 
 - **Settings** — the keeper table (add / edit / enable keepers).
-- **Status** — effective configuration + runtime (bound lease, heartbeat age, ARP nudge age/target,
-  CARP demotion), per-keeper mode, and a ⚡ button to send a manual ARP nudge (on the CARP master).
+- **Status** — effective configuration + runtime (bound lease, heartbeat age, ARP nudge age/target and
+  whether the gateway has confirmed it, CARP demotion), per-keeper mode, and a ⚡ button to send a
+  manual ARP nudge (on the CARP master).
 - **Log** — the keeper log (searchable/filterable, with a clear button).
 
 There is also a **Dashboard widget** ("CARP-VIP DHCP") showing one row per keeper — VIP, CARP role,
@@ -177,6 +178,14 @@ OPNsense CARP answers ARP + egresses data as usual. The VIP becomes failover-cap
   role poll as a fallback if the signal is ever missed. A **manual nudge** is also available for
   troubleshooting: the ⚡ button on the status page (shown on the CARP master), or `kill -USR1` on the
   keeper daemon — it fires within a second and shows up in the log.
+  The keeper also **listens for the gateway's ARP reply** to each nudge as a reachability signal: the
+  Status page and dashboard widget show when the gateway last confirmed reachability (a green check),
+  and if several consecutive nudges go **unanswered** — the sign a carrier is dropping them (DAI / DHCP
+  snooping) — the keeper logs a warning and the Status page flags it. This capture needs no promiscuous
+  mode: the CARP master already accepts the VIP's virtual MAC, so the unicast reply reaches the socket.
+  If a particular NIC drops frames for a non-primary unicast MAC and the reply is never seen, an
+  advanced **“ARP listen in promiscuous mode”** toggle (default off) is the fallback — it makes the
+  daemon receive all traffic on the segment, so it warns when enabled and should stay off unless needed.
 - **Self-healing:** the daemon never exits on a transient DHCP/interface fault — it catches errors, keeps
   its heartbeat fresh (so CARP does not falsely demote the node) and retries.
 - **Health banner:** if an enabled keeper stops holding its lease — mismatch, a stalled daemon, or a

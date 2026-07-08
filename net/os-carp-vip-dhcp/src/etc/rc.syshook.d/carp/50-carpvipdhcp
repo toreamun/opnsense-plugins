@@ -1,0 +1,25 @@
+#!/bin/sh
+
+# CARP transition hook for the CARP-VIP DHCP lease keepers.
+#
+# The kernel CARP event -> devd (carp.conf) -> configd (interface carp) ->
+# rc.syshook dispatches this with argv:  <vhid>@<iface>  <MASTER|BACKUP|INIT>.
+#
+# We poke every running keeper with SIGUSR2 to re-check its CARP role *now*
+# rather than waiting for its ~30s poll. Each keeper independently checks its
+# own vhid, so only the one that actually became master reacts (immediate ARP
+# nudge + early lease renew); the others see no change. Signalling all of them
+# is simpler and more robust than mapping the event's vhid to a keeper here,
+# and CARP transitions are rare. The keeper's own poll remains the fallback if
+# this signal is ever missed.
+
+for pf in /var/run/carpvipdhcp-*.child.pid; do
+    [ -f "${pf}" ] || continue
+    pid=$(cat "${pf}" 2>/dev/null)
+    case "${pid}" in
+        '' | *[!0-9]*) continue ;;
+    esac
+    kill -USR2 "${pid}" 2>/dev/null
+done
+
+exit 0

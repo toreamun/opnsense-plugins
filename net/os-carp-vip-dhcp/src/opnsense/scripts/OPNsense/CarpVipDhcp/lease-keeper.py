@@ -172,6 +172,7 @@ class Keeper:
         self._nudge_warned = False     # warned once about a missing nudge target
         self._was_master = None        # CARP role at the last nudge check (None = unknown yet)
         self._nudge_now = False        # operator asked for an immediate nudge (SIGUSR1)
+        self._poll_role_now = False    # a CARP transition fired -> re-check role now (SIGUSR2)
         self._renew_asap = False       # renew at the next _hold_lease tick instead of waiting for T1
         # Optional DHCP request options (empty -> not sent); built once and added to
         # every DISCOVER/REQUEST/RENEW so the server sees a consistent client identity.
@@ -704,10 +705,17 @@ class Keeper:
     def _sleep_gated(self, secs):
         """Sleep up to secs (1s steps). Return False early on stop or, when
         run-only-on-master is set, on CARP-master loss (checked every GATE_POLL).
-        Also services an operator-requested immediate nudge (SIGUSR1) so it fires
-        within a second instead of at the next heartbeat tick."""
+        Also services an operator-requested immediate nudge (SIGUSR1) and a
+        CARP-transition re-check (SIGUSR2) so both act within a second instead of
+        at the next heartbeat tick."""
         slept = 0
         while slept < secs and not self.stop:
+            if self._poll_role_now:
+                self._poll_role_now = False
+                # A CARP transition just fired (kernel -> devd -> rc.syshook.d/carp
+                # -> SIGUSR2); re-check the role now so a backup->master keeper
+                # nudges + renews immediately instead of at the next ~30s poll.
+                self._poll_carp_role()
             if self._nudge_now:
                 self._nudge_now = False
                 # Operator actions are rare and intentional -- always log them,
@@ -940,6 +948,12 @@ def main():
         # network I/O happens inside the signal handler itself.
         k._nudge_now = True
     signal.signal(signal.SIGUSR1, _sig_arp_nudge)
+
+    def _sig_carp(*_):
+        # CARP transition (rc.syshook.d/carp/50-carpvipdhcp sends SIGUSR2). Only
+        # sets a flag; the sleep loop re-checks the CARP role within a second.
+        k._poll_role_now = True
+    signal.signal(signal.SIGUSR2, _sig_carp)
 
     if a.once:
         if not k._start_sniffer():

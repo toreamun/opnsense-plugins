@@ -357,9 +357,10 @@ sequenceDiagram
   untouched). What you lose is state replication (a *later* failover then drops the
   unsynced connections) and, in this design, the backup's own internet (which rides the
   SYNC path, §6 — a convenience, see §9). Keep SYNC on a reliable dedicated link anyway.
-- **Short gateway ARP timeout:** the 240 s ARP-nudge default assumes a multi-minute
-  gateway ARP timeout. Some CPE/BNG age ARP in 60–240 s — shorten the nudge interval
-  below the gateway's timeout if the VIP blackholes between nudges.
+- **Short gateway ARP timeout:** the 120 s ARP-nudge default suits most gateways,
+  including shorter-lived caches. A few CPE/BNG age ARP even faster — if the VIP
+  blackholes between nudges, lower the interval further (toward the 30 s floor) below
+  the gateway's ARP timeout.
 - **Identical DHCP client-id across nodes:** the shared-lease premise assumes the server
   keys on `chaddr`. If it keys on the client-id (option 61) and the two nodes present
   different ones, they can get *different* addresses — set the same client-id on both

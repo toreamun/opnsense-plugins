@@ -1139,7 +1139,7 @@ def main():
     ap.add_argument("--arp-nudge", type=int, default=0, metavar="SECS",
                     help="periodically broadcast an ARP request from the leased IP "
                          "for the gateway, so upstream gear that never re-ARPs keeps "
-                         "a fresh entry (0 = off, suggested 240)")
+                         "a fresh entry (0 = off, suggested 120)")
     ap.add_argument("--arp-listen-promisc", action="store_true",
                     help="put the capture socket in promiscuous mode so the gateway's "
                          "unicast ARP reply is seen on NICs that filter non-primary "

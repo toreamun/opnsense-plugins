@@ -60,7 +60,7 @@
                     sent while CARP master. 0 = off.
                 -->
                 <arpNudgeInterval type="IntegerField">
-                    <Default>240</Default>
+                    <Default>120</Default>
                     <MinimumValue>0</MinimumValue>
                     <MaximumValue>3600</MaximumValue>
                     <ValidationMessage>ARP nudge interval must be 0 (off) or 1-3600 seconds; values below 30 are raised to 30.</ValidationMessage>

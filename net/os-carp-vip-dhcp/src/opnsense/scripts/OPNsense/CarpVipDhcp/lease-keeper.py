@@ -37,9 +37,12 @@ Security posture (this daemon parses untrusted WAN traffic as root):
     *replies*, and (once bound) ARP claiming our leased IP reach Python;
     everything else -- including the segment's broadcast who-has flood -- is
     dropped in the kernel.
-  * A DHCP reply must carry our current xid and the BOOTREPLY op before any
-    field is read (see _on_dhcp_reply); an ARP reply must come from the nudge
-    target for our leased IP (see _on_arp_reply) -- other packets are dropped early.
+  * A DHCP reply must carry the BOOTREPLY op; our own xid gates the first-party
+    path, and in follow mode a reply on our shared chaddr (the peer node's ACK)
+    is read too, but only to RECORD an observed address change for the main
+    thread's hardened follow path (see _on_dhcp_reply). An ARP reply must come
+    from the nudge target for our leased IP (see _on_arp_reply) -- other packets
+    are dropped early.
   * Only the handful of DHCP options the keeper needs is extracted; there is
     no full dissection of the reply's other option data (untrusted network
     input -- it came from whatever answered on the wire, e.g. a rogue or
@@ -234,6 +237,11 @@ class Keeper:
         self.t2_server = None          # server-provided rebinding time (DHCP opt 59)
         self.stop = False
         self._rx = None                # latest DhcpReply snapshot (set by the sniffer thread)
+        # Follow mode: a changed ISP address first seen in the PEER's ACK (both
+        # HA nodes run an identical keeper on the same shared chaddr). The sniffer
+        # writes it (a lone atomic ref-assign); the main thread consumes it and
+        # drives the hardened follow -- see _on_dhcp_reply / _check_observed_follow.
+        self._observed_change = None
         self._ev = threading.Event()
         self._sniffer = None
 
@@ -354,38 +362,70 @@ class Keeper:
         except Exception as e:
             LOG.debug("ARP conflict parse error: %s", e)
 
+    def _parse_reply(self, p, yiaddr):
+        """Snapshot only the handful of DHCP options the keeper acts on into a
+        DhcpReply; the rest of the reply's option data -- untrusted, from
+        whatever answered on the wire -- is left untouched."""
+        mt = sid = lt = rt = bt = ro = msg = None
+        for o in p[DHCP].options:
+            if isinstance(o, tuple):
+                if o[0] == "message-type":
+                    mt = o[1]
+                elif o[0] == "server_id":
+                    sid = o[1]
+                elif o[0] == "lease_time":
+                    lt = o[1]
+                elif o[0] == "renewal_time":
+                    rt = o[1]
+                elif o[0] == "rebinding_time":
+                    bt = o[1]
+                elif o[0] == "router":
+                    ro = o[1]
+                elif o[0] == "message":     # option 56: server's text (e.g. a NAK reason)
+                    msg = o[1]
+        return DhcpReply(mt, yiaddr, sid, lt, rt, bt, ro, msg)
+
+    def _chaddr_matches(self, b):
+        """True if the reply's BOOTP client hardware address is our chaddr (the
+        CARP virtual MAC). Used to accept the PEER's ACK on the shared chaddr:
+        the peer node runs an identical keeper on the very same chaddr."""
+        try:
+            raw = bytes(getattr(b, "chaddr", b"") or b"")
+        except (TypeError, ValueError):
+            return False
+        return raw[:6] == self.chraw
+
     def _on_dhcp_reply(self, p):
         try:
             if not (p.haslayer(BOOTP) and p.haslayer(DHCP)):
                 return
             b = p[BOOTP]
-            # Trust gate: only a reply to OUR in-flight exchange (random xid,
-            # regenerated per DORA) is parsed further; anything else on the
-            # segment -- other clients' traffic, replays, junk -- stops here.
-            if b.xid != self.xid or b.op != BOOTREPLY:
+            if b.op != BOOTREPLY:
                 return
-            # Extract only the fields the keeper acts on; the rest of the reply's
-            # option data -- untrusted, from whatever answered on the wire -- is
-            # left untouched.
-            mt = sid = lt = rt = bt = ro = msg = None
-            for o in p[DHCP].options:
-                if isinstance(o, tuple):
-                    if o[0] == "message-type":
-                        mt = o[1]
-                    elif o[0] == "server_id":
-                        sid = o[1]
-                    elif o[0] == "lease_time":
-                        lt = o[1]
-                    elif o[0] == "renewal_time":
-                        rt = o[1]
-                    elif o[0] == "rebinding_time":
-                        bt = o[1]
-                    elif o[0] == "router":
-                        ro = o[1]
-                    elif o[0] == "message":     # option 56: server's text (e.g. a NAK reason)
-                        msg = o[1]
-            self._rx = DhcpReply(mt, b.yiaddr, sid, lt, rt, bt, ro, msg)
-            self._ev.set()
+            # First-party path: a reply to OUR in-flight exchange (random xid,
+            # regenerated per DORA). Parsed and handed to the waiting main thread.
+            if b.xid == self.xid:
+                self._rx = self._parse_reply(p, b.yiaddr)
+                self._ev.set()
+                return
+            # Not our xid. In follow mode, still watch for the PEER's ACK: both HA
+            # nodes run an identical keeper on the SAME chaddr (the CARP virtual
+            # MAC), so the peer's ACK reveals a changed ISP address one exchange
+            # sooner than our own renewal timer -- closing the window where the
+            # two nodes hold different VIP prefixes long enough for CARP to
+            # dual-master (see docs/single-ip-wan-carp.md, section 3). This is a
+            # deliberately narrow relaxation of the xid trust gate: it requires
+            # our chaddr and an ACK for a plausible, different address, and it
+            # only RECORDS the observation (one atomic ref write) for the main
+            # thread -- which routes it through the same follow hardening
+            # (sane / same-class / expected-server / throttle) as a first-party
+            # ACK and never acts on the sniffer thread.
+            if not self.follow or not self.yiaddr or not self._chaddr_matches(b):
+                return
+            rx = self._parse_reply(p, b.yiaddr)
+            if (rx.mtype == ACK and rx.yiaddr and rx.yiaddr != self.yiaddr
+                    and _sane_ipv4(rx.yiaddr)):
+                self._observed_change = rx
         except Exception as e:
             LOG.debug("DHCP reply parse error: %s", e)
 
@@ -705,6 +745,24 @@ class Keeper:
         except Exception as e:
             LOG.error("follow_update retry failed: %s", e)
 
+    def _check_observed_follow(self):
+        """Adopt an address change first seen in the PEER's DHCP ACK (same shared
+        chaddr) without waiting for our own renewal timer. The sniffer only
+        records the observation; the follow itself runs here on the main thread,
+        through the same hardening/throttle as a first-party ACK. This collapses
+        the follow window that would otherwise leave the two nodes on different
+        VIP prefixes long enough for the backup to promote (transient
+        dual-master; see docs/single-ip-wan-carp.md section 3)."""
+        rx = self._observed_change
+        if rx is None:
+            return
+        self._observed_change = None
+        if not self.follow or not rx.yiaddr or rx.yiaddr == self.yiaddr:
+            return
+        LOG.info("observed peer DHCP ACK for %s (we hold %s) -- following early to converge",
+                 rx.yiaddr, self.yiaddr)
+        self._handle_changed_address(rx.yiaddr, rx, "OBSERVED", release_on_enforce=False)
+
     # ---- CARP role, gating & standby ----
 
     def _hb_standby(self):
@@ -883,6 +941,11 @@ class Keeper:
                 LOG.info("manual ARP nudge requested (SIGUSR1)")
                 self._arp_nudge(force=True)
                 self._hb()   # publish the new nudge age right away for the status page
+            if self._observed_change is not None:
+                # The peer's ACK revealed a changed ISP address -> follow now
+                # (within ~1s) instead of at our own renewal timer, so the two
+                # nodes converge before CARP's ~3s timeout can dual-master us.
+                self._check_observed_follow()
             if self.only_when_master and slept % GATE_POLL == 0 and not self._is_master():
                 return False
             time.sleep(1)

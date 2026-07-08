@@ -183,14 +183,12 @@ class Keeper:
         self._nudge_gw = None          # last nudge target we logged (log again on change)
         self._nudge_warned = False     # warned once about a missing nudge target
         # ARP-reply reachability, split cleanly across threads: the sniffer thread
-        # only stamps _last_arp_reply (a lone atomic float write); everything that
-        # follows -- the "consumed up to here" bookmark, the unanswered counter and
-        # the warn latch -- is touched ONLY by the main thread (in _arp_nudge), so
-        # there is no cross-thread read-modify-write to race.
+        # only stamps _last_arp_reply (a lone atomic float write); the "consumed up
+        # to here" bookmark and the unanswered counter are touched ONLY by the main
+        # thread (in _arp_nudge), so there is no cross-thread read-modify-write.
         self._last_arp_reply = 0.0     # epoch of the gateway's last ARP reply (sniffer-written, 0 = none)
         self._reply_seen_at = 0.0      # last _last_arp_reply the main thread has accounted for
         self._nudges_since_reply = 0   # consecutive nudges with no new reply (unanswered detector)
-        self._arp_unanswered_warned = False  # warned once about unanswered nudges (reset on a reply)
         self._was_master = None        # CARP role at the last nudge check (None = unknown yet)
         self._nudge_now = False        # operator asked for an immediate nudge (SIGUSR1)
         self._poll_role_now = False    # a CARP transition fired -> re-check role now (SIGUSR2)
@@ -738,18 +736,17 @@ class Keeper:
             # Reachability accounting (main-thread-only; the sniffer just stamps
             # _last_arp_reply). If a reply landed since we last looked, we are
             # reachable -> clear the counter; otherwise this nudge went unanswered.
-            # When the count reaches the threshold, warn once. The hint depends on
-            # whether we are already promiscuous: if we are, promisc is not the fix
-            # (the carrier is dropping it); if not, that NIC may simply not surface
-            # the unicast reply.
+            # The counter only steps +1 or resets to 0, so it lands on the threshold
+            # exactly once per streak -> warn there (no separate "warned" latch). The
+            # hint depends on whether we are already promiscuous: if we are, promisc
+            # is not the fix (the carrier is dropping it); if not, that NIC may simply
+            # not surface the unicast reply.
             if self._last_arp_reply > self._reply_seen_at:
                 self._reply_seen_at = self._last_arp_reply
                 self._nudges_since_reply = 0
-                self._arp_unanswered_warned = False
             else:
                 self._nudges_since_reply += 1
-            if (self._nudges_since_reply >= ARP_UNANSWERED_WARN
-                    and not self._arp_unanswered_warned):
+            if self._nudges_since_reply == ARP_UNANSWERED_WARN:
                 if self.arp_listen_promisc:
                     hint = ("the gateway is not answering -- with promiscuous "
                             "listening already on, the carrier is likely dropping "
@@ -760,7 +757,6 @@ class Keeper:
                             "'ARP listen in promiscuous mode'")
                 LOG.warning("ARP nudge unanswered: %d sent to %s for %s with no reply "
                             "-- %s", self._nudges_since_reply, gw, self.yiaddr, hint)
-                self._arp_unanswered_warned = True
             # Every fire is logged, but at the right level: the first one (and any
             # target change) at INFO so the default log shows the nudge is active;
             # the routine repeats at DEBUG, so they are there in "Debug (all)"

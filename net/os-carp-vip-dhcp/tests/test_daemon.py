@@ -248,7 +248,7 @@ def test_hold_returns_early_for_asap_renew(lk):
     keeper = _nudge_keeper(lk)
     keeper._renew_asap = True
     start = time.time()
-    assert keeper._hold(60) is True      # returns as if T1 elapsed -> caller renews
+    assert keeper._hold_lease(60) is True   # returns as if T1 elapsed -> caller renews
     assert time.time() - start < 2
     assert keeper._renew_asap is False
 

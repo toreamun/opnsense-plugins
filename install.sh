@@ -14,18 +14,37 @@
 # config.xml and are preserved; the plugin's post-install restarts the keepers
 # onto the new code.
 #
-# Pick a specific plugin (default: os-carp-vip-dhcp):
-#   fetch -o - .../install.sh | sh -s -- <plugin-name>
+# Pick a specific plugin (default: os-carp-vip-dhcp) and/or release (default:
+# latest). The release is a tag like v1.3.5; "latest" means the newest signed one:
+#   fetch -o - .../install.sh | sh -s -- <plugin-name> [release-tag]
+#   fetch -o - .../install.sh | sh -s -- os-carp-vip-dhcp v1.3.5   # pin a release
 #
-# It never hard-codes a version: the release ships a signed SHA256SUMS manifest
-# under the fixed `/releases/latest/download/` URL, and the package filename
-# (with its version) is read FROM that manifest after the signature checks out.
+# By default it never hard-codes a version: the release ships a signed SHA256SUMS
+# manifest (under the fixed `/releases/latest/download/` URL, or the pinned tag's
+# `/releases/download/<tag>/`), and the package filename (with its version) is
+# read FROM that manifest after the signature checks out.
 set -e
 
 REPO="toreamun/opnsense-plugins"
 PLUGIN="${1:-os-carp-vip-dhcp}"
-BASE="https://github.com/${REPO}/releases/latest/download"
+RELEASE="${2:-latest}"
 RAW="https://raw.githubusercontent.com/${REPO}/main"
+
+# Reject a tag with characters outside a safe set before it goes into a URL.
+if [ "${RELEASE}" != "latest" ]; then
+    case "${RELEASE}" in
+        *[!A-Za-z0-9._-]*)
+            echo "error: invalid release tag '${RELEASE}' (expected e.g. v1.3.5)" >&2
+            exit 1 ;;
+    esac
+fi
+
+# "latest" uses GitHub's fixed latest-release URL; a tag uses its own download URL.
+if [ "${RELEASE}" = "latest" ]; then
+    BASE="https://github.com/${REPO}/releases/latest/download"
+else
+    BASE="https://github.com/${REPO}/releases/download/${RELEASE}"
+fi
 
 if [ "$(id -u)" != "0" ]; then
     echo "error: run as root" >&2
@@ -35,8 +54,13 @@ fi
 WORK="$(mktemp -d)"
 trap 'rm -rf "${WORK}"' EXIT INT TERM
 
-echo ">>> Fetching the latest signed manifest + maintainer key..."
-fetch -qo "${WORK}/SHA256SUMS" "${BASE}/SHA256SUMS"
+echo ">>> Fetching the ${RELEASE} signed manifest + maintainer key..."
+if ! fetch -qo "${WORK}/SHA256SUMS" "${BASE}/SHA256SUMS"; then
+    echo "error: could not fetch the manifest for release '${RELEASE}'." >&2
+    echo "       Check the tag exists (e.g. v1.3.5) at" >&2
+    echo "       https://github.com/${REPO}/releases" >&2
+    exit 1
+fi
 fetch -qo "${WORK}/SHA256SUMS.sig" "${BASE}/SHA256SUMS.sig"
 fetch -qo "${WORK}/release.pub" "${RAW}/keys/release.pub"
 
@@ -51,10 +75,10 @@ fi
 # The package filename (with version) comes from the signed manifest.
 pkgfile="$(awk '{print $2}' "${WORK}/SHA256SUMS" | sed 's#^\./##' | grep "^${PLUGIN}-.*\.pkg$" | head -1)"
 if [ -z "${pkgfile}" ]; then
-    echo "error: no '${PLUGIN}' package in the latest release" >&2
+    echo "error: no '${PLUGIN}' package in the ${RELEASE} release" >&2
     exit 1
 fi
-echo "    latest: ${pkgfile}"
+echo "    package: ${pkgfile}"
 
 echo ">>> Downloading + checksumming the package..."
 fetch -qo "${WORK}/${pkgfile}" "${BASE}/${pkgfile}"

@@ -16,12 +16,23 @@ your box's Python, and installs the plugin:
 fetch -o - https://raw.githubusercontent.com/toreamun/opnsense-plugins/main/install.sh | sh
 ```
 
-**Re-run the exact same command to update.** It never hard-codes a version — it
-always fetches the current latest signed release and reinstalls over whatever is
-present, so install and in-place upgrade are the same one-liner. Your settings
-live in `config.xml` and are preserved, and the keeper daemons are restarted onto
-the new code automatically. The command prints whether it installed or updated
-(e.g. `updated 1.3.3 -> 1.3.4`).
+**Re-run the exact same command to update.** By default it never hard-codes a
+version — it fetches the current latest signed release and reinstalls over
+whatever is present, so install and in-place upgrade are the same one-liner. Your
+settings live in `config.xml` and are preserved, and the keeper daemons are
+restarted onto the new code automatically. The command prints whether it
+installed or updated (e.g. `updated 1.3.3 -> 1.3.4`).
+
+To install or pin a **specific release** instead of the latest, pass its tag
+(e.g. `v1.3.5`) as a second argument — useful to roll back or reproduce a build:
+
+```sh
+fetch -o - https://raw.githubusercontent.com/toreamun/opnsense-plugins/main/install.sh | sh -s -- os-carp-vip-dhcp v1.3.5
+```
+
+The first argument is the plugin name (default `os-carp-vip-dhcp`); omit the tag
+(or pass `latest`) for the newest signed release. Every release — pinned or
+latest — is signature-verified the same way.
 
 The plugin then appears under **Interfaces → Virtual IPs DHCP**.
 

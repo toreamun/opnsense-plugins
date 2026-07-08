@@ -113,7 +113,10 @@ LOG_MAX_BYTES = 512 * 1024
 LOG_BACKUPS = 3
 
 # A parsed DHCP reply, snapshotted from the sniffer thread.
-DhcpReply = namedtuple("DhcpReply", "mtype yiaddr server_id lease t1 t2 router")
+# `message` (DHCP option 56) is the server's optional human-readable text, mainly
+# a NAK reason. Defaulted so existing 7-field constructions stay valid.
+DhcpReply = namedtuple("DhcpReply", "mtype yiaddr server_id lease t1 t2 router message",
+                       defaults=(None,))
 MAC_RE = re.compile(r"^([0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}$")
 
 
@@ -230,7 +233,7 @@ class Keeper:
         self.t1_server = None          # server-provided renewal time (DHCP opt 58)
         self.t2_server = None          # server-provided rebinding time (DHCP opt 59)
         self.stop = False
-        self._rx = None                # (mtype, yiaddr, server_id, lease, t1, t2)
+        self._rx = None                # latest DhcpReply snapshot (set by the sniffer thread)
         self._ev = threading.Event()
         self._sniffer = None
 
@@ -364,7 +367,7 @@ class Keeper:
             # Extract only the fields the keeper acts on; the rest of the reply's
             # option data -- untrusted, from whatever answered on the wire -- is
             # left untouched.
-            mt = sid = lt = rt = bt = ro = None
+            mt = sid = lt = rt = bt = ro = msg = None
             for o in p[DHCP].options:
                 if isinstance(o, tuple):
                     if o[0] == "message-type":
@@ -379,7 +382,9 @@ class Keeper:
                         bt = o[1]
                     elif o[0] == "router":
                         ro = o[1]
-            self._rx = DhcpReply(mt, b.yiaddr, sid, lt, rt, bt, ro)
+                    elif o[0] == "message":     # option 56: server's text (e.g. a NAK reason)
+                        msg = o[1]
+            self._rx = DhcpReply(mt, b.yiaddr, sid, lt, rt, bt, ro, msg)
             self._ev.set()
         except Exception as e:
             LOG.debug("DHCP reply parse error: %s", e)
@@ -409,8 +414,16 @@ class Keeper:
             if rx and rx.mtype == want:
                 return rx
             if rx and rx.mtype == NAK:
-                LOG.warning("DHCPNAK received (server %s, xid 0x%08x)",
-                            rx.server_id or "unknown", self.xid)
+                # Surface the server's option-56 text (why it refused) if present;
+                # it is the operator's main clue for a rejected renew.
+                reason = ""
+                if rx.message:
+                    m = rx.message
+                    if isinstance(m, bytes):
+                        m = m.decode(errors="replace")
+                    reason = " -- %s" % str(m).strip()
+                LOG.warning("DHCPNAK received (server %s, xid 0x%08x)%s",
+                            rx.server_id or "unknown", self.xid, reason)
                 return "NAK"
         return None
 

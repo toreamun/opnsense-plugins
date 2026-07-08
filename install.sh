@@ -1,12 +1,18 @@
 #!/bin/sh
 #
-# One-line installer for a toreamun/opnsense-plugins plugin on OPNsense.
+# One-line installer / updater for a toreamun/opnsense-plugins plugin on OPNsense.
 #
 # Resolves the LATEST signed release (no version to hard-code), verifies its
 # maintainer signature, installs the Scapy runtime dependency for this box's
 # Python, and installs the plugin. Run as root on the OPNsense box:
 #
 #   fetch -o - https://raw.githubusercontent.com/toreamun/opnsense-plugins/main/install.sh | sh
+#
+# Re-run the exact same command to UPDATE: it always fetches the current latest
+# release and reinstalls over whatever is present (see `pkg add -f` below), so a
+# fresh install and an in-place upgrade are the same one-liner. Settings live in
+# config.xml and are preserved; the plugin's post-install restarts the keepers
+# onto the new code.
 #
 # Pick a specific plugin (default: os-carp-vip-dhcp):
 #   fetch -o - .../install.sh | sh -s -- <plugin-name>
@@ -63,11 +69,24 @@ echo ">>> Installing the Scapy dependency for this box's Python..."
 pyver="$(python3 -c 'import sys; print("py3%d" % sys.version_info.minor)' 2>/dev/null || echo py313)"
 pkg install -y "${pyver}-scapy"
 
-echo ">>> Installing ${PLUGIN}..."
+# Note the currently-installed version (if any) so the final line can say
+# "installed" vs "updated". `|| true` keeps set -e happy when it is absent.
+prev="$(pkg query '%v' "${PLUGIN}" 2>/dev/null || true)"
+
+if [ -n "${prev}" ]; then verb="Updating"; else verb="Installing"; fi
+echo ">>> ${verb} ${PLUGIN}..."
 # -f so the verified release is (re)installed even when an older/other build is
 # already present -- i.e. the one-liner also upgrades. The Scapy dependency was
 # installed just above (set -e aborts otherwise), so it is present.
 pkg add -f "${WORK}/${pkgfile}"
+new="$(pkg query '%v' "${PLUGIN}" 2>/dev/null || true)"
 
-echo ">>> Done. ${PLUGIN} installed and signature-verified."
+if [ -z "${prev}" ]; then
+    detail="installed"
+elif [ "${prev}" = "${new}" ]; then
+    detail="reinstalled at ${new}"
+else
+    detail="updated ${prev} -> ${new}"
+fi
+echo ">>> Done. ${PLUGIN} ${detail} and signature-verified."
 echo "    (os-carp-vip-dhcp: find it in the GUI under Interfaces > Virtual IPs DHCP.)"

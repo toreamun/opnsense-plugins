@@ -164,6 +164,20 @@ def test_observed_peer_ack_records_change(lk, tmp_path):
     assert keeper._rx is None          # the first-party slot is untouched
 
 
+def test_observed_wakes_main_loop(lk, tmp_path):
+    keeper = _observe_keeper(lk, tmp_path)
+    assert not keeper._wake.is_set()
+    keeper._on_dhcp_reply(_peer_ack(lk, "100.64.4.60"))
+    assert keeper._wake.is_set()       # sniffer wakes the maintain-loop sleep at once
+
+
+def test_ignored_observation_does_not_wake(lk, tmp_path):
+    keeper = _observe_keeper(lk, tmp_path)
+    keeper._on_dhcp_reply(_peer_ack(lk, "100.64.4.7"))     # same address -> no change
+    assert keeper._observed_change is None
+    assert not keeper._wake.is_set()
+
+
 def test_observed_ignores_same_address(lk, tmp_path):
     keeper = _observe_keeper(lk, tmp_path)
     keeper._on_dhcp_reply(_peer_ack(lk, "100.64.4.7"))     # no change from what we hold
@@ -222,12 +236,13 @@ def test_check_observed_follow_rejects_wrong_server(lk, tmp_path):
     assert keeper.fired == []          # same hardening as a first-party ACK
 
 
-def test_observed_serviced_within_a_second(lk, tmp_path):
+def test_observed_serviced_by_maintain_loop(lk, tmp_path):
     keeper = _observe_keeper(lk, tmp_path)
     keeper.fired = []
     keeper._follow_update = keeper.fired.append
     keeper._observed_change = _ack(lk, "100.64.4.60")
-    keeper._sleep_gated(1)             # the 1s maintain-loop tick services it
+    keeper._wake.set()                 # as the sniffer would -> loop returns at once
+    keeper._sleep_gated(1)
     assert keeper.fired == ["100.64.4.60"]
 
 

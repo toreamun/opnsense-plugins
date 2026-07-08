@@ -243,6 +243,11 @@ class Keeper:
         # drives the hardened follow -- see _on_dhcp_reply / _check_observed_follow.
         self._observed_change = None
         self._ev = threading.Event()
+        # Wakes the main thread's maintain-loop sleep the instant the sniffer
+        # records an observed address change, so the follow fires in
+        # milliseconds instead of waiting out the 1s tick. Set only by the
+        # sniffer thread; waited/cleared only by the main thread.
+        self._wake = threading.Event()
         self._sniffer = None
 
     # ---- sniffer (resilient) ----
@@ -426,6 +431,7 @@ class Keeper:
             if (rx.mtype == ACK and rx.yiaddr and rx.yiaddr != self.yiaddr
                     and _sane_ipv4(rx.yiaddr)):
                 self._observed_change = rx
+                self._wake.set()   # wake the maintain-loop sleep now, don't wait for the tick
         except Exception as e:
             LOG.debug("DHCP reply parse error: %s", e)
 
@@ -943,12 +949,18 @@ class Keeper:
                 self._hb()   # publish the new nudge age right away for the status page
             if self._observed_change is not None:
                 # The peer's ACK revealed a changed ISP address -> follow now
-                # (within ~1s) instead of at our own renewal timer, so the two
-                # nodes converge before CARP's ~3s timeout can dual-master us.
+                # instead of at our own renewal timer, so the two nodes converge
+                # before CARP's ~3s timeout can dual-master us. The sniffer wakes
+                # us the instant it records one (self._wake, below), so this fires
+                # within milliseconds; the 1s timeout still drives the periodic
+                # checks when nothing signals.
                 self._check_observed_follow()
             if self.only_when_master and slept % GATE_POLL == 0 and not self._is_master():
                 return False
-            time.sleep(1)
+            # Event-driven sleep: return at once when the sniffer signals a fresh
+            # observation, otherwise time out after ~1s to run the periodic checks.
+            if self._wake.wait(1.0):
+                self._wake.clear()
             slept += 1
         return not self.stop
 

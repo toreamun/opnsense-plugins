@@ -24,10 +24,12 @@ function carpvipdhcp_services()
             'description' => gettext('CARP-VIP DHCP keeper') . ' (' . $ip . ')',
             'pidfile' => "/var/run/carpvipdhcp-{$id}.pid",
             'id' => $id,
+            // Per-keeper actions (id passed through), so each Services overview
+            // row controls only its own keeper -- not all of them.
             'configd' => [
-                'restart' => ['carpvipdhcp restart'],
-                'start' => ['carpvipdhcp start'],
-                'stop' => ['carpvipdhcp stop'],
+                'restart' => ['carpvipdhcp restart_keeper ' . $id],
+                'start' => ['carpvipdhcp start_keeper ' . $id],
+                'stop' => ['carpvipdhcp stop_keeper ' . $id],
             ],
         ];
     }

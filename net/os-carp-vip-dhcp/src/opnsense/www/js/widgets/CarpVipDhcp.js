@@ -90,11 +90,16 @@ export default class CarpVipDhcp extends BaseTableWidget {
         return html;
     }
 
-    // A coloured MASTER/BACKUP pill, matching the built-in CARP Status widget.
+    // MASTER/BACKUP pill using the exact same markup as the built-in CARP Status
+    // widget (badge badge-pill carp-status-icon, green when master) so the same
+    // state reads identically across both dashboard widgets.
     _carpBadge(k) {
-        const cls = {MASTER: 'label-success', INIT: 'label-warning'}[k.carp_state] || 'label-default';
-        return $('<span></span>').addClass('label').addClass(cls)
-            .text(k.carp_state || '-').prop('outerHTML');
+        const state = k.carp_state || '-';
+        const $b = $('<span></span>').addClass('badge badge-pill carp-status-icon').text(state);
+        if (state === 'MASTER') {
+            $b.css('background-color', 'green');
+        }
+        return $b.prop('outerHTML');
     }
 
     _leaseText(k) {

@@ -57,10 +57,10 @@ class _DhcpPkt:
     """Minimal stand-in for a scapy DHCP reply: p[BOOTP].xid/op/yiaddr and
     p[DHCP].options, with haslayer() so _on_dhcp_reply parses it."""
     def __init__(self, lk, xid, options, yiaddr="100.64.4.7",
-                 chaddr=b"\x00\x00\x5e\x00\x01\xfe"):
+                 chaddr=b"\x00\x00\x5e\x00\x01\xfe", op=None):
         self._lk = lk
-        self._bootp = types.SimpleNamespace(xid=xid, op=lk.BOOTREPLY, yiaddr=yiaddr,
-                                            chaddr=chaddr)
+        self._bootp = types.SimpleNamespace(xid=xid, op=(lk.BOOTREPLY if op is None else op),
+                                            yiaddr=yiaddr, chaddr=chaddr)
         self._dhcp = types.SimpleNamespace(options=options)
 
     def haslayer(self, layer):
@@ -262,6 +262,70 @@ def test_observed_serviced_by_maintain_loop(lk, tmp_path):
     keeper._wake.set()                 # as the sniffer would -> loop returns at once
     keeper._sleep_gated(1)
     assert keeper.fired == ["100.64.4.60"]
+
+
+# ---- peer client-id mismatch warning (shared-lease sanity, review item #12) ----
+
+def _cid_keeper(lk, client_id="keeper-A"):
+    keeper = lk.Keeper("eth0", "00:00:5e:00:01:fe", "100.64.4.7", hbfile=None, client_id=client_id)
+    keeper.xid = 0x11111111                      # OUR in-flight xid
+    return keeper
+
+
+def _peer_request(lk, options, xid=0x22222222, chaddr=b"\x00\x00\x5e\x00\x01\xfe"):
+    """A DHCP REQUEST (op=BOOTREQUEST) from the peer on our shared chaddr."""
+    return _DhcpPkt(lk, xid, options + ["end"], op=lk.BOOTREQUEST, chaddr=chaddr)
+
+
+def _has_cid_warn(caplog):
+    return any("client-id" in r.getMessage() and "differs" in r.getMessage() for r in caplog.records)
+
+
+def test_peer_client_id_mismatch_warns(lk, caplog):
+    keeper = _cid_keeper(lk, "keeper-A")
+    with caplog.at_level("WARNING", logger="lease-keeper"):
+        keeper._on_dhcp_reply(_peer_request(lk, [("client_id", b"keeper-B")]))
+    assert _has_cid_warn(caplog)
+
+
+def test_peer_client_id_match_no_warn(lk, caplog):
+    keeper = _cid_keeper(lk, "keeper-A")
+    with caplog.at_level("WARNING", logger="lease-keeper"):
+        keeper._on_dhcp_reply(_peer_request(lk, [("client_id", b"keeper-A")]))
+    assert not _has_cid_warn(caplog)
+
+
+def test_peer_client_id_both_unset_no_warn(lk, caplog):
+    keeper = lk.Keeper("eth0", "00:00:5e:00:01:fe", "100.64.4.7", hbfile=None)   # no client-id
+    keeper.xid = 0x11111111
+    with caplog.at_level("WARNING", logger="lease-keeper"):
+        keeper._on_dhcp_reply(_peer_request(lk, [("server_id", "100.64.4.1")]))  # no option 61
+    assert not _has_cid_warn(caplog)
+
+
+def test_peer_client_id_wrong_chaddr_ignored(lk, caplog):
+    keeper = _cid_keeper(lk, "keeper-A")
+    with caplog.at_level("WARNING", logger="lease-keeper"):
+        keeper._on_dhcp_reply(_peer_request(lk, [("client_id", b"keeper-B")],
+                                            chaddr=b"\xaa\xbb\xcc\xdd\xee\xff"))
+    assert not _has_cid_warn(caplog)
+
+
+def test_own_request_not_client_id_checked(lk, caplog):
+    keeper = _cid_keeper(lk, "keeper-A")
+    with caplog.at_level("WARNING", logger="lease-keeper"):
+        # our OWN request (our xid) is not the peer path -> no comparison, no warn
+        keeper._on_dhcp_reply(_peer_request(lk, [("client_id", b"keeper-B")], xid=keeper.xid))
+    assert not _has_cid_warn(caplog)
+
+
+def test_peer_client_id_warns_once_per_value(lk, caplog):
+    keeper = _cid_keeper(lk, "keeper-A")
+    with caplog.at_level("WARNING", logger="lease-keeper"):
+        keeper._on_dhcp_reply(_peer_request(lk, [("client_id", b"keeper-B")]))
+        keeper._on_dhcp_reply(_peer_request(lk, [("client_id", b"keeper-B")]))   # same -> no re-warn
+    warns = [r for r in caplog.records if "client-id" in r.getMessage() and "differs" in r.getMessage()]
+    assert len(warns) == 1
 
 
 def test_id_opts_empty_by_default(lk):

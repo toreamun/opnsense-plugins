@@ -6,10 +6,7 @@
         </endpoints>
         <translations>
             <title>CARP-VIP DHCP</title>
-            <vip>VIP</vip>
-            <carp>CARP</carp>
-            <lease>Lease</lease>
-            <nudge>ARP nudge</nudge>
+            <nudge>nudge</nudge>
             <held>held</held>
             <notheld>not held</notheld>
             <standby>standby</standby>

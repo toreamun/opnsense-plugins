@@ -289,6 +289,9 @@ class Keeper:
                 return
             if arp.psrc == gw and arp.pdst == self.yiaddr:
                 self._last_arp_reply = time.time()
+                # Routine confirmation at DEBUG, mirroring "ARP nudge sent"; the
+                # main thread logs the first reply / recovery at INFO.
+                LOG.debug("ARP reply from %s (is-at) for %s", gw, self.yiaddr)
         except Exception as e:
             LOG.debug("ARP reply parse error: %s", e)
 
@@ -742,6 +745,15 @@ class Keeper:
             # is not the fix (the carrier is dropping it); if not, that NIC may simply
             # not surface the unicast reply.
             if self._last_arp_reply > self._reply_seen_at:
+                # A reply arrived since the last nudge -> reachable. Log the
+                # positive transitions at INFO (first confirmation, or recovery
+                # after an unanswered streak), mirroring the nudge-active INFO and
+                # the unanswered WARNING; every individual reply is at DEBUG.
+                if self._reply_seen_at == 0.0:
+                    LOG.info("ARP nudge confirmed: %s replied for %s", gw, self.yiaddr)
+                elif self._nudges_since_reply >= ARP_UNANSWERED_WARN:
+                    LOG.info("ARP nudge answered again by %s after %d unanswered",
+                             gw, self._nudges_since_reply)
                 self._reply_seen_at = self._last_arp_reply
                 self._nudges_since_reply = 0
             else:

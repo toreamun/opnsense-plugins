@@ -1,5 +1,6 @@
 """Unit tests for the lease-keeper daemon's pure helpers and follow decision."""
 import time
+import types
 
 
 def test_sane_ipv4(lk):
@@ -289,3 +290,128 @@ def test_nudge_missing_gateway_warns_once(lk, caplog):
         keeper._arp_nudge(force=True)
     warnings = [r for r in caplog.records if "no gateway known" in r.getMessage()]
     assert len(warnings) == 1        # warned, but only once
+
+
+# ---- ARP-reply listening (reachability confirmation) ----
+
+class _ArpPkt:
+    """Minimal stand-in for a scapy ARP packet: p[ARP] -> op/psrc/pdst, and
+    haslayer(ARP) so the sniffer dispatcher routes it."""
+    def __init__(self, lk, op, psrc, pdst):
+        self._lk = lk
+        self._arp = types.SimpleNamespace(op=op, psrc=psrc, pdst=pdst)
+
+    def haslayer(self, layer):
+        return layer is self._lk.ARP
+
+    def __getitem__(self, layer):
+        return self._arp
+
+
+def test_arp_reply_records_reachability(lk):
+    keeper = _nudge_keeper(lk)
+    keeper.router = "100.64.4.254"           # nudge target = router (opt 3)
+    keeper._nudges_since_reply = 5
+    keeper._arp_unanswered_warned = True
+    assert keeper._last_arp_reply == 0.0
+    keeper._on_arp_reply(_ArpPkt(lk, 2, "100.64.4.254", "100.64.4.7"))
+    assert keeper._last_arp_reply > 0
+    assert keeper._nudges_since_reply == 0
+    assert keeper._arp_unanswered_warned is False
+
+
+def test_arp_reply_ignores_unrelated(lk):
+    keeper = _nudge_keeper(lk)
+    keeper.router = "100.64.4.254"
+    keeper._on_arp_reply(_ArpPkt(lk, 2, "100.64.4.9", "100.64.4.7"))    # wrong sender
+    keeper._on_arp_reply(_ArpPkt(lk, 2, "100.64.4.254", "100.64.4.99"))  # wrong target IP
+    keeper._on_arp_reply(_ArpPkt(lk, 1, "100.64.4.254", "100.64.4.7"))   # a request, not a reply
+    assert keeper._last_arp_reply == 0.0
+
+
+def test_sniff_dispatch_routes_arp_reply(lk):
+    keeper = _nudge_keeper(lk)
+    keeper.router = "100.64.4.254"
+    keeper._on_sniff(_ArpPkt(lk, 2, "100.64.4.254", "100.64.4.7"))
+    assert keeper._last_arp_reply > 0
+
+
+def test_unanswered_nudges_warn_once(lk, caplog):
+    keeper = _nudge_keeper(lk)                # target = server 100.64.4.1, probe -> master
+    with caplog.at_level("WARNING", logger="lease-keeper"):
+        for _ in range(lk.ARP_UNANSWERED_WARN + 2):
+            keeper._arp_nudge(force=True)
+    warnings = [r for r in caplog.records if "unanswered" in r.getMessage()]
+    assert len(warnings) == 1
+    assert keeper._nudges_since_reply >= lk.ARP_UNANSWERED_WARN
+    # Not in promiscuous mode -> the hint should point at enabling it.
+    assert "promiscuous" in warnings[0].getMessage()
+
+
+def test_unanswered_warning_omits_promisc_hint_when_already_promisc(lk, caplog):
+    keeper = _nudge_keeper(lk, arp_listen_promisc=True)
+    with caplog.at_level("WARNING", logger="lease-keeper"):
+        for _ in range(lk.ARP_UNANSWERED_WARN):
+            keeper._arp_nudge(force=True)
+    warnings = [r for r in caplog.records if "unanswered" in r.getMessage()]
+    assert len(warnings) == 1
+    # Promisc already on -> blame the carrier, do not suggest turning promisc on.
+    assert "carrier is likely dropping" in warnings[0].getMessage()
+
+
+def test_reply_resets_unanswered_warning(lk):
+    keeper = _nudge_keeper(lk)
+    keeper.router = "100.64.4.1"
+    for _ in range(lk.ARP_UNANSWERED_WARN):
+        keeper._arp_nudge(force=True)
+    assert keeper._arp_unanswered_warned is True
+    keeper._on_arp_reply(_ArpPkt(lk, 2, "100.64.4.1", "100.64.4.7"))
+    assert keeper._nudges_since_reply == 0
+    assert keeper._arp_unanswered_warned is False
+
+
+def test_hb_includes_arp_reply_state(lk, tmp_path):
+    hb = tmp_path / "hb"
+    keeper = _nudge_keeper(lk, hbfile=str(hb))
+    keeper.router = "100.64.4.1"
+    keeper._last_nudge = 1783350000.0
+    keeper._last_arp_reply = 1783350050.0
+    keeper._hb()
+    content = hb.read_text()
+    assert " nudge=1783350000" in content
+    assert " arpok=1783350050" in content
+
+
+def test_hb_arpok_zero_when_no_reply(lk, tmp_path):
+    hb = tmp_path / "hb"
+    keeper = _nudge_keeper(lk, hbfile=str(hb))
+    keeper._hb()
+    assert " arpok=0" in hb.read_text()
+
+
+def test_arp_listen_promisc_defaults_off(lk):
+    keeper = lk.Keeper("eth0", "00:00:5e:00:01:fe", "100.64.4.7", hbfile=None)
+    assert keeper.arp_listen_promisc is False
+
+
+def test_sniffer_filter_captures_arp_and_honours_promisc(lk, monkeypatch):
+    captured = {}
+
+    class _Cap:
+        def __init__(self, *a, **k):
+            captured.update(k)
+            self.thread = types.SimpleNamespace(is_alive=lambda: True)
+
+        def start(self):
+            pass
+
+        def stop(self):
+            pass
+
+    monkeypatch.setattr(lk, "AsyncSniffer", _Cap)
+    keeper = lk.Keeper("eth0", "00:00:5e:00:01:fe", "100.64.4.7", hbfile=None,
+                       arp_listen_promisc=True)
+    assert keeper._start_sniffer() is True
+    assert "arp" in captured["filter"]        # ARP replies now reach the parser
+    assert "port 67" in captured["filter"]     # ...alongside DHCP, unchanged
+    assert captured["promisc"] is True         # opt-in flag reaches the socket

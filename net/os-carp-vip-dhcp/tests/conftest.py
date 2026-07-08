@@ -42,8 +42,10 @@ def _stub_scapy():
         def __truediv__(self, other):
             return self
 
+    # Distinct subclasses (not one shared class) so haslayer()/p[Layer] identity
+    # checks can tell ARP from BOOTP, as they do with the real scapy layers.
     for _name in ("ARP", "Ether", "IP", "UDP", "BOOTP", "DHCP"):
-        setattr(allmod, _name, _Layer)
+        setattr(allmod, _name, type(_name, (_Layer,), {}))
     allmod.sendp = lambda *a, **k: None
     allmod.AsyncSniffer = _Sniffer
     scapy.all = allmod

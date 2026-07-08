@@ -53,6 +53,54 @@ def _ack(lk, yiaddr, server="100.64.4.1"):
     return lk.DhcpReply(5, yiaddr, server, 1800, None, None, None)
 
 
+class _DhcpPkt:
+    """Minimal stand-in for a scapy DHCP reply: p[BOOTP].xid/op/yiaddr and
+    p[DHCP].options, with haslayer() so _on_dhcp_reply parses it."""
+    def __init__(self, lk, xid, options, yiaddr="100.64.4.7"):
+        self._lk = lk
+        self._bootp = types.SimpleNamespace(xid=xid, op=lk.BOOTREPLY, yiaddr=yiaddr)
+        self._dhcp = types.SimpleNamespace(options=options)
+
+    def haslayer(self, layer):
+        return layer in (self._lk.BOOTP, self._lk.DHCP)
+
+    def __getitem__(self, layer):
+        return self._bootp if layer is self._lk.BOOTP else self._dhcp
+
+
+def test_on_dhcp_reply_captures_option56_message(lk):
+    keeper = lk.Keeper("eth0", "00:00:5e:00:01:fe", "100.64.4.7", hbfile=None)
+    pkt = _DhcpPkt(lk, keeper.xid, [("message-type", lk.NAK), ("server_id", "100.64.4.1"),
+                                    ("message", "pool exhausted"), "end"])
+    keeper._on_dhcp_reply(pkt)
+    assert keeper._rx.message == "pool exhausted"
+
+
+def test_dhcpnak_logs_option56_reason(lk, caplog):
+    keeper = lk.Keeper("eth0", "00:00:5e:00:01:fe", "100.64.4.7", hbfile=None)
+    keeper._rx = lk.DhcpReply(lk.NAK, None, "100.64.4.1", None, None, None, None, "lease not available")
+    with caplog.at_level("WARNING", logger="lease-keeper"):
+        assert keeper._wait_for_dhcp_reply(lk.ACK, 0.2) == "NAK"
+    nak = [r for r in caplog.records if "DHCPNAK" in r.getMessage()]
+    assert nak and "lease not available" in nak[0].getMessage()
+
+
+def test_dhcpnak_reason_bytes_decoded(lk, caplog):
+    keeper = lk.Keeper("eth0", "00:00:5e:00:01:fe", "100.64.4.7", hbfile=None)
+    keeper._rx = lk.DhcpReply(lk.NAK, None, "100.64.4.1", None, None, None, None, b"bad chaddr")
+    with caplog.at_level("WARNING", logger="lease-keeper"):
+        keeper._wait_for_dhcp_reply(lk.ACK, 0.2)
+    assert any("bad chaddr" in r.getMessage() for r in caplog.records)
+
+
+def test_dhcpnak_without_message_still_logs(lk, caplog):
+    keeper = lk.Keeper("eth0", "00:00:5e:00:01:fe", "100.64.4.7", hbfile=None)
+    keeper._rx = lk.DhcpReply(lk.NAK, None, "100.64.4.1", None, None, None, None)   # message defaults to None
+    with caplog.at_level("WARNING", logger="lease-keeper"):
+        keeper._wait_for_dhcp_reply(lk.ACK, 0.2)
+    assert any("DHCPNAK received" in r.getMessage() for r in caplog.records)
+
+
 def test_follow_accepts_same_class(lk, tmp_path):
     keeper = _follow_keeper(lk, tmp_path)
     assert keeper._handle_changed_address("100.64.4.60", _ack(lk, "100.64.4.60"), "DORA", True) is True

@@ -36,11 +36,16 @@ class DiagnosticsController extends ApiControllerBase
         if (!is_array($records)) {
             $records = [];
         }
+        // Filter by severity threshold ("this level and above"), so choosing
+        // INFO hides DEBUG but still shows WARNING/ERROR. Empty = show everything
+        // (including DEBUG). The log page defaults its selector to INFO.
         $level = $this->request->getPost('level', 'striptags', '');
         $filter_funct = null;
         if (!empty($level)) {
-            $filter_funct = function ($record) use ($level) {
-                return isset($record['level']) && $record['level'] === $level;
+            $ranks = ['DEBUG' => 10, 'INFO' => 20, 'WARNING' => 30, 'ERROR' => 40, 'CRITICAL' => 50];
+            $min = $ranks[$level] ?? 0;
+            $filter_funct = function ($record) use ($ranks, $min) {
+                return ($ranks[$record['level'] ?? ''] ?? 0) >= $min;
             };
         }
         // No default sort key: searchRecordsetBase only ever sorts ascending on

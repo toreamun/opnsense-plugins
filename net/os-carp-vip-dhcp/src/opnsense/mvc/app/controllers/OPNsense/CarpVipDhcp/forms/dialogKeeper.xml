@@ -12,6 +12,18 @@
         <help>The CARP VirtualIP to keep a lease for. Interface, VHID (chaddr) and IP are derived from it.</help>
     </field>
     <field>
+        <id>keeper.followIp</id>
+        <label>Follow dynamic DHCP address</label>
+        <type>checkbox</type>
+        <help><![CDATA[When set (the default), if the DHCP server hands out a different address than the configured VIP, the keeper accepts it and rewrites the CARP virtual IP to match, so the VIP stays online on a dynamic address instead of going down. Both HA nodes converge on the same address automatically because they share the same chaddr (the server gives one lease per chaddr). Pair it with "Sync firewall alias" so outbound NAT and rules follow the new address; note that inbound port-forwards cannot follow a dynamic address (the upstream only routes inbound to a reserved address). Unset to ENFORCE a fixed reservation instead: a different address then raises a mismatch alarm (and, with "CARP failover on lease loss", hands the VIP to the peer) rather than being accepted.]]></help>
+    </field>
+    <field>
+        <id>keeper.aliasName</id>
+        <label>Sync firewall alias</label>
+        <type>text</type>
+        <help><![CDATA[Optional. The plugin creates and maintains a firewall Host alias with this name, always set to this CARP VIP's current address. Point your outbound NAT translation address (and any firewall rules that must follow the address) at this alias, so they follow automatically when "Follow dynamic DHCP address" changes it (applied by a state-preserving filter reload). NOTE: inbound port-forwards cannot follow a dynamic address (the upstream only routes inbound to a reserved address). The plugin never deletes the alias. See the plugin README.]]></help>
+    </field>
+    <field>
         <id>keeper.demoteOnLeaseLoss</id>
         <label>CARP failover on lease loss</label>
         <type>checkbox</type>
@@ -24,18 +36,6 @@
         <type>checkbox</type>
         <advanced>true</advanced>
         <help><![CDATA[Niche option. When set, the keeper only sends DHCP (holds the lease) while this node is the CARP master for the VIP; on backup nodes it stays running but idle (releases the lease and stands by). Use only for ISPs/DHCP servers that reject two simultaneous clients with the same chaddr. WARNING: this adds a failover gap — the new master must re-acquire the lease (DORA) before the ISP routes the VIP again. Default (unset) keeps the lease on both nodes redundantly, which fails over seamlessly.]]></help>
-    </field>
-    <field>
-        <id>keeper.followIp</id>
-        <label>Follow dynamic DHCP address</label>
-        <type>checkbox</type>
-        <help><![CDATA[When set (the default), if the DHCP server hands out a different address than the configured VIP, the keeper accepts it and rewrites the CARP virtual IP to match, so the VIP stays online on a dynamic address instead of going down. Both HA nodes converge on the same address automatically because they share the same chaddr (the server gives one lease per chaddr). Pair it with "Sync firewall alias" so outbound NAT and rules follow the new address; note that inbound port-forwards cannot follow a dynamic address (the upstream only routes inbound to a reserved address). Unset to ENFORCE a fixed reservation instead: a different address then raises a mismatch alarm (and, with "CARP failover on lease loss", hands the VIP to the peer) rather than being accepted.]]></help>
-    </field>
-    <field>
-        <id>keeper.aliasName</id>
-        <label>Sync firewall alias</label>
-        <type>text</type>
-        <help><![CDATA[Optional. The plugin creates and maintains a firewall Host alias with this name, always set to this CARP VIP's current address. Point your outbound NAT translation address (and any firewall rules that must follow the address) at this alias, so they follow automatically when "Follow dynamic DHCP address" changes it (applied by a state-preserving filter reload). NOTE: inbound port-forwards cannot follow a dynamic address (the upstream only routes inbound to a reserved address). The plugin never deletes the alias. See the plugin README.]]></help>
     </field>
     <field>
         <id>keeper.arpNudgeInterval</id>

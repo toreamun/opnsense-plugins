@@ -248,7 +248,7 @@ def test_hold_returns_early_for_asap_renew(lk):
     keeper = _nudge_keeper(lk)
     keeper._renew_asap = True
     start = time.time()
-    assert keeper._hold(60) is True      # returns as if T1 elapsed -> caller renews
+    assert keeper._hold_lease(60) is True   # returns as if T1 elapsed -> caller renews
     assert time.time() - start < 2
     assert keeper._renew_asap is False
 
@@ -262,6 +262,23 @@ def test_sigusr1_flag_services_nudge_within_a_second(lk, caplog):
     assert keeper._last_nudge > 0
     # Operator-triggered nudges must be visible in the log (the README says so).
     assert any("manual ARP nudge" in r.getMessage() for r in caplog.records)
+
+
+def test_sigusr2_flag_rechecks_carp_role_within_a_second(lk):
+    keeper = _nudge_keeper(lk, vhid=199)
+    calls = {"n": 0}
+
+    def probe():                          # backup on the first probe, master after
+        calls["n"] += 1
+        return calls["n"] > 1
+    keeper._probe_carp_master = probe
+    keeper._poll_carp_role()              # first observation: records backup
+    assert keeper._renew_asap is False
+    keeper._poll_role_now = True          # what the SIGUSR2 handler sets on a CARP event
+    keeper._sleep_gated(1)                # services the flag -> re-check -> transition
+    assert keeper._poll_role_now is False
+    assert keeper._renew_asap is True     # backup->master: renew early
+    assert keeper._last_nudge > 0         # and nudge immediately
 
 
 def test_nudge_missing_gateway_warns_once(lk, caplog):

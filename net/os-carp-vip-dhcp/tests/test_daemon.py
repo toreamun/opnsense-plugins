@@ -339,6 +339,43 @@ def test_sniff_dispatch_routes_arp_reply(lk):
     assert keeper._last_arp_reply > 0
 
 
+def test_arp_reply_logged_at_debug(lk, caplog):
+    keeper = _nudge_keeper(lk)
+    keeper.router = "100.64.4.1"
+    with caplog.at_level("DEBUG", logger="lease-keeper"):
+        keeper._on_arp_reply(_ArpPkt(lk, 2, "100.64.4.1", "100.64.4.7"))
+    assert any("ARP reply from 100.64.4.1" in r.getMessage() for r in caplog.records)
+
+
+def test_first_reply_logged_confirmed_at_info(lk, caplog):
+    keeper = _nudge_keeper(lk)
+    keeper.router = "100.64.4.1"
+    with caplog.at_level("INFO", logger="lease-keeper"):
+        keeper._arp_nudge(force=True)                                  # sent, no reply yet
+        keeper._on_arp_reply(_ArpPkt(lk, 2, "100.64.4.1", "100.64.4.7"))
+        keeper._arp_nudge(force=True)                                  # consumes -> first confirmation
+    assert any("ARP nudge confirmed" in r.getMessage() for r in caplog.records)
+
+
+def test_reply_after_unanswered_logs_recovery_at_info(lk, caplog):
+    keeper = _nudge_keeper(lk)
+    keeper.router = "100.64.4.1"
+
+    def reply():
+        keeper._on_arp_reply(_ArpPkt(lk, 2, "100.64.4.1", "100.64.4.7"))
+
+    # Establish confirmed reachability first (so the next event is a recovery, not a first).
+    keeper._arp_nudge(force=True)
+    reply()
+    keeper._arp_nudge(force=True)
+    with caplog.at_level("INFO", logger="lease-keeper"):
+        for _ in range(lk.ARP_UNANSWERED_WARN):          # unanswered streak
+            keeper._arp_nudge(force=True)
+        reply()
+        keeper._arp_nudge(force=True)                    # consume -> recovery
+    assert any("answered again" in r.getMessage() for r in caplog.records)
+
+
 def test_unanswered_nudges_warn_once(lk, caplog):
     keeper = _nudge_keeper(lk)                # target = server 100.64.4.1, probe -> master
     with caplog.at_level("WARNING", logger="lease-keeper"):

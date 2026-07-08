@@ -75,6 +75,16 @@ A small root daemon keeps a DHCP lease alive for a chosen `chaddr` — the CARP 
 
 Once the ISP routes the VIP address to that MAC, native OPNsense CARP answers ARP and egresses data as usual — so the VIP becomes failover-capable on a DHCP interface. The daemon references an existing CARP VirtualIP (deriving interface, vhid→chaddr and IP), follows the lease (RENEW at T1, REBIND at T2, re-DORA — a full Discover-Offer-Request-Ack — at expiry), and by default runs on **both** nodes redundantly — same lease, seamless failover, no split-brain. Because the lease lives on the CARP **virtual** MAC, a failover invalidates nothing upstream: the same MAC simply starts answering from the new master.
 
+## Single-IP WAN (only one public IP)
+
+Only *one* public IP on the WAN? You still get CARP failover. The shape:
+
+- each node takes a small **private** static WAN IP (used only for CARP advertisements + node identity);
+- **one floating CARP VIP** holds the single public lease — this plugin keeps it alive on the virtual MAC;
+- a **gateway group** routes the backup's own traffic out through the master over the SYNC link.
+
+That's the gist — the full recipe (IP plan, failover flow, GUI steps, lab-validation status) is in **➜ [Single-IP WAN failover](docs/single-ip-wan-carp.md)**.
+
 ---
 
 <details>

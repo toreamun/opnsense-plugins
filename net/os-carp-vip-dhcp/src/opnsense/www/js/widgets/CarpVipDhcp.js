@@ -20,11 +20,13 @@
  * IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-// Dashboard widget: one row per CARP-VIP DHCP keeper (VIP, CARP role, lease
-// state, ARP-nudge age). Reuses the diagnostics status API the plugin's Status
-// page already polls; no widget-specific backend. The cell classification below
-// mirrors the Status page (status.volt leaseCell/carpStatus/nudgeCell) in a
-// simpler form -- keep the two in sync when the health rules change.
+// Dashboard widget: one row per CARP-VIP DHCP keeper. Key/value layout (VIP on
+// the left, a status line on the right) so it stays readable in a narrow
+// dashboard column and scales as a list -- like the built-in CARP Status
+// widget, whose MASTER/BACKUP pill it mirrors. Reuses the diagnostics status
+// API the plugin's Status page already polls; no widget-specific backend. The
+// cell classification mirrors the Status page (status.volt) in a simpler form
+// -- keep the two in sync when the health rules change.
 export default class CarpVipDhcp extends BaseTableWidget {
     constructor() {
         super();
@@ -45,12 +47,7 @@ export default class CarpVipDhcp extends BaseTableWidget {
     getMarkup() {
         const $container = $('<div></div>');
         $container.append(this.createTable('carpvipdhcp-widget-table', {
-            headers: [
-                this.translations.vip,
-                this.translations.carp,
-                this.translations.lease,
-                this.translations.nudge,
-            ],
+            headerPosition: 'left',
         }));
         return $container;
     }
@@ -63,16 +60,11 @@ export default class CarpVipDhcp extends BaseTableWidget {
         }
         if (data.keepers.length === 0) {
             super.updateTable('carpvipdhcp-widget-table', [
-                [this._cell(this.translations.none, 'text-muted'), '', '', ''],
+                [this._cell(this.translations.none, 'text-muted'), ''],
             ]);
             return;
         }
-        const rows = data.keepers.map((k) => [
-            this._vipCell(k),
-            this._carpCell(k),
-            this._leaseCell(k),
-            this._nudgeCell(k),
-        ]);
+        const rows = data.keepers.map((k) => [this._vipKey(k), this._statusValue(k)]);
         super.updateTable('carpvipdhcp-widget-table', rows);
     }
 
@@ -80,7 +72,7 @@ export default class CarpVipDhcp extends BaseTableWidget {
         $('#carpvipdhcp-widget-table').empty().append($('<div></div>').text(message));
     }
 
-    // ---- cell builders (return outerHTML strings, as updateTable expects) ----
+    // ---- cell builders (return outerHTML strings; jQuery .text() escapes) ----
 
     _cell(text, cls) {
         const $s = $('<span></span>').text(text);
@@ -90,7 +82,7 @@ export default class CarpVipDhcp extends BaseTableWidget {
         return $s.prop('outerHTML');
     }
 
-    _vipCell(k) {
+    _vipKey(k) {
         let html = this._cell(k.request);
         if (k.vhid) {
             html += ' ' + this._cell('vhid ' + k.vhid, 'text-muted');
@@ -98,15 +90,14 @@ export default class CarpVipDhcp extends BaseTableWidget {
         return html;
     }
 
-    _carpCell(k) {
-        if (!k.carp_state) {
-            return this._cell('-', 'text-muted');
-        }
-        const cls = {MASTER: 'text-success', INIT: 'text-warning'}[k.carp_state] || '';
-        return this._cell(k.carp_state, cls);
+    // A coloured MASTER/BACKUP pill, matching the built-in CARP Status widget.
+    _carpBadge(k) {
+        const cls = {MASTER: 'label-success', INIT: 'label-warning'}[k.carp_state] || 'label-default';
+        return $('<span></span>').addClass('label').addClass(cls)
+            .text(k.carp_state || '-').prop('outerHTML');
     }
 
-    _leaseCell(k) {
+    _leaseText(k) {
         if (!k.running) {
             return this._cell(this.translations.stopped, 'text-danger');
         }
@@ -122,14 +113,21 @@ export default class CarpVipDhcp extends BaseTableWidget {
         return this._cell(this.translations.notheld, 'text-warning');
     }
 
-    _nudgeCell(k) {
+    _nudgeText(k) {
+        let val;
         if (!k.arp_nudge) {
-            return this._cell(this.translations.off, 'text-muted');
+            val = this.translations.off;
+        } else if (k.nudge_age === null || k.nudge_age === undefined) {
+            val = this.translations.never;
+        } else {
+            val = this._fmtAge(k.nudge_age);
         }
-        if (k.nudge_age === null || k.nudge_age === undefined) {
-            return this._cell(this.translations.never, 'text-warning');
-        }
-        return this._cell(this._fmtAge(k.nudge_age));
+        return this._cell(this.translations.nudge + ' ' + val, 'text-muted');
+    }
+
+    _statusValue(k) {
+        const sep = ' <span class="text-muted">·</span> ';
+        return this._carpBadge(k) + ' ' + this._leaseText(k) + sep + this._nudgeText(k);
     }
 
     _fmtAge(sec) {

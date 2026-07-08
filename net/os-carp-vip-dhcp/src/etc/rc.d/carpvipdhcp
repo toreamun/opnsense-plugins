@@ -42,6 +42,9 @@ carpvipdhcp_start()
             continue
         fi
         id=$(_id "${request}")
+        # When invoked for one keeper (svc_id set), skip every other keeper;
+        # empty svc_id starts them all (boot / reconfigure).
+        [ -n "${svc_id}" ] && [ "${id}" != "${svc_id}" ] && continue
         pidfile="${run_dir}/carpvipdhcp-${id}.pid"
         if [ -f "${pidfile}" ] && kill -0 "$(cat "${pidfile}")" 2>/dev/null; then
             continue
@@ -97,6 +100,12 @@ _signal_keepers()
 
 carpvipdhcp_stop()
 {
+    # One keeper only (svc_id set, e.g. a Services per-row Stop)? Stop just it.
+    if [ -n "${svc_id}" ]; then
+        carpvipdhcp_stop_id "${svc_id}"
+        echo "Stopped keeper ${svc_id}."
+        return
+    fi
     # Stop every keeper daemon, including strays whose pidfile was lost across an
     # upgrade. TERM first, wait for exit, then escalate to KILL for stragglers.
     stopped=$(_keeper_children | wc -l | tr -d ' ')
@@ -115,8 +124,8 @@ carpvipdhcp_stop()
 
 carpvipdhcp_restart()
 {
-    if [ -n "${restart_id}" ]; then
-        carpvipdhcp_stop_id "${restart_id}"
+    if [ -n "${svc_id}" ]; then
+        carpvipdhcp_stop_id "${svc_id}"
     else
         carpvipdhcp_stop
     fi
@@ -182,7 +191,9 @@ carpvipdhcp_status()
 
 load_rc_config "${name}"
 : "${carpvipdhcp_enable:=YES}"
-# Optional 2nd arg to `restart` = a keeper id to bounce on its own (see
-# carpvipdhcp_stop_id); without it, restart stops every keeper as before.
-restart_id="$2"
+# Optional 2nd arg = a single keeper id to act on (start/stop/restart just that
+# one, e.g. the Services overview per-row buttons and follow_update's re-bounce).
+# Empty = act on all keepers, exactly as before -- this is what boot (syshook)
+# and the service reconfigure use, so their path is unchanged.
+svc_id="$2"
 run_rc_command "$1"

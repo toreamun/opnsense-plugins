@@ -25,7 +25,13 @@ class ServiceController extends ApiMutableServiceControllerBase
     public function reconfigureAction()
     {
         $response = parent::reconfigureAction();
-        (new \OPNsense\Core\Backend())->configdRun('carpvipdhcp sync_aliases');
+        // Only sync aliases when the reconfigure actually ran. The base guards
+        // itself behind POST and returns status 'ok' on success; on a GET (or a
+        // failed apply) it does not touch the daemons, so we must not fire the
+        // alias sync either -- it is a state-changing action.
+        if (is_array($response) && ($response['status'] ?? '') === 'ok') {
+            (new \OPNsense\Core\Backend())->configdRun('carpvipdhcp sync_aliases');
+        }
         return $response;
     }
 

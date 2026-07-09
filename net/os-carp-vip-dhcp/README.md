@@ -43,9 +43,11 @@ On the OPNsense box, as **root**:
    fetch -o - https://raw.githubusercontent.com/toreamun/opnsense-plugins/main/install.sh | sh
    ```
    *(Trust note: this bootstrap runs as **root before it can verify itself** — trust-on-first-use over GitHub TLS, since the signature check it performs lives inside the as-yet-unverified script. To establish trust yourself instead, use the verified **Manual install** or **Build from source** paths below.)*
-3. Open **Interfaces → Virtual IPs DHCP**, add a **keeper** (a per-VIP lease-holder) pointing at that CARP VIP, and **enable** it.
+3. Open **Interfaces → Virtual IPs DHCP**, add a **keeper** (a per-VIP lease-holder) pointing at that CARP VIP, and **enable** it. *(The VIP dropdown lists your CARP VIPs — if it's empty you skipped step 1; a keeper needs an existing CARP VIP to point at. And a keeper does nothing until its **Enabled** box is ticked.)*
 
 That's it — the VIP now holds a live lease. The defaults are sensible: it follows a dynamic address, keeps the gateway's ARP fresh, and runs on both nodes for seamless failover.
+
+**You'll know it's working when**, on the **Status** page (or the dashboard widget): the keeper shows **bound** to the VIP's address, the node it runs on is CARP **master**, and gateway reachability shows a **green check** (the gateway is answering the ARP nudge). On the backup you'll instead see it **standing by** (or holding its own lease, depending on mode) — that's expected. A persistent problem raises a **dashboard banner**.
 
 - **Update:** re-run the exact same command (it always fetches the latest signed release and reinstalls in place; settings are preserved). Pin a version by appending its tag, e.g. `… | sh -s -- os-carp-vip-dhcp v1.3.10`.
 - **Uninstall:** `pkg delete os-carp-vip-dhcp` — stops the daemons and cleans up (Scapy is left in place). *(A manual, no-script install is documented at the bottom.)*
@@ -83,7 +85,7 @@ Only *one* public IP on the WAN? You still get CARP failover. The shape:
 - **one floating CARP VIP** holds the single public lease — this plugin keeps it alive on the virtual MAC;
 - a **gateway group** routes the backup's own traffic out through the master over the SYNC link.
 
-That's the gist — the full recipe (IP plan, failover flow, GUI steps, lab-validation status) is in **➜ [Single-IP WAN failover](docs/single-ip-wan-carp.md)**.
+This is the **mental model, not a setup checklist** — single-IP needs the private node IPs, a gateway group, and the SYNC link wired correctly, and each mechanism is lab-validated individually but the whole stack has not yet been field-run on a live one-IP line. Don't build it from these three bullets alone: the full recipe (IP plan, failover flow, GUI steps, lab-validation status) is in **➜ [Single-IP WAN failover](docs/single-ip-wan-carp.md)**.
 
 ---
 
@@ -111,8 +113,8 @@ Some ISP gateways/BNGs ignore gratuitous ARP and **never re-ARP an expired entry
 - **The nudge:** a periodic ARP *request* from the VIP (source = leased IP + CARP MAC) for the gateway. Default 120 s — comfortably under the ARP timeout of typical *and* shorter-lived gateway caches, at one negligible broadcast per interval. Lower it toward the 30 s floor for gear with a very short ARP timeout. Sent **only while CARP master** (never from a backup). Set 0 to disable.
 - **On becoming master** (failover or a link flap re-electing CARP): an immediate nudge **and** an early lease RENEW, within ~1 s of the kernel CARP transition — neither waits for its timer.
 - **Manual nudge:** the ⚡ button on the Status page (shown on the master), or `kill -USR1` on the daemon.
-- **Reachability:** the keeper watches for the gateway's ARP **reply**; the Status page/widget show a green check when confirmed, and if several nudges go **unanswered** (a carrier dropping them) it logs a warning and flags it. No promiscuous mode is needed — the master already accepts the VIP MAC. A NIC that filters non-primary unicast can enable the advanced **“ARP listen in promiscuous mode”** fallback *(default off; it warns when on)*.
-- **Conflict detection:** if another MAC is seen using the leased IP (duplicate address / ISP reassignment), the keeper logs a warning. Advisory only; the peer node shares the CARP MAC, so it's never mistaken for a conflict.
+- **Reachability:** the keeper watches for the gateway's ARP **reply**; the Status page/widget show a green check when confirmed, and if several nudges go **unanswered** (a carrier dropping them) it logs a warning and flags it. If the gateway keeps ignoring the nudge **while the lease is held** — the silent return-path blackhole this whole feature guards against — a **dashboard banner** is raised too (it is otherwise invisible: CARP still masters and the lease is still held). No promiscuous mode is needed — the master already accepts the VIP MAC. A NIC that filters non-primary unicast can enable the advanced **“ARP listen in promiscuous mode”** fallback *(default off; it warns when on)*.
+- **Conflict detection:** if another MAC is seen using the leased IP (duplicate address / ISP reassignment), the keeper logs a warning. Advisory only (written to the keeper log, **not** pushed as an alert — check the log or the Status page); the peer node shares the CARP MAC, so it's never mistaken for a conflict.
 
 </details>
 

@@ -66,7 +66,7 @@ The facts that drive the design:
   group (§6.2).
 - **Important:** OpenBSD's warning that the carp device must share a subnet with
   the CARP VIP applies **only to `balancing` mode**. In ordinary master/backup,
-  **a private node IP plus a public VIP in a different subnet is spec-valid** —
+  **a private node IP plus a public VIP in a different subnet works fine** —
   that is exactly what we exploit.
 
 ---
@@ -364,6 +364,29 @@ sequenceDiagram
   with no effect on the live lease. Use a **throwaway** locally-administered MAC, not
   the real virtual MAC, so a lease-binding ISP cannot associate the probe with your
   VIP.)
+- **Follow moves the VIP address only — not the prefix or the gateway:** on an ISP
+  renumber the keeper rewrites the CARP VIP to the new address (after checking it is
+  sane, in the same routability class, and from the expected server), but it does
+  **not** touch the interface prefix or System→Gateways. A **same-subnet** change is
+  seamless. A **cross-subnet** move leaves the default route pointing at the old
+  gateway → outbound dies despite a "successful" follow. The keeper now logs a loud
+  error when the ACK's gateway (DHCP option 3) changes — read it as "update the prefix
+  and gateway by hand." If your ISP renumbers across subnets, plan for manual steps.
+- **Follow trusts the DHCP ACK, which a shared-L2 neighbour can forge:** on a genuinely
+  shared segment an attacker who reads the CARP adverts (to derive the virtual MAC) can
+  send a spoofed ACK and drive the VIP to an address of their choosing (throttled to one
+  move per 60 s). During a T2 **REBIND** the expected-server check is intentionally
+  relaxed (any server may answer — legitimate DHCP), widening the window. This is the
+  same untrusted-shared-L2 exposure as the ARP-spoofing bullet above, and moot where the
+  ISP isolates you per VLAN/port. On a shared L2, prefer **run-only-on-master** plus a
+  strict upstream, or pin the address (follow off).
+- **Stopping the service is not the same as disabling a keeper:** disabling/removing a
+  keeper and pressing Apply drops it from `keeper.conf`, so the CARP eligibility hook
+  ignores it — no demotion. Stopping the whole *service*, by contrast, freezes the
+  heartbeats; a `demote_on_lease_loss` keeper then reads as failed and the node demotes,
+  handing the VIP to the peer. To take a node out of rotation on purpose that may be
+  what you want; to pause a keeper **without** a failover, disable the keeper — don't
+  stop the service.
 - **SYNC-link failure while both WAN ports stay up:** CARP advertisements still cross the
   WAN segment, so **the master keeps its role — no spurious failover or ping-pong**
   (lab-confirmed: `pfsync` demotion penalizes only the *out-of-sync* node — a backup

@@ -56,9 +56,11 @@ def _ack(lk, yiaddr, server="100.64.4.1"):
 class _DhcpPkt:
     """Minimal stand-in for a scapy DHCP reply: p[BOOTP].xid/op/yiaddr and
     p[DHCP].options, with haslayer() so _on_dhcp_reply parses it."""
-    def __init__(self, lk, xid, options, yiaddr="100.64.4.7"):
+    def __init__(self, lk, xid, options, yiaddr="100.64.4.7",
+                 chaddr=b"\x00\x00\x5e\x00\x01\xfe"):
         self._lk = lk
-        self._bootp = types.SimpleNamespace(xid=xid, op=lk.BOOTREPLY, yiaddr=yiaddr)
+        self._bootp = types.SimpleNamespace(xid=xid, op=lk.BOOTREPLY, yiaddr=yiaddr,
+                                            chaddr=chaddr)
         self._dhcp = types.SimpleNamespace(options=options)
 
     def haslayer(self, layer):
@@ -134,6 +136,132 @@ def test_enforce_mismatch_refused(lk, tmp_path):
     keeper.yiaddr = "100.64.4.7"
     keeper.release = lambda: None
     assert keeper._handle_changed_address("100.64.4.60", _ack(lk, "100.64.4.60"), "DORA", True) is False
+
+
+# ---- observed peer ACK: converge follow from the peer's exchange (single-ip s.3) ----
+
+def _observe_keeper(lk, tmp_path):
+    # Same fixture as _follow_keeper (server / yiaddr / _follow_state / fired +
+    # _follow_update stubs), plus a known in-flight xid so a peer ACK (different
+    # xid) takes the observed path.
+    keeper = _follow_keeper(lk, tmp_path)
+    keeper.xid = 0x11111111
+    return keeper
+
+
+def _peer_ack(lk, yiaddr, xid=0x22222222, server="100.64.4.1",
+              chaddr=b"\x00\x00\x5e\x00\x01\xfe"):
+    """A DHCP ACK on our shared chaddr but a DIFFERENT xid -- i.e. the peer's."""
+    return _DhcpPkt(lk, xid, [("message-type", lk.ACK), ("server_id", server),
+                              ("lease_time", 1800), "end"], yiaddr=yiaddr, chaddr=chaddr)
+
+
+def test_observed_peer_ack_records_change(lk, tmp_path):
+    keeper = _observe_keeper(lk, tmp_path)
+    keeper._on_dhcp_reply(_peer_ack(lk, "100.64.4.60"))
+    assert keeper._observed_change is not None
+    assert keeper._observed_change.yiaddr == "100.64.4.60"
+    assert keeper._rx is None          # the first-party slot is untouched
+
+
+def test_observed_wakes_main_loop(lk, tmp_path):
+    keeper = _observe_keeper(lk, tmp_path)
+    assert not keeper._wake.is_set()
+    keeper._on_dhcp_reply(_peer_ack(lk, "100.64.4.60"))
+    assert keeper._wake.is_set()       # sniffer wakes the maintain-loop sleep at once
+
+
+def test_ignored_observation_does_not_wake(lk, tmp_path):
+    keeper = _observe_keeper(lk, tmp_path)
+    keeper._on_dhcp_reply(_peer_ack(lk, "100.64.4.7"))     # same address -> no change
+    assert keeper._observed_change is None
+    assert not keeper._wake.is_set()
+
+
+def test_observed_ignores_same_address(lk, tmp_path):
+    keeper = _observe_keeper(lk, tmp_path)
+    keeper._on_dhcp_reply(_peer_ack(lk, "100.64.4.7"))     # no change from what we hold
+    assert keeper._observed_change is None
+
+
+def test_observed_ignores_wrong_chaddr(lk, tmp_path):
+    keeper = _observe_keeper(lk, tmp_path)
+    keeper._on_dhcp_reply(_peer_ack(lk, "100.64.4.60", chaddr=b"\xaa\xbb\xcc\xdd\xee\xff"))
+    assert keeper._observed_change is None
+
+
+def test_observed_ignores_non_ack(lk, tmp_path):
+    keeper = _observe_keeper(lk, tmp_path)
+    keeper._on_dhcp_reply(_DhcpPkt(lk, 0x22222222,
+                                   [("message-type", lk.OFFER), ("server_id", "100.64.4.1"), "end"],
+                                   yiaddr="100.64.4.60"))
+    assert keeper._observed_change is None
+
+
+def test_observed_ignored_when_not_follow(lk, tmp_path):
+    keeper = lk.Keeper("eth0", "00:00:5e:00:01:fe", "100.64.4.7", hbfile=None, follow=False)
+    keeper.server = "100.64.4.1"
+    keeper.yiaddr = "100.64.4.7"
+    keeper.xid = 0x11111111
+    keeper._on_dhcp_reply(_peer_ack(lk, "100.64.4.60"))
+    assert keeper._observed_change is None
+
+
+def test_own_xid_reply_uses_first_party_path(lk, tmp_path):
+    keeper = _observe_keeper(lk, tmp_path)
+    keeper._on_dhcp_reply(_DhcpPkt(lk, keeper.xid,
+                                   [("message-type", lk.ACK), ("server_id", "100.64.4.1"), "end"],
+                                   yiaddr="100.64.4.60"))
+    assert keeper._observed_change is None            # not the observed path
+    assert keeper._rx is not None and keeper._rx.yiaddr == "100.64.4.60"
+
+
+def test_observed_latest_wins(lk, tmp_path):
+    # Two peer ACKs in quick succession (the sniffer overwrites _observed_change):
+    # the handler acts on the LATEST address -- the older one is superseded (the
+    # shared lease is now the newer address), so dropping it is correct.
+    keeper = _observe_keeper(lk, tmp_path)
+    keeper._on_dhcp_reply(_peer_ack(lk, "100.64.4.60"))
+    keeper._on_dhcp_reply(_peer_ack(lk, "100.64.4.61"))
+    assert keeper._observed_change.yiaddr == "100.64.4.61"
+    keeper._check_observed_follow()
+    assert keeper.fired == ["100.64.4.61"]
+    assert keeper._observed_change is None
+
+
+def test_observed_same_address_after_follow_is_dropped(lk, tmp_path):
+    # After we've followed to the new address, a lingering observation for that
+    # same address is a no-op (the == self.yiaddr guard), never a double-follow.
+    keeper = _observe_keeper(lk, tmp_path)
+    keeper.yiaddr = "100.64.4.61"                 # we already hold the new address
+    keeper._observed_change = _ack(lk, "100.64.4.61")
+    keeper._check_observed_follow()
+    assert keeper.fired == []                     # no redundant follow
+    assert keeper._observed_change is None
+
+
+def test_check_observed_follow_drives_hardened_follow(lk, tmp_path):
+    keeper = _observe_keeper(lk, tmp_path)
+    keeper._observed_change = _ack(lk, "100.64.4.60")
+    keeper._check_observed_follow()
+    assert keeper.fired == ["100.64.4.60"]
+    assert keeper.request_ip == "100.64.4.60"
+    assert keeper._observed_change is None
+
+
+def test_check_observed_follow_rejects_wrong_server(lk, tmp_path):
+    keeper = _observe_keeper(lk, tmp_path)
+    keeper._observed_change = _ack(lk, "100.64.4.60", server="100.64.4.9")  # not our server
+    keeper._check_observed_follow()
+    assert keeper.fired == []          # same hardening as a first-party ACK
+
+
+def test_observed_serviced_by_maintain_loop(lk, tmp_path):
+    keeper = _observe_keeper(lk, tmp_path)
+    keeper._observed_change = _ack(lk, "100.64.4.60")
+    keeper._wake.set()                 # as the sniffer would -> loop returns at once
+    keeper._sleep_gated(1)
+    assert keeper.fired == ["100.64.4.60"]
 
 
 def test_id_opts_empty_by_default(lk):

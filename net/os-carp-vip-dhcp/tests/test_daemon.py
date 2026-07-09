@@ -744,3 +744,65 @@ def test_sniffer_filter_captures_arp_and_honours_promisc(lk, monkeypatch):
     assert "arp" in captured["filter"]        # ARP replies now reach the parser
     assert "port 67" in captured["filter"]     # ...alongside DHCP, unchanged
     assert captured["promisc"] is True         # opt-in flag reaches the socket
+
+
+# ---- run-only-on-master acquire grace (acq=): breaks demote/promote ping-pong ----
+
+def _gated_keeper(lk, hbfile):
+    return lk.Keeper("eth0", "00:00:5e:00:01:fe", "100.64.4.7",
+                     hbfile=hbfile, only_when_master=True, vhid=10)
+
+
+def test_hb_acq_token_when_gated_master_acquiring(lk, tmp_path):
+    hb = tmp_path / "hb"
+    keeper = _gated_keeper(lk, str(hb))
+    keeper.yiaddr = None                  # promoted, DORA in progress -> bound=-
+    keeper._acquiring_since = 1783350000.0
+    keeper._hb()
+    content = hb.read_text()
+    assert " bound=- " in content
+    assert " acq=1783350000" in content
+
+
+def test_hb_no_acq_token_once_bound(lk, tmp_path):
+    hb = tmp_path / "hb"
+    keeper = _gated_keeper(lk, str(hb))
+    keeper.yiaddr = "100.64.4.7"          # holding a lease -> grace no longer relevant
+    keeper._acquiring_since = 1783350000.0
+    keeper._hb()
+    assert "acq=" not in hb.read_text()
+
+
+def test_hb_no_acq_token_when_not_gated(lk, tmp_path):
+    hb = tmp_path / "hb"
+    keeper = lk.Keeper("eth0", "00:00:5e:00:01:fe", "100.64.4.7", hbfile=str(hb))  # not only_when_master
+    keeper.yiaddr = None
+    keeper._acquiring_since = 1783350000.0
+    keeper._hb()
+    content = hb.read_text()
+    assert " bound=- " in content
+    assert "acq=" not in content          # a plain keeper demotes immediately on loss (unchanged)
+
+
+# ---- follow across a changed gateway warns loudly (cross-subnet renumber) ----
+
+def _ack_gw(lk, yiaddr, router, server="100.64.4.1"):
+    return lk.DhcpReply(5, yiaddr, server, 1800, None, None, router)
+
+
+def test_follow_warns_on_gateway_change(lk, tmp_path, caplog):
+    keeper = _follow_keeper(lk, tmp_path)
+    keeper.router = "100.64.4.1"
+    with caplog.at_level("ERROR", logger="lease-keeper"):
+        assert keeper._handle_changed_address(
+            "100.64.5.60", _ack_gw(lk, "100.64.5.60", "100.64.5.1"), "DORA", True) is True
+    assert any("cross-subnet renumber" in r.getMessage() for r in caplog.records)
+
+
+def test_follow_no_gateway_warning_when_gateway_unchanged(lk, tmp_path, caplog):
+    keeper = _follow_keeper(lk, tmp_path)
+    keeper.router = "100.64.4.1"
+    with caplog.at_level("ERROR", logger="lease-keeper"):
+        keeper._handle_changed_address(
+            "100.64.4.60", _ack_gw(lk, "100.64.4.60", "100.64.4.1"), "DORA", True)
+    assert not any("cross-subnet" in r.getMessage() for r in caplog.records)

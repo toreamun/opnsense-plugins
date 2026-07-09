@@ -80,7 +80,17 @@ import time
 from collections import namedtuple
 from logging.handlers import RotatingFileHandler
 
-from scapy.all import ARP, Ether, IP, UDP, BOOTP, DHCP, AsyncSniffer, sendp
+# Scapy is the one heavy third-party dependency and the usual suspect when the
+# daemon won't start (missing after an upgrade, ABI mismatch, partial install).
+# Import it defensively: a bare module-level import that throws would kill the
+# process before any log handler exists -> a silent non-start with the traceback
+# going to daemon(8)'s /dev/null. Capture it instead and let main() log it once
+# logging is configured.
+try:
+    from scapy.all import ARP, Ether, IP, UDP, BOOTP, DHCP, AsyncSniffer, sendp
+    _SCAPY_IMPORT_ERROR = None
+except Exception as _scapy_exc:   # ImportError, or scapy's own import-time failures
+    _SCAPY_IMPORT_ERROR = _scapy_exc
 
 LOG = logging.getLogger("lease-keeper")
 
@@ -229,6 +239,7 @@ class Keeper:
         self._follow_fired_at = 0.0    # when we last dispatched follow_update (retry deadline)
         self._last_master = True       # last known CARP-master decision (fail to this)
         self._gated_standby = False    # currently standing by as CARP backup (run-only-on-master)
+        self._acquiring_since = None   # epoch a run-only-on-master DORA (re)started; grace for CARP
         # Follow throttle state, keyed by chaddr so it survives the follow-induced
         # restart (the request-IP-keyed runtime paths change on every follow).
         self._follow_state = "/var/run/carpvipdhcp-follow-%s" % _fs_safe(self.chaddr)
@@ -678,6 +689,13 @@ class Keeper:
             gw = self._nudge_target()
             if gw:
                 extra += " gw=%s" % gw
+        # While a run-only-on-master keeper is (re)acquiring after promotion it has
+        # no lease yet, so bound=-. Publish acq=<start> so the CARP eligibility hook
+        # can grace this bounded DORA window instead of demoting us the instant we
+        # take over -- which, paired with demote_on_lease_loss, would flap the VIP
+        # back and forth between the nodes (neither can hold it through its DORA).
+        if not self.yiaddr and self.only_when_master and self._acquiring_since:
+            extra += " acq=%d" % int(self._acquiring_since)
         self._write_hb("%d bound=%s lease=%d t1=%d t2=%d src=%s%s\n"
                        % (int(time.time()), self.yiaddr or "-", self.lease, t1, t2, src, extra))
 
@@ -734,6 +752,18 @@ class Keeper:
                 return False
             LOG.warning("ISP gave %s (VIP was %s) at %s -- following: updating the CARP VIP",
                         got, self.request_ip, phase)
+            # We rewrite the VIP *address* only, not the interface prefix or the
+            # system default gateway. If the ISP also moved the gateway (a
+            # cross-subnet renumber) the follow alone leaves the default route
+            # pointing at the old gateway -> outbound dies despite a "successful"
+            # follow. We cannot safely reconfigure System->Gateways from here, so
+            # make the operator's required action loud rather than silent.
+            if rx.router and self.router and rx.router != self.router:
+                LOG.error("follow %s -> %s also changes the gateway (%s -> %s): this looks "
+                          "like a cross-subnet renumber. The VIP address is updated but the "
+                          "interface prefix and System->Gateways are NOT -- update them "
+                          "manually or outbound routing will stay broken.",
+                          self.request_ip, got, self.router, rx.router)
             self._record_follow()
             # _follow_update reads request_ip as the old address, so remember it
             # (for the retry watchdog) and fire before overwriting request_ip.
@@ -1073,19 +1103,24 @@ class Keeper:
                 if self.yiaddr:
                     self.release()
                     self.yiaddr = None
+                self._acquiring_since = None   # standing by, not acquiring
                 self._hb_standby()
                 self._sleep(GATE_POLL)
                 return
             if self._gated_standby:
                 LOG.info("CARP master for vhid %s -- resuming DHCP (re-acquiring the lease)", self.vhid)
                 self._gated_standby = False
+                self._acquiring_since = time.time()   # start the post-promotion DORA grace
         # Acquire a lease if we do not hold one.
         if not self.yiaddr:
+            if self.only_when_master and self._acquiring_since is None:
+                self._acquiring_since = time.time()   # e.g. booted straight into master
             self._ensure_sniffer()  # a dead sniffer would silently fail every DORA
             self._hb()  # active but not holding yet -> publish bound=- (not STANDBY)
             if self.dora():
                 LOG.info("DHCP BOUND %s (lease=%ss, expires ~%s, server=%s)",
                          self.yiaddr, self.lease, self._clock_at(self.lease), self.server)
+                self._acquiring_since = None   # holding a lease again -> grace no longer applies
                 self._hb()
                 self._arp_nudge(force=True)
                 self.redora_wait = REDORA_MIN
@@ -1200,6 +1235,12 @@ def main():
     # daemon restart.
     logging.basicConfig(level=logging.DEBUG, handlers=handlers,
                         format="%(asctime)s %(levelname)s %(message)s")
+
+    if _SCAPY_IMPORT_ERROR is not None:
+        LOG.critical("cannot import scapy -- the lease keeper cannot run: %s. "
+                     "Install the matching py3<minor>-scapy package (see the plugin "
+                     "docs) and restart the service.", _SCAPY_IMPORT_ERROR)
+        return 3
 
     for label, mac in (("chaddr", a.chaddr), ("eth-src", a.eth_src)):
         if mac and not MAC_RE.match(mac):

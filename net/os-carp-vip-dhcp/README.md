@@ -42,6 +42,7 @@ On the OPNsense box, as **root**:
    ```sh
    fetch -o - https://raw.githubusercontent.com/toreamun/opnsense-plugins/main/install.sh | sh
    ```
+   *(Trust note: this bootstrap runs as **root before it can verify itself** — trust-on-first-use over GitHub TLS, since the signature check it performs lives inside the as-yet-unverified script. To establish trust yourself instead, use the verified **Manual install** or **Build from source** paths below.)*
 3. Open **Interfaces → Virtual IPs DHCP**, add a **keeper** (a per-VIP lease-holder) pointing at that CARP VIP, and **enable** it.
 
 That's it — the VIP now holds a live lease. The defaults are sensible: it follows a dynamic address, keeps the gateway's ARP fresh, and runs on both nodes for seamless failover.
@@ -73,6 +74,16 @@ A **“CARP-VIP DHCP” dashboard widget** shows one row per keeper for an at-a-
 A small root daemon keeps a DHCP lease alive for a chosen `chaddr` — the CARP virtual MAC (`00:00:5e:00:01:<vhid>`, last octet = the vhid in hex) of an existing CARP VIP. Standard `dhclient` can't do this because it ties the DHCP `chaddr` to the interface's hardware MAC; the daemon decouples them via a raw L2 socket (Scapy).
 
 Once the ISP routes the VIP address to that MAC, native OPNsense CARP answers ARP and egresses data as usual — so the VIP becomes failover-capable on a DHCP interface. The daemon references an existing CARP VirtualIP (deriving interface, vhid→chaddr and IP), follows the lease (RENEW at T1, REBIND at T2, re-DORA — a full Discover-Offer-Request-Ack — at expiry), and by default runs on **both** nodes redundantly — same lease, seamless failover, no split-brain. Because the lease lives on the CARP **virtual** MAC, a failover invalidates nothing upstream: the same MAC simply starts answering from the new master.
+
+## Single-IP WAN (only one public IP)
+
+Only *one* public IP on the WAN? You still get CARP failover. The shape:
+
+- each node takes a small **private** static WAN IP (used only for CARP advertisements + node identity);
+- **one floating CARP VIP** holds the single public lease — this plugin keeps it alive on the virtual MAC;
+- a **gateway group** routes the backup's own traffic out through the master over the SYNC link.
+
+That's the gist — the full recipe (IP plan, failover flow, GUI steps, lab-validation status) is in **➜ [Single-IP WAN failover](docs/single-ip-wan-carp.md)**.
 
 ---
 

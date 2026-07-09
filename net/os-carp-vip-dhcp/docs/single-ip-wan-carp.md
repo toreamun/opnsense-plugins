@@ -310,6 +310,20 @@ sequenceDiagram
   VRRP/CARP. **Most fiber ISPs isolate customers per VLAN/port** (you only see gw
   `.1`) → safe. **Verify** with `tcpdump -T carp` + `arp -an` on the WAN before
   trusting it. Use an unusual `vhid` + a `pass` regardless.
+- **The CARP `pass` secures the *election*, not the *segment*.** The `pass` (a SHA-1
+  HMAC) stops a stranger from injecting CARP advertisements to hijack the VIP — but it
+  does nothing about a hostile on-segment neighbour **ARP-spoofing** the VIP or the
+  gateway directly — a **general untrusted-shared-L2 exposure** that a plain, non-CARP
+  firewall on the same segment shares equally. CARP does not *create* that risk; it only
+  *adds* the election as one more thing to authenticate. On a genuinely shared L2 you
+  can additionally set CARP to **unicast** (`ifconfig <if> vhid <n> … peer <peer-node-IP>`;
+  FreeBSD 14 `carp(4)`) so advertisements go only to the peer instead of flooding the
+  segment — hardening the election against on-segment observation/injection. Caveats: it
+  is a manual ifconfig-level setting (not exposed in the OPNsense VIP GUI, so not
+  persistent without a hook), it disables CARP's TTL verification, and it still does
+  **not** stop ARP-spoofing. So unicast hardens CARP; it does not make an untrusted shared
+  L2 safe — and most fiber ISPs isolate per VLAN/port anyway (previous bullet), where it
+  is moot.
 - **`blockpriv`/`blockbogons` vs. CARP advertisements — should be fine:** a peer's
   advertisements arrive on the WAN with a **private/link-local source IP**
   (`10.1.1.x` → `blockpriv`). OPNsense installs a global `quick` rule (roughly the

@@ -8,13 +8,21 @@
 # resulting .pkg is installable with `pkg add` / uploadable to a GitHub release.
 #
 # Usage:
-#   ./build.sh [category/plugin]      # default: net/os-carp-vip-dhcp
+#   ./build.sh [-i|--install] [category/plugin]   # default plugin: net/os-carp-vip-dhcp
 #
-# Output: ./dist/<pkg>.pkg
+# Output: ./dist/<pkg>.pkg  (with --install, also pkg-add'd into the running system)
 #
 set -e
 
-PLUGIN="${1:-net/os-carp-vip-dhcp}"
+INSTALL=0
+PLUGIN="net/os-carp-vip-dhcp"
+for arg in "$@"; do
+    case "$arg" in
+        -i|--install) INSTALL=1 ;;
+        -*) echo "error: unknown option '$arg' (use -i/--install)" >&2; exit 1 ;;
+        *) PLUGIN="$arg" ;;
+    esac
+done
 REPO_DIR=$(cd "$(dirname "$0")" && pwd)
 PLUGINS_TREE="/usr/plugins"
 DIST="${REPO_DIR}/dist"
@@ -66,9 +74,25 @@ if [ -z "${found}" ]; then
     echo "error: no .pkg produced — check the build output above" >&2
     exit 1
 fi
+# The plugin depends on Scapy (py3<minor>-scapy); `pkg add` does not resolve deps,
+# so ensure it once up front (as install.sh does) before adding the .pkg.
+if [ "${INSTALL}" = "1" ]; then
+    pyver="py3$(python3 -c 'import sys; print(sys.version_info.minor)')"
+    echo ">>> Ensuring dependency ${pyver}-scapy"
+    pkg install -y "${pyver}-scapy"
+fi
+
 echo "${found}" | while read -r pkg; do
     cp -v "${pkg}" "${DIST}/"
+    if [ "${INSTALL}" = "1" ]; then
+        # force = reinstall in place when iterating on the same version from main
+        echo ">>> Installing $(basename "${pkg}")"
+        pkg add -f "${DIST}/$(basename "${pkg}")"
+    fi
 done
 
 echo ">>> Done. Packages in ${DIST}:"
 ls -1 "${DIST}"/*.pkg
+if [ "${INSTALL}" = "1" ]; then
+    echo ">>> Installed from source. Reload the GUI if it was open."
+fi

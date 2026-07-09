@@ -177,6 +177,24 @@ pkg add ./os-carp-vip-dhcp-*.pkg
 
 </details>
 
+<details>
+<summary><b>Build from source (run the latest, or don't rely on a release)</b></summary>
+
+For testers who want the latest `main` (e.g. an unreleased fix) or anyone who would rather build inspected source than trust the signed release. The plugin has no compiled code — "build" just packages the files — but it uses the OPNsense plugin build tooling, so run it on an OPNsense box (or an OPNsense build VM).
+
+```sh
+# 1. Clone (this is the "download" — main for latest, or check out a tag).
+git clone https://github.com/toreamun/opnsense-plugins
+cd opnsense-plugins            # inspect the source you're about to run
+
+# 2. Build + install, as root. Fetches the official plugins tree for the build
+#    tooling, packages net/os-carp-vip-dhcp, ensures Scapy, and pkg-adds it.
+./build.sh --install
+```
+
+`./build.sh` on its own only builds `./dist/<pkg>.pkg` (no install) — use that to build on a separate box and copy just the `.pkg` to a hardened firewall (keeping the build toolchain off it). Settings survive a reinstall; re-run the one-line `install.sh` any time to return to signed releases.
+</details>
+
 ## License
 
 BSD-2-Clause. See [LICENSE](../../LICENSE).

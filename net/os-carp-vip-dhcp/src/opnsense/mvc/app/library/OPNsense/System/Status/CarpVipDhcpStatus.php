@@ -45,6 +45,10 @@ class CarpVipDhcpStatus extends AbstractStatus
     private const STALE = 600;
     // Only alert once a problem has persisted this long, to ride out restarts.
     private const GRACE = 300;
+    // How long the gateway may go without answering ARP before we call the return
+    // path blackholed. The keeper nudges every ~120s; 600s = several missed
+    // replies. Only judged once the gateway has answered at least once (arpok>0).
+    private const ARP_STALE = 600;
 
     public function __construct()
     {
@@ -136,8 +140,32 @@ class CarpVipDhcpStatus extends AbstractStatus
             return null;   // intentionally idle CARP backup, heartbeat fresh
         }
         if (strpos($content, 'bound=' . $request . ' ') !== false) {
-            return null;
+            return $this->arpReachabilityReason($content);
         }
         return gettext('not holding the lease');
+    }
+
+    /**
+     * The keeper holds its lease -- but if it is also driving ARP nudges and the
+     * gateway, having answered before (arpok>0), has since gone silent for
+     * ARP_STALE, the return path is likely blackholed. That is the flagship
+     * failure mode the nudge exists to prevent, and it is otherwise invisible on
+     * the dashboard (CARP still masters, the lease is still held). We ignore
+     * arpok==0 (never seen): freshly acquired, or a NIC that drops the unicast
+     * reply (the promiscuous-listen fallback) -- flagging it would cry wolf.
+     */
+    private function arpReachabilityReason(string $content): ?string
+    {
+        if (strpos($content, ' nudge=') === false) {
+            return null;   // ARP nudge not enabled for this keeper -> no signal to judge
+        }
+        if (!preg_match('/\barpok=(\d+)/', $content, $m)) {
+            return null;
+        }
+        $arpok = (int)$m[1];
+        if ($arpok > 0 && (time() - $arpok) > self::ARP_STALE) {
+            return gettext('gateway stopped answering ARP (return path may be blackholed)');
+        }
+        return null;
     }
 }

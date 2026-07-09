@@ -19,6 +19,8 @@ This plugin runs a small daemon that keeps a DHCP lease alive **for the CARP VIP
   <sub><i>The Status page — the VIP holding its lease as CARP <b>master</b>, with gateway reachability confirmed (green check).</i></sub>
 </p>
 
+> **Status — independent plugin, aiming for the official tree.** This is a standalone plugin, not (yet) part of OPNsense. **If enough people find it useful, I intend to propose it for the official OPNsense community plugins** — ⭐ the repo if you'd like to see that happen.
+
 ## Is this for you?
 
 You need it if **both** of these are true:

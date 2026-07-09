@@ -96,10 +96,12 @@ follow the plugin rewrites the VIP and re-applies it **add-before-remove**, so t
 never loses its address on that node. Point outbound NAT and any address-dependent rule
 at the plugin-managed **firewall Host alias** rather than a hardcoded IP — the plugin
 updates the alias content live on a follow, so rules track the address without a ruleset
-reload. *(One caveat, not lab-tested: a CARP advertisement's checksum covers the VIP
-prefixes, so while each node rewrites its VIP the two briefly advertise different prefix
-sets; a short re-election is possible if they rewrite far apart in time. They share the
-`chaddr` and converge on the same address, which keeps the window small.)*
+reload. *(Lab-confirmed caveat: a CARP advertisement's HMAC covers the VIP prefixes, so
+during a follow the two nodes briefly advertise different prefixes. If they adopt the new
+address more than ~3 s apart — plausible, since each node's DHCP renewal lands
+independently — the backup stops validating the master's adverts and promotes: a
+transient **dual-master** until they converge. Uncommon in practice, a DHCP address
+rarely changes, but real; a future option could coordinate the change across nodes.)*
 
 An alternative binds the public address as an **IP-alias VIP on top of a CARP VIP that
 carries a stable private *election* address** (same vhid → same virtual MAC, so they

@@ -157,14 +157,23 @@ if (!$rendered_ok) {
     exit(1);
 }
 
+// Replace only the keeper that just changed address, not every keeper on the
+// node. The daemon is keyed by a filesystem-safe id derived from its request IP,
+// so a follow renames it old_id -> new_id. We must stop old_id and start new_id
+// SEPARATELY: `restart <old_id>` would stop the old daemon but then
+// carpvipdhcp_start (honouring svc_id=old_id) skips the renamed new_ip line in
+// keeper.conf -> 0 keepers started -> nothing renews the lease -> the WAN
+// silently blackholes at the next expiry. Same _id() mapping as the rc script.
+$old_id = preg_replace('/[^A-Za-z0-9]/', '_', $old_ip);
+$new_id = preg_replace('/[^A-Za-z0-9]/', '_', $new_ip);
 $out = array();
 $rc = 0;
-// Bounce only the keeper that just changed address (old id), not every keeper on
-// the node; carpvipdhcp_start then launches the renamed line from keeper.conf.
-$old_id = preg_replace('/[^A-Za-z0-9]/', '_', $old_ip);
-exec('/usr/local/etc/rc.d/carpvipdhcp restart ' . escapeshellarg($old_id) . ' 2>&1', $out, $rc);
-if ($rc !== 0) {
-    fwrite(STDERR, "keeper restart failed (rc={$rc}): " . implode(' | ', $out) . "\n");
+exec('/usr/local/etc/rc.d/carpvipdhcp stop ' . escapeshellarg($old_id) . ' 2>&1', $out, $rc);
+$out2 = array();
+$rc2 = 0;
+exec('/usr/local/etc/rc.d/carpvipdhcp start ' . escapeshellarg($new_id) . ' 2>&1', $out2, $rc2);
+if ($rc2 !== 0) {
+    fwrite(STDERR, "keeper start failed (rc={$rc2}): " . implode(' | ', $out2) . "\n");
     exit(1);
 }
 

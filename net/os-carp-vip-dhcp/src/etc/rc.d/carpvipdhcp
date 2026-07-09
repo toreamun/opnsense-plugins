@@ -134,8 +134,9 @@ carpvipdhcp_restart()
 
 # Stop only the keeper with the given filesystem-safe id (the daemon(8)
 # supervisor first, so it does not respawn the child, then the child). Used by a
-# follow to replace just the affected keeper without bouncing the others; the
-# following carpvipdhcp_start brings up the renamed line from the new keeper.conf.
+# follow to retire the old-id keeper; follow_update.php then issues a separate
+# `start <new_id>` for the renamed line (a single `restart <old_id>` would skip
+# the new line, since start honours svc_id and old_id != new_id).
 carpvipdhcp_stop_id()
 {
     tid="$1"

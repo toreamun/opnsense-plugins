@@ -97,7 +97,7 @@ All per-keeper; sensible defaults mean most setups only pick a CARP VIP and enab
 
 Some ISP gateways/BNGs ignore gratuitous ARP and **never re-ARP an expired entry**. The symptom: traffic to the VIP works right after a CARP event or DHCP exchange, then **silently blackholes** minutes later. A DHCP RENEW doesn't refresh such a gateway's ARP cache, but a received ARP *request* does.
 
-- **The nudge:** a periodic ARP *request* from the VIP (source = leased IP + CARP MAC) for the gateway. Default 240 s — well under typical 15–20 min ARP timeouts, and one broadcast per interval is negligible. Sent **only while CARP master** (never from a backup). Set 0 to disable.
+- **The nudge:** a periodic ARP *request* from the VIP (source = leased IP + CARP MAC) for the gateway. Default 120 s — comfortably under the ARP timeout of typical *and* shorter-lived gateway caches, at one negligible broadcast per interval. Lower it toward the 30 s floor for gear with a very short ARP timeout. Sent **only while CARP master** (never from a backup). Set 0 to disable.
 - **On becoming master** (failover or a link flap re-electing CARP): an immediate nudge **and** an early lease RENEW, within ~1 s of the kernel CARP transition — neither waits for its timer.
 - **Manual nudge:** the ⚡ button on the Status page (shown on the master), or `kill -USR1` on the daemon.
 - **Reachability:** the keeper watches for the gateway's ARP **reply**; the Status page/widget show a green check when confirmed, and if several nudges go **unanswered** (a carrier dropping them) it logs a warning and flags it. No promiscuous mode is needed — the master already accepts the VIP MAC. A NIC that filters non-primary unicast can enable the advanced **“ARP listen in promiscuous mode”** fallback *(default off; it warns when on)*.
@@ -148,7 +148,7 @@ Carrier access gear (BNG / access switches / OLTs) polices subscribers with mech
 - WAN is the typical — not required — placement.
 - Requires **root** (raw L2/BPF socket) and depends on **Scapy**.
 
-*Deliberately not included:* DHCP option 82 (inserted by the ISP, not the client); RFC 5227 conflict *arbitration* (CARP arbitrates between our nodes; a rogue host is beyond a subscriber device — we detect and warn, above, but don't act); DAI rate-limit pacing (one nudge / 240 s is orders of magnitude under any limit); a unicast-RENEW mode (the broadcast flag makes RFC-2131 servers broadcast OFFER/ACK to a non-promiscuous socket; a server that unicasts to the CARP MAC is still received on the master).
+*Deliberately not included:* DHCP option 82 (inserted by the ISP, not the client); RFC 5227 conflict *arbitration* (CARP arbitrates between our nodes; a rogue host is beyond a subscriber device — we detect and warn, above, but don't act); DAI rate-limit pacing (one nudge / 120 s is orders of magnitude under any limit); a unicast-RENEW mode (the broadcast flag makes RFC-2131 servers broadcast OFFER/ACK to a non-promiscuous socket; a server that unicasts to the CARP MAC is still received on the master).
 
 </details>
 

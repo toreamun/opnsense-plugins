@@ -52,6 +52,11 @@ On the OPNsense box, as **root**:
 
 That's it — the VIP now holds a live lease. The defaults are sensible: it follows a dynamic address, keeps the gateway's ARP fresh, and runs on both nodes for seamless failover.
 
+**Point your traffic at the VIP.** Keeping the lease alive is only half the job — to actually *use* the failover-capable VIP, your NAT and rules must reference **it**, not a single node's own WAN address:
+
+- **Outbound NAT** *(recommended for HA; required for a single-IP WAN)* — set **Firewall → NAT → Outbound** to translate to the **CARP VIP**, so outbound connections source from the VIP and keep working after a failover (a rule left translating to the node's own WAN IP does not fail over).
+- **Dynamic address?** Set **Sync firewall alias** on the keeper and point outbound NAT — and any rule that must follow — at that **alias** instead of a literal IP, so it tracks the address automatically on a follow. See *Following a dynamic address* below.
+
 **You'll know it's working when**, on the **Status** page (or the dashboard widget): the keeper shows **bound** to the VIP's address, the node it runs on is CARP **master**, and gateway reachability shows a **green check** (the gateway is answering the ARP nudge). On the backup you'll instead see it **standing by** (or holding its own lease, depending on mode) — that's expected. A persistent problem raises a **dashboard banner**.
 
 - **Update:** re-run the exact same command (it always fetches the latest signed release and reinstalls in place; settings are preserved). Pin a version by appending its tag, e.g. `… | sh -s -- os-carp-vip-dhcp v1.4.0`.

@@ -96,12 +96,13 @@ follow the plugin rewrites the VIP and re-applies it **add-before-remove**, so t
 never loses its address on that node. Point outbound NAT and any address-dependent rule
 at the plugin-managed **firewall Host alias** rather than a hardcoded IP — the plugin
 updates the alias content live on a follow, so rules track the address without a ruleset
-reload. *(Lab-confirmed caveat: a CARP advertisement's HMAC covers the VIP prefixes, so
-during a follow the two nodes briefly advertise different prefixes. If they adopt the new
-address more than ~3 s apart — plausible, since each node's DHCP renewal lands
-independently — the backup stops validating the master's adverts and promotes: a
-transient **dual-master** until they converge. Uncommon in practice, a DHCP address
-rarely changes, but real; a future option could coordinate the change across nodes.)*
+reload. *(A CARP advertisement's HMAC covers the VIP prefixes, so during a follow the two
+nodes briefly advertise different prefixes; if they adopted the new address more than ~3 s
+apart the backup could stop validating the master's adverts and promote — a transient
+**dual-master** (lab-confirmed). The keeper closes this: it passively observes the peer's
+DHCP ACK on the shared chaddr and follows within the same exchange, so both nodes converge
+well under the ~3 s CARP timeout. Falls back to independent convergence if the peer's ACK
+isn't visible.)*
 
 An alternative binds the public address as an **IP-alias VIP on top of a CARP VIP that
 carries a stable private *election* address** (same vhid → same virtual MAC, so they
@@ -349,11 +350,13 @@ sequenceDiagram
   with no effect on the live lease. Use a **throwaway** locally-administered MAC, not
   the real virtual MAC, so a lease-binding ISP cannot associate the probe with your
   VIP.)
-- **SYNC-link failure while both WAN ports stay up:** if the SYNC link itself drops,
-  CARP advertisements still cross the WAN segment, but the `pfsync` desync can bump the
-  demotion counter and hand over the role — and the promoted node has *also* lost the
-  SYNC path its own internet (§6) rides on. Keep SYNC on a reliable dedicated link and
-  watch for role ping-pong if it flaps.
+- **SYNC-link failure while both WAN ports stay up:** CARP advertisements still cross the
+  WAN segment, so **the master keeps its role — no spurious failover or ping-pong**
+  (lab-confirmed: `pfsync` demotion penalizes only the *out-of-sync* node — a backup
+  rejoining over the dead link went demotion 240→480 and stayed backup; the master was
+  untouched). What you lose is state replication (a *later* failover then drops the
+  unsynced connections) and, in this design, the backup's own internet (which rides the
+  SYNC path, §6 — a convenience, see §9). Keep SYNC on a reliable dedicated link anyway.
 - **Short gateway ARP timeout:** the 240 s ARP-nudge default assumes a multi-minute
   gateway ARP timeout. Some CPE/BNG age ARP in 60–240 s — shorten the nudge interval
   below the gateway's timeout if the VIP blackholes between nudges.

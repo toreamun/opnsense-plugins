@@ -38,10 +38,12 @@ if ($old_ip === $new_ip) {
 }
 
 // Optional cross-subnet args (all three together): the ISP moved us to a
-// different subnet, so also repoint the VIP prefix + the WAN gateway.
+// different subnet, so also repoint the VIP prefix + the WAN gateway. The
+// configd action always passes 5 params and pads a same-subnet call with empty
+// strings, so an empty old_gw means address-only, not a cross-subnet move.
 $old_gw = $new_gw = null;
 $new_bits = null;
-if ($argc >= 6) {
+if ($argc >= 6 && $argv[3] !== '') {
     $old_gw = $argv[3];
     $new_gw = $argv[4];
     $new_bits = (int)$argv[5];
@@ -179,13 +181,13 @@ if ($old_vip_iface !== '' && $old_ip !== $new_ip) {
 
 // Cross-subnet: the WAN gateway moved, so reapply routing (reconfigure_vips
 // re-adds the VIP but does not touch the default route). The config change above
-// is what persists; this reapply is the one path still to validate on a live box.
+// is what persists; this reapply installs the new default route.
 if ($gw_changed) {
     require_once("system.inc");
     if (function_exists('system_routing_configure')) {
         system_routing_configure();
     } else {
-        exec('/usr/local/sbin/configctl interface routing reconfigure 2>&1');
+        exec('/usr/local/sbin/configctl interface routes configure 2>&1');
     }
 }
 

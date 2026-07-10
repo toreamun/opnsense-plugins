@@ -1,4 +1,5 @@
 """Unit tests for the lease-keeper daemon's pure helpers and follow decision."""
+import os
 import time
 import types
 
@@ -556,3 +557,27 @@ def test_follow_no_gateway_change_no_extra_args(lk, tmp_path):
     keeper._handle_changed_address(          # same gateway -> no cross-subnet extras
         "100.64.4.60", _ack_gw(lk, "100.64.4.60", "100.64.4.1"), "DORA", True)
     assert keeper._follow_gw_args == []
+
+
+def test_follow_update_action_arity():
+    """The configd [follow_update] action must accept as many params as the
+    daemon can send: _fire_follow_update passes old_ip + new_ip plus
+    _follow_gw_args ([old_gw, new_gw, bits] on a cross-subnet move) = 5. configd
+    raises "Parameter mismatch" when more args than %s tokens are passed, so a
+    narrower template would silently break every cross-subnet follow via
+    configctl (a boundary the direct-call tests above never cross)."""
+    conf = os.path.join(
+        os.path.dirname(__file__), "..", "src", "opnsense", "service",
+        "conf", "actions.d", "actions_carpvipdhcp.conf")
+    params = None
+    in_section = False
+    with open(conf) as fh:
+        for raw in fh:
+            line = raw.strip()
+            if line.startswith("[") and line.endswith("]"):
+                in_section = (line == "[follow_update]")
+            elif in_section and line.startswith("parameters:"):
+                params = line.split(":", 1)[1]
+                break
+    assert params is not None, "[follow_update] action or its parameters line is missing"
+    assert params.count("%s") >= 5, "follow_update template narrower than the daemon's 5-arg call"

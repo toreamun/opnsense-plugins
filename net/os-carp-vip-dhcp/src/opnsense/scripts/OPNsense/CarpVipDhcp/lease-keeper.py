@@ -390,9 +390,7 @@ class Keeper:
                 return
             mac = (arp.hwsrc or "").lower()
             if not mac or mac == self.chaddr or mac == self._own_wan_mac():
-                # peer's shared CARP MAC, or our own WAN MAC (FreeBSD egresses
-                # VIP-sourced traffic from the physical MAC) -> our egress, not a conflict
-                return
+                return   # the peer's shared CARP MAC or our own WAN MAC -> not a conflict
             now = time.time()
             if mac == self._conflict_mac and now - self._last_conflict_warn < ARP_CONFLICT_REWARN:
                 return

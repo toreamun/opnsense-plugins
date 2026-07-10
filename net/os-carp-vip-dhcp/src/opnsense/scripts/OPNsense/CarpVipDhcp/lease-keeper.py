@@ -356,14 +356,17 @@ class Keeper:
             LOG.debug("ARP reply parse error: %s", e)
 
     def _on_arp_conflict(self, p):
-        """Warn if another MAC claims our leased IP -- an ARP whose sender IP is
-        ours but whose sender MAC is not our CARP MAC (the peer node shares that
-        MAC, so it is excluded). Signals a duplicate address / ISP reassignment.
-        Passive and advisory (spoofable); it only logs, never acts. Throttled so a
-        persistent conflict does not flood the log: re-warns only when the
-        offending MAC changes or after ARP_CONFLICT_REWARN (a new impostor thus
-        surfaces at once). Detection and throttle state are touched only here
-        (sniffer thread) -> single-owner."""
+        """Log if another MAC claims our leased VIP -- an ARP whose sender IP is
+        ours but whose sender MAC is not our CARP MAC. On an HA pair this is
+        usually benign: the peer node egresses VIP-sourced traffic from its OWN
+        physical WAN MAC (FreeBSD CARP does not source that traffic from the
+        virtual MAC), which on the wire is indistinguishable from a genuine
+        impostor -- both are just a non-CARP MAC using the VIP, and neither CARP
+        adverts nor the peer's DHCP expose the peer's physical MAC to whitelist
+        it. So this is purely advisory: it logs (saying as much), never acts. The
+        peer's CARP MAC (== our chaddr) is excluded outright. Throttled: re-warns
+        only when the offending MAC changes or after ARP_CONFLICT_REWARN. Touched
+        only here (sniffer thread) -> single-owner."""
         try:
             if not self.yiaddr:
                 return
@@ -378,8 +381,11 @@ class Keeper:
                 return
             self._conflict_mac = mac
             self._last_conflict_warn = now
-            LOG.warning("ARP conflict: %s is using our leased IP %s (our MAC is %s) "
-                        "-- possible duplicate address or ISP reassignment",
+            LOG.warning("%s is using our VIP %s (not our CARP MAC %s). On an HA pair "
+                        "this is almost always the peer node's own WAN MAC -- CARP "
+                        "egresses VIP traffic from the physical MAC on FreeBSD, so it is "
+                        "expected and harmless. Only a concern if that MAC belongs to "
+                        "neither node (a real duplicate address or ISP reassignment).",
                         mac, self.yiaddr, self.chaddr)
         except Exception as e:
             LOG.debug("ARP conflict parse error: %s", e)

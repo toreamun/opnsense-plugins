@@ -2,6 +2,8 @@
 import time
 import types
 
+import pytest
+
 
 def test_sane_ipv4(lk):
     assert lk._sane_ipv4("100.64.4.7")
@@ -78,29 +80,17 @@ def test_on_dhcp_reply_captures_option56_message(lk):
     assert keeper._rx.message == "pool exhausted"
 
 
-def test_dhcpnak_logs_option56_reason(lk, caplog):
+@pytest.mark.parametrize("message, expect", [
+    ("lease not available", "lease not available"),   # option-56 text surfaced
+    (b"bad chaddr", "bad chaddr"),                     # a bytes reason is decoded
+    (None, "DHCPNAK received"),                        # no reason -> the NAK is still logged
+])
+def test_dhcpnak_logs_reason(lk, caplog, message, expect):
     keeper = lk.Keeper("eth0", "00:00:5e:00:01:fe", "100.64.4.7", hbfile=None)
-    keeper._rx = lk.DhcpReply(lk.NAK, None, "100.64.4.1", None, None, None, None, "lease not available")
+    keeper._rx = lk.DhcpReply(lk.NAK, None, "100.64.4.1", None, None, None, None, message)
     with caplog.at_level("WARNING", logger="lease-keeper"):
         assert keeper._wait_for_dhcp_reply(lk.ACK, 0.2) == "NAK"
-    nak = [r for r in caplog.records if "DHCPNAK" in r.getMessage()]
-    assert nak and "lease not available" in nak[0].getMessage()
-
-
-def test_dhcpnak_reason_bytes_decoded(lk, caplog):
-    keeper = lk.Keeper("eth0", "00:00:5e:00:01:fe", "100.64.4.7", hbfile=None)
-    keeper._rx = lk.DhcpReply(lk.NAK, None, "100.64.4.1", None, None, None, None, b"bad chaddr")
-    with caplog.at_level("WARNING", logger="lease-keeper"):
-        keeper._wait_for_dhcp_reply(lk.ACK, 0.2)
-    assert any("bad chaddr" in r.getMessage() for r in caplog.records)
-
-
-def test_dhcpnak_without_message_still_logs(lk, caplog):
-    keeper = lk.Keeper("eth0", "00:00:5e:00:01:fe", "100.64.4.7", hbfile=None)
-    keeper._rx = lk.DhcpReply(lk.NAK, None, "100.64.4.1", None, None, None, None)   # message defaults to None
-    with caplog.at_level("WARNING", logger="lease-keeper"):
-        keeper._wait_for_dhcp_reply(lk.ACK, 0.2)
-    assert any("DHCPNAK received" in r.getMessage() for r in caplog.records)
+    assert any(expect in r.getMessage() for r in caplog.records)
 
 
 def test_follow_accepts_same_class(lk, tmp_path):
@@ -156,19 +146,14 @@ def _peer_ack(lk, yiaddr, xid=0x22222222, server="100.64.4.1",
                               ("lease_time", 1800), "end"], yiaddr=yiaddr, chaddr=chaddr)
 
 
-def test_observed_peer_ack_records_change(lk, tmp_path):
+def test_observed_peer_ack_records_change_and_wakes(lk, tmp_path):
     keeper = _observe_keeper(lk, tmp_path)
+    assert not keeper._wake.is_set()
     keeper._on_dhcp_reply(_peer_ack(lk, "100.64.4.60"))
     assert keeper._observed_change is not None
     assert keeper._observed_change.yiaddr == "100.64.4.60"
     assert keeper._rx is None          # the first-party slot is untouched
-
-
-def test_observed_wakes_main_loop(lk, tmp_path):
-    keeper = _observe_keeper(lk, tmp_path)
-    assert not keeper._wake.is_set()
-    keeper._on_dhcp_reply(_peer_ack(lk, "100.64.4.60"))
-    assert keeper._wake.is_set()       # sniffer wakes the maintain-loop sleep at once
+    assert keeper._wake.is_set()       # ...and the maintain-loop sleep is woken at once
 
 
 def test_ignored_observation_does_not_wake(lk, tmp_path):
@@ -176,12 +161,6 @@ def test_ignored_observation_does_not_wake(lk, tmp_path):
     keeper._on_dhcp_reply(_peer_ack(lk, "100.64.4.7"))     # same address -> no change
     assert keeper._observed_change is None
     assert not keeper._wake.is_set()
-
-
-def test_observed_ignores_same_address(lk, tmp_path):
-    keeper = _observe_keeper(lk, tmp_path)
-    keeper._on_dhcp_reply(_peer_ack(lk, "100.64.4.7"))     # no change from what we hold
-    assert keeper._observed_change is None
 
 
 def test_observed_ignores_wrong_chaddr(lk, tmp_path):
@@ -356,32 +335,37 @@ def test_probe_failure_skips_nudge(lk, monkeypatch):
     assert keeper._last_nudge == 0.0
 
 
-def test_hb_includes_nudge_state(lk, tmp_path):
+def test_hb_nudge_tokens_present(lk, tmp_path):
     hb = tmp_path / "hb"
     keeper = _nudge_keeper(lk, hbfile=str(hb))
     keeper.router = "100.64.4.1"
     keeper._last_nudge = 1783350000.0
+    keeper._last_arp_reply = 1783350050.0
     keeper._hb()
     content = hb.read_text()
     assert " nudge=1783350000" in content
+    assert " arpok=1783350050" in content
     assert " gw=100.64.4.1" in content
 
 
-def test_hb_nudge_never_and_no_gateway(lk, tmp_path):
+def test_hb_nudge_zeros_when_never_and_no_target(lk, tmp_path):
     hb = tmp_path / "hb"
     keeper = _nudge_keeper(lk, hbfile=str(hb))
-    keeper.server = None
+    keeper.server = None             # enabled, but no target and nothing sent yet
     keeper._hb()
     content = hb.read_text()
-    assert " nudge=0" in content     # enabled but never sent
-    assert "gw=" not in content      # no target known yet
+    assert " nudge=0" in content
+    assert " arpok=0" in content
+    assert "gw=" not in content
 
 
 def test_hb_no_nudge_tokens_when_off(lk, tmp_path):
     hb = tmp_path / "hb"
     keeper = _nudge_keeper(lk, arp_nudge=0, hbfile=str(hb))
     keeper._hb()
-    assert "nudge=" not in hb.read_text()
+    content = hb.read_text()
+    assert "nudge=" not in content
+    assert "arpok=" not in content
 
 
 def test_master_transition_renews_early_and_nudges(lk):
@@ -517,30 +501,6 @@ def test_sniffer_filter_is_static(lk):
     assert "arp[6:2] = 2" in f                            # reachability clause
     keeper.yiaddr = "100.64.4.7"
     assert keeper._sniffer_filter() == f                  # unchanged once a lease is held
-
-
-def test_hb_includes_arp_reply_state(lk, tmp_path):
-    hb = tmp_path / "hb"
-    keeper = _nudge_keeper(lk, hbfile=str(hb))
-    keeper.router = "100.64.4.1"
-    keeper._last_nudge = 1783350000.0
-    keeper._last_arp_reply = 1783350050.0
-    keeper._hb()
-    content = hb.read_text()
-    assert " nudge=1783350000" in content
-    assert " arpok=1783350050" in content
-
-
-def test_hb_arpok_zero_when_no_reply(lk, tmp_path):
-    hb = tmp_path / "hb"
-    keeper = _nudge_keeper(lk, hbfile=str(hb))
-    keeper._hb()
-    assert " arpok=0" in hb.read_text()
-
-
-def test_arp_listen_promisc_defaults_off(lk):
-    keeper = lk.Keeper("eth0", "00:00:5e:00:01:fe", "100.64.4.7", hbfile=None)
-    assert keeper.arp_listen_promisc is False
 
 
 def test_sniffer_filter_captures_arp_and_honours_promisc(lk, monkeypatch):

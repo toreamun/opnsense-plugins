@@ -3,63 +3,46 @@
 
 Keeps a DHCP lease alive for a given ``chaddr`` WITHOUT binding it to the
 interface's hardware MAC, so the leased address (typically a CARP virtual IP)
-stays routed by the ISP. The broadcast flag is set so OFFER/ACK are broadcast.
-This does lease maintenance ONLY; ARP for the address and data traffic are
-handled by CARP. Optionally (--arp-nudge) it also refreshes the upstream
-gateway's ARP entry for the leased address, for gateways that ignore
-gratuitous ARP and never re-ARP an expired entry (traffic to the address
-silently blackholes until the gateway receives an ARP *request* from it). It
-also watches for the gateway's ARP reply to that nudge as a reachability
-signal, warns if repeated nudges go unanswered (a likely sign the carrier is
-dropping them), and flags an ARP conflict if another MAC claims the leased
-address. By default it is ungated and runs on both HA nodes for redundancy;
-opt-in run-only-on-master gating restricts it to the CARP master.
+stays routed by the ISP. Lease maintenance ONLY -- ARP for the address and data
+traffic are handled by CARP. The BOOTP broadcast flag is set so OFFER/ACK are
+broadcast. Optionally (--arp-nudge) it refreshes the upstream gateway's ARP
+entry for the leased address, for gateways that never re-ARP an expired entry
+(traffic then silently blackholes until they get an ARP *request*). Runs on both
+HA nodes for redundancy.
 
 Robustness:
-  * Full DHCP lifecycle: DORA (Discover / Offer / Request / Ack, the lease
-    acquisition handshake) -> BOUND, RENEW at T1, REBIND at T2, re-DORA at expiry.
+  * Full DHCP lifecycle: DORA (Discover/Offer/Request/Ack) -> BOUND, RENEW at
+    T1, REBIND at T2, re-DORA at expiry.
   * Single instance via pidfile; heartbeat file (fresh = the lease is renewing).
   * Resilient sniffer: restarted if its thread dies (e.g. the interface flaps).
   * All I/O wrapped in try/except so the main loop never crashes; a non-zero
-    exit on a fatal error lets the supervisor restart it.
+    exit lets the supervisor restart it.
   * RELEASE is NOT sent on a normal stop (SIGTERM) -- only with
     --once/--release-on-exit -- so the address is not given up needlessly.
 
 Security posture (this daemon parses untrusted WAN traffic as root):
-  * The sniffer is NOT promiscuous by default: DHCP requests carry the BOOTP
-    broadcast flag so the server broadcasts its replies to a non-promiscuous
-    socket, and the gateway's unicast ARP reply to a nudge reaches us because
-    the CARP master already accepts the VIP's virtual MAC (its own traffic).
-    --arp-listen-promisc is an opt-in fallback (default off) for NICs that drop
-    non-primary unicast; it widens capture to the whole segment, so it warns
-    when enabled.
-  * The BPF filter is the next boundary: only DHCP (udp port 67/68), ARP
-    *replies*, and (once bound) ARP claiming our leased IP reach Python;
-    everything else -- including the segment's broadcast who-has flood -- is
-    dropped in the kernel.
-  * A DHCP reply must carry the BOOTREPLY op; our own xid gates the first-party
-    path, and in follow mode a reply on our shared chaddr (the peer node's ACK)
-    is read too, but only to RECORD an observed address change for the main
-    thread's hardened follow path (see _on_dhcp_reply). An ARP reply must come
-    from the nudge target for our leased IP (see _on_arp_reply) -- other packets
-    are dropped early.
-  * Only the handful of DHCP options the keeper needs is extracted; there is
-    no full dissection of the reply's other option data (untrusted network
-    input -- it came from whatever answered on the wire, e.g. a rogue or
-    spoofed DHCP server).
+  * The sniffer is NOT promiscuous by default: the BOOTP broadcast flag makes
+    the server broadcast its replies to a non-promiscuous socket, and the
+    gateway's unicast ARP reply to a nudge reaches us because the CARP master
+    already accepts the VIP's virtual MAC. --arp-listen-promisc is an opt-in
+    fallback (warned when enabled) for NICs that drop non-primary unicast.
+  * The BPF filter is the next boundary: only DHCP (udp 67/68) and ARP replies
+    reach Python; everything else -- including the who-has flood -- is dropped
+    in the kernel.
+  * A reply must carry BOOTREPLY; our own xid gates the first-party path, and in
+    follow mode a reply on our shared chaddr (the peer's ACK) is read only to
+    RECORD an observed address change (see _on_dhcp_reply). Only the DHCP options
+    the keeper needs are extracted -- no dissection of the rest (untrusted input).
   * Follow mode never rewrites the CARP VIP from a single ACK: the new address
-    is validated for plausibility, routability class and expected server, and
+    is validated (plausibility, routability class, expected server) and
     rate-throttled against flap/spoof storms (see _handle_changed_address).
-  * A parse error in the sniffer callback is dropped (debug-logged); malformed
-    input can never take the main loop down.
+  * A parse error in the sniffer callback is dropped (debug-logged).
 
 Cooperating with ISP access-network policing (DHCP snooping, Dynamic ARP
-Inspection, gratuitous-ARP filtering, IP source guard, per-subscriber MAC
-limits): the design keeps the lease on the CARP virtual MAC and shapes the ARP
-nudge to match the snooped binding, so the carrier's guards see legitimate,
-consistent state. The README's "Playing nicely with ISP access-network
-security" section is the full map from each mechanism to how this code
-satisfies it; the load-bearing spots below point back to it.
+Inspection, IP source guard, per-subscriber MAC limits): the lease stays on the
+CARP virtual MAC and the ARP nudge is shaped to match the snooped binding, so
+the carrier's guards see consistent state. The README's "Playing nicely with
+ISP access-network security" section is the full map.
 
 Usage:
   lease-keeper.py --iface <if> --chaddr <mac> --request <ip>

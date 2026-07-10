@@ -248,8 +248,8 @@ if ($rc !== 0) {
     fwrite(STDERR, "manage_alias failed (rc={$rc}): " . implode(' | ', $out) . "\n");
 }
 
+$msg = "updated CARP VIP {$old_ip} -> {$new_ip}";
 if ($gw_changed) {
-    echo "updated CARP VIP {$old_ip} -> {$new_ip} and WAN gateway {$old_gw} -> {$new_gw} (/{$new_bits})\n";
-} else {
-    echo "updated CARP VIP {$old_ip} -> {$new_ip}\n";
+    $msg .= " and WAN gateway {$old_gw} -> {$new_gw} (/{$new_bits})";
 }
+echo "{$msg}\n";

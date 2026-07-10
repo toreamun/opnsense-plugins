@@ -23,9 +23,8 @@ CONFIG_XML = "/conf/config.xml"
 RUN_DIR = "/var/run"
 
 # A gateway ARP reply counts as reachability confirmation only while fresh: within
-# this many nudge intervals (matching the daemon's unanswered-nudge threshold), but
-# never less than the floor (guards very short intervals). Older = stale -> the GUI
-# flags it, mirroring the daemon's "ARP nudge unanswered" warning.
+# this many nudge intervals, but never less than the floor (guards very short
+# intervals). Older = stale -> the GUI shows it as unconfirmed.
 ARP_CONFIRM_INTERVALS = 3
 ARP_CONFIRM_FLOOR = 90
 
@@ -50,6 +49,13 @@ def _epoch_and_age(value):
     return epoch, (int(time.time()) - epoch if epoch else None)
 
 
+def _int_token(value):
+    try:
+        return int(value)
+    except ValueError:
+        return None
+
+
 def parse_heartbeat(path):
     result = {"bound": None, "lease": None, "t1": None, "t2": None, "timing_source": None,
               "mismatch": False, "mismatch_got": None, "mismatch_want": None,
@@ -72,20 +78,11 @@ def parse_heartbeat(path):
             value = part.split("=", 1)[1]
             result["bound"] = None if value == "-" else value
         elif part.startswith("lease="):
-            try:
-                result["lease"] = int(part.split("=", 1)[1])
-            except ValueError:
-                pass
+            result["lease"] = _int_token(part.split("=", 1)[1])
         elif part.startswith("t1="):
-            try:
-                result["t1"] = int(part.split("=", 1)[1])
-            except ValueError:
-                pass
+            result["t1"] = _int_token(part.split("=", 1)[1])
         elif part.startswith("t2="):
-            try:
-                result["t2"] = int(part.split("=", 1)[1])
-            except ValueError:
-                pass
+            result["t2"] = _int_token(part.split("=", 1)[1])
         elif part.startswith("src="):
             result["timing_source"] = part.split("=", 1)[1]
         elif part.startswith("nudge="):

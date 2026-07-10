@@ -153,13 +153,15 @@ def read_keepers(states, names):
         parts = line.split("|")
         if len(parts) < 4:
             continue
+        # keeper.conf field order (keep in lockstep with the template + rc.d readers):
+        # 0 request|1 iface|2 chaddr|3 demote|4 vhid|5 follow|6 vendor|7 client-id|
+        # 8 hostname|9 arp-nudge|10 arp-listen-promisc
         request, iface, chaddr, demote = parts[0], parts[1], parts[2], parts[3]
         vhid = parts[4] if len(parts) > 4 else ""
         follow = parts[5] if len(parts) > 5 else "0"
-        try:
-            arp_nudge = int(parts[9]) if len(parts) > 9 and parts[9] else 0
-        except ValueError:
-            arp_nudge = 0
+        arp_nudge = 0
+        if len(parts) > 9:
+            arp_nudge = _int_token(parts[9]) or 0
         kid = keeper_id(request)
         pid = pid_alive("%s/carpvipdhcp-%s.pid" % (RUN_DIR, kid))
         entry = {

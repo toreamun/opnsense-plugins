@@ -115,6 +115,11 @@ MAC_RE = re.compile(r"^([0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}$")
 
 _CGNAT = ipaddress.ip_network("100.64.0.0/10")
 
+# Static BPF capture filter: DHCP (broadcast OFFER/ACK) + ARP replies to our nudge
+# (arp[6:2]=2). A boundary, not an optimization -- it keeps everything else (incl. the
+# segment's broadcast who-has flood) out of the Python parser.
+SNIFFER_FILTER = "(udp and (port 67 or port 68)) or (arp and arp[6:2] = 2)"
+
 
 def _sane_ipv4(ip):
     """True for a plausible host IPv4 lease address (rejects 0.0.0.0, multicast,
@@ -221,7 +226,7 @@ class Keeper:
         # drives the hardened follow -- see _on_dhcp_reply / _check_observed_follow.
         self._observed_change = None
         self._ev = threading.Event()
-        # General early-wake for the maintain-loop sleep (_sleep_gated): lets it
+        # General early-wake for the maintain-loop sleep (_sleep_interruptible): lets it
         # return before the 1s tick when there is pending work. Currently the
         # sniffer sets it on an observed address change so the follow fires in
         # milliseconds; a future fast-wake need should reuse this rather than mint
@@ -231,12 +236,6 @@ class Keeper:
         self._sniffer = None
 
     # ---- sniffer (resilient) ----
-    def _sniffer_filter(self):
-        # DHCP (broadcast OFFER/ACK) + ARP replies to our nudge (arp[6:2]=2). The
-        # BPF filter is a boundary, not an optimization: it keeps everything else
-        # (incl. the segment's broadcast who-has flood) out of the Python parser.
-        return "(udp and (port 67 or port 68)) or (arp and arp[6:2] = 2)"
-
     def _start_sniffer(self):
         try:
             if self._sniffer:
@@ -250,7 +249,7 @@ class Keeper:
             # virtual MAC. arp_listen_promisc is the opt-in fallback for NICs that
             # drop non-primary unicast (widens capture -- warned at startup).
             self._sniffer = AsyncSniffer(
-                iface=self.iface, filter=self._sniffer_filter(),
+                iface=self.iface, filter=SNIFFER_FILTER,
                 prn=self._on_sniff, store=0, promisc=self.arp_listen_promisc)
             self._sniffer.start()
             return True
@@ -712,7 +711,8 @@ class Keeper:
     def _probe_carp_master(self):
         """Raw CARP-role probe for our vhid: True/False from ifconfig, None when
         the probe itself fails; no vhid configured -> True (nothing to gate on).
-        The ARP nudge is the caller and fails closed (no nudge on a failed probe)."""
+        Callers apply their own policy on a None probe -- the ARP nudge fails closed
+        (no nudge unless a confirmed MASTER); the CARP-transition poll just skips."""
         if not self.vhid:
             return True
         try:
@@ -812,7 +812,7 @@ class Keeper:
             slept += 1
         return slept
 
-    def _sleep_gated(self, secs):
+    def _sleep_interruptible(self, secs):
         """Sleep up to secs (1s steps). Return False early on stop. Also services an
         operator-requested immediate nudge (SIGUSR1) and a CARP-transition re-check
         (SIGUSR2) so both act within a second instead of at the next heartbeat tick."""
@@ -847,7 +847,7 @@ class Keeper:
         """Sleep up to secs while holding a lease, rewriting the heartbeat every
         HB_REFRESH so a healthy keeper never looks stale (leases can be hours and
         the CARP demotion hook only sees heartbeat freshness). Returns False early
-        on stop or CARP-master loss."""
+        on stop."""
         remaining = secs
         while remaining > 0 and not self.stop:
             if self._renew_asap:
@@ -856,7 +856,7 @@ class Keeper:
                 self._renew_asap = False
                 return not self.stop
             chunk = min(HB_REFRESH, remaining)
-            if not self._sleep_gated(chunk):
+            if not self._sleep_interruptible(chunk):
                 return False
             remaining -= chunk
             self._hb()
@@ -915,10 +915,10 @@ class Keeper:
                 self.redora_wait = REDORA_MIN
             else:
                 LOG.warning("DHCP acquire (DISCOVER/REQUEST) failed -- retrying in %ds", self.redora_wait)
-                self._sleep_gated(self.redora_wait)
+                self._sleep_interruptible(self.redora_wait)
                 self.redora_wait = min(self.redora_wait * 2, REDORA_MAX)
             return
-        # Maintain: wait until T1, then RENEW; bail early on stop or master loss.
+        # Maintain: wait until T1, then RENEW; bail early on stop.
         t1, t2, src = self._timing()
         # The renew/rebind plan is verbose and identical every cycle for a stable
         # lease, so log it at DEBUG -- the default (INFO) log stays clean and
@@ -939,7 +939,7 @@ class Keeper:
         ok = False
         while elapsed < t2 and not self.stop:
             step = min(REBIND_POLL_STEP, t2 - elapsed)
-            if not self._sleep_gated(step):
+            if not self._sleep_interruptible(step):
                 break
             elapsed += step
             self._hb()   # still holding the lease until T2 -- keep the heartbeat fresh

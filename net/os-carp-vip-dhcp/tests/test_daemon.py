@@ -239,7 +239,7 @@ def test_observed_serviced_by_maintain_loop(lk, tmp_path):
     keeper = _observe_keeper(lk, tmp_path)
     keeper._observed_change = _ack(lk, "100.64.4.60")
     keeper._wake.set()                 # as the sniffer would -> loop returns at once
-    keeper._sleep_gated(1)
+    keeper._sleep_interruptible(1)
     assert keeper.fired == ["100.64.4.60"]
 
 
@@ -418,7 +418,7 @@ def test_sigusr1_flag_services_nudge_within_a_second(lk, caplog):
     keeper = _nudge_keeper(lk)
     keeper._nudge_now = True             # what the SIGUSR1 handler sets
     with caplog.at_level("INFO", logger="lease-keeper"):
-        keeper._sleep_gated(1)
+        keeper._sleep_interruptible(1)
     assert keeper._nudge_now is False
     assert keeper._last_nudge > 0
     # Operator-triggered nudges must be visible in the log (the README says so).
@@ -436,7 +436,7 @@ def test_sigusr2_flag_rechecks_carp_role_within_a_second(lk):
     keeper._poll_carp_role()              # first observation: records backup
     assert keeper._renew_asap is False
     keeper._poll_role_now = True          # what the SIGUSR2 handler sets on a CARP event
-    keeper._sleep_gated(1)                # services the flag -> re-check -> transition
+    keeper._sleep_interruptible(1)                # services the flag -> re-check -> transition
     assert keeper._poll_role_now is False
     assert keeper._renew_asap is True     # backup->master: renew early
     assert keeper._last_nudge > 0         # and nudge immediately
@@ -493,14 +493,9 @@ def test_arp_reply_logged_at_debug(lk, caplog):
 
 
 def test_sniffer_filter_is_static(lk):
-    keeper = lk.Keeper("eth0", "00:00:5e:00:01:fe", "100.64.4.7", hbfile=None)
-    # The filter is a fixed boundary: DHCP + ARP replies (nudge reachability). It
-    # does not depend on the leased IP, so it is never rebuilt at runtime.
-    f = keeper._sniffer_filter()
-    assert "port 67 or port 68" in f                      # DHCP clause
-    assert "arp[6:2] = 2" in f                            # reachability clause
-    keeper.yiaddr = "100.64.4.7"
-    assert keeper._sniffer_filter() == f                  # unchanged once a lease is held
+    # A fixed BPF boundary: DHCP + ARP replies (nudge reachability), no lease dependence.
+    assert "port 67 or port 68" in lk.SNIFFER_FILTER      # DHCP clause
+    assert "arp[6:2] = 2" in lk.SNIFFER_FILTER            # reachability clause
 
 
 def test_sniffer_filter_captures_arp_and_honours_promisc(lk, monkeypatch):

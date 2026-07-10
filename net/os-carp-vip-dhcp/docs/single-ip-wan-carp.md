@@ -185,6 +185,16 @@ flowchart TB
 > production pick an unusual vhid — see [§8 vhid collision](#8-open-questions-and-risks)
 > about shared ISP L2.
 
+> **The VIP is not a network you choose:** it is whatever address the ISP leases on the
+> virtual MAC, so it always sits in the ISP gateway's subnet (the gateway must be
+> on-link). The `/24` here is illustrative; the real mask is the ISP's. If the ISP only
+> changes your *address* within that subnet, `followIp` adopts it seamlessly. If it moves
+> you to a *different* subnet with a *different* gateway, follow rewrites the VIP address
+> but not the netmask or the System > Gateways entry, so that case needs a manual fix for
+> now (the daemon logs a `cross-subnet renumber` error). Bringing follow to parity with a
+> plain DHCP interface here (adopt the new mask and gateway automatically) is tracked in
+> issue #39.
+
 ---
 
 ## 6  The backup's internet — gateway group

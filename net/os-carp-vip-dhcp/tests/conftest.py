@@ -48,7 +48,6 @@ def _stub_scapy():
         setattr(allmod, _name, type(_name, (_Layer,), {}))
     allmod.sendp = lambda *a, **k: None
     allmod.AsyncSniffer = _Sniffer
-    allmod.get_if_hwaddr = lambda iface: ""   # tests override per-case; "" -> no own-MAC match
     scapy.all = allmod
     sys.modules["scapy"] = scapy
     sys.modules["scapy.all"] = allmod

@@ -87,7 +87,7 @@ from logging.handlers import RotatingFileHandler
 # going to daemon(8)'s /dev/null. Capture it instead and let main() log it once
 # logging is configured.
 try:
-    from scapy.all import ARP, Ether, IP, UDP, BOOTP, DHCP, AsyncSniffer, sendp, get_if_hwaddr
+    from scapy.all import ARP, Ether, IP, UDP, BOOTP, DHCP, AsyncSniffer, sendp
     _SCAPY_IMPORT_ERROR = None
 except Exception as _scapy_exc:   # ImportError, or scapy's own import-time failures
     _SCAPY_IMPORT_ERROR = _scapy_exc
@@ -123,7 +123,6 @@ REBIND_MARGIN = 15         # ensure T2 is at least this far past T1
 BROADCAST_FLAG = 0x8000    # BOOTP flags: ask the server to broadcast OFFER/ACK
 ARP_NUDGE_MIN = 30         # floor for --arp-nudge so a typo cannot flood the segment
 ARP_UNANSWERED_WARN = 3    # warn after this many consecutive nudges with no gateway reply
-ARP_CONFLICT_REWARN = 3600  # re-warn about a persistent ARP conflict at most this often
 LOG_MAX_BYTES = 512 * 1024
 LOG_BACKUPS = 3
 
@@ -211,13 +210,6 @@ class Keeper:
         self._last_arp_reply = 0.0     # epoch of the gateway's last ARP reply (sniffer-written, 0 = none)
         self._reply_seen_at = 0.0      # last _last_arp_reply the main thread has accounted for
         self._nudges_since_reply = 0   # consecutive nudges with no new reply (unanswered detector)
-        # ARP conflict (another MAC claiming our leased IP). Detected + throttled
-        # entirely on the sniffer thread, so these are single-owner too.
-        self._sniffer_yiaddr = None    # leased IP the current sniffer filter was built for
-        self._last_conflict_warn = 0.0  # throttle for the conflict warning
-        self._conflict_mac = None       # last foreign MAC seen using our IP
-        self._own_mac = None            # our WAN iface's physical MAC (lazy; excluded from conflicts)
-        self._own_mac_resolved = False
         self._peer_cid_warned = None    # last divergent peer client-id warned about (sniffer-owned)
         self._was_master = None        # CARP role at the last nudge check (None = unknown yet)
         self._nudge_now = False        # operator asked for an immediate nudge (SIGUSR1)
@@ -271,18 +263,10 @@ class Keeper:
 
     # ---- sniffer (resilient) ----
     def _sniffer_filter(self):
-        # DHCP (broadcast OFFER/ACK) + ARP replies to our nudge (arp[6:2]=2). Once
-        # we hold a lease, also capture ARP whose SENDER protocol address is our
-        # leased IP (arp[14:4]) -- to spot another MAC claiming our address. The
+        # DHCP (broadcast OFFER/ACK) + ARP replies to our nudge (arp[6:2]=2). The
         # BPF filter is a boundary, not an optimization: it keeps everything else
         # (incl. the segment's broadcast who-has flood) out of the Python parser.
-        f = "(udp and (port 67 or port 68)) or (arp and arp[6:2] = 2)"
-        try:
-            if self.yiaddr:
-                f += " or (arp and arp[14:4] = %d)" % int(ipaddress.IPv4Address(self.yiaddr))
-        except ValueError:
-            pass
-        return f
+        return "(udp and (port 67 or port 68)) or (arp and arp[6:2] = 2)"
 
     def _start_sniffer(self):
         try:
@@ -296,7 +280,6 @@ class Keeper:
             # nudge reaches us because the CARP master already accepts the VIP's
             # virtual MAC. arp_listen_promisc is the opt-in fallback for NICs that
             # drop non-primary unicast (widens capture -- warned at startup).
-            self._sniffer_yiaddr = self.yiaddr   # what the filter below is built for
             self._sniffer = AsyncSniffer(
                 iface=self.iface, filter=self._sniffer_filter(),
                 prn=self._on_sniff, store=0, promisc=self.arp_listen_promisc)
@@ -315,11 +298,6 @@ class Keeper:
             LOG.warning("DHCP-reply sniffer down -- (re)starting")
             self._start_sniffer()
             time.sleep(1)
-        elif self.yiaddr != self._sniffer_yiaddr:
-            # Our leased IP became known (or changed) -> rebuild the filter so the
-            # conflict clause (ARP sender == our IP) tracks the current address.
-            LOG.debug("rebuilding sniffer filter for leased IP %s", self.yiaddr)
-            self._start_sniffer()
 
     def _on_sniff(self, p):
         # One sniffer feeds two parsers; keep the DHCP and ARP concerns separate.
@@ -329,7 +307,6 @@ class Keeper:
             self._on_dhcp_reply(p)
         elif p.haslayer(ARP):
             self._on_arp_reply(p)      # gateway answering our nudge (reachability)
-            self._on_arp_conflict(p)   # someone else claiming our leased IP
 
     def _on_arp_reply(self, p):
         """Record the gateway's ARP reply to our nudge as a reachability signal.
@@ -356,54 +333,6 @@ class Keeper:
                 LOG.debug("ARP reply from %s (is-at) for %s", gw, self.yiaddr)
         except Exception as e:
             LOG.debug("ARP reply parse error: %s", e)
-
-    def _own_wan_mac(self):
-        """Our WAN interface's own physical MAC, resolved once and cached. FreeBSD
-        egresses VIP-sourced traffic from this MAC, so an ARP from it using our VIP
-        is our own egress, not a conflict. None if it cannot be determined."""
-        if not self._own_mac_resolved:
-            self._own_mac_resolved = True
-            try:
-                self._own_mac = (get_if_hwaddr(self.iface) or "").lower() or None
-            except Exception:
-                self._own_mac = None
-        return self._own_mac
-
-    def _on_arp_conflict(self, p):
-        """Log if another MAC claims our leased VIP -- an ARP whose sender IP is
-        ours but whose sender MAC is not our CARP MAC. On an HA pair this is
-        usually benign: the peer node egresses VIP-sourced traffic from its OWN
-        physical WAN MAC (FreeBSD CARP does not source that traffic from the
-        virtual MAC), which on the wire is indistinguishable from a genuine
-        impostor -- both are just a non-CARP MAC using the VIP, and neither CARP
-        adverts nor the peer's DHCP expose the peer's physical MAC to whitelist
-        it. So this is purely advisory: it logs (saying as much), never acts. Our
-        OWN WAN MAC and the peer's CARP MAC (== our chaddr) are excluded outright,
-        so only the peer's physical MAC (or a genuine impostor) can surface here.
-        Throttled: re-warns only when the offending MAC changes or after
-        ARP_CONFLICT_REWARN. Touched only here (sniffer thread) -> single-owner."""
-        try:
-            if not self.yiaddr:
-                return
-            arp = p[ARP]
-            if arp.psrc != self.yiaddr:
-                return
-            mac = (arp.hwsrc or "").lower()
-            if not mac or mac == self.chaddr or mac == self._own_wan_mac():
-                return   # the peer's shared CARP MAC or our own WAN MAC -> not a conflict
-            now = time.time()
-            if mac == self._conflict_mac and now - self._last_conflict_warn < ARP_CONFLICT_REWARN:
-                return
-            self._conflict_mac = mac
-            self._last_conflict_warn = now
-            LOG.warning("%s is using our VIP %s (not our CARP MAC %s). On an HA pair "
-                        "this is almost always the peer node's own WAN MAC -- CARP "
-                        "egresses VIP traffic from the physical MAC on FreeBSD, so it is "
-                        "expected and harmless. Only a concern if that MAC belongs to "
-                        "neither node (a real duplicate address or ISP reassignment).",
-                        mac, self.yiaddr, self.chaddr)
-        except Exception as e:
-            LOG.debug("ARP conflict parse error: %s", e)
 
     def _parse_reply(self, p, yiaddr):
         """Snapshot only the handful of DHCP options the keeper acts on into a

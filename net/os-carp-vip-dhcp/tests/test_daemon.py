@@ -616,57 +616,15 @@ def test_reply_after_unanswered_logs_recovery_at_info(lk, caplog):
     assert any("answered again" in r.getMessage() for r in caplog.records)
 
 
-# ---- ARP conflict detection (another MAC claiming our leased IP) ----
-
-def test_arp_conflict_warns(lk, caplog):
-    keeper = _nudge_keeper(lk)                    # yiaddr=100.64.4.7, chaddr=00:00:5e:00:01:fe
-    with caplog.at_level("WARNING", logger="lease-keeper"):
-        keeper._on_arp_conflict(_ArpPkt(lk, 2, "100.64.4.7", "100.64.4.1", hwsrc="aa:bb:cc:dd:ee:ff"))
-    assert any("using our VIP" in r.getMessage() for r in caplog.records)
-
-
-def test_arp_conflict_ignores_our_own_mac(lk, caplog):
-    keeper = _nudge_keeper(lk)
-    with caplog.at_level("WARNING", logger="lease-keeper"):
-        # Same as our CARP MAC (the peer node shares it) -> not a conflict.
-        keeper._on_arp_conflict(_ArpPkt(lk, 1, "100.64.4.7", "100.64.4.1", hwsrc="00:00:5e:00:01:fe"))
-    assert not any("using our VIP" in r.getMessage() for r in caplog.records)
-
-
-def test_arp_conflict_ignores_our_own_wan_mac(lk, caplog, monkeypatch):
-    # FreeBSD egresses VIP traffic from the physical MAC, so our own WAN MAC using
-    # the VIP is our own egress, not a conflict (matched case-insensitively).
-    monkeypatch.setattr(lk, "get_if_hwaddr", lambda iface: "de:ad:be:ef:ca:fe")
-    keeper = _nudge_keeper(lk)
-    with caplog.at_level("WARNING", logger="lease-keeper"):
-        keeper._on_arp_conflict(_ArpPkt(lk, 2, "100.64.4.7", "100.64.4.1", hwsrc="DE:AD:BE:EF:CA:FE"))
-    assert not any("using our VIP" in r.getMessage() for r in caplog.records)
-
-
-def test_arp_conflict_ignores_other_ip(lk, caplog):
-    keeper = _nudge_keeper(lk)
-    with caplog.at_level("WARNING", logger="lease-keeper"):
-        keeper._on_arp_conflict(_ArpPkt(lk, 1, "100.64.4.99", "100.64.4.1", hwsrc="aa:bb:cc:dd:ee:ff"))
-    assert not any("using our VIP" in r.getMessage() for r in caplog.records)
-
-
-def test_arp_conflict_throttled_per_mac(lk, caplog):
-    keeper = _nudge_keeper(lk)
-    pkt = _ArpPkt(lk, 2, "100.64.4.7", "100.64.4.1", hwsrc="aa:bb:cc:dd:ee:ff")
-    with caplog.at_level("WARNING", logger="lease-keeper"):
-        keeper._on_arp_conflict(pkt)
-        keeper._on_arp_conflict(pkt)              # same MAC within the re-warn window
-    warnings = [r for r in caplog.records if "using our VIP" in r.getMessage()]
-    assert len(warnings) == 1
-
-
-def test_sniffer_filter_tracks_leased_ip(lk):
+def test_sniffer_filter_is_static(lk):
     keeper = lk.Keeper("eth0", "00:00:5e:00:01:fe", "100.64.4.7", hbfile=None)
-    assert "arp[14:4]" not in keeper._sniffer_filter()   # no lease yet -> no conflict clause
-    keeper.yiaddr = "100.64.4.7"
+    # The filter is a fixed boundary: DHCP + ARP replies (nudge reachability). It
+    # does not depend on the leased IP, so it is never rebuilt at runtime.
     f = keeper._sniffer_filter()
-    assert "arp[6:2] = 2" in f                            # reachability clause kept
-    assert "arp[14:4]" in f                               # conflict clause added for the leased IP
+    assert "port 67 or port 68" in f                      # DHCP clause
+    assert "arp[6:2] = 2" in f                            # reachability clause
+    keeper.yiaddr = "100.64.4.7"
+    assert keeper._sniffer_filter() == f                  # unchanged once a lease is held
 
 
 def test_unanswered_nudges_warn_once(lk, caplog):

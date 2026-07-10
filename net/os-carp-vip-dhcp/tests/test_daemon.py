@@ -633,6 +633,16 @@ def test_arp_conflict_ignores_our_own_mac(lk, caplog):
     assert not any("using our VIP" in r.getMessage() for r in caplog.records)
 
 
+def test_arp_conflict_ignores_our_own_wan_mac(lk, caplog, monkeypatch):
+    # FreeBSD egresses VIP traffic from the physical MAC, so our own WAN MAC using
+    # the VIP is our own egress, not a conflict (matched case-insensitively).
+    monkeypatch.setattr(lk, "get_if_hwaddr", lambda iface: "de:ad:be:ef:ca:fe")
+    keeper = _nudge_keeper(lk)
+    with caplog.at_level("WARNING", logger="lease-keeper"):
+        keeper._on_arp_conflict(_ArpPkt(lk, 2, "100.64.4.7", "100.64.4.1", hwsrc="DE:AD:BE:EF:CA:FE"))
+    assert not any("using our VIP" in r.getMessage() for r in caplog.records)
+
+
 def test_arp_conflict_ignores_other_ip(lk, caplog):
     keeper = _nudge_keeper(lk)
     with caplog.at_level("WARNING", logger="lease-keeper"):

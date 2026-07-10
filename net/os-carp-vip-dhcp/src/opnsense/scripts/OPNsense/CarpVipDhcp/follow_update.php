@@ -128,7 +128,7 @@ if ($rc !== 0) {
 if ($old_vip_iface !== '' && $old_ip !== $new_ip) {
     $dev = get_real_interface($old_vip_iface);
     if (!empty($dev)) {
-        mwexec('/sbin/ifconfig ' . escapeshellarg($dev) . ' -alias ' . escapeshellarg($old_ip));
+        exec('/sbin/ifconfig ' . escapeshellarg($dev) . ' -alias ' . escapeshellarg($old_ip) . ' 2>&1');
     }
 }
 

@@ -23,9 +23,8 @@ CONFIG_XML = "/conf/config.xml"
 RUN_DIR = "/var/run"
 
 # A gateway ARP reply counts as reachability confirmation only while fresh: within
-# this many nudge intervals (matching the daemon's unanswered-nudge threshold), but
-# never less than the floor (guards very short intervals). Older = stale -> the GUI
-# flags it, mirroring the daemon's "ARP nudge unanswered" warning.
+# this many nudge intervals, but never less than the floor (guards very short
+# intervals). Older = stale -> the GUI shows it as unconfirmed.
 ARP_CONFIRM_INTERVALS = 3
 ARP_CONFIRM_FLOOR = 90
 
@@ -50,9 +49,16 @@ def _epoch_and_age(value):
     return epoch, (int(time.time()) - epoch if epoch else None)
 
 
+def _int_token(value):
+    try:
+        return int(value)
+    except ValueError:
+        return None
+
+
 def parse_heartbeat(path):
     result = {"bound": None, "lease": None, "t1": None, "t2": None, "timing_source": None,
-              "standby": False, "mismatch": False, "mismatch_got": None, "mismatch_want": None,
+              "mismatch": False, "mismatch_got": None, "mismatch_want": None,
               "hb_epoch": None, "hb_age": None, "nudge_epoch": None, "nudge_age": None, "gw": None,
               "arp_reply_epoch": None, "arp_reply_age": None}
     try:
@@ -72,20 +78,11 @@ def parse_heartbeat(path):
             value = part.split("=", 1)[1]
             result["bound"] = None if value == "-" else value
         elif part.startswith("lease="):
-            try:
-                result["lease"] = int(part.split("=", 1)[1])
-            except ValueError:
-                pass
+            result["lease"] = _int_token(part.split("=", 1)[1])
         elif part.startswith("t1="):
-            try:
-                result["t1"] = int(part.split("=", 1)[1])
-            except ValueError:
-                pass
+            result["t1"] = _int_token(part.split("=", 1)[1])
         elif part.startswith("t2="):
-            try:
-                result["t2"] = int(part.split("=", 1)[1])
-            except ValueError:
-                pass
+            result["t2"] = _int_token(part.split("=", 1)[1])
         elif part.startswith("src="):
             result["timing_source"] = part.split("=", 1)[1]
         elif part.startswith("nudge="):
@@ -102,8 +99,6 @@ def parse_heartbeat(path):
                 pass
         elif part.startswith("gw="):
             result["gw"] = part.split("=", 1)[1]
-        elif part == "STANDBY":
-            result["standby"] = True
         elif part == "MISMATCH":
             result["mismatch"] = True
         elif part.startswith("got="):
@@ -158,14 +153,15 @@ def read_keepers(states, names):
         parts = line.split("|")
         if len(parts) < 4:
             continue
+        # keeper.conf field order (keep in lockstep with the template + rc.d readers):
+        # 0 request|1 iface|2 chaddr|3 demote|4 vhid|5 follow|6 vendor|7 client-id|
+        # 8 hostname|9 arp-nudge|10 arp-listen-promisc
         request, iface, chaddr, demote = parts[0], parts[1], parts[2], parts[3]
         vhid = parts[4] if len(parts) > 4 else ""
-        run_only = parts[5] if len(parts) > 5 else "0"
-        follow = parts[6] if len(parts) > 6 else "0"
-        try:
-            arp_nudge = int(parts[10]) if len(parts) > 10 and parts[10] else 0
-        except ValueError:
-            arp_nudge = 0
+        follow = parts[5] if len(parts) > 5 else "0"
+        arp_nudge = 0
+        if len(parts) > 9:
+            arp_nudge = _int_token(parts[9]) or 0
         kid = keeper_id(request)
         pid = pid_alive("%s/carpvipdhcp-%s.pid" % (RUN_DIR, kid))
         entry = {
@@ -176,7 +172,6 @@ def read_keepers(states, names):
             "vhid": vhid,
             "carp_state": states.get(vhid) if vhid else None,
             "demote_on_lease_loss": demote == "1",
-            "run_only_on_master": run_only == "1",
             "follow_ip": follow == "1",
             "arp_nudge": arp_nudge,
             "running": pid is not None,

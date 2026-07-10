@@ -341,8 +341,7 @@ sequenceDiagram
 - **Gateway-monitor noise (dpinger):** the backup always logs `WAN_ISP` as DOWN —
   that *is* the mechanism, not a fault.
 - **Failover transient:** connection states not covered by pfsync are lost across
-  the switch. (In the niche run-only-on-master mode the new master must also re-DORA
-  the lease, adding a few seconds.)
+  the switch.
 - **Gateway that never re-ARPs the VIP (steady-state blackhole) — verify this:** some
   ISP gateways ignore gratuitous ARP *and* never re-query an ARP entry once it
   expires. A few minutes after the last refresh, return traffic to the VIP then
@@ -378,8 +377,8 @@ sequenceDiagram
   move per 60 s). During a T2 **REBIND** the expected-server check is intentionally
   relaxed (any server may answer — legitimate DHCP), widening the window. This is the
   same untrusted-shared-L2 exposure as the ARP-spoofing bullet above, and moot where the
-  ISP isolates you per VLAN/port. On a shared L2, prefer **run-only-on-master** plus a
-  strict upstream, or pin the address (follow off).
+  ISP isolates you per VLAN/port. On a shared L2, pin the address (follow off) or use a
+  strict upstream.
 - **Stopping the service is not the same as disabling a keeper:** disabling/removing a
   keeper and pressing Apply drops it from `keeper.conf`, so the CARP eligibility hook
   ignores it — no demotion. Stopping the whole *service*, by contrast, freezes the
@@ -435,12 +434,11 @@ skip it entirely and pull NTP/DNS/config from the master over SYNC, dropping §6
 3. **CARP VIP** `123.123.123.123/24`, vhid 9, `pass`, advskew 0/100 →
    _Interfaces → Virtual IPs_.
 4. **Plugin** [os-carp-vip-dhcp](../README.md): a keeper on the VIP, `followIp=1`.
-   Ungated gives seamless failover, but both nodes then periodically source the
-   virtual MAC (DHCP renewals) on the shared WAN-front switch → MAC-table flap;
-   **run-only-on-master** avoids that (only the master sources it) at the cost of a
-   small DORA gap on failover. Choose per how your ISP/switch tolerates the MAC. (The
-   ARP nudge is master-gated regardless of this choice, so it never adds to the flap —
-   only the DHCP renewals in ungated mode do.)
+   Both nodes hold the lease warm, so failover is seamless — but on a shared WAN-front
+   switch both nodes periodically source the virtual MAC (DHCP renewals), which can
+   cause a MAC-table flap; use a switch/topology that tolerates it (or a dedicated
+   point-to-point uplink). (The ARP nudge is master-gated, so it never adds to the flap
+   — only the DHCP renewals do.)
 5. **SYNC if:** `10.2.2.1/30` / `.2/30`; pfsync + XMLRPC config-sync →
    _System → High Availability_.
 6. **Gateways:** `WAN_ISP` (123.123.123.1, on WAN), `PEER_SYNC` (peer's SYNC IP, on

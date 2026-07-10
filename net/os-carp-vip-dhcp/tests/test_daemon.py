@@ -2,6 +2,8 @@
 import time
 import types
 
+import pytest
+
 
 def test_sane_ipv4(lk):
     assert lk._sane_ipv4("100.64.4.7")
@@ -78,29 +80,17 @@ def test_on_dhcp_reply_captures_option56_message(lk):
     assert keeper._rx.message == "pool exhausted"
 
 
-def test_dhcpnak_logs_option56_reason(lk, caplog):
+@pytest.mark.parametrize("message, expect", [
+    ("lease not available", "lease not available"),   # option-56 text surfaced
+    (b"bad chaddr", "bad chaddr"),                     # a bytes reason is decoded
+    (None, "DHCPNAK received"),                        # no reason -> the NAK is still logged
+])
+def test_dhcpnak_logs_reason(lk, caplog, message, expect):
     keeper = lk.Keeper("eth0", "00:00:5e:00:01:fe", "100.64.4.7", hbfile=None)
-    keeper._rx = lk.DhcpReply(lk.NAK, None, "100.64.4.1", None, None, None, None, "lease not available")
+    keeper._rx = lk.DhcpReply(lk.NAK, None, "100.64.4.1", None, None, None, None, message)
     with caplog.at_level("WARNING", logger="lease-keeper"):
         assert keeper._wait_for_dhcp_reply(lk.ACK, 0.2) == "NAK"
-    nak = [r for r in caplog.records if "DHCPNAK" in r.getMessage()]
-    assert nak and "lease not available" in nak[0].getMessage()
-
-
-def test_dhcpnak_reason_bytes_decoded(lk, caplog):
-    keeper = lk.Keeper("eth0", "00:00:5e:00:01:fe", "100.64.4.7", hbfile=None)
-    keeper._rx = lk.DhcpReply(lk.NAK, None, "100.64.4.1", None, None, None, None, b"bad chaddr")
-    with caplog.at_level("WARNING", logger="lease-keeper"):
-        keeper._wait_for_dhcp_reply(lk.ACK, 0.2)
-    assert any("bad chaddr" in r.getMessage() for r in caplog.records)
-
-
-def test_dhcpnak_without_message_still_logs(lk, caplog):
-    keeper = lk.Keeper("eth0", "00:00:5e:00:01:fe", "100.64.4.7", hbfile=None)
-    keeper._rx = lk.DhcpReply(lk.NAK, None, "100.64.4.1", None, None, None, None)   # message defaults to None
-    with caplog.at_level("WARNING", logger="lease-keeper"):
-        keeper._wait_for_dhcp_reply(lk.ACK, 0.2)
-    assert any("DHCPNAK received" in r.getMessage() for r in caplog.records)
+    assert any(expect in r.getMessage() for r in caplog.records)
 
 
 def test_follow_accepts_same_class(lk, tmp_path):
@@ -156,19 +146,14 @@ def _peer_ack(lk, yiaddr, xid=0x22222222, server="100.64.4.1",
                               ("lease_time", 1800), "end"], yiaddr=yiaddr, chaddr=chaddr)
 
 
-def test_observed_peer_ack_records_change(lk, tmp_path):
+def test_observed_peer_ack_records_change_and_wakes(lk, tmp_path):
     keeper = _observe_keeper(lk, tmp_path)
+    assert not keeper._wake.is_set()
     keeper._on_dhcp_reply(_peer_ack(lk, "100.64.4.60"))
     assert keeper._observed_change is not None
     assert keeper._observed_change.yiaddr == "100.64.4.60"
     assert keeper._rx is None          # the first-party slot is untouched
-
-
-def test_observed_wakes_main_loop(lk, tmp_path):
-    keeper = _observe_keeper(lk, tmp_path)
-    assert not keeper._wake.is_set()
-    keeper._on_dhcp_reply(_peer_ack(lk, "100.64.4.60"))
-    assert keeper._wake.is_set()       # sniffer wakes the maintain-loop sleep at once
+    assert keeper._wake.is_set()       # ...and the maintain-loop sleep is woken at once
 
 
 def test_ignored_observation_does_not_wake(lk, tmp_path):
@@ -176,12 +161,6 @@ def test_ignored_observation_does_not_wake(lk, tmp_path):
     keeper._on_dhcp_reply(_peer_ack(lk, "100.64.4.7"))     # same address -> no change
     assert keeper._observed_change is None
     assert not keeper._wake.is_set()
-
-
-def test_observed_ignores_same_address(lk, tmp_path):
-    keeper = _observe_keeper(lk, tmp_path)
-    keeper._on_dhcp_reply(_peer_ack(lk, "100.64.4.7"))     # no change from what we hold
-    assert keeper._observed_change is None
 
 
 def test_observed_ignores_wrong_chaddr(lk, tmp_path):
@@ -260,72 +239,8 @@ def test_observed_serviced_by_maintain_loop(lk, tmp_path):
     keeper = _observe_keeper(lk, tmp_path)
     keeper._observed_change = _ack(lk, "100.64.4.60")
     keeper._wake.set()                 # as the sniffer would -> loop returns at once
-    keeper._sleep_gated(1)
+    keeper._sleep_interruptible(1)
     assert keeper.fired == ["100.64.4.60"]
-
-
-# ---- peer client-id mismatch warning (shared-lease sanity, review item #12) ----
-
-def _cid_keeper(lk, client_id="keeper-A"):
-    keeper = lk.Keeper("eth0", "00:00:5e:00:01:fe", "100.64.4.7", hbfile=None, client_id=client_id)
-    keeper.xid = 0x11111111                      # OUR in-flight xid
-    return keeper
-
-
-def _peer_request(lk, options, xid=0x22222222, chaddr=b"\x00\x00\x5e\x00\x01\xfe"):
-    """A DHCP REQUEST (op=BOOTREQUEST) from the peer on our shared chaddr."""
-    return _DhcpPkt(lk, xid, options + ["end"], op=lk.BOOTREQUEST, chaddr=chaddr)
-
-
-def _has_cid_warn(caplog):
-    return any("client-id" in r.getMessage() and "differs" in r.getMessage() for r in caplog.records)
-
-
-def test_peer_client_id_mismatch_warns(lk, caplog):
-    keeper = _cid_keeper(lk, "keeper-A")
-    with caplog.at_level("WARNING", logger="lease-keeper"):
-        keeper._on_dhcp_reply(_peer_request(lk, [("client_id", b"keeper-B")]))
-    assert _has_cid_warn(caplog)
-
-
-def test_peer_client_id_match_no_warn(lk, caplog):
-    keeper = _cid_keeper(lk, "keeper-A")
-    with caplog.at_level("WARNING", logger="lease-keeper"):
-        keeper._on_dhcp_reply(_peer_request(lk, [("client_id", b"keeper-A")]))
-    assert not _has_cid_warn(caplog)
-
-
-def test_peer_client_id_both_unset_no_warn(lk, caplog):
-    keeper = lk.Keeper("eth0", "00:00:5e:00:01:fe", "100.64.4.7", hbfile=None)   # no client-id
-    keeper.xid = 0x11111111
-    with caplog.at_level("WARNING", logger="lease-keeper"):
-        keeper._on_dhcp_reply(_peer_request(lk, [("server_id", "100.64.4.1")]))  # no option 61
-    assert not _has_cid_warn(caplog)
-
-
-def test_peer_client_id_wrong_chaddr_ignored(lk, caplog):
-    keeper = _cid_keeper(lk, "keeper-A")
-    with caplog.at_level("WARNING", logger="lease-keeper"):
-        keeper._on_dhcp_reply(_peer_request(lk, [("client_id", b"keeper-B")],
-                                            chaddr=b"\xaa\xbb\xcc\xdd\xee\xff"))
-    assert not _has_cid_warn(caplog)
-
-
-def test_own_request_not_client_id_checked(lk, caplog):
-    keeper = _cid_keeper(lk, "keeper-A")
-    with caplog.at_level("WARNING", logger="lease-keeper"):
-        # our OWN request (our xid) is not the peer path -> no comparison, no warn
-        keeper._on_dhcp_reply(_peer_request(lk, [("client_id", b"keeper-B")], xid=keeper.xid))
-    assert not _has_cid_warn(caplog)
-
-
-def test_peer_client_id_warns_once_per_value(lk, caplog):
-    keeper = _cid_keeper(lk, "keeper-A")
-    with caplog.at_level("WARNING", logger="lease-keeper"):
-        keeper._on_dhcp_reply(_peer_request(lk, [("client_id", b"keeper-B")]))
-        keeper._on_dhcp_reply(_peer_request(lk, [("client_id", b"keeper-B")]))   # same -> no re-warn
-    warns = [r for r in caplog.records if "client-id" in r.getMessage() and "differs" in r.getMessage()]
-    assert len(warns) == 1
 
 
 def test_id_opts_empty_by_default(lk):
@@ -420,32 +335,37 @@ def test_probe_failure_skips_nudge(lk, monkeypatch):
     assert keeper._last_nudge == 0.0
 
 
-def test_hb_includes_nudge_state(lk, tmp_path):
+def test_hb_nudge_tokens_present(lk, tmp_path):
     hb = tmp_path / "hb"
     keeper = _nudge_keeper(lk, hbfile=str(hb))
     keeper.router = "100.64.4.1"
     keeper._last_nudge = 1783350000.0
+    keeper._last_arp_reply = 1783350050.0
     keeper._hb()
     content = hb.read_text()
     assert " nudge=1783350000" in content
+    assert " arpok=1783350050" in content
     assert " gw=100.64.4.1" in content
 
 
-def test_hb_nudge_never_and_no_gateway(lk, tmp_path):
+def test_hb_nudge_zeros_when_never_and_no_target(lk, tmp_path):
     hb = tmp_path / "hb"
     keeper = _nudge_keeper(lk, hbfile=str(hb))
-    keeper.server = None
+    keeper.server = None             # enabled, but no target and nothing sent yet
     keeper._hb()
     content = hb.read_text()
-    assert " nudge=0" in content     # enabled but never sent
-    assert "gw=" not in content      # no target known yet
+    assert " nudge=0" in content
+    assert " arpok=0" in content
+    assert "gw=" not in content
 
 
 def test_hb_no_nudge_tokens_when_off(lk, tmp_path):
     hb = tmp_path / "hb"
     keeper = _nudge_keeper(lk, arp_nudge=0, hbfile=str(hb))
     keeper._hb()
-    assert "nudge=" not in hb.read_text()
+    content = hb.read_text()
+    assert "nudge=" not in content
+    assert "arpok=" not in content
 
 
 def test_master_transition_renews_early_and_nudges(lk):
@@ -498,7 +418,7 @@ def test_sigusr1_flag_services_nudge_within_a_second(lk, caplog):
     keeper = _nudge_keeper(lk)
     keeper._nudge_now = True             # what the SIGUSR1 handler sets
     with caplog.at_level("INFO", logger="lease-keeper"):
-        keeper._sleep_gated(1)
+        keeper._sleep_interruptible(1)
     assert keeper._nudge_now is False
     assert keeper._last_nudge > 0
     # Operator-triggered nudges must be visible in the log (the README says so).
@@ -516,7 +436,7 @@ def test_sigusr2_flag_rechecks_carp_role_within_a_second(lk):
     keeper._poll_carp_role()              # first observation: records backup
     assert keeper._renew_asap is False
     keeper._poll_role_now = True          # what the SIGUSR2 handler sets on a CARP event
-    keeper._sleep_gated(1)                # services the flag -> re-check -> transition
+    keeper._sleep_interruptible(1)                # services the flag -> re-check -> transition
     assert keeper._poll_role_now is False
     assert keeper._renew_asap is True     # backup->master: renew early
     assert keeper._last_nudge > 0         # and nudge immediately
@@ -548,21 +468,6 @@ class _ArpPkt:
         return self._arp
 
 
-def test_arp_reply_stamped_by_sniffer_consumed_on_next_nudge(lk):
-    keeper = _nudge_keeper(lk)
-    keeper.router = "100.64.4.254"           # nudge target = router (opt 3)
-    keeper._nudges_since_reply = 5           # simulate a prior unanswered streak
-    assert keeper._last_arp_reply == 0.0
-    # The sniffer thread only stamps the reply time -- it must NOT touch the
-    # main-thread-owned counter (that is what keeps them race-free).
-    keeper._on_arp_reply(_ArpPkt(lk, 2, "100.64.4.254", "100.64.4.7"))
-    assert keeper._last_arp_reply > 0
-    assert keeper._nudges_since_reply == 5
-    # The next nudge (main thread) consumes the reply and clears the streak.
-    keeper._arp_nudge(force=True)
-    assert keeper._nudges_since_reply == 0
-
-
 def test_arp_reply_ignores_unrelated(lk):
     keeper = _nudge_keeper(lk)
     keeper.router = "100.64.4.254"
@@ -587,150 +492,10 @@ def test_arp_reply_logged_at_debug(lk, caplog):
     assert any("ARP reply from 100.64.4.1" in r.getMessage() for r in caplog.records)
 
 
-def test_first_reply_logged_confirmed_at_info(lk, caplog):
-    keeper = _nudge_keeper(lk)
-    keeper.router = "100.64.4.1"
-    with caplog.at_level("INFO", logger="lease-keeper"):
-        keeper._arp_nudge(force=True)                                  # sent, no reply yet
-        keeper._on_arp_reply(_ArpPkt(lk, 2, "100.64.4.1", "100.64.4.7"))
-        keeper._arp_nudge(force=True)                                  # consumes -> first confirmation
-    assert any("ARP nudge confirmed" in r.getMessage() for r in caplog.records)
-
-
-def test_reply_after_unanswered_logs_recovery_at_info(lk, caplog):
-    keeper = _nudge_keeper(lk)
-    keeper.router = "100.64.4.1"
-
-    def reply():
-        keeper._on_arp_reply(_ArpPkt(lk, 2, "100.64.4.1", "100.64.4.7"))
-
-    # Establish confirmed reachability first (so the next event is a recovery, not a first).
-    keeper._arp_nudge(force=True)
-    reply()
-    keeper._arp_nudge(force=True)
-    with caplog.at_level("INFO", logger="lease-keeper"):
-        for _ in range(lk.ARP_UNANSWERED_WARN):          # unanswered streak
-            keeper._arp_nudge(force=True)
-        reply()
-        keeper._arp_nudge(force=True)                    # consume -> recovery
-    assert any("answered again" in r.getMessage() for r in caplog.records)
-
-
-# ---- ARP conflict detection (another MAC claiming our leased IP) ----
-
-def test_arp_conflict_warns(lk, caplog):
-    keeper = _nudge_keeper(lk)                    # yiaddr=100.64.4.7, chaddr=00:00:5e:00:01:fe
-    with caplog.at_level("WARNING", logger="lease-keeper"):
-        keeper._on_arp_conflict(_ArpPkt(lk, 2, "100.64.4.7", "100.64.4.1", hwsrc="aa:bb:cc:dd:ee:ff"))
-    assert any("using our VIP" in r.getMessage() for r in caplog.records)
-
-
-def test_arp_conflict_ignores_our_own_mac(lk, caplog):
-    keeper = _nudge_keeper(lk)
-    with caplog.at_level("WARNING", logger="lease-keeper"):
-        # Same as our CARP MAC (the peer node shares it) -> not a conflict.
-        keeper._on_arp_conflict(_ArpPkt(lk, 1, "100.64.4.7", "100.64.4.1", hwsrc="00:00:5e:00:01:fe"))
-    assert not any("using our VIP" in r.getMessage() for r in caplog.records)
-
-
-def test_arp_conflict_ignores_our_own_wan_mac(lk, caplog, monkeypatch):
-    # FreeBSD egresses VIP traffic from the physical MAC, so our own WAN MAC using
-    # the VIP is our own egress, not a conflict (matched case-insensitively).
-    monkeypatch.setattr(lk, "get_if_hwaddr", lambda iface: "de:ad:be:ef:ca:fe")
-    keeper = _nudge_keeper(lk)
-    with caplog.at_level("WARNING", logger="lease-keeper"):
-        keeper._on_arp_conflict(_ArpPkt(lk, 2, "100.64.4.7", "100.64.4.1", hwsrc="DE:AD:BE:EF:CA:FE"))
-    assert not any("using our VIP" in r.getMessage() for r in caplog.records)
-
-
-def test_arp_conflict_ignores_other_ip(lk, caplog):
-    keeper = _nudge_keeper(lk)
-    with caplog.at_level("WARNING", logger="lease-keeper"):
-        keeper._on_arp_conflict(_ArpPkt(lk, 1, "100.64.4.99", "100.64.4.1", hwsrc="aa:bb:cc:dd:ee:ff"))
-    assert not any("using our VIP" in r.getMessage() for r in caplog.records)
-
-
-def test_arp_conflict_throttled_per_mac(lk, caplog):
-    keeper = _nudge_keeper(lk)
-    pkt = _ArpPkt(lk, 2, "100.64.4.7", "100.64.4.1", hwsrc="aa:bb:cc:dd:ee:ff")
-    with caplog.at_level("WARNING", logger="lease-keeper"):
-        keeper._on_arp_conflict(pkt)
-        keeper._on_arp_conflict(pkt)              # same MAC within the re-warn window
-    warnings = [r for r in caplog.records if "using our VIP" in r.getMessage()]
-    assert len(warnings) == 1
-
-
-def test_sniffer_filter_tracks_leased_ip(lk):
-    keeper = lk.Keeper("eth0", "00:00:5e:00:01:fe", "100.64.4.7", hbfile=None)
-    assert "arp[14:4]" not in keeper._sniffer_filter()   # no lease yet -> no conflict clause
-    keeper.yiaddr = "100.64.4.7"
-    f = keeper._sniffer_filter()
-    assert "arp[6:2] = 2" in f                            # reachability clause kept
-    assert "arp[14:4]" in f                               # conflict clause added for the leased IP
-
-
-def test_unanswered_nudges_warn_once(lk, caplog):
-    keeper = _nudge_keeper(lk)                # target = server 100.64.4.1, probe -> master
-    with caplog.at_level("WARNING", logger="lease-keeper"):
-        for _ in range(lk.ARP_UNANSWERED_WARN + 2):
-            keeper._arp_nudge(force=True)
-    warnings = [r for r in caplog.records if "unanswered" in r.getMessage()]
-    assert len(warnings) == 1
-    assert keeper._nudges_since_reply >= lk.ARP_UNANSWERED_WARN
-    # Not in promiscuous mode -> the hint should point at enabling it.
-    assert "promiscuous" in warnings[0].getMessage()
-
-
-def test_unanswered_warning_omits_promisc_hint_when_already_promisc(lk, caplog):
-    keeper = _nudge_keeper(lk, arp_listen_promisc=True)
-    with caplog.at_level("WARNING", logger="lease-keeper"):
-        for _ in range(lk.ARP_UNANSWERED_WARN):
-            keeper._arp_nudge(force=True)
-    warnings = [r for r in caplog.records if "unanswered" in r.getMessage()]
-    assert len(warnings) == 1
-    # Promisc already on -> blame the carrier, do not suggest turning promisc on.
-    assert "carrier is likely dropping" in warnings[0].getMessage()
-
-
-def test_reply_resets_and_rearms_unanswered_warning(lk, caplog):
-    keeper = _nudge_keeper(lk)
-    keeper.router = "100.64.4.1"
-    with caplog.at_level("WARNING", logger="lease-keeper"):
-        for _ in range(lk.ARP_UNANSWERED_WARN):
-            keeper._arp_nudge(force=True)          # warns once, at the threshold
-        # A reply lands (stamped by the sniffer); the next nudge consumes it and clears.
-        keeper._on_arp_reply(_ArpPkt(lk, 2, "100.64.4.1", "100.64.4.7"))
-        keeper._arp_nudge(force=True)
-        assert keeper._nudges_since_reply == 0
-        # A fresh unanswered streak warns again -- the reset re-arms it (no latch).
-        for _ in range(lk.ARP_UNANSWERED_WARN):
-            keeper._arp_nudge(force=True)
-    warnings = [r for r in caplog.records if "unanswered" in r.getMessage()]
-    assert len(warnings) == 2
-
-
-def test_hb_includes_arp_reply_state(lk, tmp_path):
-    hb = tmp_path / "hb"
-    keeper = _nudge_keeper(lk, hbfile=str(hb))
-    keeper.router = "100.64.4.1"
-    keeper._last_nudge = 1783350000.0
-    keeper._last_arp_reply = 1783350050.0
-    keeper._hb()
-    content = hb.read_text()
-    assert " nudge=1783350000" in content
-    assert " arpok=1783350050" in content
-
-
-def test_hb_arpok_zero_when_no_reply(lk, tmp_path):
-    hb = tmp_path / "hb"
-    keeper = _nudge_keeper(lk, hbfile=str(hb))
-    keeper._hb()
-    assert " arpok=0" in hb.read_text()
-
-
-def test_arp_listen_promisc_defaults_off(lk):
-    keeper = lk.Keeper("eth0", "00:00:5e:00:01:fe", "100.64.4.7", hbfile=None)
-    assert keeper.arp_listen_promisc is False
+def test_sniffer_filter_is_static(lk):
+    # A fixed BPF boundary: DHCP + ARP replies (nudge reachability), no lease dependence.
+    assert "port 67 or port 68" in lk.SNIFFER_FILTER      # DHCP clause
+    assert "arp[6:2] = 2" in lk.SNIFFER_FILTER            # reachability clause
 
 
 def test_sniffer_filter_captures_arp_and_honours_promisc(lk, monkeypatch):
@@ -754,44 +519,6 @@ def test_sniffer_filter_captures_arp_and_honours_promisc(lk, monkeypatch):
     assert "arp" in captured["filter"]        # ARP replies now reach the parser
     assert "port 67" in captured["filter"]     # ...alongside DHCP, unchanged
     assert captured["promisc"] is True         # opt-in flag reaches the socket
-
-
-# ---- run-only-on-master acquire grace (acq=): breaks demote/promote ping-pong ----
-
-def _gated_keeper(lk, hbfile):
-    return lk.Keeper("eth0", "00:00:5e:00:01:fe", "100.64.4.7",
-                     hbfile=hbfile, only_when_master=True, vhid=10)
-
-
-def test_hb_acq_token_when_gated_master_acquiring(lk, tmp_path):
-    hb = tmp_path / "hb"
-    keeper = _gated_keeper(lk, str(hb))
-    keeper.yiaddr = None                  # promoted, DORA in progress -> bound=-
-    keeper._acquiring_since = 1783350000.0
-    keeper._hb()
-    content = hb.read_text()
-    assert " bound=- " in content
-    assert " acq=1783350000" in content
-
-
-def test_hb_no_acq_token_once_bound(lk, tmp_path):
-    hb = tmp_path / "hb"
-    keeper = _gated_keeper(lk, str(hb))
-    keeper.yiaddr = "100.64.4.7"          # holding a lease -> grace no longer relevant
-    keeper._acquiring_since = 1783350000.0
-    keeper._hb()
-    assert "acq=" not in hb.read_text()
-
-
-def test_hb_no_acq_token_when_not_gated(lk, tmp_path):
-    hb = tmp_path / "hb"
-    keeper = lk.Keeper("eth0", "00:00:5e:00:01:fe", "100.64.4.7", hbfile=str(hb))  # not only_when_master
-    keeper.yiaddr = None
-    keeper._acquiring_since = 1783350000.0
-    keeper._hb()
-    content = hb.read_text()
-    assert " bound=- " in content
-    assert "acq=" not in content          # a plain keeper demotes immediately on loss (unchanged)
 
 
 # ---- follow across a changed gateway warns loudly (cross-subnet renumber) ----

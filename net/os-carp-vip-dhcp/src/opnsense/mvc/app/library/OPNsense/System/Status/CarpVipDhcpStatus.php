@@ -119,7 +119,7 @@ class CarpVipDhcpStatus extends AbstractStatus
 
     /**
      * null if the keeper is healthy, otherwise a short reason. Mirrors the CARP
-     * service-status hook's heartbeat semantics (STANDBY / MISMATCH / bound==)
+     * service-status hook's heartbeat semantics (MISMATCH / bound==)
      * and adds staleness detection for a dead or stuck daemon.
      */
     private function unhealthyReason(string $request): ?string
@@ -135,9 +135,6 @@ class CarpVipDhcpStatus extends AbstractStatus
         }
         if (strpos($content, 'MISMATCH') !== false) {
             return gettext('ISP handed a different address than the VIP');
-        }
-        if (strpos($content, 'STANDBY') !== false) {
-            return null;   // intentionally idle CARP backup, heartbeat fresh
         }
         if (strpos($content, 'bound=' . $request . ' ') !== false) {
             return $this->arpReachabilityReason($content);

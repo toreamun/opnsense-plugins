@@ -7,7 +7,7 @@
 # rc(8) wrapper for the CARP-VIP DHCP lease keepers (lease-keeper.py).
 # Reads /usr/local/etc/carpvipdhcp/keeper.conf (rendered by the configd template):
 # one line per enabled keeper ->
-#   REQUEST_IP|IFACE|CHADDR|DEMOTE_ON_LEASE_LOSS|VHID|RUN_ONLY_ON_MASTER|FOLLOW_IP|VENDOR_CLASS|CLIENT_ID|HOSTNAME|ARP_NUDGE|ARP_LISTEN_PROMISC.
+#   REQUEST_IP|IFACE|CHADDR|DEMOTE_ON_LEASE_LOSS|VHID|FOLLOW_IP|VENDOR_CLASS|CLIENT_ID|HOSTNAME|ARP_NUDGE|ARP_LISTEN_PROMISC.
 # Starts one supervised daemon per line, keyed by a filesystem-safe request-IP id.
 
 . /etc/rc.subr
@@ -35,7 +35,7 @@ carpvipdhcp_start()
 {
     [ -f "${conf}" ] || { echo "no config"; return 0; }
     count=0
-    while IFS='|' read -r request iface chaddr demote vhid runmaster follow vendorclass clientid hostname arpnudge arplistenpromisc || [ -n "${request}" ]; do
+    while IFS='|' read -r request iface chaddr demote vhid follow vendorclass clientid hostname arpnudge arplistenpromisc || [ -n "${request}" ]; do
         [ -n "${request}" ] || continue
         case "${request}" in \#*) continue ;; esac
         if [ -z "${iface}" ] || [ -z "${chaddr}" ]; then
@@ -53,14 +53,9 @@ carpvipdhcp_start()
             --pidfile "${run_dir}/carpvipdhcp-${id}.child.pid" \
             --hbfile "${run_dir}/carpvipdhcp-${id}.hb" \
             --logfile "${log_dir}/carpvipdhcp-${id}.log"
-        # The vhid identifies the keeper's CARP VIP; individual daemon features
-        # (DHCP gating, the ARP-nudge master check) decide whether to gate on it.
+        # The vhid identifies the keeper's CARP VIP; the ARP nudge uses it to only
+        # nudge while this node is CARP master.
         [ -n "${vhid}" ] && set -- "$@" --vhid "${vhid}"
-        # Run-only-on-master keepers self-gate: the daemon runs on both nodes but
-        # only sends DHCP while this node is CARP master for the vhid (else stands by).
-        if [ "${runmaster}" = "1" ]; then
-            set -- "$@" --only-when-master
-        fi
         # Follow mode: accept a changed ISP address and rewrite the CARP VIP to match.
         if [ "${follow}" = "1" ]; then
             set -- "$@" --follow

@@ -31,11 +31,6 @@
                     <Default>0</Default>
                 </demoteOnLeaseLoss>
 
-                <!-- Only send DHCP (hold the lease) while this node is CARP master for the VIP; stand by (idle) on backup. Niche: adds a failover DORA gap. Default: off (hold on both nodes). -->
-                <runOnlyOnMaster type="BooleanField">
-                    <Default>0</Default>
-                </runOnlyOnMaster>
-
                 <!-- Dynamic DHCP: if the server hands out a DIFFERENT address, update the CARP VIP to match instead of alarming, so the VIP stays online. Default: on. Unset to enforce a fixed reservation (alarm on mismatch). -->
                 <followIp type="BooleanField">
                     <Default>1</Default>

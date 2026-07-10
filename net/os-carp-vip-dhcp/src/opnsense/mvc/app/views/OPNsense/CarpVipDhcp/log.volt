@@ -36,11 +36,8 @@
             }
         });
 
-        // Move the level filter and clear-log button into the grid's action bar
-        // so they share the row with the search / refresh / rowcount / columns /
-        // export icons instead of sitting on a line of their own (core
-        // Diagnostics/log.volt pattern). The level filter goes to the left of the
-        // bar, the clear button to the right with the other command icons.
+        // Move the level filter (left) and clear-log button (right) into the grid's
+        // action bar so they share the search/refresh/columns row (core log.volt pattern).
         let actionBar = $("#grid-log-header .actionBar");
         $("#level-wrapper").detach().prependTo(actionBar);
         $("#command-wrapper").detach().appendTo(actionBar);

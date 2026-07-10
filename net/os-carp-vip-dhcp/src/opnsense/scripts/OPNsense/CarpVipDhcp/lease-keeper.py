@@ -3,64 +3,46 @@
 
 Keeps a DHCP lease alive for a given ``chaddr`` WITHOUT binding it to the
 interface's hardware MAC, so the leased address (typically a CARP virtual IP)
-stays routed by the ISP. The broadcast flag is set so OFFER/ACK are broadcast.
-This does lease maintenance ONLY; ARP for the address and data traffic are
-handled by CARP. Optionally (--arp-nudge) it also refreshes the upstream
-gateway's ARP entry for the leased address, for gateways that ignore
-gratuitous ARP and never re-ARP an expired entry (traffic to the address
-silently blackholes until the gateway receives an ARP *request* from it). It
-also watches for the gateway's ARP reply to that nudge as a reachability
-signal, warns if repeated nudges go unanswered (a likely sign the carrier is
-dropping them), and flags an ARP conflict if another MAC claims the leased
-address. By default it is ungated and runs on both HA nodes for redundancy;
-opt-in run-only-on-master gating restricts it to the CARP master.
+stays routed by the ISP. Lease maintenance ONLY -- ARP for the address and data
+traffic are handled by CARP. The BOOTP broadcast flag is set so OFFER/ACK are
+broadcast. Optionally (--arp-nudge) it refreshes the upstream gateway's ARP
+entry for the leased address, for gateways that never re-ARP an expired entry
+(traffic then silently blackholes until they get an ARP *request*). Runs on both
+HA nodes for redundancy.
 
 Robustness:
-  * Full DHCP lifecycle: DORA (Discover / Offer / Request / Ack, the lease
-    acquisition handshake) -> BOUND, RENEW at T1, REBIND at T2, re-DORA at expiry.
+  * Full DHCP lifecycle: DORA (Discover/Offer/Request/Ack) -> BOUND, RENEW at
+    T1, REBIND at T2, re-DORA at expiry.
   * Single instance via pidfile; heartbeat file (fresh = the lease is renewing).
   * Resilient sniffer: restarted if its thread dies (e.g. the interface flaps).
   * All I/O wrapped in try/except so the main loop never crashes; a non-zero
-    exit on a fatal error lets the supervisor restart it.
+    exit lets the supervisor restart it.
   * RELEASE is NOT sent on a normal stop (SIGTERM) -- only with
     --once/--release-on-exit -- so the address is not given up needlessly.
 
 Security posture (this daemon parses untrusted WAN traffic as root):
-  * The sniffer is NOT promiscuous by default: DHCP requests carry the BOOTP
-    broadcast flag so the server broadcasts its replies to a non-promiscuous
-    socket, and the gateway's unicast ARP reply to a nudge reaches us because
-    the CARP master already accepts the VIP's virtual MAC (its own traffic).
-    --arp-listen-promisc is an opt-in fallback (default off) for NICs that drop
-    non-primary unicast; it widens capture to the whole segment, so it warns
-    when enabled.
-  * The BPF filter is the next boundary: only DHCP (udp port 67/68), ARP
-    *replies*, and (once bound) ARP claiming our leased IP reach Python;
-    everything else -- including the segment's broadcast who-has flood -- is
-    dropped in the kernel.
-  * A DHCP reply must carry the BOOTREPLY op; our own xid gates the first-party
-    path, and in follow mode a reply on our shared chaddr (the peer node's ACK)
-    is read too, but only to RECORD an observed address change for the main
-    thread's hardened follow path. A peer REQUEST on our shared chaddr is read
-    only to compare its option-61 client-id against ours (an advisory warning)
-    (see _on_dhcp_reply). An ARP reply must come from the nudge target for our
-    leased IP (see _on_arp_reply) -- other packets are dropped early.
-  * Only the handful of DHCP options the keeper needs is extracted; there is
-    no full dissection of the reply's other option data (untrusted network
-    input -- it came from whatever answered on the wire, e.g. a rogue or
-    spoofed DHCP server).
+  * The sniffer is NOT promiscuous by default: the BOOTP broadcast flag makes
+    the server broadcast its replies to a non-promiscuous socket, and the
+    gateway's unicast ARP reply to a nudge reaches us because the CARP master
+    already accepts the VIP's virtual MAC. --arp-listen-promisc is an opt-in
+    fallback (warned when enabled) for NICs that drop non-primary unicast.
+  * The BPF filter is the next boundary: only DHCP (udp 67/68) and ARP replies
+    reach Python; everything else -- including the who-has flood -- is dropped
+    in the kernel.
+  * A reply must carry BOOTREPLY; our own xid gates the first-party path, and in
+    follow mode a reply on our shared chaddr (the peer's ACK) is read only to
+    RECORD an observed address change (see _on_dhcp_reply). Only the DHCP options
+    the keeper needs are extracted -- no dissection of the rest (untrusted input).
   * Follow mode never rewrites the CARP VIP from a single ACK: the new address
-    is validated for plausibility, routability class and expected server, and
+    is validated (plausibility, routability class, expected server) and
     rate-throttled against flap/spoof storms (see _handle_changed_address).
-  * A parse error in the sniffer callback is dropped (debug-logged); malformed
-    input can never take the main loop down.
+  * A parse error in the sniffer callback is dropped (debug-logged).
 
 Cooperating with ISP access-network policing (DHCP snooping, Dynamic ARP
-Inspection, gratuitous-ARP filtering, IP source guard, per-subscriber MAC
-limits): the design keeps the lease on the CARP virtual MAC and shapes the ARP
-nudge to match the snooped binding, so the carrier's guards see legitimate,
-consistent state. The README's "Playing nicely with ISP access-network
-security" section is the full map from each mechanism to how this code
-satisfies it; the load-bearing spots below point back to it.
+Inspection, IP source guard, per-subscriber MAC limits): the lease stays on the
+CARP virtual MAC and the ARP nudge is shaped to match the snooped binding, so
+the carrier's guards see consistent state. The README's "Playing nicely with
+ISP access-network security" section is the full map.
 
 Usage:
   lease-keeper.py --iface <if> --chaddr <mac> --request <ip>
@@ -87,7 +69,7 @@ from logging.handlers import RotatingFileHandler
 # going to daemon(8)'s /dev/null. Capture it instead and let main() log it once
 # logging is configured.
 try:
-    from scapy.all import ARP, Ether, IP, UDP, BOOTP, DHCP, AsyncSniffer, sendp, get_if_hwaddr
+    from scapy.all import ARP, Ether, IP, UDP, BOOTP, DHCP, AsyncSniffer, sendp
     _SCAPY_IMPORT_ERROR = None
 except Exception as _scapy_exc:   # ImportError, or scapy's own import-time failures
     _SCAPY_IMPORT_ERROR = _scapy_exc
@@ -97,10 +79,8 @@ LOG = logging.getLogger("lease-keeper")
 # DHCP message types (RFC 2131).
 OFFER, ACK, NAK = 2, 5, 6
 BOOTREPLY = 2              # BOOTP op field: a server->client reply (unrelated to OFFER)
-BOOTREQUEST = 1            # BOOTP op field: a client->server request (the peer's DISCOVER/REQUEST)
 
 # Timing / retry tunables (seconds unless noted).
-GATE_POLL = 5              # between CARP-master checks when run-only-on-master is set
 HB_REFRESH = 30            # rewrite the heartbeat at least this often while holding a lease
 DEFAULT_LEASE = 3600       # fallback lease time if the server sends none
 DORA_ATTEMPTS = 5          # DISCOVER and REQUEST attempts per acquire
@@ -122,8 +102,6 @@ MIN_T1 = 30                # floor for the renew timer (very short leases)
 REBIND_MARGIN = 15         # ensure T2 is at least this far past T1
 BROADCAST_FLAG = 0x8000    # BOOTP flags: ask the server to broadcast OFFER/ACK
 ARP_NUDGE_MIN = 30         # floor for --arp-nudge so a typo cannot flood the segment
-ARP_UNANSWERED_WARN = 3    # warn after this many consecutive nudges with no gateway reply
-ARP_CONFLICT_REWARN = 3600  # re-warn about a persistent ARP conflict at most this often
 LOG_MAX_BYTES = 512 * 1024
 LOG_BACKUPS = 3
 
@@ -136,6 +114,11 @@ MAC_RE = re.compile(r"^([0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}$")
 
 
 _CGNAT = ipaddress.ip_network("100.64.0.0/10")
+
+# Static BPF capture filter: DHCP (broadcast OFFER/ACK) + ARP replies to our nudge
+# (arp[6:2]=2). A boundary, not an optimization -- it keeps everything else (incl. the
+# segment's broadcast who-has flood) out of the Python parser.
+SNIFFER_FILTER = "(udp and (port 67 or port 68)) or (arp and arp[6:2] = 2)"
 
 
 def _sane_ipv4(ip):
@@ -179,7 +162,7 @@ def mac2raw(m):
 
 class Keeper:
     def __init__(self, iface, chaddr, request_ip=None, eth_src=None,
-                 hbfile=None, release_on_exit=False, only_when_master=False, vhid=None,
+                 hbfile=None, release_on_exit=False, vhid=None,
                  follow=False, vendor_class=None, client_id=None, hostname=None,
                  arp_nudge=0, arp_listen_promisc=False):
         self.iface = iface
@@ -189,7 +172,6 @@ class Keeper:
         self.eth_src = (eth_src or chaddr).lower()
         self.hbfile = hbfile
         self.release_on_exit = release_on_exit
-        self.only_when_master = only_when_master
         self.vhid = str(vhid) if vhid else None
         self.follow = follow
         # ARP nudge: keep the upstream gateway's ARP entry for the leased address
@@ -204,21 +186,9 @@ class Keeper:
         self._last_nudge = 0.0
         self._nudge_gw = None          # last nudge target we logged (log again on change)
         self._nudge_warned = False     # warned once about a missing nudge target
-        # ARP-reply reachability, split cleanly across threads: the sniffer thread
-        # only stamps _last_arp_reply (a lone atomic float write); the "consumed up
-        # to here" bookmark and the unanswered counter are touched ONLY by the main
-        # thread (in _arp_nudge), so there is no cross-thread read-modify-write.
-        self._last_arp_reply = 0.0     # epoch of the gateway's last ARP reply (sniffer-written, 0 = none)
-        self._reply_seen_at = 0.0      # last _last_arp_reply the main thread has accounted for
-        self._nudges_since_reply = 0   # consecutive nudges with no new reply (unanswered detector)
-        # ARP conflict (another MAC claiming our leased IP). Detected + throttled
-        # entirely on the sniffer thread, so these are single-owner too.
-        self._sniffer_yiaddr = None    # leased IP the current sniffer filter was built for
-        self._last_conflict_warn = 0.0  # throttle for the conflict warning
-        self._conflict_mac = None       # last foreign MAC seen using our IP
-        self._own_mac = None            # our WAN iface's physical MAC (lazy; excluded from conflicts)
-        self._own_mac_resolved = False
-        self._peer_cid_warned = None    # last divergent peer client-id warned about (sniffer-owned)
+        # Reachability: the sniffer stamps _last_arp_reply when the gateway answers
+        # a nudge (a lone atomic float write); the status page surfaces its age.
+        self._last_arp_reply = 0.0     # epoch of the gateway's last ARP reply (0 = none)
         self._was_master = None        # CARP role at the last nudge check (None = unknown yet)
         self._nudge_now = False        # operator asked for an immediate nudge (SIGUSR1)
         self._poll_role_now = False    # a CARP transition fired -> re-check role now (SIGUSR2)
@@ -229,7 +199,6 @@ class Keeper:
         # (opt 60), client-id (61) or hostname (12) -- the "client identity checks"
         # row of the README's ISP-security section.
         self._id_opts = []
-        self._client_id = client_id     # kept for the peer client-id sanity check
         if vendor_class:
             self._id_opts.append(("vendor_class_id", vendor_class))
         if client_id:
@@ -239,9 +208,6 @@ class Keeper:
         self._followed_ip = None       # last address we asked configd to follow to
         self._follow_from = None       # address we followed FROM (for the retry watchdog)
         self._follow_fired_at = 0.0    # when we last dispatched follow_update (retry deadline)
-        self._last_master = True       # last known CARP-master decision (fail to this)
-        self._gated_standby = False    # currently standing by as CARP backup (run-only-on-master)
-        self._acquiring_since = None   # epoch a run-only-on-master DORA (re)started; grace for CARP
         # Follow throttle state, keyed by chaddr so it survives the follow-induced
         # restart (the request-IP-keyed runtime paths change on every follow).
         self._follow_state = "/var/run/carpvipdhcp-follow-%s" % _fs_safe(self.chaddr)
@@ -260,7 +226,7 @@ class Keeper:
         # drives the hardened follow -- see _on_dhcp_reply / _check_observed_follow.
         self._observed_change = None
         self._ev = threading.Event()
-        # General early-wake for the maintain-loop sleep (_sleep_gated): lets it
+        # General early-wake for the maintain-loop sleep (_sleep_interruptible): lets it
         # return before the 1s tick when there is pending work. Currently the
         # sniffer sets it on an observed address change so the follow fires in
         # milliseconds; a future fast-wake need should reuse this rather than mint
@@ -270,20 +236,6 @@ class Keeper:
         self._sniffer = None
 
     # ---- sniffer (resilient) ----
-    def _sniffer_filter(self):
-        # DHCP (broadcast OFFER/ACK) + ARP replies to our nudge (arp[6:2]=2). Once
-        # we hold a lease, also capture ARP whose SENDER protocol address is our
-        # leased IP (arp[14:4]) -- to spot another MAC claiming our address. The
-        # BPF filter is a boundary, not an optimization: it keeps everything else
-        # (incl. the segment's broadcast who-has flood) out of the Python parser.
-        f = "(udp and (port 67 or port 68)) or (arp and arp[6:2] = 2)"
-        try:
-            if self.yiaddr:
-                f += " or (arp and arp[14:4] = %d)" % int(ipaddress.IPv4Address(self.yiaddr))
-        except ValueError:
-            pass
-        return f
-
     def _start_sniffer(self):
         try:
             if self._sniffer:
@@ -296,9 +248,8 @@ class Keeper:
             # nudge reaches us because the CARP master already accepts the VIP's
             # virtual MAC. arp_listen_promisc is the opt-in fallback for NICs that
             # drop non-primary unicast (widens capture -- warned at startup).
-            self._sniffer_yiaddr = self.yiaddr   # what the filter below is built for
             self._sniffer = AsyncSniffer(
-                iface=self.iface, filter=self._sniffer_filter(),
+                iface=self.iface, filter=SNIFFER_FILTER,
                 prn=self._on_sniff, store=0, promisc=self.arp_listen_promisc)
             self._sniffer.start()
             return True
@@ -315,11 +266,6 @@ class Keeper:
             LOG.warning("DHCP-reply sniffer down -- (re)starting")
             self._start_sniffer()
             time.sleep(1)
-        elif self.yiaddr != self._sniffer_yiaddr:
-            # Our leased IP became known (or changed) -> rebuild the filter so the
-            # conflict clause (ARP sender == our IP) tracks the current address.
-            LOG.debug("rebuilding sniffer filter for leased IP %s", self.yiaddr)
-            self._start_sniffer()
 
     def _on_sniff(self, p):
         # One sniffer feeds two parsers; keep the DHCP and ARP concerns separate.
@@ -329,19 +275,14 @@ class Keeper:
             self._on_dhcp_reply(p)
         elif p.haslayer(ARP):
             self._on_arp_reply(p)      # gateway answering our nudge (reachability)
-            self._on_arp_conflict(p)   # someone else claiming our leased IP
 
     def _on_arp_reply(self, p):
-        """Record the gateway's ARP reply to our nudge as a reachability signal.
-        Only the reply to OUR who-has counts: op=2 (is-at), sender = the nudge
-        target gateway, target protocol address = our leased IP. Anything else on
-        the segment is ignored. Runs on the sniffer thread and does ONE thing --
-        stamp _last_arp_reply (a lone atomic write); the main thread consumes it
-        in _arp_nudge, so the counter/warn state is single-owner (no race).
-
-        The signal is advisory: an on-segment attacker could forge a reply (or
-        withhold one), so a green "reachable" is not proof. It only drives a
-        diagnostic; nothing here feeds lease/CARP/follow decisions."""
+        """Stamp _last_arp_reply when the gateway answers our nudge -- a reachability
+        signal the status page surfaces by age. Only the reply to OUR who-has counts:
+        op=2 (is-at), sender = the nudge target gateway, target = our leased IP. Runs
+        on the sniffer thread; the stamp is a lone atomic write. Advisory only (an
+        on-segment attacker could forge or withhold it); nothing here feeds
+        lease/CARP/follow decisions."""
         try:
             arp = p[ARP]
             if arp.op != 2:                     # 2 = is-at (reply); requests are filtered out in BPF
@@ -351,59 +292,9 @@ class Keeper:
                 return
             if arp.psrc == gw and arp.pdst == self.yiaddr:
                 self._last_arp_reply = time.time()
-                # Routine confirmation at DEBUG, mirroring "ARP nudge sent"; the
-                # main thread logs the first reply / recovery at INFO.
                 LOG.debug("ARP reply from %s (is-at) for %s", gw, self.yiaddr)
         except Exception as e:
             LOG.debug("ARP reply parse error: %s", e)
-
-    def _own_wan_mac(self):
-        """Our WAN interface's own physical MAC, resolved once and cached. FreeBSD
-        egresses VIP-sourced traffic from this MAC, so an ARP from it using our VIP
-        is our own egress, not a conflict. None if it cannot be determined."""
-        if not self._own_mac_resolved:
-            self._own_mac_resolved = True
-            try:
-                self._own_mac = (get_if_hwaddr(self.iface) or "").lower() or None
-            except Exception:
-                self._own_mac = None
-        return self._own_mac
-
-    def _on_arp_conflict(self, p):
-        """Log if another MAC claims our leased VIP -- an ARP whose sender IP is
-        ours but whose sender MAC is not our CARP MAC. On an HA pair this is
-        usually benign: the peer node egresses VIP-sourced traffic from its OWN
-        physical WAN MAC (FreeBSD CARP does not source that traffic from the
-        virtual MAC), which on the wire is indistinguishable from a genuine
-        impostor -- both are just a non-CARP MAC using the VIP, and neither CARP
-        adverts nor the peer's DHCP expose the peer's physical MAC to whitelist
-        it. So this is purely advisory: it logs (saying as much), never acts. Our
-        OWN WAN MAC and the peer's CARP MAC (== our chaddr) are excluded outright,
-        so only the peer's physical MAC (or a genuine impostor) can surface here.
-        Throttled: re-warns only when the offending MAC changes or after
-        ARP_CONFLICT_REWARN. Touched only here (sniffer thread) -> single-owner."""
-        try:
-            if not self.yiaddr:
-                return
-            arp = p[ARP]
-            if arp.psrc != self.yiaddr:
-                return
-            mac = (arp.hwsrc or "").lower()
-            if not mac or mac == self.chaddr or mac == self._own_wan_mac():
-                return   # the peer's shared CARP MAC or our own WAN MAC -> not a conflict
-            now = time.time()
-            if mac == self._conflict_mac and now - self._last_conflict_warn < ARP_CONFLICT_REWARN:
-                return
-            self._conflict_mac = mac
-            self._last_conflict_warn = now
-            LOG.warning("%s is using our VIP %s (not our CARP MAC %s). On an HA pair "
-                        "this is almost always the peer node's own WAN MAC -- CARP "
-                        "egresses VIP traffic from the physical MAC on FreeBSD, so it is "
-                        "expected and harmless. Only a concern if that MAC belongs to "
-                        "neither node (a real duplicate address or ISP reassignment).",
-                        mac, self.yiaddr, self.chaddr)
-        except Exception as e:
-            LOG.debug("ARP conflict parse error: %s", e)
 
     def _parse_reply(self, p, yiaddr):
         """Snapshot only the handful of DHCP options the keeper acts on into a
@@ -443,15 +334,6 @@ class Keeper:
             if not (p.haslayer(BOOTP) and p.haslayer(DHCP)):
                 return
             b = p[BOOTP]
-            # A REQUEST from the peer on our shared chaddr carries its option-61
-            # client-id; check it diverges from ours (advisory). Both HA nodes must
-            # present the SAME client-id, or a server that keys the lease on option
-            # 61 instead of the chaddr hands them different addresses and the shared
-            # VIP breaks. Sniffer-thread single-owner; only logs, never acts.
-            if b.op == BOOTREQUEST:
-                if b.xid != self.xid and self._chaddr_matches(b):
-                    self._check_peer_client_id(p)
-                return
             if b.op != BOOTREPLY:
                 return
             # First-party path: a reply to OUR in-flight exchange (random xid,
@@ -481,33 +363,6 @@ class Keeper:
                 self._wake.set()   # wake the maintain-loop sleep now, don't wait for the tick
         except Exception as e:
             LOG.debug("DHCP reply parse error: %s", e)
-
-    def _check_peer_client_id(self, p):
-        """Warn if the peer's DHCP client-id (option 61) differs from ours. Both HA
-        nodes must present the same client-id for the shared VIP; a server that keys
-        the lease on option 61 (not the chaddr) would otherwise hand the two nodes
-        different addresses and the shared VIP breaks. Passive/advisory, sniffer-thread
-        single-owner -- warns once per distinct divergent value (config-sync keeps the
-        keeper config, hence the client-id, identical across nodes)."""
-        try:
-            peer_cid = None
-            for o in p[DHCP].options:
-                if isinstance(o, tuple) and o[0] == "client_id":
-                    peer_cid = o[1]
-                    break
-            if isinstance(peer_cid, str):
-                peer_cid = peer_cid.encode()
-            our_cid = self._client_id.encode() if self._client_id else None
-            if peer_cid == our_cid or peer_cid == self._peer_cid_warned:
-                return
-            self._peer_cid_warned = peer_cid
-            LOG.warning("peer DHCP client-id %r differs from ours %r on the shared chaddr "
-                        "%s -- both HA nodes must use the SAME client-id, or a server that "
-                        "keys the lease on option 61 will hand them different addresses and "
-                        "break the shared VIP (config-sync keeps them identical)",
-                        peer_cid, our_cid, self.chaddr)
-        except Exception as e:
-            LOG.debug("peer client-id parse error: %s", e)
 
     # ---- DHCP protocol (send / await reply / DORA / renew / release) ----
 
@@ -562,8 +417,6 @@ class Keeper:
         for attempt in range(1, DORA_ATTEMPTS + 1):
             if self.stop:
                 return False
-            if self.only_when_master and not self._is_master():
-                return False
             self._ensure_sniffer()
             self._rx = None
             try:
@@ -585,8 +438,6 @@ class Keeper:
             return False
         for attempt in range(1, DORA_ATTEMPTS + 1):
             if self.stop:
-                return False
-            if self.only_when_master and not self._is_master():
                 return False
             self._rx = None
             try:
@@ -710,13 +561,6 @@ class Keeper:
             gw = self._nudge_target()
             if gw:
                 extra += " gw=%s" % gw
-        # While a run-only-on-master keeper is (re)acquiring after promotion it has
-        # no lease yet, so bound=-. Publish acq=<start> so the CARP eligibility hook
-        # can grace this bounded DORA window instead of demoting us the instant we
-        # take over -- which, paired with demote_on_lease_loss, would flap the VIP
-        # back and forth between the nodes (neither can hold it through its DORA).
-        if not self.yiaddr and self.only_when_master and self._acquiring_since:
-            extra += " acq=%d" % int(self._acquiring_since)
         self._write_hb("%d bound=%s lease=%d t1=%d t2=%d src=%s%s\n"
                        % (int(time.time()), self.yiaddr or "-", self.lease, t1, t2, src, extra))
 
@@ -862,17 +706,13 @@ class Keeper:
                  rx.yiaddr, self.yiaddr)
         self._handle_changed_address(rx.yiaddr, rx, "OBSERVED", release_on_enforce=False)
 
-    # ---- CARP role, gating & standby ----
-
-    def _hb_standby(self):
-        # Run-only-on-master: we are CARP backup and intentionally hold no lease.
-        self._write_hb("%d STANDBY\n" % int(time.time()))
+    # ---- CARP role (master probe, transitions) ----
 
     def _probe_carp_master(self):
         """Raw CARP-role probe for our vhid: True/False from ifconfig, None when
         the probe itself fails; no vhid configured -> True (nothing to gate on).
-        Callers apply their own failure policy: _is_master fails open with the
-        last known role, the ARP nudge fails closed."""
+        Callers apply their own policy on a None probe -- the ARP nudge fails closed
+        (no nudge unless a confirmed MASTER); the CARP-transition poll just skips."""
         if not self.vhid:
             return True
         try:
@@ -882,18 +722,6 @@ class Keeper:
             return ("carp: MASTER vhid %s " % self.vhid) in out
         except (OSError, subprocess.SubprocessError):
             return None
-
-    def _is_master(self):
-        """True if we should act as a DHCP client now: gating off, or this node is
-        CARP master for our vhid. On a failed probe, keep the last known decision
-        (fail open) so a transient ifconfig failure does not flap both nodes to
-        master at once."""
-        if not self.only_when_master or not self.vhid:
-            return True
-        probed = self._probe_carp_master()
-        if probed is not None:
-            self._last_master = probed
-        return self._last_master
 
     def _poll_carp_role(self):
         """Watch for a backup->master transition (called on the heartbeat
@@ -962,44 +790,10 @@ class Keeper:
                       hwdst="00:00:00:00:00:00", pdst=gw),
                   iface=self.iface, verbose=0)
             self._last_nudge = time.time()
-            # Reachability accounting (main-thread-only; the sniffer just stamps
-            # _last_arp_reply). If a reply landed since we last looked, we are
-            # reachable -> clear the counter; otherwise this nudge went unanswered.
-            # The counter only steps +1 or resets to 0, so it lands on the threshold
-            # exactly once per streak -> warn there (no separate "warned" latch). The
-            # hint depends on whether we are already promiscuous: if we are, promisc
-            # is not the fix (the carrier is dropping it); if not, that NIC may simply
-            # not surface the unicast reply.
-            if self._last_arp_reply > self._reply_seen_at:
-                # A reply arrived since the last nudge -> reachable. Log the
-                # positive transitions at INFO (first confirmation, or recovery
-                # after an unanswered streak), mirroring the nudge-active INFO and
-                # the unanswered WARNING; every individual reply is at DEBUG.
-                if self._reply_seen_at == 0.0:
-                    LOG.info("ARP nudge confirmed: %s replied for %s", gw, self.yiaddr)
-                elif self._nudges_since_reply >= ARP_UNANSWERED_WARN:
-                    LOG.info("ARP nudge answered again by %s after %d unanswered",
-                             gw, self._nudges_since_reply)
-                self._reply_seen_at = self._last_arp_reply
-                self._nudges_since_reply = 0
-            else:
-                self._nudges_since_reply += 1
-            if self._nudges_since_reply == ARP_UNANSWERED_WARN:
-                if self.arp_listen_promisc:
-                    hint = ("the gateway is not answering -- with promiscuous "
-                            "listening already on, the carrier is likely dropping "
-                            "the nudge (DAI/DHCP snooping)")
-                else:
-                    hint = ("the gateway may be dropping it (DAI/DHCP snooping), or "
-                            "this NIC may not surface the unicast reply without "
-                            "'ARP listen in promiscuous mode'")
-                LOG.warning("ARP nudge unanswered: %d sent to %s for %s with no reply "
-                            "-- %s", self._nudges_since_reply, gw, self.yiaddr, hint)
-            # Every fire is logged, but at the right level: the first one (and any
-            # target change) at INFO so the default log shows the nudge is active;
-            # the routine repeats at DEBUG, so they are there in "Debug (all)"
-            # without flooding INFO (nudges fire every arp_nudge seconds, oftener
-            # than DHCP renews).
+            # Log the first nudge (and any target change) at INFO so the default log
+            # shows the nudge is active; routine repeats at DEBUG (they fire oftener
+            # than DHCP renews). Whether the gateway actually answered is surfaced by
+            # age on the status page (via _last_arp_reply -> the heartbeat's arpok=).
             if gw != self._nudge_gw:
                 LOG.info("ARP nudge active: who-has %s tell %s (src %s) every %ds",
                          gw, self.yiaddr, self.chaddr, self.arp_nudge)
@@ -1018,12 +812,10 @@ class Keeper:
             slept += 1
         return slept
 
-    def _sleep_gated(self, secs):
-        """Sleep up to secs (1s steps). Return False early on stop or, when
-        run-only-on-master is set, on CARP-master loss (checked every GATE_POLL).
-        Also services an operator-requested immediate nudge (SIGUSR1) and a
-        CARP-transition re-check (SIGUSR2) so both act within a second instead of
-        at the next heartbeat tick."""
+    def _sleep_interruptible(self, secs):
+        """Sleep up to secs (1s steps). Return False early on stop. Also services an
+        operator-requested immediate nudge (SIGUSR1) and a CARP-transition re-check
+        (SIGUSR2) so both act within a second instead of at the next heartbeat tick."""
         slept = 0
         while slept < secs and not self.stop:
             if self._poll_role_now:
@@ -1044,8 +836,6 @@ class Keeper:
                 # A peer-ACK observation is pending -> follow now (rationale +
                 # the dual-master window it closes are in _check_observed_follow).
                 self._check_observed_follow()
-            if self.only_when_master and slept % GATE_POLL == 0 and not self._is_master():
-                return False
             # Event-driven sleep: return at once when the sniffer signals a fresh
             # observation, otherwise time out after ~1s to run the periodic checks.
             if self._wake.wait(1.0):
@@ -1057,7 +847,7 @@ class Keeper:
         """Sleep up to secs while holding a lease, rewriting the heartbeat every
         HB_REFRESH so a healthy keeper never looks stale (leases can be hours and
         the CARP demotion hook only sees heartbeat freshness). Returns False early
-        on stop or CARP-master loss."""
+        on stop."""
         remaining = secs
         while remaining > 0 and not self.stop:
             if self._renew_asap:
@@ -1066,7 +856,7 @@ class Keeper:
                 self._renew_asap = False
                 return not self.stop
             chunk = min(HB_REFRESH, remaining)
-            if not self._sleep_gated(chunk):
+            if not self._sleep_interruptible(chunk):
                 return False
             remaining -= chunk
             self._hb()
@@ -1081,11 +871,10 @@ class Keeper:
         while not self.stop and not self._start_sniffer():
             LOG.warning("sniffer start failed -- retrying in %ds", SNIFFER_RETRY)
             self._sleep(SNIFFER_RETRY)
-        gate = (" (only when CARP master, vhid %s)" % self.vhid) if self.only_when_master else ""
         # eth-src matters for L2 debugging but only when it differs from the chaddr.
         ethsrc = (" eth-src=%s" % self.eth_src) if self.eth_src != self.chaddr else ""
-        LOG.info("lease-keeper active on %s: chaddr=%s%s request=%s%s",
-                 self.iface, self.chaddr, ethsrc, self.request_ip or "any", gate)
+        LOG.info("lease-keeper active on %s: chaddr=%s%s request=%s",
+                 self.iface, self.chaddr, ethsrc, self.request_ip or "any")
         time.sleep(0.5)
         while not self.stop:
             # The keeper must NEVER die on a bad DHCP state: catch any unexpected
@@ -1114,43 +903,22 @@ class Keeper:
         """One iteration of the maintain loop. Returns to run() (which loops again)
         on every state transition; any exception it raises is caught by run() and
         retried, so a transient fault can never terminate the keeper."""
-        # Run-only-on-master gating: stand by (no DHCP) while we are CARP backup.
-        # Log the master<->backup mode change once per transition (not every poll).
-        if self.only_when_master:
-            if not self._is_master():
-                if not self._gated_standby:
-                    LOG.info("CARP backup for vhid %s -- releasing the lease and standing by", self.vhid)
-                    self._gated_standby = True
-                if self.yiaddr:
-                    self.release()
-                    self.yiaddr = None
-                self._acquiring_since = None   # standing by, not acquiring
-                self._hb_standby()
-                self._sleep(GATE_POLL)
-                return
-            if self._gated_standby:
-                LOG.info("CARP master for vhid %s -- resuming DHCP (re-acquiring the lease)", self.vhid)
-                self._gated_standby = False
-                self._acquiring_since = time.time()   # start the post-promotion DORA grace
         # Acquire a lease if we do not hold one.
         if not self.yiaddr:
-            if self.only_when_master and self._acquiring_since is None:
-                self._acquiring_since = time.time()   # e.g. booted straight into master
             self._ensure_sniffer()  # a dead sniffer would silently fail every DORA
-            self._hb()  # active but not holding yet -> publish bound=- (not STANDBY)
+            self._hb()  # active but not holding yet -> publish bound=-
             if self.dora():
                 LOG.info("DHCP BOUND %s (lease=%ss, expires ~%s, server=%s)",
                          self.yiaddr, self.lease, self._clock_at(self.lease), self.server)
-                self._acquiring_since = None   # holding a lease again -> grace no longer applies
                 self._hb()
                 self._arp_nudge(force=True)
                 self.redora_wait = REDORA_MIN
             else:
                 LOG.warning("DHCP acquire (DISCOVER/REQUEST) failed -- retrying in %ds", self.redora_wait)
-                self._sleep_gated(self.redora_wait)
+                self._sleep_interruptible(self.redora_wait)
                 self.redora_wait = min(self.redora_wait * 2, REDORA_MAX)
             return
-        # Maintain: wait until T1, then RENEW; bail early on stop or master loss.
+        # Maintain: wait until T1, then RENEW; bail early on stop.
         t1, t2, src = self._timing()
         # The renew/rebind plan is verbose and identical every cycle for a stable
         # lease, so log it at DEBUG -- the default (INFO) log stays clean and
@@ -1171,7 +939,7 @@ class Keeper:
         ok = False
         while elapsed < t2 and not self.stop:
             step = min(REBIND_POLL_STEP, t2 - elapsed)
-            if not self._sleep_gated(step):
+            if not self._sleep_interruptible(step):
                 break
             elapsed += step
             self._hb()   # still holding the lease until T2 -- keep the heartbeat fresh
@@ -1184,8 +952,6 @@ class Keeper:
             self._hb()
             self._arp_nudge(force=True)
             return
-        if self.only_when_master and not self._is_master():
-            return  # lost master -> top of loop releases and stands by
         LOG.error("DHCP lease expired -- re-acquiring (back to DISCOVER)")
         self.yiaddr = None
 
@@ -1227,7 +993,6 @@ def main():
     ap.add_argument("--hbfile", default="/var/run/lease-keeper.hb")
     ap.add_argument("--logfile", default="/var/log/lease-keeper.log")
     ap.add_argument("--vhid", default=None)
-    ap.add_argument("--only-when-master", action="store_true")
     ap.add_argument("--follow", action="store_true")
     ap.add_argument("--vendor-class", default=None)
     ap.add_argument("--client-id", default=None)
@@ -1270,7 +1035,7 @@ def main():
 
     k = Keeper(a.iface, a.chaddr, a.request, a.eth_src,
                hbfile=a.hbfile, release_on_exit=a.release_on_exit or a.once,
-               only_when_master=a.only_when_master, vhid=a.vhid, follow=a.follow,
+               vhid=a.vhid, follow=a.follow,
                vendor_class=a.vendor_class, client_id=a.client_id, hostname=a.hostname,
                arp_nudge=a.arp_nudge, arp_listen_promisc=a.arp_listen_promisc)
 

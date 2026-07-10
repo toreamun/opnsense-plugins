@@ -16,7 +16,7 @@ class SettingsController extends ApiMutableModelControllerBase
     {
         return $this->searchBase(
             'keepers.keeper',
-            ['enabled', 'carpVip', 'demoteOnLeaseLoss', 'runOnlyOnMaster', 'followIp', 'aliasName', 'description']
+            ['enabled', 'carpVip', 'demoteOnLeaseLoss', 'followIp', 'aliasName', 'description']
         );
     }
 

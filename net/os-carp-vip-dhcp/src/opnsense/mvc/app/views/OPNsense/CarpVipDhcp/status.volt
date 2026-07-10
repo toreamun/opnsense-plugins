@@ -76,9 +76,6 @@
             return '<span class="label label-warning">'
                 + "{{ lang._('mismatch') }}" + ': ' + dash(k.bound) + '</span>';
         }
-        if (k.standby === true) {
-            return '<span class="label label-default">' + "{{ lang._('standby (backup)') }}" + '</span>';
-        }
         if (k.bound && k.bound === k.request) {
             return '<span class="label label-success">' + "{{ lang._('held') }}" + '</span>';
         }
@@ -120,11 +117,9 @@
         } else {
             cell = '<span title="' + tip + '">' + fmtAge(k.nudge_age) + '</span>';
         }
-        // Reachability: did the gateway answer the nudge? Only meaningful once we
-        // have actually nudged. When confirmed, show just a check (the reply age
-        // tracks the nudge age, so a second duration here would be redundant) with
-        // the age in the tooltip. A reply that stops coming goes stale and flips to
-        // the warning -- the ISP-dropping symptom the daemon also logs.
+        // Reachability (only once nudged): a check when the gateway replied (age in
+        // the tooltip); on a bound master whose replies have gone stale, a warning
+        // that the gateway may be dropping the nudge.
         if (k.nudge_age != null) {
             if (k.arp_confirmed === true) {
                 cell += ' <span class="text-success" title="'

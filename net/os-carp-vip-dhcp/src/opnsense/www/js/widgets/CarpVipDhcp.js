@@ -109,9 +109,6 @@ export default class CarpVipDhcp extends BaseTableWidget {
         if (k.mismatch) {
             return this._cell(this.translations.mismatch, 'text-danger');
         }
-        if (k.standby) {
-            return this._cell(this.translations.standby, 'text-muted');
-        }
         if (k.bound && k.bound === k.request) {
             return this._cell(this.translations.held, 'text-success');
         }

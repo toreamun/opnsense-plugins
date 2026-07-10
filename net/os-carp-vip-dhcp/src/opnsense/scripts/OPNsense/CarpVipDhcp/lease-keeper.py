@@ -40,10 +40,9 @@ Security posture (this daemon parses untrusted WAN traffic as root):
   * A DHCP reply must carry the BOOTREPLY op; our own xid gates the first-party
     path, and in follow mode a reply on our shared chaddr (the peer node's ACK)
     is read too, but only to RECORD an observed address change for the main
-    thread's hardened follow path. A peer REQUEST on our shared chaddr is read
-    only to compare its option-61 client-id against ours (an advisory warning)
-    (see _on_dhcp_reply). An ARP reply must come from the nudge target for our
-    leased IP (see _on_arp_reply) -- other packets are dropped early.
+    thread's hardened follow path (see _on_dhcp_reply). An ARP reply must come
+    from the nudge target for our leased IP (see _on_arp_reply) -- other packets
+    are dropped early.
   * Only the handful of DHCP options the keeper needs is extracted; there is
     no full dissection of the reply's other option data (untrusted network
     input -- it came from whatever answered on the wire, e.g. a rogue or
@@ -97,7 +96,6 @@ LOG = logging.getLogger("lease-keeper")
 # DHCP message types (RFC 2131).
 OFFER, ACK, NAK = 2, 5, 6
 BOOTREPLY = 2              # BOOTP op field: a server->client reply (unrelated to OFFER)
-BOOTREQUEST = 1            # BOOTP op field: a client->server request (the peer's DISCOVER/REQUEST)
 
 # Timing / retry tunables (seconds unless noted).
 GATE_POLL = 5              # between CARP-master checks when run-only-on-master is set
@@ -210,7 +208,6 @@ class Keeper:
         self._last_arp_reply = 0.0     # epoch of the gateway's last ARP reply (sniffer-written, 0 = none)
         self._reply_seen_at = 0.0      # last _last_arp_reply the main thread has accounted for
         self._nudges_since_reply = 0   # consecutive nudges with no new reply (unanswered detector)
-        self._peer_cid_warned = None    # last divergent peer client-id warned about (sniffer-owned)
         self._was_master = None        # CARP role at the last nudge check (None = unknown yet)
         self._nudge_now = False        # operator asked for an immediate nudge (SIGUSR1)
         self._poll_role_now = False    # a CARP transition fired -> re-check role now (SIGUSR2)
@@ -221,7 +218,6 @@ class Keeper:
         # (opt 60), client-id (61) or hostname (12) -- the "client identity checks"
         # row of the README's ISP-security section.
         self._id_opts = []
-        self._client_id = client_id     # kept for the peer client-id sanity check
         if vendor_class:
             self._id_opts.append(("vendor_class_id", vendor_class))
         if client_id:
@@ -372,15 +368,6 @@ class Keeper:
             if not (p.haslayer(BOOTP) and p.haslayer(DHCP)):
                 return
             b = p[BOOTP]
-            # A REQUEST from the peer on our shared chaddr carries its option-61
-            # client-id; check it diverges from ours (advisory). Both HA nodes must
-            # present the SAME client-id, or a server that keys the lease on option
-            # 61 instead of the chaddr hands them different addresses and the shared
-            # VIP breaks. Sniffer-thread single-owner; only logs, never acts.
-            if b.op == BOOTREQUEST:
-                if b.xid != self.xid and self._chaddr_matches(b):
-                    self._check_peer_client_id(p)
-                return
             if b.op != BOOTREPLY:
                 return
             # First-party path: a reply to OUR in-flight exchange (random xid,
@@ -410,33 +397,6 @@ class Keeper:
                 self._wake.set()   # wake the maintain-loop sleep now, don't wait for the tick
         except Exception as e:
             LOG.debug("DHCP reply parse error: %s", e)
-
-    def _check_peer_client_id(self, p):
-        """Warn if the peer's DHCP client-id (option 61) differs from ours. Both HA
-        nodes must present the same client-id for the shared VIP; a server that keys
-        the lease on option 61 (not the chaddr) would otherwise hand the two nodes
-        different addresses and the shared VIP breaks. Passive/advisory, sniffer-thread
-        single-owner -- warns once per distinct divergent value (config-sync keeps the
-        keeper config, hence the client-id, identical across nodes)."""
-        try:
-            peer_cid = None
-            for o in p[DHCP].options:
-                if isinstance(o, tuple) and o[0] == "client_id":
-                    peer_cid = o[1]
-                    break
-            if isinstance(peer_cid, str):
-                peer_cid = peer_cid.encode()
-            our_cid = self._client_id.encode() if self._client_id else None
-            if peer_cid == our_cid or peer_cid == self._peer_cid_warned:
-                return
-            self._peer_cid_warned = peer_cid
-            LOG.warning("peer DHCP client-id %r differs from ours %r on the shared chaddr "
-                        "%s -- both HA nodes must use the SAME client-id, or a server that "
-                        "keys the lease on option 61 will hand them different addresses and "
-                        "break the shared VIP (config-sync keeps them identical)",
-                        peer_cid, our_cid, self.chaddr)
-        except Exception as e:
-            LOG.debug("peer client-id parse error: %s", e)
 
     # ---- DHCP protocol (send / await reply / DORA / renew / release) ----
 

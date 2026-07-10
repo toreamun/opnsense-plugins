@@ -484,21 +484,6 @@ class _ArpPkt:
         return self._arp
 
 
-def test_arp_reply_stamped_by_sniffer_consumed_on_next_nudge(lk):
-    keeper = _nudge_keeper(lk)
-    keeper.router = "100.64.4.254"           # nudge target = router (opt 3)
-    keeper._nudges_since_reply = 5           # simulate a prior unanswered streak
-    assert keeper._last_arp_reply == 0.0
-    # The sniffer thread only stamps the reply time -- it must NOT touch the
-    # main-thread-owned counter (that is what keeps them race-free).
-    keeper._on_arp_reply(_ArpPkt(lk, 2, "100.64.4.254", "100.64.4.7"))
-    assert keeper._last_arp_reply > 0
-    assert keeper._nudges_since_reply == 5
-    # The next nudge (main thread) consumes the reply and clears the streak.
-    keeper._arp_nudge(force=True)
-    assert keeper._nudges_since_reply == 0
-
-
 def test_arp_reply_ignores_unrelated(lk):
     keeper = _nudge_keeper(lk)
     keeper.router = "100.64.4.254"
@@ -523,35 +508,6 @@ def test_arp_reply_logged_at_debug(lk, caplog):
     assert any("ARP reply from 100.64.4.1" in r.getMessage() for r in caplog.records)
 
 
-def test_first_reply_logged_confirmed_at_info(lk, caplog):
-    keeper = _nudge_keeper(lk)
-    keeper.router = "100.64.4.1"
-    with caplog.at_level("INFO", logger="lease-keeper"):
-        keeper._arp_nudge(force=True)                                  # sent, no reply yet
-        keeper._on_arp_reply(_ArpPkt(lk, 2, "100.64.4.1", "100.64.4.7"))
-        keeper._arp_nudge(force=True)                                  # consumes -> first confirmation
-    assert any("ARP nudge confirmed" in r.getMessage() for r in caplog.records)
-
-
-def test_reply_after_unanswered_logs_recovery_at_info(lk, caplog):
-    keeper = _nudge_keeper(lk)
-    keeper.router = "100.64.4.1"
-
-    def reply():
-        keeper._on_arp_reply(_ArpPkt(lk, 2, "100.64.4.1", "100.64.4.7"))
-
-    # Establish confirmed reachability first (so the next event is a recovery, not a first).
-    keeper._arp_nudge(force=True)
-    reply()
-    keeper._arp_nudge(force=True)
-    with caplog.at_level("INFO", logger="lease-keeper"):
-        for _ in range(lk.ARP_UNANSWERED_WARN):          # unanswered streak
-            keeper._arp_nudge(force=True)
-        reply()
-        keeper._arp_nudge(force=True)                    # consume -> recovery
-    assert any("answered again" in r.getMessage() for r in caplog.records)
-
-
 def test_sniffer_filter_is_static(lk):
     keeper = lk.Keeper("eth0", "00:00:5e:00:01:fe", "100.64.4.7", hbfile=None)
     # The filter is a fixed boundary: DHCP + ARP replies (nudge reachability). It
@@ -561,46 +517,6 @@ def test_sniffer_filter_is_static(lk):
     assert "arp[6:2] = 2" in f                            # reachability clause
     keeper.yiaddr = "100.64.4.7"
     assert keeper._sniffer_filter() == f                  # unchanged once a lease is held
-
-
-def test_unanswered_nudges_warn_once(lk, caplog):
-    keeper = _nudge_keeper(lk)                # target = server 100.64.4.1, probe -> master
-    with caplog.at_level("WARNING", logger="lease-keeper"):
-        for _ in range(lk.ARP_UNANSWERED_WARN + 2):
-            keeper._arp_nudge(force=True)
-    warnings = [r for r in caplog.records if "unanswered" in r.getMessage()]
-    assert len(warnings) == 1
-    assert keeper._nudges_since_reply >= lk.ARP_UNANSWERED_WARN
-    # Not in promiscuous mode -> the hint should point at enabling it.
-    assert "promiscuous" in warnings[0].getMessage()
-
-
-def test_unanswered_warning_omits_promisc_hint_when_already_promisc(lk, caplog):
-    keeper = _nudge_keeper(lk, arp_listen_promisc=True)
-    with caplog.at_level("WARNING", logger="lease-keeper"):
-        for _ in range(lk.ARP_UNANSWERED_WARN):
-            keeper._arp_nudge(force=True)
-    warnings = [r for r in caplog.records if "unanswered" in r.getMessage()]
-    assert len(warnings) == 1
-    # Promisc already on -> blame the carrier, do not suggest turning promisc on.
-    assert "carrier is likely dropping" in warnings[0].getMessage()
-
-
-def test_reply_resets_and_rearms_unanswered_warning(lk, caplog):
-    keeper = _nudge_keeper(lk)
-    keeper.router = "100.64.4.1"
-    with caplog.at_level("WARNING", logger="lease-keeper"):
-        for _ in range(lk.ARP_UNANSWERED_WARN):
-            keeper._arp_nudge(force=True)          # warns once, at the threshold
-        # A reply lands (stamped by the sniffer); the next nudge consumes it and clears.
-        keeper._on_arp_reply(_ArpPkt(lk, 2, "100.64.4.1", "100.64.4.7"))
-        keeper._arp_nudge(force=True)
-        assert keeper._nudges_since_reply == 0
-        # A fresh unanswered streak warns again -- the reset re-arms it (no latch).
-        for _ in range(lk.ARP_UNANSWERED_WARN):
-            keeper._arp_nudge(force=True)
-    warnings = [r for r in caplog.records if "unanswered" in r.getMessage()]
-    assert len(warnings) == 2
 
 
 def test_hb_includes_arp_reply_state(lk, tmp_path):

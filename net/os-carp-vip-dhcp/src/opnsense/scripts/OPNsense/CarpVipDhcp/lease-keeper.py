@@ -120,7 +120,6 @@ MIN_T1 = 30                # floor for the renew timer (very short leases)
 REBIND_MARGIN = 15         # ensure T2 is at least this far past T1
 BROADCAST_FLAG = 0x8000    # BOOTP flags: ask the server to broadcast OFFER/ACK
 ARP_NUDGE_MIN = 30         # floor for --arp-nudge so a typo cannot flood the segment
-ARP_UNANSWERED_WARN = 3    # warn after this many consecutive nudges with no gateway reply
 LOG_MAX_BYTES = 512 * 1024
 LOG_BACKUPS = 3
 
@@ -201,13 +200,9 @@ class Keeper:
         self._last_nudge = 0.0
         self._nudge_gw = None          # last nudge target we logged (log again on change)
         self._nudge_warned = False     # warned once about a missing nudge target
-        # ARP-reply reachability, split cleanly across threads: the sniffer thread
-        # only stamps _last_arp_reply (a lone atomic float write); the "consumed up
-        # to here" bookmark and the unanswered counter are touched ONLY by the main
-        # thread (in _arp_nudge), so there is no cross-thread read-modify-write.
-        self._last_arp_reply = 0.0     # epoch of the gateway's last ARP reply (sniffer-written, 0 = none)
-        self._reply_seen_at = 0.0      # last _last_arp_reply the main thread has accounted for
-        self._nudges_since_reply = 0   # consecutive nudges with no new reply (unanswered detector)
+        # Reachability: the sniffer stamps _last_arp_reply when the gateway answers
+        # a nudge (a lone atomic float write); the status page surfaces its age.
+        self._last_arp_reply = 0.0     # epoch of the gateway's last ARP reply (0 = none)
         self._was_master = None        # CARP role at the last nudge check (None = unknown yet)
         self._nudge_now = False        # operator asked for an immediate nudge (SIGUSR1)
         self._poll_role_now = False    # a CARP transition fired -> re-check role now (SIGUSR2)
@@ -305,16 +300,12 @@ class Keeper:
             self._on_arp_reply(p)      # gateway answering our nudge (reachability)
 
     def _on_arp_reply(self, p):
-        """Record the gateway's ARP reply to our nudge as a reachability signal.
-        Only the reply to OUR who-has counts: op=2 (is-at), sender = the nudge
-        target gateway, target protocol address = our leased IP. Anything else on
-        the segment is ignored. Runs on the sniffer thread and does ONE thing --
-        stamp _last_arp_reply (a lone atomic write); the main thread consumes it
-        in _arp_nudge, so the counter/warn state is single-owner (no race).
-
-        The signal is advisory: an on-segment attacker could forge a reply (or
-        withhold one), so a green "reachable" is not proof. It only drives a
-        diagnostic; nothing here feeds lease/CARP/follow decisions."""
+        """Stamp _last_arp_reply when the gateway answers our nudge -- a reachability
+        signal the status page surfaces by age. Only the reply to OUR who-has counts:
+        op=2 (is-at), sender = the nudge target gateway, target = our leased IP. Runs
+        on the sniffer thread; the stamp is a lone atomic write. Advisory only (an
+        on-segment attacker could forge or withhold it); nothing here feeds
+        lease/CARP/follow decisions."""
         try:
             arp = p[ARP]
             if arp.op != 2:                     # 2 = is-at (reply); requests are filtered out in BPF
@@ -324,8 +315,6 @@ class Keeper:
                 return
             if arp.psrc == gw and arp.pdst == self.yiaddr:
                 self._last_arp_reply = time.time()
-                # Routine confirmation at DEBUG, mirroring "ARP nudge sent"; the
-                # main thread logs the first reply / recovery at INFO.
                 LOG.debug("ARP reply from %s (is-at) for %s", gw, self.yiaddr)
         except Exception as e:
             LOG.debug("ARP reply parse error: %s", e)
@@ -851,44 +840,10 @@ class Keeper:
                       hwdst="00:00:00:00:00:00", pdst=gw),
                   iface=self.iface, verbose=0)
             self._last_nudge = time.time()
-            # Reachability accounting (main-thread-only; the sniffer just stamps
-            # _last_arp_reply). If a reply landed since we last looked, we are
-            # reachable -> clear the counter; otherwise this nudge went unanswered.
-            # The counter only steps +1 or resets to 0, so it lands on the threshold
-            # exactly once per streak -> warn there (no separate "warned" latch). The
-            # hint depends on whether we are already promiscuous: if we are, promisc
-            # is not the fix (the carrier is dropping it); if not, that NIC may simply
-            # not surface the unicast reply.
-            if self._last_arp_reply > self._reply_seen_at:
-                # A reply arrived since the last nudge -> reachable. Log the
-                # positive transitions at INFO (first confirmation, or recovery
-                # after an unanswered streak), mirroring the nudge-active INFO and
-                # the unanswered WARNING; every individual reply is at DEBUG.
-                if self._reply_seen_at == 0.0:
-                    LOG.info("ARP nudge confirmed: %s replied for %s", gw, self.yiaddr)
-                elif self._nudges_since_reply >= ARP_UNANSWERED_WARN:
-                    LOG.info("ARP nudge answered again by %s after %d unanswered",
-                             gw, self._nudges_since_reply)
-                self._reply_seen_at = self._last_arp_reply
-                self._nudges_since_reply = 0
-            else:
-                self._nudges_since_reply += 1
-            if self._nudges_since_reply == ARP_UNANSWERED_WARN:
-                if self.arp_listen_promisc:
-                    hint = ("the gateway is not answering -- with promiscuous "
-                            "listening already on, the carrier is likely dropping "
-                            "the nudge (DAI/DHCP snooping)")
-                else:
-                    hint = ("the gateway may be dropping it (DAI/DHCP snooping), or "
-                            "this NIC may not surface the unicast reply without "
-                            "'ARP listen in promiscuous mode'")
-                LOG.warning("ARP nudge unanswered: %d sent to %s for %s with no reply "
-                            "-- %s", self._nudges_since_reply, gw, self.yiaddr, hint)
-            # Every fire is logged, but at the right level: the first one (and any
-            # target change) at INFO so the default log shows the nudge is active;
-            # the routine repeats at DEBUG, so they are there in "Debug (all)"
-            # without flooding INFO (nudges fire every arp_nudge seconds, oftener
-            # than DHCP renews).
+            # Log the first nudge (and any target change) at INFO so the default log
+            # shows the nudge is active; routine repeats at DEBUG (they fire oftener
+            # than DHCP renews). Whether the gateway actually answered is surfaced by
+            # age on the status page (via _last_arp_reply -> the heartbeat's arpok=).
             if gw != self._nudge_gw:
                 LOG.info("ARP nudge active: who-has %s tell %s (src %s) every %ds",
                          gw, self.yiaddr, self.chaddr, self.arp_nudge)

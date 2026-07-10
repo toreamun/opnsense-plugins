@@ -87,7 +87,7 @@ from logging.handlers import RotatingFileHandler
 # going to daemon(8)'s /dev/null. Capture it instead and let main() log it once
 # logging is configured.
 try:
-    from scapy.all import ARP, Ether, IP, UDP, BOOTP, DHCP, AsyncSniffer, sendp
+    from scapy.all import ARP, Ether, IP, UDP, BOOTP, DHCP, AsyncSniffer, sendp, get_if_hwaddr
     _SCAPY_IMPORT_ERROR = None
 except Exception as _scapy_exc:   # ImportError, or scapy's own import-time failures
     _SCAPY_IMPORT_ERROR = _scapy_exc
@@ -216,6 +216,8 @@ class Keeper:
         self._sniffer_yiaddr = None    # leased IP the current sniffer filter was built for
         self._last_conflict_warn = 0.0  # throttle for the conflict warning
         self._conflict_mac = None       # last foreign MAC seen using our IP
+        self._own_mac = None            # our WAN iface's physical MAC (lazy; excluded from conflicts)
+        self._own_mac_resolved = False
         self._peer_cid_warned = None    # last divergent peer client-id warned about (sniffer-owned)
         self._was_master = None        # CARP role at the last nudge check (None = unknown yet)
         self._nudge_now = False        # operator asked for an immediate nudge (SIGUSR1)
@@ -355,6 +357,18 @@ class Keeper:
         except Exception as e:
             LOG.debug("ARP reply parse error: %s", e)
 
+    def _own_wan_mac(self):
+        """Our WAN interface's own physical MAC, resolved once and cached. FreeBSD
+        egresses VIP-sourced traffic from this MAC, so an ARP from it using our VIP
+        is our own egress, not a conflict. None if it cannot be determined."""
+        if not self._own_mac_resolved:
+            self._own_mac_resolved = True
+            try:
+                self._own_mac = (get_if_hwaddr(self.iface) or "").lower() or None
+            except Exception:
+                self._own_mac = None
+        return self._own_mac
+
     def _on_arp_conflict(self, p):
         """Log if another MAC claims our leased VIP -- an ARP whose sender IP is
         ours but whose sender MAC is not our CARP MAC. On an HA pair this is
@@ -363,10 +377,11 @@ class Keeper:
         virtual MAC), which on the wire is indistinguishable from a genuine
         impostor -- both are just a non-CARP MAC using the VIP, and neither CARP
         adverts nor the peer's DHCP expose the peer's physical MAC to whitelist
-        it. So this is purely advisory: it logs (saying as much), never acts. The
-        peer's CARP MAC (== our chaddr) is excluded outright. Throttled: re-warns
-        only when the offending MAC changes or after ARP_CONFLICT_REWARN. Touched
-        only here (sniffer thread) -> single-owner."""
+        it. So this is purely advisory: it logs (saying as much), never acts. Our
+        OWN WAN MAC and the peer's CARP MAC (== our chaddr) are excluded outright,
+        so only the peer's physical MAC (or a genuine impostor) can surface here.
+        Throttled: re-warns only when the offending MAC changes or after
+        ARP_CONFLICT_REWARN. Touched only here (sniffer thread) -> single-owner."""
         try:
             if not self.yiaddr:
                 return
@@ -374,7 +389,9 @@ class Keeper:
             if arp.psrc != self.yiaddr:
                 return
             mac = (arp.hwsrc or "").lower()
-            if not mac or mac == self.chaddr:   # our own / peer's CARP MAC -> not a conflict
+            if not mac or mac == self.chaddr or mac == self._own_wan_mac():
+                # peer's shared CARP MAC, or our own WAN MAC (FreeBSD egresses
+                # VIP-sourced traffic from the physical MAC) -> our egress, not a conflict
                 return
             now = time.time()
             if mac == self._conflict_mac and now - self._last_conflict_warn < ARP_CONFLICT_REWARN:

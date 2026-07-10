@@ -186,14 +186,13 @@ flowchart TB
 > about shared ISP L2.
 
 > **The VIP is not a network you choose:** it is whatever address the ISP leases on the
-> virtual MAC, so it always sits in the ISP gateway's subnet (the gateway must be
-> on-link). The `/24` here is illustrative; the real mask is the ISP's. If the ISP only
-> changes your *address* within that subnet, `followIp` adopts it seamlessly. If it moves
-> you to a *different* subnet with a *different* gateway, follow rewrites the VIP address
-> but not the netmask or the System > Gateways entry, so that case needs a manual fix for
-> now (the daemon logs a `cross-subnet renumber` error). Bringing follow to parity with a
-> plain DHCP interface here (adopt the new mask and gateway automatically) is tracked in
-> issue #39.
+> virtual MAC, so it always sits in the ISP gateway's subnet. The `/24` here is
+> illustrative; the real mask is the ISP's. With `followIp` on, the plugin follows a
+> changed lease, including a cross-subnet renumber: it adopts the new address and, from
+> the DHCP ACK's subnet mask and gateway, updates the VIP prefix and the WAN gateway too,
+> so outbound keeps working (the same as a plain DHCP interface). If the ACK carries no
+> subnet mask it can only move the address, and logs a warning to fix the prefix and
+> gateway by hand.
 
 ---
 

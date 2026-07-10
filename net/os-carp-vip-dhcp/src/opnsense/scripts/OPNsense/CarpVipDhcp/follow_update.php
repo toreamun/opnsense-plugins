@@ -2,13 +2,18 @@
 <?php
 
 /*
- * follow_update.php <old_ip> <new_ip>
+ * follow_update.php <old_ip> <new_ip> [<old_gw> <new_gw> <new_bits>]
  *
  * Triggered by a follow-mode keeper daemon when the ISP hands out a different
  * address. Rewrites the CARP VIP (whose current subnet is <old_ip>) and every
  * keeper that references it to <new_ip>, then re-applies the VIP and restarts
  * the keepers. Both HA nodes run this independently and converge on the same
  * address because they share the same chaddr (one ISP lease per chaddr).
+ *
+ * On a cross-subnet renumber the daemon also passes the old/new gateway and the
+ * new prefix length: the VIP's subnet_bits and the WAN gateway are updated too
+ * and routing is reapplied, so outbound keeps working (parity with a plain DHCP
+ * interface). Same-subnet moves omit those args and touch only the address.
  */
 
 require_once("config.inc");
@@ -30,6 +35,28 @@ foreach ([$old_ip, $new_ip] as $ip) {
 }
 if ($old_ip === $new_ip) {
     exit(0);
+}
+
+// Optional cross-subnet args (all three together): the ISP moved us to a
+// different subnet, so also repoint the VIP prefix + the WAN gateway. The
+// configd action always passes 5 params and pads a same-subnet call with empty
+// strings, so an empty old_gw means address-only, not a cross-subnet move.
+$old_gw = $new_gw = null;
+$new_bits = null;
+if ($argc >= 6 && $argv[3] !== '') {
+    $old_gw = $argv[3];
+    $new_gw = $argv[4];
+    $new_bits = (int)$argv[5];
+    foreach ([$old_gw, $new_gw] as $g) {
+        if (!filter_var($g, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
+            fwrite(STDERR, "invalid gateway argument: {$g}\n");
+            exit(1);
+        }
+    }
+    if ($new_bits < 1 || $new_bits > 32) {
+        fwrite(STDERR, "invalid prefix bits: {$argv[5]}\n");
+        exit(1);
+    }
 }
 
 // Single-writer per node. Two follow_update runs racing on the same node (a
@@ -54,6 +81,9 @@ if (isset($config['virtualip']['vip']) && is_array($config['virtualip']['vip']))
     foreach ($config['virtualip']['vip'] as $idx => $vip) {
         if (($vip['mode'] ?? '') === 'carp' && ($vip['subnet'] ?? '') === $old_ip) {
             $config['virtualip']['vip'][$idx]['subnet'] = $new_ip;
+            if ($new_bits !== null) {
+                $config['virtualip']['vip'][$idx]['subnet_bits'] = $new_bits;
+            }
             $old_vip_iface = $vip['interface'] ?? '';
             $vip_changed = true;
         }
@@ -81,7 +111,24 @@ if (isset($config['OPNsense']['CarpVipDhcp']['keepers']['keeper'])) {
     }
 }
 
-if (!$vip_changed && !$keeper_changed) {
+// 2b. Cross-subnet: repoint the WAN gateway on the VIP's interface (the entry
+// whose current gateway is old_gw) to the new gateway.
+$gw_changed = false;
+if ($new_gw !== null && $old_vip_iface !== ''
+        && isset($config['gateways']['gateway_item']) && is_array($config['gateways']['gateway_item'])) {
+    foreach ($config['gateways']['gateway_item'] as $gidx => $gw) {
+        if (($gw['interface'] ?? '') === $old_vip_iface && ($gw['gateway'] ?? '') === $old_gw
+                && ($gw['ipprotocol'] ?? 'inet') === 'inet') {
+            $config['gateways']['gateway_item'][$gidx]['gateway'] = $new_gw;
+            $gw_changed = true;
+        }
+    }
+    if (!$gw_changed) {
+        fwrite(STDERR, "warning: no IPv4 gateway on {$old_vip_iface} with address {$old_gw} to repoint\n");
+    }
+}
+
+if (!$vip_changed && !$keeper_changed && !$gw_changed) {
     // Nothing referenced old_ip. Either there is genuinely nothing to do, or a
     // previous run (or the peer node) already migrated the config to new_ip and
     // this is a retry. If a CARP VIP already carries new_ip, fall through and
@@ -129,6 +176,18 @@ if ($old_vip_iface !== '' && $old_ip !== $new_ip) {
     $dev = get_real_interface($old_vip_iface);
     if (!empty($dev)) {
         exec('/sbin/ifconfig ' . escapeshellarg($dev) . ' -alias ' . escapeshellarg($old_ip) . ' 2>&1');
+    }
+}
+
+// Cross-subnet: the WAN gateway moved, so reapply routing (reconfigure_vips
+// re-adds the VIP but does not touch the default route). The config change above
+// is what persists; this reapply installs the new default route.
+if ($gw_changed) {
+    require_once("system.inc");
+    if (function_exists('system_routing_configure')) {
+        system_routing_configure();
+    } else {
+        exec('/usr/local/sbin/configctl interface routes configure 2>&1');
     }
 }
 
@@ -189,4 +248,8 @@ if ($rc !== 0) {
     fwrite(STDERR, "manage_alias failed (rc={$rc}): " . implode(' | ', $out) . "\n");
 }
 
-echo "updated CARP VIP {$old_ip} -> {$new_ip}\n";
+$msg = "updated CARP VIP {$old_ip} -> {$new_ip}";
+if ($gw_changed) {
+    $msg .= " and WAN gateway {$old_gw} -> {$new_gw} (/{$new_bits})";
+}
+echo "{$msg}\n";

@@ -622,7 +622,7 @@ def test_arp_conflict_warns(lk, caplog):
     keeper = _nudge_keeper(lk)                    # yiaddr=100.64.4.7, chaddr=00:00:5e:00:01:fe
     with caplog.at_level("WARNING", logger="lease-keeper"):
         keeper._on_arp_conflict(_ArpPkt(lk, 2, "100.64.4.7", "100.64.4.1", hwsrc="aa:bb:cc:dd:ee:ff"))
-    assert any("ARP conflict" in r.getMessage() for r in caplog.records)
+    assert any("using our VIP" in r.getMessage() for r in caplog.records)
 
 
 def test_arp_conflict_ignores_our_own_mac(lk, caplog):
@@ -630,14 +630,14 @@ def test_arp_conflict_ignores_our_own_mac(lk, caplog):
     with caplog.at_level("WARNING", logger="lease-keeper"):
         # Same as our CARP MAC (the peer node shares it) -> not a conflict.
         keeper._on_arp_conflict(_ArpPkt(lk, 1, "100.64.4.7", "100.64.4.1", hwsrc="00:00:5e:00:01:fe"))
-    assert not any("ARP conflict" in r.getMessage() for r in caplog.records)
+    assert not any("using our VIP" in r.getMessage() for r in caplog.records)
 
 
 def test_arp_conflict_ignores_other_ip(lk, caplog):
     keeper = _nudge_keeper(lk)
     with caplog.at_level("WARNING", logger="lease-keeper"):
         keeper._on_arp_conflict(_ArpPkt(lk, 1, "100.64.4.99", "100.64.4.1", hwsrc="aa:bb:cc:dd:ee:ff"))
-    assert not any("ARP conflict" in r.getMessage() for r in caplog.records)
+    assert not any("using our VIP" in r.getMessage() for r in caplog.records)
 
 
 def test_arp_conflict_throttled_per_mac(lk, caplog):
@@ -646,7 +646,7 @@ def test_arp_conflict_throttled_per_mac(lk, caplog):
     with caplog.at_level("WARNING", logger="lease-keeper"):
         keeper._on_arp_conflict(pkt)
         keeper._on_arp_conflict(pkt)              # same MAC within the re-warn window
-    warnings = [r for r in caplog.records if "ARP conflict" in r.getMessage()]
+    warnings = [r for r in caplog.records if "using our VIP" in r.getMessage()]
     assert len(warnings) == 1
 
 

@@ -107,9 +107,10 @@ LOG_BACKUPS = 3
 
 # A parsed DHCP reply, snapshotted from the sniffer thread.
 # `message` (DHCP option 56) is the server's optional human-readable text, mainly
-# a NAK reason. Defaulted so existing 7-field constructions stay valid.
-DhcpReply = namedtuple("DhcpReply", "mtype yiaddr server_id lease t1 t2 router message",
-                       defaults=(None,))
+# a NAK reason; `subnet_mask` (option 1) is used to follow a cross-subnet renumber.
+# Both are defaulted so existing 7-field constructions stay valid.
+DhcpReply = namedtuple("DhcpReply", "mtype yiaddr server_id lease t1 t2 router message subnet_mask",
+                       defaults=(None, None))
 MAC_RE = re.compile(r"^([0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}$")
 
 
@@ -149,6 +150,15 @@ def _same_ip_class(a, b):
         return _is_localish(a) == _is_localish(b)
     except ValueError:
         return False
+
+
+def _mask_to_bits(mask):
+    """Dotted-quad subnet mask (DHCP option 1) -> prefix length, or None if absent
+    or unparseable."""
+    try:
+        return ipaddress.IPv4Network("0.0.0.0/%s" % mask).prefixlen
+    except (ValueError, TypeError):
+        return None
 
 
 def _fs_safe(s):
@@ -208,6 +218,7 @@ class Keeper:
         self._followed_ip = None       # last address we asked configd to follow to
         self._follow_from = None       # address we followed FROM (for the retry watchdog)
         self._follow_fired_at = 0.0    # when we last dispatched follow_update (retry deadline)
+        self._follow_gw_args = []      # extra follow_update args on a cross-subnet move: [old_gw, new_gw, bits]
         # Follow throttle state, keyed by chaddr so it survives the follow-induced
         # restart (the request-IP-keyed runtime paths change on every follow).
         self._follow_state = "/var/run/carpvipdhcp-follow-%s" % _fs_safe(self.chaddr)
@@ -300,7 +311,7 @@ class Keeper:
         """Snapshot only the handful of DHCP options the keeper acts on into a
         DhcpReply; the rest of the reply's option data -- untrusted, from
         whatever answered on the wire -- is left untouched."""
-        mt = sid = lt = rt = bt = ro = msg = None
+        mt = sid = lt = rt = bt = ro = msg = sm = None
         for o in p[DHCP].options:
             if isinstance(o, tuple):
                 if o[0] == "message-type":
@@ -317,7 +328,9 @@ class Keeper:
                     ro = o[1]
                 elif o[0] == "message":     # option 56: server's text (e.g. a NAK reason)
                     msg = o[1]
-        return DhcpReply(mt, yiaddr, sid, lt, rt, bt, ro, msg)
+                elif o[0] == "subnet_mask":  # option 1: to follow a cross-subnet renumber
+                    sm = o[1]
+        return DhcpReply(mt, yiaddr, sid, lt, rt, bt, ro, msg, sm)
 
     def _chaddr_matches(self, b):
         """True if the reply's BOOTP client hardware address is our chaddr (the
@@ -617,18 +630,23 @@ class Keeper:
                 return False
             LOG.warning("ISP gave %s (VIP was %s) at %s -- following: updating the CARP VIP",
                         got, self.request_ip, phase)
-            # We rewrite the VIP *address* only, not the interface prefix or the
-            # system default gateway. If the ISP also moved the gateway (a
-            # cross-subnet renumber) the follow alone leaves the default route
-            # pointing at the old gateway -> outbound dies despite a "successful"
-            # follow. We cannot safely reconfigure System->Gateways from here, so
-            # make the operator's required action loud rather than silent.
+            # If the ISP also moved the gateway (a cross-subnet renumber), follow the
+            # new gateway + prefix too so outbound keeps working -- parity with what a
+            # plain DHCP interface does. Needs the new subnet mask (opt 1) to set the
+            # VIP prefix; without it we can only move the address, so warn instead.
+            self._follow_gw_args = []
             if rx.router and self.router and rx.router != self.router:
-                LOG.error("follow %s -> %s also changes the gateway (%s -> %s): this looks "
-                          "like a cross-subnet renumber. The VIP address is updated but the "
-                          "interface prefix and System->Gateways are NOT -- update them "
-                          "manually or outbound routing will stay broken.",
-                          self.request_ip, got, self.router, rx.router)
+                bits = _mask_to_bits(rx.subnet_mask)
+                if bits:
+                    LOG.warning("follow %s -> %s also moves the gateway (%s -> %s), subnet "
+                                "/%d -- following across the subnet", self.request_ip, got,
+                                self.router, rx.router, bits)
+                    self._follow_gw_args = [self.router, rx.router, str(bits)]
+                else:
+                    LOG.error("follow %s -> %s changes the gateway (%s -> %s) but the ACK "
+                              "carried no subnet mask -- updating the VIP address only; fix the "
+                              "interface prefix + System->Gateways by hand", self.request_ip,
+                              got, self.router, rx.router)
             self._record_follow()
             # _follow_update reads request_ip as the old address, so remember it
             # (for the retry watchdog) and fire before overwriting request_ip.
@@ -667,8 +685,9 @@ class Keeper:
         """Dispatch the configd follow_update action (old -> new) and stamp the
         retry deadline. Separate from _follow_update so the watchdog can re-drive
         a stalled follow without tripping the _followed_ip equality guard."""
-        subprocess.Popen(["/usr/local/sbin/configctl", "-d", "carpvipdhcp",
-                          "follow_update", old_ip, new_ip])
+        cmd = ["/usr/local/sbin/configctl", "-d", "carpvipdhcp", "follow_update", old_ip, new_ip]
+        cmd += self._follow_gw_args   # cross-subnet: [old_gw, new_gw, bits]; empty on a same-subnet move
+        subprocess.Popen(cmd)
         self._follow_fired_at = time.time()
 
     def _follow_watchdog(self):

@@ -566,44 +566,6 @@ def test_sniffer_filter_captures_arp_and_honours_promisc(lk, monkeypatch):
     assert captured["promisc"] is True         # opt-in flag reaches the socket
 
 
-# ---- run-only-on-master acquire grace (acq=): breaks demote/promote ping-pong ----
-
-def _gated_keeper(lk, hbfile):
-    return lk.Keeper("eth0", "00:00:5e:00:01:fe", "100.64.4.7",
-                     hbfile=hbfile, only_when_master=True, vhid=10)
-
-
-def test_hb_acq_token_when_gated_master_acquiring(lk, tmp_path):
-    hb = tmp_path / "hb"
-    keeper = _gated_keeper(lk, str(hb))
-    keeper.yiaddr = None                  # promoted, DORA in progress -> bound=-
-    keeper._acquiring_since = 1783350000.0
-    keeper._hb()
-    content = hb.read_text()
-    assert " bound=- " in content
-    assert " acq=1783350000" in content
-
-
-def test_hb_no_acq_token_once_bound(lk, tmp_path):
-    hb = tmp_path / "hb"
-    keeper = _gated_keeper(lk, str(hb))
-    keeper.yiaddr = "100.64.4.7"          # holding a lease -> grace no longer relevant
-    keeper._acquiring_since = 1783350000.0
-    keeper._hb()
-    assert "acq=" not in hb.read_text()
-
-
-def test_hb_no_acq_token_when_not_gated(lk, tmp_path):
-    hb = tmp_path / "hb"
-    keeper = lk.Keeper("eth0", "00:00:5e:00:01:fe", "100.64.4.7", hbfile=str(hb))  # not only_when_master
-    keeper.yiaddr = None
-    keeper._acquiring_since = 1783350000.0
-    keeper._hb()
-    content = hb.read_text()
-    assert " bound=- " in content
-    assert "acq=" not in content          # a plain keeper demotes immediately on loss (unchanged)
-
-
 # ---- follow across a changed gateway warns loudly (cross-subnet renumber) ----
 
 def _ack_gw(lk, yiaddr, router, server="100.64.4.1"):

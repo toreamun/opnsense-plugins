@@ -52,7 +52,7 @@ def _epoch_and_age(value):
 
 def parse_heartbeat(path):
     result = {"bound": None, "lease": None, "t1": None, "t2": None, "timing_source": None,
-              "standby": False, "mismatch": False, "mismatch_got": None, "mismatch_want": None,
+              "mismatch": False, "mismatch_got": None, "mismatch_want": None,
               "hb_epoch": None, "hb_age": None, "nudge_epoch": None, "nudge_age": None, "gw": None,
               "arp_reply_epoch": None, "arp_reply_age": None}
     try:
@@ -102,8 +102,6 @@ def parse_heartbeat(path):
                 pass
         elif part.startswith("gw="):
             result["gw"] = part.split("=", 1)[1]
-        elif part == "STANDBY":
-            result["standby"] = True
         elif part == "MISMATCH":
             result["mismatch"] = True
         elif part.startswith("got="):
@@ -160,10 +158,9 @@ def read_keepers(states, names):
             continue
         request, iface, chaddr, demote = parts[0], parts[1], parts[2], parts[3]
         vhid = parts[4] if len(parts) > 4 else ""
-        run_only = parts[5] if len(parts) > 5 else "0"
-        follow = parts[6] if len(parts) > 6 else "0"
+        follow = parts[5] if len(parts) > 5 else "0"
         try:
-            arp_nudge = int(parts[10]) if len(parts) > 10 and parts[10] else 0
+            arp_nudge = int(parts[9]) if len(parts) > 9 and parts[9] else 0
         except ValueError:
             arp_nudge = 0
         kid = keeper_id(request)
@@ -176,7 +173,6 @@ def read_keepers(states, names):
             "vhid": vhid,
             "carp_state": states.get(vhid) if vhid else None,
             "demote_on_lease_loss": demote == "1",
-            "run_only_on_master": run_only == "1",
             "follow_ip": follow == "1",
             "arp_nudge": arp_nudge,
             "running": pid is not None,

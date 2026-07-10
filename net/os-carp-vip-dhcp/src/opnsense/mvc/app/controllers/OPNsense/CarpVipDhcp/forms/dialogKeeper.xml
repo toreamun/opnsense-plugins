@@ -31,13 +31,6 @@
         <help><![CDATA[Enforce mode only. When set, this node demotes itself (handing the CARP virtual IP to the peer) if this keeper stops holding its DHCP lease. Only meaningful with "Follow dynamic DHCP address" OFF (a following keeper adopts a new address instead of losing its lease, so the two are mutually exclusive). When unset (default), the keeper just keeps the lease alive on both nodes redundantly, without affecting CARP.]]></help>
     </field>
     <field>
-        <id>keeper.runOnlyOnMaster</id>
-        <label>Run only on CARP master</label>
-        <type>checkbox</type>
-        <advanced>true</advanced>
-        <help><![CDATA[Niche option. When set, the keeper only sends DHCP (holds the lease) while this node is the CARP master for the VIP; on backup nodes it stays running but idle (releases the lease and stands by). Use only for ISPs/DHCP servers that reject two simultaneous clients with the same chaddr. WARNING: this adds a failover gap — the new master must re-acquire the lease (DORA) before the ISP routes the VIP again. Default (unset) keeps the lease on both nodes redundantly, which fails over seamlessly.]]></help>
-    </field>
-    <field>
         <id>keeper.arpNudgeInterval</id>
         <label>ARP nudge interval (s)</label>
         <type>text</type>

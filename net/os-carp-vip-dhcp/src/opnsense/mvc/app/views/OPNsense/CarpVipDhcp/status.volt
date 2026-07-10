@@ -76,9 +76,6 @@
             return '<span class="label label-warning">'
                 + "{{ lang._('mismatch') }}" + ': ' + dash(k.bound) + '</span>';
         }
-        if (k.standby === true) {
-            return '<span class="label label-default">' + "{{ lang._('standby (backup)') }}" + '</span>';
-        }
         if (k.bound && k.bound === k.request) {
             return '<span class="label label-success">' + "{{ lang._('held') }}" + '</span>';
         }

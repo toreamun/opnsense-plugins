@@ -18,7 +18,6 @@ def test_parse_heartbeat_bound(tmp_path):
     assert result["t1"] == 900
     assert result["t2"] == 1575
     assert result["timing_source"] == "derived"
-    assert not result["standby"]
     assert not result["mismatch"]
 
 
@@ -26,12 +25,6 @@ def test_parse_heartbeat_unbound(tmp_path):
     hb = tmp_path / "hb"
     hb.write_text("1783350773 bound=- lease=1800 t1=900 t2=1575 src=derived\n")
     assert status.parse_heartbeat(str(hb))["bound"] is None
-
-
-def test_parse_heartbeat_standby(tmp_path):
-    hb = tmp_path / "hb"
-    hb.write_text("1783350773 STANDBY\n")
-    assert status.parse_heartbeat(str(hb))["standby"] is True
 
 
 def test_parse_heartbeat_mismatch(tmp_path):
@@ -95,8 +88,8 @@ def test_parse_heartbeat_without_nudge_tokens(tmp_path):
 def test_read_keepers_arp_nudge_field(tmp_path, monkeypatch):
     conf = tmp_path / "keeper.conf"
     conf.write_text(
-        "100.64.4.7|eth0|00:00:5e:00:01:fe|0|254|0|1||||240|0\n"
-        "100.64.4.8|eth0|00:00:5e:00:01:fd|0|253|0|1|||\n")   # old 10-field line
+        "100.64.4.7|eth0|00:00:5e:00:01:fe|0|254|1||||240|0\n"
+        "100.64.4.8|eth0|00:00:5e:00:01:fd|0|253|1|||\n")   # short line (no arp-nudge field)
     monkeypatch.setattr(status, "CONFFILE", str(conf))
     monkeypatch.setattr(status, "RUN_DIR", str(tmp_path))
     keepers = status.read_keepers({}, {})

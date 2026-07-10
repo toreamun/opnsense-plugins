@@ -22,7 +22,6 @@
                 <th data-column-id="followIp" data-width="7em" data-type="boolean" data-formatter="boolean">{{ lang._('Follow IP') }}</th>
                 <th data-column-id="aliasName" data-width="10em" data-type="string">{{ lang._('Sync alias') }}</th>
                 <th data-column-id="demoteOnLeaseLoss" data-width="9em" data-type="boolean" data-formatter="boolean">{{ lang._('CARP failover') }}</th>
-                <th data-column-id="runOnlyOnMaster" data-width="8em" data-type="boolean" data-formatter="boolean">{{ lang._('Master-only') }}</th>
                 <th data-column-id="description" data-type="string">{{ lang._('Description') }}</th>
                 <th data-column-id="uuid" data-type="string" data-identifier="true" data-visible="false">{{ lang._('ID') }}</th>
                 <th data-column-id="commands" data-width="7em" data-formatter="commands" data-sortable="false">{{ lang._('Commands') }}</th>

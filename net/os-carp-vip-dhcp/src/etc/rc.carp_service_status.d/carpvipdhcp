@@ -17,14 +17,6 @@ RUN_DIR="/var/run"
 # truly stalled keeper, never a mid-cycle one. (The health *banner* uses a
 # tighter 600s ceiling -- a notice is cheap, so it can be more responsive.)
 MAX_AGE=3600
-# A run-only-on-master keeper holds no lease while it is backup, so on promotion
-# it must DORA from scratch and briefly publishes bound=- acq=<epoch>. Grace that
-# bounded acquire window: demoting during it (when demote_on_lease_loss is also
-# set) hands the VIP straight back, and the peer then DORAs and demotes too --
-# the two nodes flap the VIP between them. A genuinely stuck acquire outlasts
-# this and still demotes. Comfortably covers a slow DORA plus a retry backoff.
-ACQUIRE_GRACE=120
-
 [ -f "${CONF}" ] || exit 0
 
 _id()
@@ -33,7 +25,7 @@ _id()
 }
 
 now=$(date +%s)
-while IFS='|' read -r request iface chaddr demote vhid runmaster follow vendorclass clientid hostname arpnudge arplistenpromisc || [ -n "${request}" ]; do
+while IFS='|' read -r request iface chaddr demote vhid follow vendorclass clientid hostname arpnudge arplistenpromisc || [ -n "${request}" ]; do
     [ -n "${request}" ] || continue
     case "${request}" in \#*) continue ;; esac
     [ "${demote}" = "1" ] || continue
@@ -47,18 +39,9 @@ while IFS='|' read -r request iface chaddr demote vhid runmaster follow vendorcl
     # holds the requested VIP lease.
     content=$(cat "${hb}" 2>/dev/null)
     case "${content}" in
-        *STANDBY*) continue ;;
         *MISMATCH*) exit 1 ;;
         *"bound=${request} "*) : ;;
-        *"bound=- "*)
-            # (Re)acquiring: grace the bounded post-promotion DORA window (acq=),
-            # else demote. A plain bound=- with no acq= (a non-gated keeper that
-            # lost its lease) has no acq token and falls through to exit 1.
-            acq=$(echo "${content}" | sed -n 's/.*[[:space:]]acq=\([0-9][0-9]*\).*/\1/p')
-            [ -n "${acq}" ] && [ $(( now - acq )) -le "${ACQUIRE_GRACE}" ] && continue
-            exit 1
-            ;;
-        *) exit 1 ;;
+        *) exit 1 ;;   # bound=- (lost/not-yet-acquired lease) or anything else -> demote
     esac
 done < "${CONF}"
 exit 0

@@ -98,7 +98,6 @@ OFFER, ACK, NAK = 2, 5, 6
 BOOTREPLY = 2              # BOOTP op field: a server->client reply (unrelated to OFFER)
 
 # Timing / retry tunables (seconds unless noted).
-GATE_POLL = 5              # between CARP-master checks when run-only-on-master is set
 HB_REFRESH = 30            # rewrite the heartbeat at least this often while holding a lease
 DEFAULT_LEASE = 3600       # fallback lease time if the server sends none
 DORA_ATTEMPTS = 5          # DISCOVER and REQUEST attempts per acquire
@@ -175,7 +174,7 @@ def mac2raw(m):
 
 class Keeper:
     def __init__(self, iface, chaddr, request_ip=None, eth_src=None,
-                 hbfile=None, release_on_exit=False, only_when_master=False, vhid=None,
+                 hbfile=None, release_on_exit=False, vhid=None,
                  follow=False, vendor_class=None, client_id=None, hostname=None,
                  arp_nudge=0, arp_listen_promisc=False):
         self.iface = iface
@@ -185,7 +184,6 @@ class Keeper:
         self.eth_src = (eth_src or chaddr).lower()
         self.hbfile = hbfile
         self.release_on_exit = release_on_exit
-        self.only_when_master = only_when_master
         self.vhid = str(vhid) if vhid else None
         self.follow = follow
         # ARP nudge: keep the upstream gateway's ARP entry for the leased address
@@ -222,9 +220,6 @@ class Keeper:
         self._followed_ip = None       # last address we asked configd to follow to
         self._follow_from = None       # address we followed FROM (for the retry watchdog)
         self._follow_fired_at = 0.0    # when we last dispatched follow_update (retry deadline)
-        self._last_master = True       # last known CARP-master decision (fail to this)
-        self._gated_standby = False    # currently standing by as CARP backup (run-only-on-master)
-        self._acquiring_since = None   # epoch a run-only-on-master DORA (re)started; grace for CARP
         # Follow throttle state, keyed by chaddr so it survives the follow-induced
         # restart (the request-IP-keyed runtime paths change on every follow).
         self._follow_state = "/var/run/carpvipdhcp-follow-%s" % _fs_safe(self.chaddr)
@@ -440,8 +435,6 @@ class Keeper:
         for attempt in range(1, DORA_ATTEMPTS + 1):
             if self.stop:
                 return False
-            if self.only_when_master and not self._is_master():
-                return False
             self._ensure_sniffer()
             self._rx = None
             try:
@@ -463,8 +456,6 @@ class Keeper:
             return False
         for attempt in range(1, DORA_ATTEMPTS + 1):
             if self.stop:
-                return False
-            if self.only_when_master and not self._is_master():
                 return False
             self._rx = None
             try:
@@ -588,13 +579,6 @@ class Keeper:
             gw = self._nudge_target()
             if gw:
                 extra += " gw=%s" % gw
-        # While a run-only-on-master keeper is (re)acquiring after promotion it has
-        # no lease yet, so bound=-. Publish acq=<start> so the CARP eligibility hook
-        # can grace this bounded DORA window instead of demoting us the instant we
-        # take over -- which, paired with demote_on_lease_loss, would flap the VIP
-        # back and forth between the nodes (neither can hold it through its DORA).
-        if not self.yiaddr and self.only_when_master and self._acquiring_since:
-            extra += " acq=%d" % int(self._acquiring_since)
         self._write_hb("%d bound=%s lease=%d t1=%d t2=%d src=%s%s\n"
                        % (int(time.time()), self.yiaddr or "-", self.lease, t1, t2, src, extra))
 
@@ -740,17 +724,12 @@ class Keeper:
                  rx.yiaddr, self.yiaddr)
         self._handle_changed_address(rx.yiaddr, rx, "OBSERVED", release_on_enforce=False)
 
-    # ---- CARP role, gating & standby ----
-
-    def _hb_standby(self):
-        # Run-only-on-master: we are CARP backup and intentionally hold no lease.
-        self._write_hb("%d STANDBY\n" % int(time.time()))
+    # ---- CARP role (master probe, transitions) ----
 
     def _probe_carp_master(self):
         """Raw CARP-role probe for our vhid: True/False from ifconfig, None when
         the probe itself fails; no vhid configured -> True (nothing to gate on).
-        Callers apply their own failure policy: _is_master fails open with the
-        last known role, the ARP nudge fails closed."""
+        The ARP nudge is the caller and fails closed (no nudge on a failed probe)."""
         if not self.vhid:
             return True
         try:
@@ -760,18 +739,6 @@ class Keeper:
             return ("carp: MASTER vhid %s " % self.vhid) in out
         except (OSError, subprocess.SubprocessError):
             return None
-
-    def _is_master(self):
-        """True if we should act as a DHCP client now: gating off, or this node is
-        CARP master for our vhid. On a failed probe, keep the last known decision
-        (fail open) so a transient ifconfig failure does not flap both nodes to
-        master at once."""
-        if not self.only_when_master or not self.vhid:
-            return True
-        probed = self._probe_carp_master()
-        if probed is not None:
-            self._last_master = probed
-        return self._last_master
 
     def _poll_carp_role(self):
         """Watch for a backup->master transition (called on the heartbeat
@@ -863,11 +830,9 @@ class Keeper:
         return slept
 
     def _sleep_gated(self, secs):
-        """Sleep up to secs (1s steps). Return False early on stop or, when
-        run-only-on-master is set, on CARP-master loss (checked every GATE_POLL).
-        Also services an operator-requested immediate nudge (SIGUSR1) and a
-        CARP-transition re-check (SIGUSR2) so both act within a second instead of
-        at the next heartbeat tick."""
+        """Sleep up to secs (1s steps). Return False early on stop. Also services an
+        operator-requested immediate nudge (SIGUSR1) and a CARP-transition re-check
+        (SIGUSR2) so both act within a second instead of at the next heartbeat tick."""
         slept = 0
         while slept < secs and not self.stop:
             if self._poll_role_now:
@@ -888,8 +853,6 @@ class Keeper:
                 # A peer-ACK observation is pending -> follow now (rationale +
                 # the dual-master window it closes are in _check_observed_follow).
                 self._check_observed_follow()
-            if self.only_when_master and slept % GATE_POLL == 0 and not self._is_master():
-                return False
             # Event-driven sleep: return at once when the sniffer signals a fresh
             # observation, otherwise time out after ~1s to run the periodic checks.
             if self._wake.wait(1.0):
@@ -925,11 +888,10 @@ class Keeper:
         while not self.stop and not self._start_sniffer():
             LOG.warning("sniffer start failed -- retrying in %ds", SNIFFER_RETRY)
             self._sleep(SNIFFER_RETRY)
-        gate = (" (only when CARP master, vhid %s)" % self.vhid) if self.only_when_master else ""
         # eth-src matters for L2 debugging but only when it differs from the chaddr.
         ethsrc = (" eth-src=%s" % self.eth_src) if self.eth_src != self.chaddr else ""
-        LOG.info("lease-keeper active on %s: chaddr=%s%s request=%s%s",
-                 self.iface, self.chaddr, ethsrc, self.request_ip or "any", gate)
+        LOG.info("lease-keeper active on %s: chaddr=%s%s request=%s",
+                 self.iface, self.chaddr, ethsrc, self.request_ip or "any")
         time.sleep(0.5)
         while not self.stop:
             # The keeper must NEVER die on a bad DHCP state: catch any unexpected
@@ -958,34 +920,13 @@ class Keeper:
         """One iteration of the maintain loop. Returns to run() (which loops again)
         on every state transition; any exception it raises is caught by run() and
         retried, so a transient fault can never terminate the keeper."""
-        # Run-only-on-master gating: stand by (no DHCP) while we are CARP backup.
-        # Log the master<->backup mode change once per transition (not every poll).
-        if self.only_when_master:
-            if not self._is_master():
-                if not self._gated_standby:
-                    LOG.info("CARP backup for vhid %s -- releasing the lease and standing by", self.vhid)
-                    self._gated_standby = True
-                if self.yiaddr:
-                    self.release()
-                    self.yiaddr = None
-                self._acquiring_since = None   # standing by, not acquiring
-                self._hb_standby()
-                self._sleep(GATE_POLL)
-                return
-            if self._gated_standby:
-                LOG.info("CARP master for vhid %s -- resuming DHCP (re-acquiring the lease)", self.vhid)
-                self._gated_standby = False
-                self._acquiring_since = time.time()   # start the post-promotion DORA grace
         # Acquire a lease if we do not hold one.
         if not self.yiaddr:
-            if self.only_when_master and self._acquiring_since is None:
-                self._acquiring_since = time.time()   # e.g. booted straight into master
             self._ensure_sniffer()  # a dead sniffer would silently fail every DORA
-            self._hb()  # active but not holding yet -> publish bound=- (not STANDBY)
+            self._hb()  # active but not holding yet -> publish bound=-
             if self.dora():
                 LOG.info("DHCP BOUND %s (lease=%ss, expires ~%s, server=%s)",
                          self.yiaddr, self.lease, self._clock_at(self.lease), self.server)
-                self._acquiring_since = None   # holding a lease again -> grace no longer applies
                 self._hb()
                 self._arp_nudge(force=True)
                 self.redora_wait = REDORA_MIN
@@ -1028,8 +969,6 @@ class Keeper:
             self._hb()
             self._arp_nudge(force=True)
             return
-        if self.only_when_master and not self._is_master():
-            return  # lost master -> top of loop releases and stands by
         LOG.error("DHCP lease expired -- re-acquiring (back to DISCOVER)")
         self.yiaddr = None
 
@@ -1071,7 +1010,6 @@ def main():
     ap.add_argument("--hbfile", default="/var/run/lease-keeper.hb")
     ap.add_argument("--logfile", default="/var/log/lease-keeper.log")
     ap.add_argument("--vhid", default=None)
-    ap.add_argument("--only-when-master", action="store_true")
     ap.add_argument("--follow", action="store_true")
     ap.add_argument("--vendor-class", default=None)
     ap.add_argument("--client-id", default=None)
@@ -1114,7 +1052,7 @@ def main():
 
     k = Keeper(a.iface, a.chaddr, a.request, a.eth_src,
                hbfile=a.hbfile, release_on_exit=a.release_on_exit or a.once,
-               only_when_master=a.only_when_master, vhid=a.vhid, follow=a.follow,
+               vhid=a.vhid, follow=a.follow,
                vendor_class=a.vendor_class, client_id=a.client_id, hostname=a.hostname,
                arp_nudge=a.arp_nudge, arp_listen_promisc=a.arp_listen_promisc)
 

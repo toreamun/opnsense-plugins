@@ -634,3 +634,11 @@ def test_renew_omits_server_id_and_requested_addr(lk):
         wire = [o for o in keeper._dhcp_options(mtype, extra) if isinstance(o, tuple)]
         assert all(o[0] != "server_id" for o in wire)
         assert all(o[0] != "requested_addr" for o in wire)
+
+
+def test_backoff_jitter(lk):
+    # RFC 2131 §4.1 randomized backoff: the jittered delay stays within +/-25% of
+    # the base and is not constant, so two shared-chaddr nodes de-synchronize.
+    vals = [lk._jittered(8) for _ in range(200)]
+    assert all(6.0 <= v <= 10.0 for v in vals)   # 8 * [0.75, 1.25]
+    assert len(set(vals)) > 1

@@ -610,3 +610,27 @@ def test_absorb_reply_captures_gw_and_mask(lk):
     keeper._absorb_reply(rx, lk.DEFAULT_LEASE)
     assert keeper.router == "100.64.4.1"
     assert keeper.mask_bits == 24
+
+
+def test_renew_omits_server_id_and_requested_addr(lk):
+    # RFC 2131 §4.3.2: a RENEWING/REBINDING REQUEST MUST NOT carry server_id or
+    # requested_addr, and ciaddr MUST be the client's address.
+    keeper = _plain_keeper(lk)
+    keeper.server, keeper.yiaddr, keeper.lease = "100.64.4.1", "100.64.4.7", 1800
+    sent = []
+    keeper._ensure_sniffer = lambda: None
+    keeper._send_dhcp = lambda mtype, extra, ciaddr="0.0.0.0": sent.append((mtype, extra, ciaddr))
+    keeper._wait_for_dhcp_reply = lambda want, timeout: lk.DhcpReply(
+        lk.ACK, keeper.yiaddr, keeper.server, 1800, None, None, None)
+    assert keeper.renew() is True            # RENEW (T1)
+    assert keeper.renew(rebind=True) is True  # REBIND (T2)
+    assert sent, "renew sent nothing"
+    for mtype, extra, ciaddr in sent:
+        assert mtype == "request"
+        assert ciaddr == "100.64.4.7"          # ciaddr MUST be the client's address
+        # assert on the ACTUAL assembled option list, not the stubbed extras
+        # (which are always empty here) -- so a regression that re-added
+        # server_id to renew's opts would fail this.
+        wire = [o for o in keeper._dhcp_options(mtype, extra) if isinstance(o, tuple)]
+        assert all(o[0] != "server_id" for o in wire)
+        assert all(o[0] != "requested_addr" for o in wire)

@@ -496,10 +496,14 @@ class Keeper:
         return False
 
     def renew(self, rebind=False):
-        # RENEWING/REBINDING (RFC 2131 4.3.2/4.4.5): ciaddr identifies the lease,
-        # so requested_addr is omitted. RENEW (T1) still names the leasing server;
-        # REBIND (T2) drops server_id so ANY DHCP server may answer.
-        opts = [] if rebind or not self.server else [("server_id", self.server)]
+        # RENEWING/REBINDING (RFC 2131 4.3.2): ciaddr identifies the lease, so
+        # server_id AND requested_addr MUST NOT be set in either state. We always
+        # broadcast (the co-resident non-promiscuous sniffer needs the reply
+        # broadcast), so any server may answer, which is fine for a single-server
+        # ISP WAN. `rebind` is still load-bearing: it picks the log label AND
+        # (via the `phase` it sets) relaxes the expected-server check in
+        # _handle_changed_address, since at T2 any server may legitimately answer.
+        opts = []
         for _ in range(RENEW_ATTEMPTS):
             if self.stop:
                 return False

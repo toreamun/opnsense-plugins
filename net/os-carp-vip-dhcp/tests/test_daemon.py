@@ -581,3 +581,32 @@ def test_follow_update_action_arity():
                 break
     assert params is not None, "[follow_update] action or its parameters line is missing"
     assert params.count("%s") >= 5, "follow_update template narrower than the daemon's 5-arg call"
+
+
+# ---- RFC 2131/2132 compliance ----
+
+def _plain_keeper(lk):
+    return lk.Keeper("eth0", "00:00:5e:00:01:fe", "100.64.4.7", hbfile=None)
+
+
+def test_dhcp_options_include_param_req_list(lk):
+    # Every DISCOVER/REQUEST must carry the Parameter Request List (RFC 2132 §9.8)
+    # so the server returns the subnet mask (1) + router (3) follow-mode needs.
+    keeper = _plain_keeper(lk)
+    opts = keeper._dhcp_options("discover", [("requested_addr", "100.64.4.7")])
+    assert opts[0] == ("message-type", "discover")
+    assert ("param_req_list", lk.PARAM_REQ_LIST) in opts
+    assert 1 in lk.PARAM_REQ_LIST and 3 in lk.PARAM_REQ_LIST
+    assert ("requested_addr", "100.64.4.7") in opts
+    assert opts[-1] == "end"
+
+
+def test_absorb_reply_captures_gw_and_mask(lk):
+    # The PRL asks for opt 3 (router) + opt 1 (mask); _absorb_reply keeps both so
+    # the BOUND log can surface them (and follow mode can use the mask).
+    keeper = _plain_keeper(lk)
+    rx = lk.DhcpReply(lk.ACK, "100.64.4.7", "100.64.4.1", 1800, None, None,
+                      "100.64.4.1", None, "255.255.255.0")
+    keeper._absorb_reply(rx, lk.DEFAULT_LEASE)
+    assert keeper.router == "100.64.4.1"
+    assert keeper.mask_bits == 24

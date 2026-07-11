@@ -80,6 +80,13 @@ LOG = logging.getLogger("lease-keeper")
 OFFER, ACK, NAK = 2, 5, 6
 BOOTREPLY = 2              # BOOTP op field: a server->client reply (unrelated to OFFER)
 
+# Options we ask the server to include on every DISCOVER/REQUEST (RFC 2132 option
+# 55, Parameter Request List). Subnet mask (1) + router (3) drive follow mode's
+# cross-subnet decision; lease/server-id/T1/T2 (51/54/58/59) drive renew timing.
+# Many servers return ONLY options named in the PRL, so without this the keeper
+# can silently miss the mask/router it needs to follow a cross-subnet renumber.
+PARAM_REQ_LIST = [1, 3, 51, 54, 58, 59]
+
 # Timing / retry tunables (seconds unless noted).
 HB_REFRESH = 30            # rewrite the heartbeat at least this often while holding a lease
 DEFAULT_LEASE = 3600       # fallback lease time if the server sends none
@@ -193,6 +200,7 @@ class Keeper:
         # Opt-in fallback for NICs that drop non-primary unicast MACs.
         self.arp_listen_promisc = arp_listen_promisc
         self.router = None             # default gateway (DHCP opt 3, fallback: server_id)
+        self.mask_bits = None          # subnet prefix length from opt 1 (for logging + follow)
         self._last_nudge = 0.0
         self._nudge_gw = None          # last nudge target we logged (log again on change)
         self._nudge_warned = False     # warned once about a missing nudge target
@@ -379,6 +387,13 @@ class Keeper:
 
     # ---- DHCP protocol (send / await reply / DORA / renew / release) ----
 
+    def _dhcp_options(self, mtype, extra):
+        """The DHCP option list for a message: type, our Parameter Request List
+        (so the server returns the mask/router/timers the keeper acts on), the
+        identity options, then the per-message extras."""
+        return ([("message-type", mtype), ("param_req_list", PARAM_REQ_LIST)]
+                + self._id_opts + extra + ["end"])
+
     def _send_dhcp(self, mtype, extra, ciaddr="0.0.0.0"):
         # ciaddr is set for RENEW/REBIND (the client already owns the address);
         # the broadcast flag stays on so the reply is reliably captured by the sniffer.
@@ -386,7 +401,7 @@ class Keeper:
                IP(src=ciaddr, dst="255.255.255.255") /
                UDP(sport=68, dport=67) /
                BOOTP(chaddr=self.chraw, xid=self.xid, ciaddr=ciaddr, flags=BROADCAST_FLAG) /
-               DHCP(options=[("message-type", mtype)] + self._id_opts + extra + ["end"]))
+               DHCP(options=self._dhcp_options(mtype, extra)))
         sendp(pkt, iface=self.iface, verbose=0)
 
     def _wait_for_dhcp_reply(self, want, timeout):
@@ -416,11 +431,14 @@ class Keeper:
         return None
 
     def _absorb_reply(self, rx, default_lease):
-        """Adopt lease timing and gateway (DHCP option 3) from an ACK -- the one
-        place that knows which DhcpReply fields carry keeper state."""
+        """Adopt lease timing, gateway (opt 3) and subnet mask (opt 1) from an ACK
+        -- the one place that knows which DhcpReply fields carry keeper state.
+        gateway + mask are what the Parameter Request List asks for; keep them for
+        logging + the cross-subnet follow decision."""
         self.lease = rx.lease or default_lease
         self.t1_server, self.t2_server = rx.t1, rx.t2
         self.router = rx.router or self.router
+        self.mask_bits = _mask_to_bits(rx.subnet_mask) or self.mask_bits
 
     def dora(self):
         """Acquire a lease via the DHCP DORA handshake -- Discover, Offer,
@@ -927,8 +945,10 @@ class Keeper:
             self._ensure_sniffer()  # a dead sniffer would silently fail every DORA
             self._hb()  # active but not holding yet -> publish bound=-
             if self.dora():
-                LOG.info("DHCP BOUND %s (lease=%ss, expires ~%s, server=%s)",
-                         self.yiaddr, self.lease, self._clock_at(self.lease), self.server)
+                LOG.info("DHCP BOUND %s (lease=%ss, expires ~%s, server=%s, gw=%s, mask=%s)",
+                         self.yiaddr, self.lease, self._clock_at(self.lease), self.server,
+                         self.router or "?",
+                         "/%d" % self.mask_bits if self.mask_bits else "none")
                 self._hb()
                 self._arp_nudge(force=True)
                 self.redora_wait = REDORA_MIN

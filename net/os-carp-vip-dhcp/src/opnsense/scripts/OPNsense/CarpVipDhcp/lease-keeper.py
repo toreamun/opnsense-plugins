@@ -173,6 +173,16 @@ def _fs_safe(s):
     return re.sub(r"[^A-Za-z0-9]", "_", s or "")
 
 
+def _jittered(base):
+    """A retransmit/backoff delay with +/-25% uniform jitter (RFC 2131 4.1
+    recommends a randomized backoff). Both HA nodes share the chaddr, so
+    jittering the acquire and REBIND retransmit cadences keeps them from
+    broadcasting in lockstep and colliding at the server. (The T1/T2 lease
+    timers are deterministic and shared too, but jittering those is a
+    lease-timing change, not a 4.1 retransmit concern, so they stay exact.)"""
+    return base * random.uniform(0.75, 1.25)
+
+
 def mac2raw(m):
     return bytes.fromhex(m.replace(":", "").replace("-", ""))
 
@@ -464,7 +474,7 @@ class Keeper:
                 break
             # xid included so the exchange can be matched against a packet capture.
             LOG.info("no DHCP OFFER (attempt %d, xid 0x%08x)", attempt, self.xid)
-            time.sleep(min(2 * attempt, ATTEMPT_BACKOFF_CAP))
+            time.sleep(min(_jittered(2 ** attempt), ATTEMPT_BACKOFF_CAP))
         else:
             return False
         for attempt in range(1, DORA_ATTEMPTS + 1):
@@ -492,7 +502,7 @@ class Keeper:
                 return True
             LOG.info("no DHCP ACK from %s for %s (attempt %d, xid 0x%08x)",
                      self.server, self.yiaddr, attempt, self.xid)
-            time.sleep(min(2 * attempt, ATTEMPT_BACKOFF_CAP))
+            time.sleep(min(_jittered(2 ** attempt), ATTEMPT_BACKOFF_CAP))
         return False
 
     def renew(self, rebind=False):
@@ -958,7 +968,7 @@ class Keeper:
                 self.redora_wait = REDORA_MIN
             else:
                 LOG.warning("DHCP acquire (DISCOVER/REQUEST) failed -- retrying in %ds", self.redora_wait)
-                self._sleep_interruptible(self.redora_wait)
+                self._sleep_interruptible(_jittered(self.redora_wait))
                 self.redora_wait = min(self.redora_wait * 2, REDORA_MAX)
             return
         # Maintain: wait until T1, then RENEW; bail early on stop.
@@ -981,7 +991,11 @@ class Keeper:
         elapsed = t1
         ok = False
         while elapsed < t2 and not self.stop:
-            step = min(REBIND_POLL_STEP, t2 - elapsed)
+            # Jitter the REBIND retransmit cadence: both nodes hit T2 together
+            # (identical lease timers), so an un-jittered step would broadcast
+            # REBIND in lockstep. Overshooting t2 slightly is harmless (the guard
+            # re-checks). Account the actual jittered wait so elapsed tracks it.
+            step = _jittered(min(REBIND_POLL_STEP, t2 - elapsed))
             if not self._sleep_interruptible(step):
                 break
             elapsed += step

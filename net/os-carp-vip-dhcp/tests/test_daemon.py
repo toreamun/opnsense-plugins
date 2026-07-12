@@ -51,6 +51,50 @@ def test_dhcpreply_giaddr_defaults_none(lk):
     assert rx.giaddr is None
 
 
+def _reboot_keeper(lk):
+    k = lk.Keeper("eth0", "00:00:5e:00:01:fe", "100.64.4.7", hbfile=None)
+    k._ensure_sniffer = lambda: None
+    k.sent = []
+    k._send_dhcp = lambda mtype, extra, ciaddr="0.0.0.0": k.sent.append((mtype, extra, ciaddr))
+    return k
+
+
+def test_reboot_request_shape_and_bind(lk):
+    k = _reboot_keeper(lk)
+    k._wait_for_dhcp_reply = lambda want, timeout: lk.DhcpReply(
+        lk.ACK, "100.64.4.7", "100.64.4.1", 1800, None, None, None)
+    assert k.reboot() is True
+    assert k.yiaddr == "100.64.4.7" and k.server == "100.64.4.1"
+    mtype, extra, ciaddr = k.sent[0]
+    assert mtype == "request" and ciaddr == "0.0.0.0"          # INIT-REBOOT: ciaddr stays 0
+    assert ("requested_addr", "100.64.4.7") in extra           # option 50 = our known address
+    assert not any(o[0] == "server_id" for o in extra if isinstance(o, tuple))  # RFC 4.3.2: no server-id
+
+
+def test_reboot_nak_falls_through(lk):
+    k = _reboot_keeper(lk)
+    k._wait_for_dhcp_reply = lambda want, timeout: "NAK"
+    assert k.reboot() is False
+    assert k.yiaddr is None
+
+
+def test_reboot_skipped_without_request_ip(lk):
+    k = lk.Keeper("eth0", "00:00:5e:00:01:fe", None, hbfile=None)
+    assert k.reboot() is False        # no known address -> nothing to reboot-request
+
+
+def test_acquire_reboot_first_then_dora(lk):
+    k = _reboot_keeper(lk)
+    calls = []
+    k.reboot = lambda: (calls.append("reboot"), False)[1]
+    k.dora = lambda: (calls.append("dora"), True)[1]
+    assert k._acquire() is True
+    assert calls == ["reboot", "dora"]      # first acquire: INIT-REBOOT then DISCOVER fallback
+    calls.clear()
+    assert k._acquire() is True
+    assert calls == ["dora"]                # subsequent acquires: DISCOVER only
+
+
 def test_fmt_reply_readable(lk):
     off = lk.DhcpReply(2, "100.64.4.74", "100.64.4.1", 120, 60, 105, "100.64.4.1",
                        None, "255.255.255.0", None)

@@ -91,6 +91,7 @@ PARAM_REQ_LIST = [1, 3, 51, 54, 58, 59]
 HB_REFRESH = 30            # rewrite the heartbeat at least this often while holding a lease
 DEFAULT_LEASE = 3600       # fallback lease time if the server sends none
 DORA_ATTEMPTS = 5          # DISCOVER and REQUEST attempts per acquire
+REBOOT_ATTEMPTS = 2        # INIT-REBOOT REQUEST attempts before falling back to a full DISCOVER
 RENEW_ATTEMPTS = 3         # REQUEST attempts per renew
 REPLY_TIMEOUT = 4          # wait for an OFFER/ACK during acquire
 RENEW_TIMEOUT = 3          # wait for an ACK during renew
@@ -275,6 +276,7 @@ class Keeper:
         # restart (the request-IP-keyed runtime paths change on every follow).
         self._follow_state = "/var/run/carpvipdhcp-follow-%s" % _fs_safe(self.chaddr)
         self.redora_wait = REDORA_MIN
+        self._tried_reboot = False     # the first acquire tries INIT-REBOOT before a full DISCOVER
         # Link-return fast path (only while UNBOUND): a carrier down->up edge resets
         # the backoff and re-DORAs at once, like dhclient's link-up -> state_reboot.
         self._link_up = None           # last carrier state seen (None = unknown / not probed)
@@ -544,6 +546,58 @@ class Keeper:
                      self.server, self.yiaddr, attempt, self.xid)
             time.sleep(min(_jittered(2 ** attempt), ATTEMPT_BACKOFF_CAP))
         return False
+
+    def reboot(self):
+        """INIT-REBOOT (RFC 2131 4.3.2): we already know the address we want
+        (request_ip), so REQUEST it directly instead of a full DISCOVER -- one
+        exchange, and a server that is reachable but refuses the address answers
+        with a NAK (a DISCOVER it may just ignore), surfacing 'reachable but
+        refused' in the log. server_id MUST NOT be set and ciaddr stays 0 (we do
+        not own the address on the interface). Returns True once BOUND, False on
+        NAK/timeout so the caller falls back to a full DORA."""
+        if not self.request_ip:
+            return False
+        self.xid = random.randint(1, 0xFFFFFFFF)
+        extra = [("requested_addr", self.request_ip)]
+        for attempt in range(1, REBOOT_ATTEMPTS + 1):
+            if self.stop:
+                return False
+            self._ensure_sniffer()
+            self._rx = None
+            try:
+                self._send_dhcp("request", extra)
+            except Exception as e:
+                LOG.error("DHCP INIT-REBOOT send failed: %s", e)
+                time.sleep(SEND_RETRY_DELAY)
+                continue
+            rx = self._wait_for_dhcp_reply(ACK, REPLY_TIMEOUT)
+            if rx == "NAK":
+                return False   # server refused our known address -> full DISCOVER
+            if rx:
+                got = rx.yiaddr
+                if got and got != self.request_ip:
+                    return self._handle_changed_address(got, rx, "REBOOT", release_on_enforce=True)
+                self.yiaddr, self.server = self.request_ip, rx.server_id
+                self._absorb_reply(rx, DEFAULT_LEASE)
+                return True
+            LOG.info("no DHCP ACK to INIT-REBOOT for %s (attempt %d, xid 0x%08x)",
+                     self.request_ip, attempt, self.xid)
+            if attempt < REBOOT_ATTEMPTS:   # no backoff after the last try -- fall to DORA at once
+                time.sleep(min(_jittered(2 ** attempt), ATTEMPT_BACKOFF_CAP))
+        return False
+
+    def _acquire(self):
+        """Get a lease. The first acquire after (re)start tries INIT-REBOOT (a
+        direct REQUEST for our known address) before a full DISCOVER; after that,
+        the normal DORA. INIT-REBOOT is one exchange and surfaces a NAK when the
+        server is reachable but refuses the address."""
+        if not self._tried_reboot:
+            self._tried_reboot = True
+            if self.request_ip:
+                if self.reboot():
+                    return True
+                LOG.info("INIT-REBOOT did not bind %s -- falling back to DISCOVER", self.request_ip)
+        return self.dora()
 
     def renew(self, rebind=False):
         # RENEWING/REBINDING (RFC 2131 4.3.2): ciaddr identifies the lease, so
@@ -1044,7 +1098,7 @@ class Keeper:
         if not self.yiaddr:
             self._ensure_sniffer()  # a dead sniffer would silently fail every DORA
             self._hb()  # active but not holding yet -> publish bound=-
-            if self.dora():
+            if self._acquire():
                 LOG.info("DHCP BOUND %s (lease=%ss, expires ~%s, server=%s, gw=%s, mask=%s)",
                          self.yiaddr, self.lease, self._clock_at(self.lease), self.server,
                          self.router or "?",

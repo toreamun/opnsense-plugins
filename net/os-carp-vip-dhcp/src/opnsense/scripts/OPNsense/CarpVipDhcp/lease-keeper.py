@@ -98,7 +98,11 @@ ATTEMPT_BACKOFF_CAP = 8    # max wait between acquire attempts
 SEND_RETRY_DELAY = 2       # wait after a failed packet send before retrying
 REBIND_POLL_STEP = 10      # how often to re-try RENEW during the REBIND window
 REDORA_MIN = 10            # initial wait after a failed acquire
-REDORA_MAX = 300           # max exponential-backoff wait after a failed acquire
+# REDORA_MAX lowered from 300 so worst-case re-acquire lag stays ~45s even if the
+# link-return fast path (below) misses; the backoff doubles 10 -> 20 -> 40 -> 45.
+REDORA_MAX = 45            # max exponential-backoff wait after a failed acquire
+LINK_POLL_STEP = 3         # while UNBOUND, poll interface carrier this often (s) for the link-return fast path
+LINK_KICK_DEBOUNCE = 8     # min seconds between link-return re-DORA kicks (damps a flapping link)
 SNIFFER_RETRY = 5          # wait before retrying a failed packet-sniffer start
 LOOP_ERROR_BACKOFF = 10    # wait after an unexpected main-loop error before retrying
 MIN_FOLLOW_INTERVAL = 60   # min seconds between follow (VIP rewrite) events -- damps flap/spoof storms
@@ -241,6 +245,11 @@ class Keeper:
         # restart (the request-IP-keyed runtime paths change on every follow).
         self._follow_state = "/var/run/carpvipdhcp-follow-%s" % _fs_safe(self.chaddr)
         self.redora_wait = REDORA_MIN
+        # Link-return fast path (only while UNBOUND): a carrier down->up edge resets
+        # the backoff and re-DORAs at once, like dhclient's link-up -> state_reboot.
+        self._link_up = None           # last carrier state seen (None = unknown / not probed)
+        self._link_kick_at = 0.0       # epoch of the last link-return kick (debounce)
+        self._link_returned = False    # set by _sleep_interruptible on a carrier return while unbound
         self.xid = random.randint(1, 0xFFFFFFFF)
         self.server = None
         self.yiaddr = None
@@ -774,6 +783,42 @@ class Keeper:
         except (OSError, subprocess.SubprocessError):
             return None
 
+    def _iface_link_up(self):
+        """Interface carrier from ifconfig: True on 'status: active', False on a
+        present-but-inactive status (no carrier / no link), None when it cannot be
+        read (probe failed, or the NIC reports no status line). Used only by the
+        unbound link-return fast path; a None result never disturbs the backoff."""
+        try:
+            out = subprocess.check_output(["/sbin/ifconfig", self.iface], errors="replace")
+            if isinstance(out, bytes):
+                out = out.decode(errors="replace")
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if "status: active" in out:
+            return True
+        if "status: " in out:
+            return False
+        return None
+
+    def _check_link_returned(self):
+        """While UNBOUND, detect a carrier down->up edge so the keeper re-DORAs at
+        once instead of waiting out the backoff (mirrors dhclient link-up ->
+        state_reboot). Returns True only on a *seen-down* -> up transition, debounced
+        against a flapping link. An initial unknown->up is NOT a trigger (we were
+        already up), so this never fires spuriously at startup."""
+        up = self._iface_link_up()
+        if up is None:
+            return False
+        prev = self._link_up
+        self._link_up = up
+        if up and prev is False:
+            now = time.time()
+            if now - self._link_kick_at < LINK_KICK_DEBOUNCE:
+                return False
+            self._link_kick_at = now
+            return True
+        return False
+
     def _poll_carp_role(self):
         """Watch for a backup->master transition (called on the heartbeat
         cadence). Becoming master renews the lease early and, when enabled,
@@ -887,6 +932,12 @@ class Keeper:
                 # A peer-ACK observation is pending -> follow now (rationale +
                 # the dual-master window it closes are in _check_observed_follow).
                 self._check_observed_follow()
+            # Link-return fast path: only while UNBOUND, poll carrier every few
+            # seconds; a down->up edge means the WAN just came back, so stop waiting
+            # and let _run_once re-DORA immediately (the bound path skips this).
+            if self.yiaddr is None and slept % LINK_POLL_STEP == 0 and self._check_link_returned():
+                self._link_returned = True
+                return not self.stop
             # Event-driven sleep: return at once when the sniffer signals a fresh
             # observation, otherwise time out after ~1s to run the periodic checks.
             if self._wake.wait(1.0):
@@ -968,8 +1019,15 @@ class Keeper:
                 self.redora_wait = REDORA_MIN
             else:
                 LOG.warning("DHCP acquire (DISCOVER/REQUEST) failed -- retrying in %ds", self.redora_wait)
+                self._link_returned = False
                 self._sleep_interruptible(_jittered(self.redora_wait))
-                self.redora_wait = min(self.redora_wait * 2, REDORA_MAX)
+                if self._link_returned:
+                    # WAN carrier returned mid-backoff: re-acquire now instead of
+                    # waiting out the next backoff (matches native dhclient).
+                    LOG.info("WAN link returned while unbound -- re-acquiring now")
+                    self.redora_wait = REDORA_MIN
+                else:
+                    self.redora_wait = min(self.redora_wait * 2, REDORA_MAX)
             return
         # Maintain: wait until T1, then RENEW; bail early on stop.
         t1, t2, src = self._timing()

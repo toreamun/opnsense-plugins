@@ -28,16 +28,16 @@ def test_fs_safe(lk):
 
 def test_timing_derived(lk):
     keeper = lk.Keeper("eth0", "00:00:5e:00:01:fe", "100.64.4.7", hbfile=None)
-    keeper.lease = 1800
-    assert keeper._timing() == (900, 1575, "derived")
+    keeper._dhcp.lease = 1800
+    assert keeper._dhcp.timing() == (900, 1575, "derived")
 
 
 def test_timing_honours_server(lk):
     keeper = lk.Keeper("eth0", "00:00:5e:00:01:fe", "100.64.4.7", hbfile=None)
-    keeper.lease = 1800
-    keeper.t1_server = 600
-    keeper.t2_server = 1200
-    assert keeper._timing() == (600, 1200, "server")
+    keeper._dhcp.lease = 1800
+    keeper._dhcp.t1_server = 600
+    keeper._dhcp.t2_server = 1200
+    assert keeper._dhcp.timing() == (600, 1200, "server")
 
 
 def test_redora_max_bounded(lk):
@@ -55,16 +55,16 @@ def _reboot_keeper(lk):
     k = lk.Keeper("eth0", "00:00:5e:00:01:fe", "100.64.4.7", hbfile=None)
     k._ensure_sniffer = lambda: None
     k.sent = []
-    k._send_dhcp = lambda mtype, extra, ciaddr="0.0.0.0": k.sent.append((mtype, extra, ciaddr))
+    k._dhcp._send_dhcp = lambda mtype, extra, ciaddr="0.0.0.0": k.sent.append((mtype, extra, ciaddr))
     return k
 
 
 def test_reboot_request_shape_and_bind(lk):
     k = _reboot_keeper(lk)
-    k._wait_for_dhcp_reply = lambda want, timeout: lk.DhcpReply(
+    k._dhcp._wait_for_dhcp_reply = lambda want, timeout: lk.DhcpReply(
         lk.ACK, "100.64.4.7", "100.64.4.1", 1800, None, None, None)
-    assert k.reboot() is True
-    assert k.yiaddr == "100.64.4.7" and k.server == "100.64.4.1"
+    assert k._dhcp.reboot("100.64.4.7") is True
+    assert k._dhcp.yiaddr == "100.64.4.7" and k._dhcp.server == "100.64.4.1"
     mtype, extra, ciaddr = k.sent[0]
     assert mtype == "request" and ciaddr == "0.0.0.0"          # INIT-REBOOT: ciaddr stays 0
     assert ("requested_addr", "100.64.4.7") in extra           # option 50 = our known address
@@ -73,25 +73,25 @@ def test_reboot_request_shape_and_bind(lk):
 
 def test_reboot_nak_falls_through(lk):
     k = _reboot_keeper(lk)
-    k._wait_for_dhcp_reply = lambda want, timeout: "NAK"
-    assert k.reboot() is False
-    assert k.yiaddr is None
+    k._dhcp._wait_for_dhcp_reply = lambda want, timeout: "NAK"
+    assert k._dhcp.reboot("100.64.4.7") is False
+    assert k._dhcp.yiaddr is None
 
 
 def test_reboot_skipped_without_request_ip(lk):
     k = lk.Keeper("eth0", "00:00:5e:00:01:fe", None, hbfile=None)
-    assert k.reboot() is False        # no known address -> nothing to reboot-request
+    assert k._dhcp.reboot(None) is False  # no known address -> nothing to reboot-request
 
 
 def test_acquire_reboot_first_then_dora(lk):
     k = _reboot_keeper(lk)
     calls = []
-    k.reboot = lambda: (calls.append("reboot"), False)[1]
-    k.dora = lambda: (calls.append("dora"), True)[1]
-    assert k._acquire() is True
+    k._dhcp.reboot = lambda rip: (calls.append("reboot"), False)[1]
+    k._dhcp.dora = lambda rip=None: (calls.append("dora"), True)[1]
+    assert k._dhcp.acquire("100.64.4.7") is True
     assert calls == ["reboot", "dora"]      # first acquire: INIT-REBOOT then DISCOVER fallback
     calls.clear()
-    assert k._acquire() is True
+    assert k._dhcp.acquire("100.64.4.7") is True
     assert calls == ["dora"]                # subsequent acquires: DISCOVER only
 
 
@@ -165,12 +165,12 @@ def test_check_link_returned_debounce(lk, monkeypatch):
 def _follow_keeper(lk, tmp_path):
     keeper = lk.Keeper("eth0", "00:00:5e:00:01:fe", "100.64.4.7", hbfile=None, follow=True)
     keeper._follow_state = str(tmp_path / "follow_state")
-    keeper.server = "100.64.4.1"
-    keeper.yiaddr = "100.64.4.7"
+    keeper._dhcp.server = "100.64.4.1"
+    keeper._dhcp.yiaddr = "100.64.4.7"
     keeper.fired = []
     keeper._follow_update = keeper.fired.append
     keeper._hb_mismatch = lambda got: None
-    keeper.release = lambda: None
+    keeper._dhcp.release = lambda *a: None
     return keeper
 
 
@@ -213,10 +213,10 @@ def test_parse_reply_extracts_fields_and_relay(lk):
 
 def test_on_dhcp_reply_captures_option56_message(lk):
     keeper = lk.Keeper("eth0", "00:00:5e:00:01:fe", "100.64.4.7", hbfile=None)
-    pkt = _DhcpPkt(lk, keeper.xid, [("message-type", lk.NAK), ("server_id", "100.64.4.1"),
-                                    ("message", "pool exhausted"), "end"])
+    pkt = _DhcpPkt(lk, keeper._dhcp.xid, [("message-type", lk.NAK), ("server_id", "100.64.4.1"),
+                                          ("message", "pool exhausted"), "end"])
     keeper._on_dhcp_reply(pkt)
-    assert keeper._rx.message == "pool exhausted"
+    assert keeper._dhcp._rx.message == "pool exhausted"
 
 
 @pytest.mark.parametrize("message, expect", [
@@ -226,9 +226,9 @@ def test_on_dhcp_reply_captures_option56_message(lk):
 ])
 def test_dhcpnak_logs_reason(lk, caplog, message, expect):
     keeper = lk.Keeper("eth0", "00:00:5e:00:01:fe", "100.64.4.7", hbfile=None)
-    keeper._rx = lk.DhcpReply(lk.NAK, None, "100.64.4.1", None, None, None, None, message)
+    keeper._dhcp._rx = lk.DhcpReply(lk.NAK, None, "100.64.4.1", None, None, None, None, message)
     with caplog.at_level("WARNING", logger="lease-keeper"):
-        assert keeper._wait_for_dhcp_reply(lk.ACK, 0.2) == "NAK"
+        assert keeper._dhcp._wait_for_dhcp_reply(lk.ACK, 0.2) == "NAK"
     assert any(expect in r.getMessage() for r in caplog.records)
 
 
@@ -261,10 +261,13 @@ def test_follow_throttled_within_interval(lk, tmp_path):
 
 def test_enforce_mismatch_refused(lk, tmp_path):
     keeper = lk.Keeper("eth0", "00:00:5e:00:01:fe", "100.64.4.7", hbfile=None, follow=False)
-    keeper.server = "100.64.4.1"
-    keeper.yiaddr = "100.64.4.7"
-    keeper.release = lambda: None
+    keeper._dhcp.server = "100.64.4.1"
+    keeper._dhcp.yiaddr = "100.64.4.7"
+    released = []
+    keeper._dhcp.release = lambda *a: released.append(a)
     assert keeper._handle_changed_address("100.64.4.60", _ack(lk, "100.64.4.60"), "DORA", True) is False
+    assert released == [("100.64.4.60", "100.64.4.1")]  # the refused grant is released...
+    assert keeper._dhcp.yiaddr is None                  # ...and not held (run loop re-acquires)
 
 
 # ---- observed peer ACK: converge follow from the peer's exchange (single-ip s.3) ----
@@ -274,7 +277,7 @@ def _observe_keeper(lk, tmp_path):
     # _follow_update stubs), plus a known in-flight xid so a peer ACK (different
     # xid) takes the observed path.
     keeper = _follow_keeper(lk, tmp_path)
-    keeper.xid = 0x11111111
+    keeper._dhcp.xid = 0x11111111
     return keeper
 
 
@@ -291,7 +294,7 @@ def test_observed_peer_ack_records_change_and_wakes(lk, tmp_path):
     keeper._on_dhcp_reply(_peer_ack(lk, "100.64.4.60"))
     assert keeper._observed_change is not None
     assert keeper._observed_change.yiaddr == "100.64.4.60"
-    assert keeper._rx is None          # the first-party slot is untouched
+    assert keeper._dhcp._rx is None          # the first-party slot is untouched
     assert keeper._wake.is_set()       # ...and the maintain-loop sleep is woken at once
 
 
@@ -318,20 +321,20 @@ def test_observed_ignores_non_ack(lk, tmp_path):
 
 def test_observed_ignored_when_not_follow(lk, tmp_path):
     keeper = lk.Keeper("eth0", "00:00:5e:00:01:fe", "100.64.4.7", hbfile=None, follow=False)
-    keeper.server = "100.64.4.1"
-    keeper.yiaddr = "100.64.4.7"
-    keeper.xid = 0x11111111
+    keeper._dhcp.server = "100.64.4.1"
+    keeper._dhcp.yiaddr = "100.64.4.7"
+    keeper._dhcp.xid = 0x11111111
     keeper._on_dhcp_reply(_peer_ack(lk, "100.64.4.60"))
     assert keeper._observed_change is None
 
 
 def test_own_xid_reply_uses_first_party_path(lk, tmp_path):
     keeper = _observe_keeper(lk, tmp_path)
-    keeper._on_dhcp_reply(_DhcpPkt(lk, keeper.xid,
+    keeper._on_dhcp_reply(_DhcpPkt(lk, keeper._dhcp.xid,
                                    [("message-type", lk.ACK), ("server_id", "100.64.4.1"), "end"],
                                    yiaddr="100.64.4.60"))
     assert keeper._observed_change is None            # not the observed path
-    assert keeper._rx is not None and keeper._rx.yiaddr == "100.64.4.60"
+    assert keeper._dhcp._rx is not None and keeper._dhcp._rx.yiaddr == "100.64.4.60"
 
 
 def test_observed_latest_wins(lk, tmp_path):
@@ -351,7 +354,7 @@ def test_observed_same_address_after_follow_is_dropped(lk, tmp_path):
     # After we've followed to the new address, a lingering observation for that
     # same address is a no-op (the == self.yiaddr guard), never a double-follow.
     keeper = _observe_keeper(lk, tmp_path)
-    keeper.yiaddr = "100.64.4.61"                 # we already hold the new address
+    keeper._dhcp.yiaddr = "100.64.4.61"                 # we already hold the new address
     keeper._observed_change = _ack(lk, "100.64.4.61")
     keeper._check_observed_follow()
     assert keeper.fired == []                     # no redundant follow
@@ -384,22 +387,22 @@ def test_observed_serviced_by_maintain_loop(lk, tmp_path):
 
 def test_id_opts_empty_by_default(lk):
     keeper = lk.Keeper("eth0", "00:00:5e:00:01:fe", "100.64.4.7", hbfile=None)
-    assert keeper._id_opts == []
+    assert keeper._dhcp._id_opts == []
 
 
 def test_id_opts_built_from_args(lk):
     keeper = lk.Keeper("eth0", "00:00:5e:00:01:fe", "100.64.4.7", hbfile=None,
                        vendor_class="MSFT 5.0", client_id="keeper-1", hostname="vip")
-    assert ("vendor_class_id", "MSFT 5.0") in keeper._id_opts
-    assert ("client_id", b"keeper-1") in keeper._id_opts
-    assert ("hostname", "vip") in keeper._id_opts
+    assert ("vendor_class_id", "MSFT 5.0") in keeper._dhcp._id_opts
+    assert ("client_id", b"keeper-1") in keeper._dhcp._id_opts
+    assert ("hostname", "vip") in keeper._dhcp._id_opts
 
 
 def _nudge_keeper(lk, arp_nudge=240, hbfile=None, **kwargs):
     keeper = lk.Keeper("eth0", "00:00:5e:00:01:fe", "100.64.4.7",
                        hbfile=hbfile, arp_nudge=arp_nudge, **kwargs)
-    keeper.yiaddr = "100.64.4.7"
-    keeper.server = "100.64.4.1"
+    keeper._dhcp.yiaddr = "100.64.4.7"
+    keeper._dhcp.server = "100.64.4.1"
     keeper._probe_carp_master = lambda: True   # the real probe needs ifconfig
     return keeper
 
@@ -429,19 +432,19 @@ def test_nudge_respects_interval_and_force(lk):
 
 def test_nudge_requires_gateway_and_lease(lk):
     keeper = _nudge_keeper(lk)
-    keeper.server = None            # no router option and no server_id -> no target
+    keeper._dhcp.server = None            # no router option and no server_id -> no target
     keeper._arp_nudge(force=True)
     assert keeper._nudge.last_nudge == 0.0
-    keeper.server = "100.64.4.1"
-    keeper.yiaddr = None            # not bound -> no source address
+    keeper._dhcp.server = "100.64.4.1"
+    keeper._dhcp.yiaddr = None            # not bound -> no source address
     keeper._arp_nudge(force=True)
     assert keeper._nudge.last_nudge == 0.0
 
 
 def test_nudge_works_from_router_option_alone(lk):
     keeper = _nudge_keeper(lk)
-    keeper.server = None
-    keeper.router = "100.64.4.254"   # DHCP option 3 alone is a valid target
+    keeper._dhcp.server = None
+    keeper._dhcp.router = "100.64.4.254"   # DHCP option 3 alone is a valid target
     keeper._arp_nudge(force=True)
     assert keeper._nudge.last_nudge > 0
 
@@ -463,8 +466,8 @@ def test_probe_failure_skips_nudge(lk, monkeypatch):
     # a confirmed MASTER.
     keeper = lk.Keeper("eth0", "00:00:5e:00:01:fe", "100.64.4.7", hbfile=None,
                        vhid=199, arp_nudge=240)
-    keeper.yiaddr = "100.64.4.7"
-    keeper.server = "100.64.4.1"
+    keeper._dhcp.yiaddr = "100.64.4.7"
+    keeper._dhcp.server = "100.64.4.1"
 
     def boom(*a, **k):
         raise OSError("ifconfig unavailable")
@@ -477,7 +480,7 @@ def test_probe_failure_skips_nudge(lk, monkeypatch):
 def test_hb_nudge_tokens_present(lk, tmp_path):
     hb = tmp_path / "hb"
     keeper = _nudge_keeper(lk, hbfile=str(hb))
-    keeper.router = "100.64.4.1"
+    keeper._dhcp.router = "100.64.4.1"
     keeper._nudge.last_nudge = 1783350000.0
     keeper._nudge.last_reply = 1783350050.0
     keeper._hb()
@@ -490,7 +493,7 @@ def test_hb_nudge_tokens_present(lk, tmp_path):
 def test_hb_nudge_zeros_when_never_and_no_target(lk, tmp_path):
     hb = tmp_path / "hb"
     keeper = _nudge_keeper(lk, hbfile=str(hb))
-    keeper.server = None             # enabled, but no target and nothing sent yet
+    keeper._dhcp.server = None             # enabled, but no target and nothing sent yet
     keeper._hb()
     content = hb.read_text()
     assert " nudge=0" in content
@@ -583,7 +586,7 @@ def test_sigusr2_flag_rechecks_carp_role_within_a_second(lk):
 
 def test_nudge_missing_gateway_warns_once(lk, caplog):
     keeper = _nudge_keeper(lk)
-    keeper.server = None             # enabled + bound, but no target
+    keeper._dhcp.server = None             # enabled + bound, but no target
     with caplog.at_level("WARNING", logger="lease-keeper"):
         keeper._arp_nudge(force=True)
         keeper._arp_nudge(force=True)
@@ -609,7 +612,7 @@ class _ArpPkt:
 
 def test_arp_reply_ignores_unrelated(lk):
     keeper = _nudge_keeper(lk)
-    keeper.router = "100.64.4.254"
+    keeper._dhcp.router = "100.64.4.254"
     keeper._on_sniff(_ArpPkt(lk, 2, "100.64.4.9", "100.64.4.7"))    # wrong sender
     keeper._on_sniff(_ArpPkt(lk, 2, "100.64.4.254", "100.64.4.99"))  # wrong target IP
     keeper._on_sniff(_ArpPkt(lk, 1, "100.64.4.254", "100.64.4.7"))   # a request, not a reply
@@ -620,7 +623,7 @@ def test_arp_reply_stamps_reachability_and_logs(lk, caplog):
     # A matching is-at reply from the nudge target, dispatched through the
     # sniffer path, stamps the reachability epoch and logs at DEBUG.
     keeper = _nudge_keeper(lk)
-    keeper.router = "100.64.4.1"
+    keeper._dhcp.router = "100.64.4.1"
     with caplog.at_level("DEBUG", logger="lease-keeper"):
         keeper._on_sniff(_ArpPkt(lk, 2, "100.64.4.1", "100.64.4.7"))
     assert keeper._nudge.last_reply > 0
@@ -664,7 +667,7 @@ def _ack_gw(lk, yiaddr, router, server="100.64.4.1", mask=None):
 
 def test_follow_across_subnet_with_mask(lk, tmp_path, caplog):
     keeper = _follow_keeper(lk, tmp_path)
-    keeper.router = "100.64.4.1"
+    keeper._dhcp.router = "100.64.4.1"
     with caplog.at_level("WARNING", logger="lease-keeper"):
         assert keeper._handle_changed_address(
             "100.64.5.60", _ack_gw(lk, "100.64.5.60", "100.64.5.1", mask="255.255.255.0"),
@@ -676,7 +679,7 @@ def test_follow_across_subnet_with_mask(lk, tmp_path, caplog):
 
 def test_follow_gateway_change_without_mask_warns(lk, tmp_path, caplog):
     keeper = _follow_keeper(lk, tmp_path)
-    keeper.router = "100.64.4.1"
+    keeper._dhcp.router = "100.64.4.1"
     with caplog.at_level("ERROR", logger="lease-keeper"):   # no mask in the ACK
         keeper._handle_changed_address(
             "100.64.5.60", _ack_gw(lk, "100.64.5.60", "100.64.5.1"), "DORA", True)
@@ -687,7 +690,7 @@ def test_follow_gateway_change_without_mask_warns(lk, tmp_path, caplog):
 
 def test_follow_no_gateway_change_no_extra_args(lk, tmp_path):
     keeper = _follow_keeper(lk, tmp_path)
-    keeper.router = "100.64.4.1"
+    keeper._dhcp.router = "100.64.4.1"
     keeper._handle_changed_address(          # same gateway -> no cross-subnet extras
         "100.64.4.60", _ack_gw(lk, "100.64.4.60", "100.64.4.1"), "DORA", True)
     assert keeper._follow_gw_args == []
@@ -727,7 +730,7 @@ def test_dhcp_options_include_param_req_list(lk):
     # Every DISCOVER/REQUEST must carry the Parameter Request List (RFC 2132 §9.8)
     # so the server returns the subnet mask (1) + router (3) follow-mode needs.
     keeper = _plain_keeper(lk)
-    opts = lk._dhcp_options("discover", [("requested_addr", "100.64.4.7")], keeper._id_opts)
+    opts = lk._dhcp_options("discover", [("requested_addr", "100.64.4.7")], keeper._dhcp._id_opts)
     assert opts[0] == ("message-type", "discover")
     assert ("param_req_list", lk.PARAM_REQ_LIST) in opts
     assert 1 in lk.PARAM_REQ_LIST and 3 in lk.PARAM_REQ_LIST
@@ -741,23 +744,23 @@ def test_absorb_reply_captures_gw_and_mask(lk):
     keeper = _plain_keeper(lk)
     rx = lk.DhcpReply(lk.ACK, "100.64.4.7", "100.64.4.1", 1800, None, None,
                       "100.64.4.1", None, "255.255.255.0")
-    keeper._absorb_reply(rx, lk.DEFAULT_LEASE)
-    assert keeper.router == "100.64.4.1"
-    assert keeper.mask_bits == 24
+    keeper._dhcp._absorb_reply(rx, lk.DEFAULT_LEASE)
+    assert keeper._dhcp.router == "100.64.4.1"
+    assert keeper._dhcp.mask_bits == 24
 
 
 def test_renew_omits_server_id_and_requested_addr(lk):
     # RFC 2131 §4.3.2: a RENEWING/REBINDING REQUEST MUST NOT carry server_id or
     # requested_addr, and ciaddr MUST be the client's address.
     keeper = _plain_keeper(lk)
-    keeper.server, keeper.yiaddr, keeper.lease = "100.64.4.1", "100.64.4.7", 1800
+    keeper._dhcp.server, keeper._dhcp.yiaddr, keeper._dhcp.lease = "100.64.4.1", "100.64.4.7", 1800
     sent = []
     keeper._ensure_sniffer = lambda: None
-    keeper._send_dhcp = lambda mtype, extra, ciaddr="0.0.0.0": sent.append((mtype, extra, ciaddr))
-    keeper._wait_for_dhcp_reply = lambda want, timeout: lk.DhcpReply(
-        lk.ACK, keeper.yiaddr, keeper.server, 1800, None, None, None)
-    assert keeper.renew() is True            # RENEW (T1)
-    assert keeper.renew(rebind=True) is True  # REBIND (T2)
+    keeper._dhcp._send_dhcp = lambda mtype, extra, ciaddr="0.0.0.0": sent.append((mtype, extra, ciaddr))
+    keeper._dhcp._wait_for_dhcp_reply = lambda want, timeout: lk.DhcpReply(
+        lk.ACK, keeper._dhcp.yiaddr, keeper._dhcp.server, 1800, None, None, None)
+    assert keeper._dhcp.renew() is True            # RENEW (T1)
+    assert keeper._dhcp.renew(rebind=True) is True  # REBIND (T2)
     assert sent, "renew sent nothing"
     for mtype, extra, ciaddr in sent:
         assert mtype == "request"
@@ -765,7 +768,7 @@ def test_renew_omits_server_id_and_requested_addr(lk):
         # assert on the ACTUAL assembled option list, not the stubbed extras
         # (which are always empty here) -- so a regression that re-added
         # server_id to renew's opts would fail this.
-        wire = [o for o in lk._dhcp_options(mtype, extra, keeper._id_opts) if isinstance(o, tuple)]
+        wire = [o for o in lk._dhcp_options(mtype, extra, keeper._dhcp._id_opts) if isinstance(o, tuple)]
         assert all(o[0] != "server_id" for o in wire)
         assert all(o[0] != "requested_addr" for o in wire)
 

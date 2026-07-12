@@ -117,6 +117,11 @@ ARP_NUDGE_MIN = 30         # floor for --arp-nudge so a typo cannot flood the se
 LOG_MAX_BYTES = 512 * 1024
 LOG_BACKUPS = 3
 
+# ---- DHCP wire format: parse / format / build ----
+# Pure encode/decode helpers with no Keeper state: they turn scapy packets into a
+# DhcpReply and turn a message type into an option list. The stateful protocol
+# sequences (DORA / INIT-REBOOT / renew) live in the Keeper class further down.
+
 # A parsed DHCP reply, snapshotted from the sniffer thread.
 # `message` (DHCP option 56) is the server's optional human-readable text, mainly
 # a NAK reason; `subnet_mask` (option 1) is used to follow a cross-subnet renumber;
@@ -151,6 +156,43 @@ def _fmt_reply(rx):
                rx.t1 if rx.t1 is not None else "-", rx.t2 if rx.t2 is not None else "-",
                rx.router or "-", rx.subnet_mask or "-",
                (" msg=%r" % txt) if txt else ""))
+
+
+def _parse_reply(p, yiaddr):
+    """Snapshot only the handful of DHCP options the keeper acts on into a
+    DhcpReply; the rest of the reply's option data -- untrusted, from
+    whatever answered on the wire -- is left untouched."""
+    mt = sid = lt = rt = bt = ro = msg = sm = None
+    for o in p[DHCP].options:
+        if isinstance(o, tuple):
+            if o[0] == "message-type":
+                mt = o[1]
+            elif o[0] == "server_id":
+                sid = o[1]
+            elif o[0] == "lease_time":
+                lt = o[1]
+            elif o[0] == "renewal_time":
+                rt = o[1]
+            elif o[0] == "rebinding_time":
+                bt = o[1]
+            elif o[0] == "router":
+                ro = o[1]
+            elif o[0] == "message":     # option 56: server's text (e.g. a NAK reason)
+                msg = o[1]
+            elif o[0] == "subnet_mask":  # option 1: to follow a cross-subnet renumber
+                sm = o[1]
+    gi = getattr(p[BOOTP], "giaddr", None)   # relay agent; 0.0.0.0 = directly attached
+    if gi in (None, "0.0.0.0", 0):
+        gi = None
+    return DhcpReply(mt, yiaddr, sid, lt, rt, bt, ro, msg, sm, gi)
+
+
+def _dhcp_options(mtype, extra, id_opts):
+    """The DHCP option list for a message: type, our Parameter Request List
+    (so the server returns the mask/router/timers the keeper acts on), the
+    identity options, then the per-message extras."""
+    return ([("message-type", mtype), ("param_req_list", PARAM_REQ_LIST)]
+            + id_opts + extra + ["end"])
 
 
 MAC_RE = re.compile(r"^([0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}$")
@@ -366,34 +408,6 @@ class Keeper:
         except Exception as e:
             LOG.debug("ARP reply parse error: %s", e)
 
-    def _parse_reply(self, p, yiaddr):
-        """Snapshot only the handful of DHCP options the keeper acts on into a
-        DhcpReply; the rest of the reply's option data -- untrusted, from
-        whatever answered on the wire -- is left untouched."""
-        mt = sid = lt = rt = bt = ro = msg = sm = None
-        for o in p[DHCP].options:
-            if isinstance(o, tuple):
-                if o[0] == "message-type":
-                    mt = o[1]
-                elif o[0] == "server_id":
-                    sid = o[1]
-                elif o[0] == "lease_time":
-                    lt = o[1]
-                elif o[0] == "renewal_time":
-                    rt = o[1]
-                elif o[0] == "rebinding_time":
-                    bt = o[1]
-                elif o[0] == "router":
-                    ro = o[1]
-                elif o[0] == "message":     # option 56: server's text (e.g. a NAK reason)
-                    msg = o[1]
-                elif o[0] == "subnet_mask":  # option 1: to follow a cross-subnet renumber
-                    sm = o[1]
-        gi = getattr(p[BOOTP], "giaddr", None)   # relay agent; 0.0.0.0 = directly attached
-        if gi in (None, "0.0.0.0", 0):
-            gi = None
-        return DhcpReply(mt, yiaddr, sid, lt, rt, bt, ro, msg, sm, gi)
-
     def _chaddr_matches(self, b):
         """True if the reply's BOOTP client hardware address is our chaddr (the
         CARP virtual MAC). Used to accept the PEER's ACK on the shared chaddr:
@@ -414,7 +428,7 @@ class Keeper:
             # First-party path: a reply to OUR in-flight exchange (random xid,
             # regenerated per DORA). Parsed and handed to the waiting main thread.
             if b.xid == self.xid:
-                self._rx = self._parse_reply(p, b.yiaddr)
+                self._rx = _parse_reply(p, b.yiaddr)
                 LOG.debug("DHCP reply: %s", _fmt_reply(self._rx))
                 self._ev.set()
                 return
@@ -432,7 +446,7 @@ class Keeper:
             # ACK and never acts on the sniffer thread.
             if not self.follow or not self.yiaddr or not self._chaddr_matches(b):
                 return
-            rx = self._parse_reply(p, b.yiaddr)
+            rx = _parse_reply(p, b.yiaddr)
             if (rx.mtype == ACK and rx.yiaddr and rx.yiaddr != self.yiaddr
                     and _sane_ipv4(rx.yiaddr)):
                 self._observed_change = rx
@@ -442,13 +456,6 @@ class Keeper:
 
     # ---- DHCP protocol (send / await reply / DORA / renew / release) ----
 
-    def _dhcp_options(self, mtype, extra):
-        """The DHCP option list for a message: type, our Parameter Request List
-        (so the server returns the mask/router/timers the keeper acts on), the
-        identity options, then the per-message extras."""
-        return ([("message-type", mtype), ("param_req_list", PARAM_REQ_LIST)]
-                + self._id_opts + extra + ["end"])
-
     def _send_dhcp(self, mtype, extra, ciaddr="0.0.0.0"):
         # ciaddr is set for RENEW/REBIND (the client already owns the address);
         # the broadcast flag stays on so the reply is reliably captured by the sniffer.
@@ -456,7 +463,7 @@ class Keeper:
                IP(src=ciaddr, dst="255.255.255.255") /
                UDP(sport=68, dport=67) /
                BOOTP(chaddr=self.chraw, xid=self.xid, ciaddr=ciaddr, flags=BROADCAST_FLAG) /
-               DHCP(options=self._dhcp_options(mtype, extra)))
+               DHCP(options=_dhcp_options(mtype, extra, self._id_opts)))
         sendp(pkt, iface=self.iface, verbose=0)
 
     def _wait_for_dhcp_reply(self, want, timeout):

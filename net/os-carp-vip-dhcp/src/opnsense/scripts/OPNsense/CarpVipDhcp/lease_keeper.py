@@ -408,13 +408,18 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
 
         return self.dora(request_ip)
 
-    def dora(self, request_ip=None):  # pylint: disable=too-many-return-statements
-        """Acquire a lease via the DHCP DORA handshake -- Discover, Offer,
-        Request, Ack. Returns True once BOUND, False on failure/NAK."""
+    def dora(self, request_ip=None):
+        """Acquire a lease via the DHCP DORA handshake: the SELECTING phase
+        (DISCOVER until an OFFER arrives) then the REQUESTING phase (REQUEST
+        the offer until the ACK lands). Returns True once BOUND, False on
+        failure/NAK."""
         self.xid = random.randint(1, 0xFFFFFFFF)
-        extra = [("requested_addr", request_ip)] if request_ip else []
+        return self._discover(request_ip) and self._request_offer(request_ip)
 
-        # DISCOVER until an OFFER arrives (or the attempts run out).
+    def _discover(self, request_ip):
+        """SELECTING: broadcast DISCOVER until a server OFFERs; record the
+        offered address and server. False on NAK/timeout/stop."""
+        extra = [("requested_addr", request_ip)] if request_ip else []
         for attempt in range(1, DORA_ATTEMPTS + 1):
             if self._should_stop():
                 return False
@@ -431,14 +436,16 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
                 return False
             if rx:
                 self.yiaddr, self.server = rx.yiaddr, rx.server_id
-                break
+                return True
             # xid included so the exchange can be matched against a packet capture.
             LOG.info("no DHCP OFFER (attempt %d, xid 0x%08x)", attempt, self.xid)
             time.sleep(min(_jittered(2 ** attempt), ATTEMPT_BACKOFF_CAP))
-        else:
-            return False
+        return False
 
-        # REQUEST the offered address until the ACK lands.
+    def _request_offer(self, request_ip):
+        """REQUESTING: REQUEST the offered address until the ACK lands and we
+        are BOUND. False on NAK/timeout/stop; an ACK for a different address
+        goes through the on_changed_address policy hook."""
         for attempt in range(1, DORA_ATTEMPTS + 1):
             if self._should_stop():
                 return False
@@ -466,7 +473,14 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
             time.sleep(min(_jittered(2 ** attempt), ATTEMPT_BACKOFF_CAP))
         return False
 
-    def reboot(self, request_ip):  # pylint: disable=too-many-return-statements
+    # reboot() and renew() share _request_offer's REQUEST->ACK shape: they are
+    # the RFC 2131 REBOOTING and RENEWING/REBINDING states next to REQUESTING.
+    # They stay separate linear loops on purpose -- the three differ on nine
+    # axes (options, ciaddr, attempts, timeout, backoff, send-failure policy,
+    # expected address, changed-address phase, bind action), so a shared
+    # parametrized engine would turn each into config that is harder to audit
+    # against the RFC than the plain loop it replaces.
+    def reboot(self, request_ip):
         """INIT-REBOOT (RFC 2131 4.3.2): we already know the address we want
         (request_ip), so REQUEST it directly instead of a full DISCOVER -- one
         exchange, and a server that is reachable but refuses the address answers
@@ -506,6 +520,8 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
                 time.sleep(min(_jittered(2 ** attempt), ATTEMPT_BACKOFF_CAP))
         return False
 
+    # One return per protocol gate (unbound/stop/send-fail/NAK/changed/ok);
+    # folding them into an attempt-helper trades readable gates for plumbing.
     def renew(self, rebind=False):  # pylint: disable=too-many-return-statements
         """REQUEST an extension of the held lease. Returns True on a fresh ACK,
         False on NAK/timeout/unbound (the caller escalates: RENEW -> REBIND ->
@@ -678,7 +694,7 @@ class ArpNudge:  # pylint: disable=too-many-instance-attributes
             LOG.debug("ARP reply parse error: %s", e)
 
 
-class Keeper:  # pylint: disable=too-many-instance-attributes,too-few-public-methods
+class Keeper:  # pylint: disable=too-many-instance-attributes
     """Policy and orchestration around the components: owns the packet sniffer
     (feeding DHCP replies to DhcpClient and ARP replies to ArpNudge), the
     follow/enforce decision for a changed address, the heartbeat, the CARP
@@ -1119,6 +1135,22 @@ class Keeper:  # pylint: disable=too-many-instance-attributes,too-few-public-met
         ArpNudge component; it owns the pacing, the master gate and the send."""
         self._nudge.maybe_nudge(self._dhcp.yiaddr, self._nudge_target(), force=force)
 
+    # ---- operator/signal API (set flags only; the loops act within a second) ----
+
+    def request_stop(self):
+        """Ask the daemon to exit at the next loop tick (SIGINT/SIGTERM)."""
+        self.stop = True
+
+    def trigger_nudge(self):
+        """Request an immediate ARP nudge (SIGUSR1 / configd action). Flag
+        only: no network I/O happens in signal context."""
+        self._nudge_now = True
+
+    def recheck_carp_role(self):
+        """Re-check the CARP role within a second (SIGUSR2 from the CARP
+        syshook) instead of waiting for the next ~30s poll."""
+        self._poll_role_now = True
+
     # ---- main loop / sleeps ----
 
     def _sleep(self, secs):
@@ -1154,7 +1186,7 @@ class Keeper:  # pylint: disable=too-many-instance-attributes,too-few-public-met
                 self._check_observed_follow()
             # Link-return fast path: only while UNBOUND, poll carrier every few
             # seconds; a down->up edge means the WAN just came back, so stop waiting
-            # and let _run_once re-DORA immediately (the bound path skips this).
+            # and let _maintain_step re-DORA immediately (the bound path skips this).
             if self._dhcp.yiaddr is None and slept % LINK_POLL_STEP == 0 and self._check_link_returned():
                 self._link_returned = True
                 return not self.stop
@@ -1205,7 +1237,7 @@ class Keeper:  # pylint: disable=too-many-instance-attributes,too-few-public-met
             # error, keep the heartbeat fresh so CARP does not falsely demote us,
             # and retry after a short backoff.
             try:
-                self._run_once()
+                self._maintain_step()
             except Exception:
                 LOG.exception("unexpected error in main loop -- recovering")
                 try:
@@ -1224,7 +1256,7 @@ class Keeper:  # pylint: disable=too-many-instance-attributes,too-few-public-met
         LOG.info("stopped")
         return 0
 
-    def _run_once(self):  # pylint: disable=too-many-branches,too-many-statements
+    def _maintain_step(self):
         """One iteration of the maintain loop. Returns to run() (which loops again)
         on every state transition; any exception it raises is caught by run() and
         retried, so a transient fault can never terminate the keeper."""
@@ -1326,10 +1358,8 @@ def acquire_pidfile(path):
             sys.exit(5)
 
 
-# main() drives the Keeper internals directly (signal flags, the --once path).
-# pylint: disable=protected-access
-def main():  # pylint: disable=too-many-branches,too-many-statements
-    """CLI entry point: parse args, wire up the Keeper and signals, run."""
+def _build_arg_parser():
+    """The daemon's CLI."""
     ap = argparse.ArgumentParser(description="Robust DHCP lease-keeper (chaddr decoupled from the iface MAC)")
     ap.add_argument("--iface", required=True)
     ap.add_argument("--chaddr", required=True)
@@ -1353,20 +1383,47 @@ def main():  # pylint: disable=too-many-branches,too-many-statements
                          "unicast MACs (default off; only needed if replies aren't seen)")
     ap.add_argument("--once", action="store_true")
     ap.add_argument("--release-on-exit", action="store_true")
-    a = ap.parse_args()
+    return ap
 
+
+def _setup_logging(logfile):
+    """stderr plus a rotating file. DEBUG is always written (routine detail
+    like the renew/rebind plan): the volume is low, the log page hides DEBUG
+    by default, and its filter reveals it -- so "turning up the log level"
+    needs no daemon restart."""
     handlers: list[logging.Handler] = [logging.StreamHandler()]
-    if a.logfile:
+    if logfile:
         try:
-            handlers.append(RotatingFileHandler(a.logfile, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUPS))
+            handlers.append(RotatingFileHandler(logfile, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUPS))
         except Exception:
             pass
-    # Write DEBUG too (routine detail like the renew/rebind plan). The volume is
-    # low here, and the log page defaults to hiding DEBUG -- selecting a lower
-    # level in its filter reveals it, so "turning up the log level" needs no
-    # daemon restart.
     logging.basicConfig(level=logging.DEBUG, handlers=handlers,
                         format="%(asctime)s %(levelname)s %(message)s")
+
+
+# The one-shot mode drives the Keeper/DhcpClient internals directly.
+# pylint: disable=protected-access
+def _claim_once(k):
+    """--once mode: claim, report, release -- a wiring test, not service mode."""
+    if not k._start_sniffer():
+        return 3
+    time.sleep(0.5)
+    ok = k._dhcp.dora(k.request_ip)
+    LOG.info("DHCP claim %s -> %s", k.chaddr, k._dhcp.yiaddr if ok else "FAIL")
+    if ok:
+        k._dhcp.release()
+    try:
+        if k._sniffer:
+            k._sniffer.stop()
+    except Exception:
+        pass
+    return 0 if ok else 1
+
+
+def main():
+    """CLI entry point: parse args, wire up the Keeper and signals, run."""
+    a = _build_arg_parser().parse_args()
+    _setup_logging(a.logfile)
 
     if _SCAPY_IMPORT_ERROR is not None:
         LOG.critical("cannot import scapy -- the lease keeper cannot run: %s. "
@@ -1392,37 +1449,22 @@ def main():  # pylint: disable=too-many-branches,too-many-statements
 
     def _sig(*_):
         LOG.info("signal received -- stopping")
-        k.stop = True
+        k.request_stop()
     signal.signal(signal.SIGINT, _sig)
     signal.signal(signal.SIGTERM, _sig)
 
     def _sig_arp_nudge(*_):
         # Operator-requested immediate ARP nudge (configd action / kill -USR1).
-        # Only sets a flag; the sleep loops service it within a second, so no
-        # network I/O happens inside the signal handler itself.
-        k._nudge_now = True
+        k.trigger_nudge()
     signal.signal(signal.SIGUSR1, _sig_arp_nudge)  # type: ignore[attr-defined]  # pylint: disable=no-member
 
     def _sig_carp(*_):
-        # CARP transition (rc.syshook.d/carp/50-carpvipdhcp sends SIGUSR2). Only
-        # sets a flag; the sleep loop re-checks the CARP role within a second.
-        k._poll_role_now = True
+        # CARP transition (rc.syshook.d/carp/50-carpvipdhcp sends SIGUSR2).
+        k.recheck_carp_role()
     signal.signal(signal.SIGUSR2, _sig_carp)  # type: ignore[attr-defined]  # pylint: disable=no-member
 
     if a.once:
-        if not k._start_sniffer():
-            return 3
-        time.sleep(0.5)
-        ok = k._dhcp.dora(a.request)
-        LOG.info("DHCP claim %s -> %s", k.chaddr, k._dhcp.yiaddr if ok else "FAIL")
-        if ok:
-            k._dhcp.release()
-        try:
-            if k._sniffer:
-                k._sniffer.stop()
-        except Exception:
-            pass
-        return 0 if ok else 1
+        return _claim_once(k)
 
     pf = acquire_pidfile(a.pidfile)
     try:

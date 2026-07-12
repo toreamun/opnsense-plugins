@@ -40,6 +40,66 @@ def test_timing_honours_server(lk):
     assert keeper._timing() == (600, 1200, "server")
 
 
+def test_redora_max_lowered(lk):
+    # Part 1 of the link-return fix: worst-case re-acquire lag is bounded (was 300s).
+    assert lk.REDORA_MIN <= lk.REDORA_MAX <= 60
+
+
+def _link_keeper(lk):
+    return lk.Keeper("eth0", "00:00:5e:00:01:fe", "100.64.4.7", hbfile=None)
+
+
+def test_iface_link_up_parsing(lk, monkeypatch):
+    k = _link_keeper(lk)
+    monkeypatch.setattr(lk.subprocess, "check_output",
+                        lambda *a, **kw: "igc1: flags=...\n\tstatus: active\n")
+    assert k._iface_link_up() is True
+    monkeypatch.setattr(lk.subprocess, "check_output",
+                        lambda *a, **kw: "igc1: flags=...\n\tstatus: no carrier\n")
+    assert k._iface_link_up() is False
+    monkeypatch.setattr(lk.subprocess, "check_output",
+                        lambda *a, **kw: "igc1: flags=...\n\t(no status line)\n")
+    assert k._iface_link_up() is None
+
+    def boom(*a, **kw):
+        raise OSError("iface gone")
+    monkeypatch.setattr(lk.subprocess, "check_output", boom)
+    assert k._iface_link_up() is None
+
+
+def test_check_link_returned_edge(lk):
+    k = _link_keeper(lk)
+    seq = []
+    k._iface_link_up = lambda: seq.pop(0)
+    # initial unknown -> up is NOT a trigger (we were already up)
+    seq[:] = [True]
+    assert k._check_link_returned() is False
+    assert k._link_up is True
+    # up -> up: no trigger
+    seq[:] = [True]
+    assert k._check_link_returned() is False
+    # up -> down: recorded, no trigger
+    seq[:] = [False]
+    assert k._check_link_returned() is False
+    assert k._link_up is False
+    # down -> up: TRIGGER
+    seq[:] = [True]
+    assert k._check_link_returned() is True
+    # unreadable carrier never disturbs state
+    k._iface_link_up = lambda: None
+    assert k._check_link_returned() is False
+
+
+def test_check_link_returned_debounce(lk, monkeypatch):
+    k = _link_keeper(lk)
+    monkeypatch.setattr(lk.time, "time", lambda: 1000.0)
+    k._iface_link_up = lambda: True
+    k._link_up = False                       # pretend we saw the link go down
+    assert k._check_link_returned() is True   # first down->up fires (kick_at was 0.0)
+    k._link_up = False                       # another down at the same instant
+    assert k._check_link_returned() is False  # debounced (now - kick_at = 0 < LINK_KICK_DEBOUNCE)
+
+
 def _follow_keeper(lk, tmp_path):
     keeper = lk.Keeper("eth0", "00:00:5e:00:01:fe", "100.64.4.7", hbfile=None, follow=True)
     keeper._follow_state = str(tmp_path / "follow_state")

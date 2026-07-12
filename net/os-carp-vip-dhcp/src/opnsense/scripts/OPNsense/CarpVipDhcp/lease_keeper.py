@@ -117,6 +117,7 @@ REDORA_MAX = 45            # max exponential-backoff wait after a failed acquire
 LINK_POLL_STEP = 3         # while UNBOUND, poll interface carrier this often (s) for the link-return fast path
 LINK_KICK_DEBOUNCE = 8     # min seconds between link-return re-DORA kicks (damps a flapping link)
 SNIFFER_RETRY = 5          # wait before retrying a failed packet-sniffer start
+SNIFFER_WARMUP = 0.5       # let the capture thread attach before the first send
 LOOP_ERROR_BACKOFF = 10    # wait after an unexpected main-loop error before retrying
 MIN_FOLLOW_INTERVAL = 60   # min seconds between follow (VIP rewrite) events -- damps flap/spoof storms
 FOLLOW_RETRY_DEADLINE = 120  # re-drive follow_update if we are not restarted within this after firing
@@ -146,6 +147,15 @@ LOG_BACKUPS = 3
 # shorter constructions stay valid.
 DhcpReply = namedtuple("DhcpReply", "mtype yiaddr server_id lease t1 t2 router message subnet_mask giaddr",
                        defaults=(None, None, None))
+
+# Changed-address phase labels: which exchange saw the differing ACK. Log
+# text and policy input at once -- FollowPolicy relaxes its expected-server
+# check on PHASE_REBIND (at T2 any server may legitimately answer).
+PHASE_DORA = "DORA"
+PHASE_REBOOT = "REBOOT"
+PHASE_RENEW = "RENEW"
+PHASE_REBIND = "REBIND"
+PHASE_OBSERVED = "OBSERVED"
 
 # DHCP message-type names (option 53), for readable reply logging.
 MTYPE_NAMES = {1: "DISCOVER", 2: "OFFER", 3: "REQUEST", 4: "DECLINE",
@@ -266,6 +276,12 @@ def _fs_safe(s):
     return re.sub(r"[^A-Za-z0-9]", "_", s or "")
 
 
+def _new_xid():
+    """A fresh random transaction id (nonzero 32-bit, regenerated per exchange
+    so stale replies cannot match)."""
+    return random.randint(1, 0xFFFFFFFF)
+
+
 def _jittered(base):
     """A retransmit/backoff delay with +/-25% uniform jitter (RFC 2131 4.1
     recommends a randomized backoff). Both HA nodes share the chaddr, so
@@ -321,7 +337,7 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
         self._ensure_sniffer = ensure_sniffer
         self._on_changed = on_changed_address
 
-        self.xid = random.randint(1, 0xFFFFFFFF)
+        self.xid = _new_xid()
         self.yiaddr = None
         self.server = None
         self.lease = DEFAULT_LEASE
@@ -426,7 +442,7 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
         (DISCOVER until an OFFER arrives) then the REQUESTING phase (REQUEST
         the offer until the ACK lands). Returns True once BOUND, False on
         failure/NAK."""
-        self.xid = random.randint(1, 0xFFFFFFFF)
+        self.xid = _new_xid()
         return self._discover(request_ip) and self._request_offer(request_ip)
 
     def _discover(self, request_ip):
@@ -478,7 +494,7 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
             if rx:
                 got = rx.yiaddr
                 if request_ip and got != request_ip:
-                    return self._on_changed(got, rx, "DORA", True)
+                    return self._on_changed(got, rx, PHASE_DORA, True)
                 self.adopt(rx)
                 return True
             LOG.info("no DHCP ACK from %s for %s (attempt %d, xid 0x%08x)",
@@ -504,7 +520,7 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
         if not request_ip:
             return False
 
-        self.xid = random.randint(1, 0xFFFFFFFF)
+        self.xid = _new_xid()
         extra = [("requested_addr", request_ip)]
         for attempt in range(1, REBOOT_ATTEMPTS + 1):
             if self._should_stop():
@@ -523,7 +539,7 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
             if rx:
                 got = rx.yiaddr
                 if got and got != request_ip:
-                    return self._on_changed(got, rx, "REBOOT", True)
+                    return self._on_changed(got, rx, PHASE_REBOOT, True)
                 self.yiaddr, self.server = request_ip, rx.server_id
                 self._absorb_reply(rx, DEFAULT_LEASE)
                 return True
@@ -560,7 +576,7 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
             try:
                 self._send_dhcp("request", opts, ciaddr=yiaddr)
             except Exception as e:
-                LOG.error("DHCP %s send failed: %s", "REBIND" if rebind else "RENEW", e)
+                LOG.error("DHCP %s send failed: %s", PHASE_REBIND if rebind else PHASE_RENEW, e)
                 return False
             rx = self._wait_for_dhcp_reply(ACK, RENEW_TIMEOUT)
             if rx == "NAK":
@@ -571,7 +587,7 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
                     # Some dynamic servers change the address at renewal (ACK with a
                     # new yiaddr) instead of NAKing. Route it through the same
                     # follow / enforce decision (and hardening) as the initial DORA.
-                    phase = "REBIND" if rebind else "RENEW"
+                    phase = PHASE_REBIND if rebind else PHASE_RENEW
                     return self._on_changed(got, rx, phase, False)
                 self._absorb_reply(rx, self.lease)
                 return True
@@ -774,7 +790,7 @@ class FollowPolicy:  # pylint: disable=too-many-instance-attributes
                           "(possible spoofed ACK from %s)", phase, self.target, got,
                           rx.server_id)
                 return False
-            if phase != "REBIND" and rx.server_id and self._dhcp.server and rx.server_id != self._dhcp.server:
+            if phase != PHASE_REBIND and rx.server_id and self._dhcp.server and rx.server_id != self._dhcp.server:
                 LOG.error("%s: ACK from unexpected server %s (leased from %s) -- not following",
                           phase, rx.server_id, self._dhcp.server)
                 return False
@@ -887,7 +903,7 @@ class FollowPolicy:  # pylint: disable=too-many-instance-attributes
             return
         LOG.info("observed peer DHCP ACK for %s (we hold %s) -- following early to converge",
                  rx.yiaddr, self._dhcp.yiaddr)
-        self.on_changed_address(rx.yiaddr, rx, "OBSERVED", release_on_enforce=False)
+        self.on_changed_address(rx.yiaddr, rx, PHASE_OBSERVED, release_on_enforce=False)
 
 
 class Keeper:  # pylint: disable=too-many-instance-attributes
@@ -1291,7 +1307,7 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         ethsrc = f" eth-src={self.eth_src}" if self.eth_src != self.chaddr else ""
         LOG.info("lease-keeper active on %s: chaddr=%s%s request=%s",
                  self.iface, self.chaddr, ethsrc, self._follow.target or "any")
-        time.sleep(0.5)
+        time.sleep(SNIFFER_WARMUP)
 
         while not self._stop:
             # The keeper must NEVER die on a bad DHCP state: catch any unexpected
@@ -1465,7 +1481,7 @@ def _claim_once(k):
     """--once mode: claim, report, release -- a wiring test, not service mode."""
     if not k._start_sniffer():
         return 3
-    time.sleep(0.5)
+    time.sleep(SNIFFER_WARMUP)
     ok = k._dhcp.dora(k._follow.target)
     LOG.info("DHCP claim %s -> %s", k.chaddr, k._dhcp.yiaddr if ok else "FAIL")
     if ok:

@@ -63,6 +63,9 @@ def _load(filename, modname):
     spec = importlib.util.spec_from_file_location(modname, path)
     assert spec and spec.loader, path
     module = importlib.util.module_from_spec(spec)
+    # Register before exec: dataclasses (and anything else that resolves
+    # annotations) looks the module up in sys.modules by __module__.
+    sys.modules[modname] = module
     spec.loader.exec_module(module)
     return module
 

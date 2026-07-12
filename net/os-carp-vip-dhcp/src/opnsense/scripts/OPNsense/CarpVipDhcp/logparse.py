@@ -1,7 +1,7 @@
 #!/usr/local/bin/python3
 """Parse the per-keeper daemon logs into structured JSON records (root, via configd).
 
-Each lease-keeper.py log line looks like:
+Each lease_keeper.py log line looks like:
     2026-07-06 12:34:56,789 INFO some message
 Output: a JSON array of {timestamp, keeper, vhid, level, message}, newest first,
 which the Diagnostics API feeds to a searchable/sortable bootgrid.

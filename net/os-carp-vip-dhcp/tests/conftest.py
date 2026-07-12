@@ -1,6 +1,6 @@
 """Pytest bootstrap: make the plugin's configd scripts importable and stub scapy.
 
-lease-keeper.py imports scapy at module load, but the daemon logic under test
+lease_keeper.py imports scapy at module load, but the daemon logic under test
 never touches the network, so a lightweight stub lets the suite run without the
 dependency (and without root or a live interface). status.py / logparse.py are
 plain-stdlib and import directly once their directory is on sys.path.
@@ -66,5 +66,5 @@ def _load(filename, modname):
 
 @pytest.fixture(scope="session")
 def lk():
-    """The lease-keeper daemon module (loaded via importlib -- hyphenated name)."""
-    return _load("lease-keeper.py", "lease_keeper")
+    """The lease_keeper daemon module (loaded via importlib so scapy stays stubbed)."""
+    return _load("lease_keeper.py", "lease_keeper")

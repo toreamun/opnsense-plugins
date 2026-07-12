@@ -45,8 +45,8 @@ the carrier's guards see consistent state. The README's "Playing nicely with
 ISP access-network security" section is the full map.
 
 Usage:
-  lease-keeper.py --iface <if> --chaddr <mac> --request <ip>
-  lease-keeper.py ... --once            # one-shot claim+verify+release (test)
+  lease_keeper.py --iface <if> --chaddr <mac> --request <ip>
+  lease_keeper.py ... --once            # one-shot claim+verify+release (test)
 """
 import argparse
 import ipaddress

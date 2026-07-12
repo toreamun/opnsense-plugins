@@ -1,4 +1,4 @@
-"""Unit tests for the lease-keeper daemon's pure helpers and follow decision.
+"""Unit tests for the lease_keeper daemon's pure helpers and follow decision.
 
 Tests reach into private state/methods by design, and use comments over
 per-test docstrings."""

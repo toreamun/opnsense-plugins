@@ -45,6 +45,24 @@ def test_redora_max_bounded(lk):
     assert lk.REDORA_MIN <= lk.REDORA_MAX <= 60
 
 
+def test_dhcpreply_giaddr_defaults_none(lk):
+    # the new giaddr field defaults, so shorter DhcpReply constructions stay valid.
+    rx = lk.DhcpReply(5, "1.2.3.4", "1.2.3.1", 1800, None, None, None)
+    assert rx.giaddr is None
+
+
+def test_fmt_reply_readable(lk):
+    off = lk.DhcpReply(2, "100.64.4.74", "100.64.4.1", 120, 60, 105, "100.64.4.1",
+                       None, "255.255.255.0", None)
+    s = lk._fmt_reply(off)
+    assert "OFFER" in s and "yiaddr=100.64.4.74" in s and "server=100.64.4.1" in s
+    assert "giaddr=none" in s          # directly attached: no relay in path
+    nak = lk.DhcpReply(6, None, "100.64.4.1", None, None, None, None,
+                       b"no free leases", None, "100.64.4.9")
+    s2 = lk._fmt_reply(nak)
+    assert "NAK" in s2 and "giaddr=100.64.4.9" in s2 and "no free leases" in s2
+
+
 def _link_keeper(lk):
     return lk.Keeper("eth0", "00:00:5e:00:01:fe", "100.64.4.7", hbfile=None)
 

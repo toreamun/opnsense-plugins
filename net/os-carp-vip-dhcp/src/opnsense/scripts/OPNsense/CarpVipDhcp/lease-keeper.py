@@ -118,10 +118,40 @@ LOG_BACKUPS = 3
 
 # A parsed DHCP reply, snapshotted from the sniffer thread.
 # `message` (DHCP option 56) is the server's optional human-readable text, mainly
-# a NAK reason; `subnet_mask` (option 1) is used to follow a cross-subnet renumber.
-# Both are defaulted so existing 7-field constructions stay valid.
-DhcpReply = namedtuple("DhcpReply", "mtype yiaddr server_id lease t1 t2 router message subnet_mask",
-                       defaults=(None, None))
+# a NAK reason; `subnet_mask` (option 1) is used to follow a cross-subnet renumber;
+# `giaddr` (BOOTP header) is the relay agent, None when the server is directly
+# attached (no relay in path). The trailing fields are defaulted so existing
+# shorter constructions stay valid.
+DhcpReply = namedtuple("DhcpReply", "mtype yiaddr server_id lease t1 t2 router message subnet_mask giaddr",
+                       defaults=(None, None, None))
+
+# DHCP message-type names (option 53), for readable reply logging.
+MTYPE_NAMES = {1: "DISCOVER", 2: "OFFER", 3: "REQUEST", 4: "DECLINE",
+               5: "ACK", 6: "NAK", 7: "RELEASE", 8: "INFORM"}
+
+
+def _msg_text(msg):
+    """DHCP option-56 server text (usually a NAK reason) as a stripped str, or ""
+    when absent. Option 56 may arrive as bytes or str depending on the server."""
+    if isinstance(msg, bytes):
+        msg = msg.decode(errors="replace")
+    return str(msg).strip() if msg else ""
+
+
+def _fmt_reply(rx):
+    """One readable line decoding a received first-party DHCP reply. Logged at
+    DEBUG (the keeper's default level), so every reply's fields (type, addresses,
+    timers, gateway, mask, relay, server text) show in the log without a capture."""
+    txt = _msg_text(rx.message)
+    return ("%s yiaddr=%s server=%s giaddr=%s lease=%s t1=%s t2=%s gw=%s mask=%s%s"
+            % (MTYPE_NAMES.get(rx.mtype, "type=%s" % rx.mtype), rx.yiaddr or "-",
+               rx.server_id or "-", rx.giaddr or "none",
+               rx.lease if rx.lease is not None else "-",
+               rx.t1 if rx.t1 is not None else "-", rx.t2 if rx.t2 is not None else "-",
+               rx.router or "-", rx.subnet_mask or "-",
+               (" msg=%r" % txt) if txt else ""))
+
+
 MAC_RE = re.compile(r"^([0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}$")
 
 
@@ -357,7 +387,10 @@ class Keeper:
                     msg = o[1]
                 elif o[0] == "subnet_mask":  # option 1: to follow a cross-subnet renumber
                     sm = o[1]
-        return DhcpReply(mt, yiaddr, sid, lt, rt, bt, ro, msg, sm)
+        gi = getattr(p[BOOTP], "giaddr", None)   # relay agent; 0.0.0.0 = directly attached
+        if gi in (None, "0.0.0.0", 0):
+            gi = None
+        return DhcpReply(mt, yiaddr, sid, lt, rt, bt, ro, msg, sm, gi)
 
     def _chaddr_matches(self, b):
         """True if the reply's BOOTP client hardware address is our chaddr (the
@@ -380,6 +413,7 @@ class Keeper:
             # regenerated per DORA). Parsed and handed to the waiting main thread.
             if b.xid == self.xid:
                 self._rx = self._parse_reply(p, b.yiaddr)
+                LOG.debug("DHCP reply: %s", _fmt_reply(self._rx))
                 self._ev.set()
                 return
             # Not our xid. In follow mode, still watch for the PEER's ACK: both HA
@@ -438,14 +472,11 @@ class Keeper:
             if rx and rx.mtype == NAK:
                 # Surface the server's option-56 text (why it refused) if present;
                 # it is the operator's main clue for a rejected renew.
-                reason = ""
-                if rx.message:
-                    m = rx.message
-                    if isinstance(m, bytes):
-                        m = m.decode(errors="replace")
-                    reason = " -- %s" % str(m).strip()
-                LOG.warning("DHCPNAK received (server %s, xid 0x%08x)%s",
-                            rx.server_id or "unknown", self.xid, reason)
+                txt = _msg_text(rx.message)
+                reason = " -- %s" % txt if txt else ""
+                LOG.warning("DHCPNAK received (server %s, xid 0x%08x%s)%s",
+                            rx.server_id or "unknown", self.xid,
+                            (" via relay %s" % rx.giaddr) if rx.giaddr else "", reason)
                 return "NAK"
         return None
 

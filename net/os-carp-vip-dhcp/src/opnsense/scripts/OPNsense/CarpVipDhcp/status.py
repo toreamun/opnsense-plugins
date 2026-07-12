@@ -151,7 +151,7 @@ def iface_names():
     return names
 
 
-def read_keepers(states, names):  # pylint: disable=too-many-locals
+def read_keepers(states, names):
     """One status entry per keeper.conf line: config, process, CARP role and
     heartbeat fields, plus the derived arp_confirmed freshness flag."""
     keepers = []

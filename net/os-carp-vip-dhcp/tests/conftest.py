@@ -26,7 +26,7 @@ def _stub_scapy():
     scapy: Any = types.ModuleType("scapy")
     allmod: Any = types.ModuleType("scapy.all")
 
-    class _Sniffer:  # pylint: disable=too-few-public-methods
+    class _Sniffer:
         def __init__(self, *_args, **_kwargs):
             self.thread = types.SimpleNamespace(is_alive=lambda: True)
 

@@ -40,8 +40,8 @@ def test_timing_honours_server(lk):
     assert keeper._timing() == (600, 1200, "server")
 
 
-def test_redora_max_lowered(lk):
-    # Part 1 of the link-return fix: worst-case re-acquire lag is bounded (was 300s).
+def test_redora_max_bounded(lk):
+    # the re-DORA backoff cap stays bounded so worst-case re-acquire lag is small.
     assert lk.REDORA_MIN <= lk.REDORA_MAX <= 60
 
 

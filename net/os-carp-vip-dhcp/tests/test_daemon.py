@@ -182,10 +182,10 @@ class _DhcpPkt:
     """Minimal stand-in for a scapy DHCP reply: p[BOOTP].xid/op/yiaddr and
     p[DHCP].options, with haslayer() so _on_dhcp_reply parses it."""
     def __init__(self, lk, xid, options, yiaddr="100.64.4.7",
-                 chaddr=b"\x00\x00\x5e\x00\x01\xfe", op=None):
+                 chaddr=b"\x00\x00\x5e\x00\x01\xfe", op=None, giaddr="0.0.0.0"):
         self._lk = lk
         self._bootp = types.SimpleNamespace(xid=xid, op=(lk.BOOTREPLY if op is None else op),
-                                            yiaddr=yiaddr, chaddr=chaddr)
+                                            yiaddr=yiaddr, chaddr=chaddr, giaddr=giaddr)
         self._dhcp = types.SimpleNamespace(options=options)
 
     def haslayer(self, layer):
@@ -193,6 +193,22 @@ class _DhcpPkt:
 
     def __getitem__(self, layer):
         return self._bootp if layer is self._lk.BOOTP else self._dhcp
+
+
+def test_parse_reply_extracts_fields_and_relay(lk):
+    # The pure wire decoder pulls the acted-on options into a DhcpReply and maps
+    # the relay giaddr (0.0.0.0 -> None when directly attached).
+    pkt = _DhcpPkt(lk, 0x1234, [("message-type", lk.ACK), ("server_id", "100.64.4.1"),
+                                ("lease_time", 1800), ("router", "100.64.4.1"),
+                                ("subnet_mask", "255.255.255.0"), "end"],
+                   yiaddr="100.64.4.7", giaddr="100.64.4.9")
+    rx = lk._parse_reply(pkt, "100.64.4.7")
+    assert rx.mtype == lk.ACK and rx.yiaddr == "100.64.4.7"
+    assert rx.server_id == "100.64.4.1" and rx.lease == 1800
+    assert rx.router == "100.64.4.1" and rx.subnet_mask == "255.255.255.0"
+    assert rx.giaddr == "100.64.4.9"           # relay in path
+    directly_attached = _DhcpPkt(lk, 0x1234, [("message-type", lk.ACK), "end"], giaddr="0.0.0.0")
+    assert lk._parse_reply(directly_attached, "100.64.4.7").giaddr is None
 
 
 def test_on_dhcp_reply_captures_option56_message(lk):
@@ -715,7 +731,7 @@ def test_dhcp_options_include_param_req_list(lk):
     # Every DISCOVER/REQUEST must carry the Parameter Request List (RFC 2132 §9.8)
     # so the server returns the subnet mask (1) + router (3) follow-mode needs.
     keeper = _plain_keeper(lk)
-    opts = keeper._dhcp_options("discover", [("requested_addr", "100.64.4.7")])
+    opts = lk._dhcp_options("discover", [("requested_addr", "100.64.4.7")], keeper._id_opts)
     assert opts[0] == ("message-type", "discover")
     assert ("param_req_list", lk.PARAM_REQ_LIST) in opts
     assert 1 in lk.PARAM_REQ_LIST and 3 in lk.PARAM_REQ_LIST
@@ -753,7 +769,7 @@ def test_renew_omits_server_id_and_requested_addr(lk):
         # assert on the ACTUAL assembled option list, not the stubbed extras
         # (which are always empty here) -- so a regression that re-added
         # server_id to renew's opts would fail this.
-        wire = [o for o in keeper._dhcp_options(mtype, extra) if isinstance(o, tuple)]
+        wire = [o for o in lk._dhcp_options(mtype, extra, keeper._id_opts) if isinstance(o, tuple)]
         assert all(o[0] != "server_id" for o in wire)
         assert all(o[0] != "requested_addr" for o in wire)
 

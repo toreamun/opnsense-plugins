@@ -224,7 +224,7 @@ def _ack(lk, yiaddr, server="100.64.4.1"):
 class _DhcpPkt:
     """Minimal stand-in for a scapy DHCP reply: p[BOOTP].xid/op/yiaddr and
     p[DHCP].options, with haslayer() so _on_dhcp_reply parses it."""
-    def __init__(self, lk, xid, options, yiaddr="100.64.4.7",
+    def __init__(self, lk, xid, options, yiaddr="100.64.4.7",  # pylint: disable=R0913,R0917
                  chaddr=b"\x00\x00\x5e\x00\x01\xfe", op=None, giaddr="0.0.0.0"):
         self._lk = lk
         self._bootp = types.SimpleNamespace(xid=xid, op=(lk.BOOTREPLY if op is None else op),

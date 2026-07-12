@@ -48,6 +48,11 @@ Usage:
   lease_keeper.py --iface <if> --chaddr <mac> --request <ip>
   lease_keeper.py ... --once            # one-shot claim+verify+release (test)
 """
+# The daemon must never die on unexpected input: catch-all with logging is
+# the documented posture (see "All I/O wrapped in try/except" above).
+# pylint: disable=broad-exception-caught
+# A single deployable file is a deliberate constraint of this daemon.
+# pylint: disable=too-many-lines
 import argparse
 import ipaddress
 import logging
@@ -282,7 +287,7 @@ def _clock_at(offset):
     return time.strftime("%H:%M", time.localtime(time.time() + offset))
 
 
-class DhcpClient:
+class DhcpClient:  # pylint: disable=too-many-instance-attributes
     """RFC 2131 client for one chaddr: owns the lease state (yiaddr, server,
     lease/T1/T2, router, mask) and the stateful protocol sequences
     (INIT-REBOOT / DORA / RENEW / REBIND / RELEASE) with their send/await
@@ -293,7 +298,7 @@ class DhcpClient:
     release_on_enforce) -> bool for an ACK whose address differs from the
     expected one (True = the caller validated and adopted it, see adopt())."""
 
-    def __init__(self, iface, chaddr, eth_src, id_opts,
+    def __init__(self, iface, chaddr, eth_src, id_opts,  # pylint: disable=R0913,R0917
                  should_stop, ensure_sniffer, on_changed_address):
         self.iface = iface
         self.chaddr = chaddr
@@ -403,7 +408,7 @@ class DhcpClient:
 
         return self.dora(request_ip)
 
-    def dora(self, request_ip=None):
+    def dora(self, request_ip=None):  # pylint: disable=too-many-return-statements
         """Acquire a lease via the DHCP DORA handshake -- Discover, Offer,
         Request, Ack. Returns True once BOUND, False on failure/NAK."""
         self.xid = random.randint(1, 0xFFFFFFFF)
@@ -461,7 +466,7 @@ class DhcpClient:
             time.sleep(min(_jittered(2 ** attempt), ATTEMPT_BACKOFF_CAP))
         return False
 
-    def reboot(self, request_ip):
+    def reboot(self, request_ip):  # pylint: disable=too-many-return-statements
         """INIT-REBOOT (RFC 2131 4.3.2): we already know the address we want
         (request_ip), so REQUEST it directly instead of a full DISCOVER -- one
         exchange, and a server that is reachable but refuses the address answers
@@ -501,7 +506,7 @@ class DhcpClient:
                 time.sleep(min(_jittered(2 ** attempt), ATTEMPT_BACKOFF_CAP))
         return False
 
-    def renew(self, rebind=False):
+    def renew(self, rebind=False):  # pylint: disable=too-many-return-statements
         """REQUEST an extension of the held lease. Returns True on a fresh ACK,
         False on NAK/timeout/unbound (the caller escalates: RENEW -> REBIND ->
         re-acquire)."""
@@ -583,7 +588,7 @@ class DhcpClient:
         return t1, t2, src
 
 
-class ArpNudge:
+class ArpNudge:  # pylint: disable=too-many-instance-attributes
     """Keep the upstream gateway's ARP entry for the leased address fresh, for
     gateways that ignore gratuitous ARP and never re-ARP an expired entry (see
     the README's "ARP nudge" section). Owns the nudge pacing and the gateway
@@ -673,14 +678,14 @@ class ArpNudge:
             LOG.debug("ARP reply parse error: %s", e)
 
 
-class Keeper:
+class Keeper:  # pylint: disable=too-many-instance-attributes,too-few-public-methods
     """Policy and orchestration around the components: owns the packet sniffer
     (feeding DHCP replies to DhcpClient and ARP replies to ArpNudge), the
     follow/enforce decision for a changed address, the heartbeat, the CARP
     role watch, the acquire pacing (backoff + link-return fast path) and the
     signal-driven operator actions. The lease itself lives in DhcpClient."""
 
-    def __init__(self, iface, chaddr, request_ip=None, eth_src=None,
+    def __init__(self, iface, chaddr, request_ip=None, eth_src=None,  # pylint: disable=R0913,R0917
                  hbfile=None, release_on_exit=False, vhid=None,
                  follow=False, vendor_class=None, client_id=None, hostname=None,
                  arp_nudge=0, arp_listen_promisc=False):
@@ -1219,7 +1224,7 @@ class Keeper:
         LOG.info("stopped")
         return 0
 
-    def _run_once(self):
+    def _run_once(self):  # pylint: disable=too-many-branches,too-many-statements
         """One iteration of the maintain loop. Returns to run() (which loops again)
         on every state transition; any exception it raises is caught by run() and
         retried, so a transient fault can never terminate the keeper."""
@@ -1323,7 +1328,7 @@ def acquire_pidfile(path):
 
 # main() drives the Keeper internals directly (signal flags, the --once path).
 # pylint: disable=protected-access
-def main():
+def main():  # pylint: disable=too-many-branches,too-many-statements
     """CLI entry point: parse args, wire up the Keeper and signals, run."""
     ap = argparse.ArgumentParser(description="Robust DHCP lease-keeper (chaddr decoupled from the iface MAC)")
     ap.add_argument("--iface", required=True)

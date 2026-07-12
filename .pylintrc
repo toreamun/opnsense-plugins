@@ -1,26 +1,15 @@
-# Pylint config aligned with this repo's flake8 settings in setup.cfg
-# (OPNsense practice: max line length 120).
+# Pylint config: PROJECT-WIDE conventions only. Local deviations from the
+# default design limits are annotated inline at the deviation site, so the
+# strict defaults keep applying everywhere else.
 [FORMAT]
+# Aligned with the flake8 settings in setup.cfg (OPNsense practice).
 max-line-length=120
 
 [BASIC]
-# Short names idiomatic in the network code and tests:
+# Short names idiomatic across this codebase's network code and tests:
 # p = scapy packet, rx = parsed reply, b = BOOTP layer, gw = gateway,
-# c/k/n = component instances in tests, t1/t2 = DHCP timers.
+# c/k/n = component or keeper instances in tests, t1/t2 = DHCP timers,
+# m = MAC string, e = exception, f = file handle, fd/pf = descriptors,
+# a/ap = parsed args / parser, s = formatted string, ok = loop result,
+# lk = the daemon-module test fixture.
 good-names=p,rx,b,gw,c,k,n,s,t1,t2,ok,e,f,a,m,fd,pf,ap,lk
-
-[MESSAGES CONTROL]
-# broad-exception-caught: the daemons must never die on unexpected input --
-#   catch-all with logging is the documented posture (see lease-keeper.py's
-#   module docstring, "All I/O wrapped in try/except").
-# design metrics (too-many-*, too-few-public-methods): single-file daemons;
-#   constructor/loop sizes are deliberate and reviewed, not accidental.
-disable=broad-exception-caught,
-        too-many-arguments,
-        too-many-positional-arguments,
-        too-many-instance-attributes,
-        too-many-return-statements,
-        too-many-branches,
-        too-many-statements,
-        too-many-lines,
-        too-few-public-methods

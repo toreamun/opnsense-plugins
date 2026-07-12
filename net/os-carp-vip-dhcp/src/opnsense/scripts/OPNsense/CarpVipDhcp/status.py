@@ -18,6 +18,8 @@ import subprocess
 import time
 import xml.etree.ElementTree as ET
 
+from keeperconf import keeper_lines
+
 CONFFILE = "/usr/local/etc/carpvipdhcp/keeper.conf"
 CONFIG_XML = "/conf/config.xml"
 RUN_DIR = "/var/run"
@@ -30,12 +32,15 @@ ARP_CONFIRM_FLOOR = 90
 
 
 def keeper_id(request_ip):
+    """Filesystem-safe keeper id (same charset as the daemon uses)."""
     return re.sub(r"[^A-Za-z0-9]", "_", request_ip)
 
 
 def pid_alive(path):
+    """The live pid recorded in the pidfile, or None (absent/stale/foreign)."""
     try:
-        pid = int(open(path).read().strip())
+        with open(path, encoding="utf-8") as f:
+            pid = int(f.read().strip())
         os.kill(pid, 0)
         return pid
     except (OSError, ValueError):
@@ -56,13 +61,42 @@ def _int_token(value):
         return None
 
 
+def _epoch_pair(value):
+    """(epoch, age) for the nudge=/arpok= tokens; a 0 epoch means 'never yet'
+    and a garbled value parses to nothing -- age stays None either way."""
+    try:
+        return _epoch_and_age(value)
+    except ValueError:
+        return None, None
+
+
+# Heartbeat token dispatch: token -> (result fields, value parser). The parser
+# returns one value per field. Tokens are data, not logic -- adding one is a
+# table row, in lockstep with what lease_keeper.py's _hb()/_hb_mismatch() emit.
+_HB_TOKENS = {
+    "bound": (("bound",), lambda v: (None if v == "-" else v,)),
+    "lease": (("lease",), lambda v: (_int_token(v),)),
+    "t1": (("t1",), lambda v: (_int_token(v),)),
+    "t2": (("t2",), lambda v: (_int_token(v),)),
+    "src": (("timing_source",), lambda v: (v,)),
+    "nudge": (("nudge_epoch", "nudge_age"), _epoch_pair),
+    "arpok": (("arp_reply_epoch", "arp_reply_age"), _epoch_pair),
+    "gw": (("gw",), lambda v: (v,)),
+    "got": (("mismatch_got",), lambda v: (v,)),
+    "want": (("mismatch_want",), lambda v: (v,)),
+}
+
+
 def parse_heartbeat(path):
+    """Parse one heartbeat file into the per-keeper status fields (all None /
+    False when the file is absent or unreadable)."""
     result = {"bound": None, "lease": None, "t1": None, "t2": None, "timing_source": None,
               "mismatch": False, "mismatch_got": None, "mismatch_want": None,
               "hb_epoch": None, "hb_age": None, "nudge_epoch": None, "nudge_age": None, "gw": None,
               "arp_reply_epoch": None, "arp_reply_age": None}
     try:
-        raw = open(path).read().strip()
+        with open(path, encoding="utf-8") as f:
+            raw = f.read().strip()
     except OSError:
         return result
     parts = raw.split()
@@ -74,37 +108,14 @@ def parse_heartbeat(path):
     except ValueError:
         return result
     for part in parts[1:]:
-        if part.startswith("bound="):
-            value = part.split("=", 1)[1]
-            result["bound"] = None if value == "-" else value
-        elif part.startswith("lease="):
-            result["lease"] = _int_token(part.split("=", 1)[1])
-        elif part.startswith("t1="):
-            result["t1"] = _int_token(part.split("=", 1)[1])
-        elif part.startswith("t2="):
-            result["t2"] = _int_token(part.split("=", 1)[1])
-        elif part.startswith("src="):
-            result["timing_source"] = part.split("=", 1)[1]
-        elif part.startswith("nudge="):
-            # nudge=0 means "enabled but never sent yet" -> age stays None.
-            try:
-                result["nudge_epoch"], result["nudge_age"] = _epoch_and_age(part.split("=", 1)[1])
-            except ValueError:
-                pass
-        elif part.startswith("arpok="):
-            # arpok=0 means "no gateway ARP reply seen yet" -> age stays None.
-            try:
-                result["arp_reply_epoch"], result["arp_reply_age"] = _epoch_and_age(part.split("=", 1)[1])
-            except ValueError:
-                pass
-        elif part.startswith("gw="):
-            result["gw"] = part.split("=", 1)[1]
-        elif part == "MISMATCH":
+        if part == "MISMATCH":
             result["mismatch"] = True
-        elif part.startswith("got="):
-            result["mismatch_got"] = part.split("=", 1)[1]
-        elif part.startswith("want="):
-            result["mismatch_want"] = part.split("=", 1)[1]
+            continue
+        token, sep, value = part.partition("=")
+        spec = _HB_TOKENS.get(token) if sep else None
+        if spec:
+            fields, parse = spec
+            result.update(zip(fields, parse(value)))
     return result
 
 
@@ -140,17 +151,11 @@ def iface_names():
     return names
 
 
-def read_keepers(states, names):
+def read_keepers(states, names):  # pylint: disable=too-many-locals
+    """One status entry per keeper.conf line: config, process, CARP role and
+    heartbeat fields, plus the derived arp_confirmed freshness flag."""
     keepers = []
-    try:
-        lines = open(CONFFILE).read().splitlines()
-    except OSError:
-        return keepers
-    for line in lines:
-        line = line.strip()
-        if not line or line.startswith("#") or "|" not in line:
-            continue
-        parts = line.split("|")
+    for parts in keeper_lines(CONFFILE):
         if len(parts) < 4:
             continue
         # keeper.conf field order (keep in lockstep with the template + rc.d readers):
@@ -163,7 +168,7 @@ def read_keepers(states, names):
         if len(parts) > 9:
             arp_nudge = _int_token(parts[9]) or 0
         kid = keeper_id(request)
-        pid = pid_alive("%s/carpvipdhcp-%s.pid" % (RUN_DIR, kid))
+        pid = pid_alive(f"{RUN_DIR}/carpvipdhcp-{kid}.pid")
         entry = {
             "request": request,
             "iface": iface,
@@ -177,7 +182,7 @@ def read_keepers(states, names):
             "running": pid is not None,
             "pid": pid,
         }
-        entry.update(parse_heartbeat("%s/carpvipdhcp-%s.hb" % (RUN_DIR, kid)))
+        entry.update(parse_heartbeat(f"{RUN_DIR}/carpvipdhcp-{kid}.hb"))
         age = entry.get("arp_reply_age")
         entry["arp_confirmed"] = (
             age is not None and age <= max(ARP_CONFIRM_FLOOR, arp_nudge * ARP_CONFIRM_INTERVALS))
@@ -186,6 +191,7 @@ def read_keepers(states, names):
 
 
 def carp_demotion():
+    """The kernel CARP demotion counter, or None when unreadable."""
     try:
         out = subprocess.check_output(["/sbin/sysctl", "-n", "net.inet.carp.demotion"])
         return int(out.strip())
@@ -194,6 +200,7 @@ def carp_demotion():
 
 
 def main():
+    """Emit the status JSON document on stdout."""
     print(json.dumps({
         "carp_demotion": carp_demotion(),
         "keepers": read_keepers(carp_states(), iface_names()),

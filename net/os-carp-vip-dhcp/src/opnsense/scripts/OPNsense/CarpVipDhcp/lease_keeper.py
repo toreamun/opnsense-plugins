@@ -694,12 +694,194 @@ class ArpNudge:  # pylint: disable=too-many-instance-attributes
             LOG.debug("ARP reply parse error: %s", e)
 
 
+class FollowPolicy:  # pylint: disable=too-many-instance-attributes
+    """Decides what happens when the server grants a DIFFERENT address than
+    the target this keeper exists to hold. In follow mode: validate the new
+    address (plausibility, routability class, expected server), throttle
+    against flap/spoof storms, drive the configd VIP rewrite and adopt it
+    into the DHCP client. Otherwise (enforce, a fixed reservation): alarm,
+    release the refused grant and stay unbound. Owns the target address
+    (rewritten on a successful follow), the persisted follow throttle, the
+    apply-retry watchdog and the peer-ACK observation handoff."""
+
+    def __init__(self, target, follow, chaddr, dhcp, hb_mismatch):
+        self.target = target           # the address this keeper is meant to hold
+        self.follow = follow
+        self._dhcp = dhcp
+        self._hb_mismatch = hb_mismatch
+        self._followed_ip = None       # last address we asked configd to follow to
+        self._follow_from = None       # address we followed FROM (for the retry watchdog)
+        self._fired_at = 0.0           # when we last dispatched follow_update (retry deadline)
+        self._gw_args = []             # extra follow_update args on a cross-subnet move: [old_gw, new_gw, bits]
+        # Throttle state, keyed by chaddr so it survives the follow-induced
+        # restart (the target-keyed runtime paths change on every follow).
+        self._state_file = f"/var/run/carpvipdhcp-follow-{_fs_safe(chaddr)}"
+        # A changed ISP address first seen in the PEER's ACK (both HA nodes run
+        # an identical keeper on the same shared chaddr). The sniffer thread
+        # records it via observe() -- a lone atomic ref-assign -- and the main
+        # thread consumes it in check_observed().
+        self._observed = None
+
+    def _last_follow_time(self):
+        """Epoch of this chaddr's last follow (persisted so the throttle survives
+        the follow-induced restart). 0 if never / unreadable."""
+        try:
+            with open(self._state_file, encoding="utf-8") as f:
+                return float(f.read().strip())
+        except (OSError, ValueError):
+            return 0.0
+
+    def _record_follow(self):
+        try:
+            tmp = self._state_file + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(str(int(time.time())))
+            os.replace(tmp, self._state_file)
+        except OSError as e:
+            LOG.warning("could not persist follow timestamp: %s", e)
+
+    def on_changed_address(self, got, rx, phase, release_on_enforce):
+        """An ACK arrived whose address differs from the one we hold/request.
+
+        In follow mode: validate the address (sane, same routability class, from
+        the expected server), throttle against flap/spoof storms, then adopt it
+        (rewrite the CARP VIP). Otherwise (enforce): alarm on the mismatch.
+        Returns True if we are now bound to `got`, False if the caller should
+        re-acquire.
+        """
+        if self.follow:
+            if not _sane_ipv4(got):
+                LOG.error("%s: ACK yiaddr %r from server %s implausible -- not following",
+                          phase, got, rx.server_id)
+                return False
+            if not _same_ip_class(self.target, got):
+                LOG.error("%s: refusing to follow %s -> %s across address class "
+                          "(possible spoofed ACK from %s)", phase, self.target, got,
+                          rx.server_id)
+                return False
+            if phase != "REBIND" and rx.server_id and self._dhcp.server and rx.server_id != self._dhcp.server:
+                LOG.error("%s: ACK from unexpected server %s (leased from %s) -- not following",
+                          phase, rx.server_id, self._dhcp.server)
+                return False
+
+            waited = time.time() - self._last_follow_time()
+            if waited < MIN_FOLLOW_INTERVAL:
+                LOG.warning("%s: follow %s -> %s throttled (%.0fs < %ds) -- deferring",
+                            phase, self.target, got, waited, MIN_FOLLOW_INTERVAL)
+                return False
+
+            LOG.warning("ISP gave %s (VIP was %s) at %s -- following: updating the CARP VIP",
+                        got, self.target, phase)
+            # If the ISP also moved the gateway (a cross-subnet renumber), follow the
+            # new gateway + prefix too so outbound keeps working -- parity with what a
+            # plain DHCP interface does. Needs the new subnet mask (opt 1) to set the
+            # VIP prefix; without it we can only move the address, so warn instead.
+            self._gw_args = []
+            old_router = self._dhcp.router
+            if rx.router and old_router and rx.router != old_router:
+                bits = _mask_to_bits(rx.subnet_mask)
+                if bits:
+                    LOG.warning("follow %s -> %s also moves the gateway (%s -> %s), subnet "
+                                "/%d -- following across the subnet", self.target, got,
+                                old_router, rx.router, bits)
+                    self._gw_args = [old_router, rx.router, str(bits)]
+                else:
+                    LOG.error("follow %s -> %s changes the gateway (%s -> %s) but the ACK "
+                              "carried no subnet mask -- updating the VIP address only; fix the "
+                              "interface prefix + System->Gateways by hand", self.target,
+                              got, old_router, rx.router)
+
+            self._record_follow()
+            # _follow_update reads target as the old address, so remember it
+            # (for the retry watchdog) and fire before overwriting target.
+            self._follow_from = self.target
+            self._follow_update(got)
+            self.target = got
+            self._dhcp.adopt(rx)
+            return True
+        # Enforce: a fixed reservation must always return the target.
+        LOG.error("%s: IP mismatch -- server %s gave %s, requested %s (reservation problem?)",
+                  phase, rx.server_id, got, self.target)
+        self._hb_mismatch(got, self.target)
+        if release_on_enforce:
+            self._dhcp.release(got, rx.server_id)
+            # DORA's OFFER phase already recorded a tentative yiaddr; drop it so
+            # the run loop re-acquires instead of renewing the refused grant.
+            self._dhcp.expire()
+        return False
+
+    def _follow_update(self, new_ip):
+        """Ask configd to rewrite the CARP VIP (and this keeper's reference) from
+        the target to new_ip, then reconfigure. Fire-and-forget: the resulting
+        service restart replaces this daemon with one bound to the new address."""
+        if new_ip == self._followed_ip:
+            return   # already asked for this address
+        try:
+            self._fire_follow_update(self.target, new_ip)
+            # Only mark as handled once the request was actually dispatched, so a
+            # spawn failure is retried next cycle instead of getting stuck.
+            self._followed_ip = new_ip
+            LOG.info("requested CARP VIP update %s -> %s", self.target, new_ip)
+        except Exception as e:
+            LOG.error("follow_update request failed: %s", e)
+
+    def _fire_follow_update(self, old_ip, new_ip):
+        """Dispatch the configd follow_update action (old -> new) and stamp the
+        retry deadline. Separate from _follow_update so the watchdog can re-drive
+        a stalled follow without tripping the _followed_ip equality guard."""
+        cmd = ["/usr/local/sbin/configctl", "-d", "carpvipdhcp", "follow_update", old_ip, new_ip]
+        cmd += self._gw_args   # cross-subnet: [old_gw, new_gw, bits]; empty on a same-subnet move
+        subprocess.Popen(cmd)  # pylint: disable=consider-using-with
+        self._fired_at = time.time()
+
+    def watchdog(self):
+        """Re-drive a follow that never took effect. After a successful follow,
+        follow_update restarts this daemon within a few seconds; if we are still
+        alive well past FOLLOW_RETRY_DEADLINE, its apply failed or stalled, so
+        re-dispatch it (idempotent: it reconverges whether the config already
+        moved or not, and its rc.d restart <old-id> eventually replaces us)."""
+        if not (self.follow and self._followed_ip and self._follow_from):
+            return
+        if time.time() - self._fired_at < FOLLOW_RETRY_DEADLINE:
+            return
+        LOG.warning("follow %s -> %s not applied within %ds -- re-driving",
+                    self._follow_from, self._followed_ip, FOLLOW_RETRY_DEADLINE)
+        try:
+            self._fire_follow_update(self._follow_from, self._followed_ip)
+        except Exception as e:
+            LOG.error("follow_update retry failed: %s", e)
+
+    def observe(self, rx):
+        """Record a peer-ACK observation (sniffer thread; a lone ref-assign);
+        the main loop consumes it in check_observed()."""
+        self._observed = rx
+
+    def check_observed(self):
+        """Adopt an address change first seen in the PEER's DHCP ACK (same shared
+        chaddr) without waiting for our own renewal timer. The sniffer only
+        records the observation; the follow itself runs here on the main thread,
+        through the same hardening/throttle as a first-party ACK. This collapses
+        the follow window that would otherwise leave the two nodes on different
+        VIP prefixes long enough for the backup to promote (transient
+        dual-master; see docs/single-ip-wan-carp.md section 3)."""
+        rx = self._observed
+        if rx is None:
+            return
+        self._observed = None
+        if not self.follow or not rx.yiaddr or rx.yiaddr == self._dhcp.yiaddr:
+            return
+        LOG.info("observed peer DHCP ACK for %s (we hold %s) -- following early to converge",
+                 rx.yiaddr, self._dhcp.yiaddr)
+        self.on_changed_address(rx.yiaddr, rx, "OBSERVED", release_on_enforce=False)
+
+
 class Keeper:  # pylint: disable=too-many-instance-attributes
-    """Policy and orchestration around the components: owns the packet sniffer
-    (feeding DHCP replies to DhcpClient and ARP replies to ArpNudge), the
-    follow/enforce decision for a changed address, the heartbeat, the CARP
-    role watch, the acquire pacing (backoff + link-return fast path) and the
-    signal-driven operator actions. The lease itself lives in DhcpClient."""
+    """Orchestration around the components: owns the packet sniffer (feeding
+    DHCP replies to DhcpClient, ARP replies to ArpNudge and peer-ACK
+    observations to FollowPolicy), the heartbeat, the CARP role watch, the
+    acquire pacing (backoff + link-return fast path) and the signal-driven
+    operator actions. The lease lives in DhcpClient; the changed-address
+    decision and the target address live in FollowPolicy."""
 
     def __init__(self, iface, chaddr, request_ip=None, eth_src=None,  # pylint: disable=R0913,R0917
                  hbfile=None, release_on_exit=False, vhid=None,
@@ -707,12 +889,10 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
                  arp_nudge=0, arp_listen_promisc=False):
         self.iface = iface
         self.chaddr = chaddr.lower()
-        self.request_ip = request_ip
         self.eth_src = (eth_src or chaddr).lower()
         self.hbfile = hbfile
         self.release_on_exit = release_on_exit
         self.vhid = str(vhid) if vhid else None
-        self.follow = follow
         # ARP nudge component: owns the pacing and reachability state; the
         # keeper supplies the lease binding per nudge (_arp_nudge) and the
         # CARP-role probe (late-bound so tests can stub _probe_carp_master).
@@ -746,14 +926,11 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
             iface, self.chaddr, self.eth_src, id_opts,
             should_stop=lambda: self.stop,
             ensure_sniffer=lambda: self._ensure_sniffer(),  # pylint: disable=unnecessary-lambda
-            on_changed_address=self._handle_changed_address)
-        self._followed_ip = None       # last address we asked configd to follow to
-        self._follow_from = None       # address we followed FROM (for the retry watchdog)
-        self._follow_fired_at = 0.0    # when we last dispatched follow_update (retry deadline)
-        self._follow_gw_args = []      # extra follow_update args on a cross-subnet move: [old_gw, new_gw, bits]
-        # Follow throttle state, keyed by chaddr so it survives the follow-induced
-        # restart (the request-IP-keyed runtime paths change on every follow).
-        self._follow_state = f"/var/run/carpvipdhcp-follow-{_fs_safe(self.chaddr)}"
+            on_changed_address=self._on_changed_address)
+        # Follow/enforce policy component: owns the target address and the
+        # follow bookkeeping; drives the client via adopt()/release()/expire().
+        self._follow = FollowPolicy(request_ip, follow, self.chaddr, self._dhcp,
+                                    self._hb_mismatch)
         self.redora_wait = REDORA_MIN
         # Link-return fast path (only while UNBOUND): a carrier down->up edge resets
         # the backoff and re-DORAs at once, like dhclient's link-up -> state_reboot.
@@ -761,11 +938,6 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         self._link_kick_at = 0.0       # epoch of the last link-return kick (debounce)
         self._link_returned = False    # set by _sleep_interruptible on a carrier return while unbound
         self.stop = False
-        # Follow mode: a changed ISP address first seen in the PEER's ACK (both
-        # HA nodes run an identical keeper on the same shared chaddr). The sniffer
-        # writes it (a lone atomic ref-assign); the main thread consumes it and
-        # drives the hardened follow -- see _on_dhcp_reply / _check_observed_follow.
-        self._observed_change = None
         # General early-wake for the maintain-loop sleep (_sleep_interruptible): lets it
         # return before the 1s tick when there is pending work. Currently the
         # sniffer sets it on an observed address change so the follow fires in
@@ -851,12 +1023,12 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
             # thread -- which routes it through the same follow hardening
             # (sane / same-class / expected-server / throttle) as a first-party
             # ACK and never acts on the sniffer thread.
-            if not self.follow or not self._dhcp.yiaddr or not self._chaddr_matches(b):
+            if not self._follow.follow or not self._dhcp.yiaddr or not self._chaddr_matches(b):
                 return
             rx = _parse_reply(p, b.yiaddr)
             if (rx.mtype == ACK and rx.yiaddr and rx.yiaddr != self._dhcp.yiaddr
                     and _sane_ipv4(rx.yiaddr)):
-                self._observed_change = rx
+                self._follow.observe(rx)
                 self._wake.set()   # wake the maintain-loop sleep now, don't wait for the tick
         except Exception as e:
             LOG.debug("DHCP reply parse error: %s", e)
@@ -890,158 +1062,14 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         self._write_hb(f"{int(time.time())} bound={self._dhcp.yiaddr or '-'} "
                        f"lease={self._dhcp.lease} t1={t1} t2={t2} src={src}{extra}\n")
 
-    def _hb_mismatch(self, got):
+    def _hb_mismatch(self, got, want):
         # Write a clear marker into the heartbeat file so a supervisor/human sees the mismatch.
-        self._write_hb(f"{int(time.time())} MISMATCH got={got} want={self.request_ip}\n")
+        self._write_hb(f"{int(time.time())} MISMATCH got={got} want={want}\n")
 
-    # ---- follow mode (adopt a changed ISP address, with spoof hardening) ----
-
-    def _last_follow_time(self):
-        """Epoch of this chaddr's last follow (persisted so the throttle survives
-        the follow-induced restart). 0 if never / unreadable."""
-        try:
-            with open(self._follow_state, encoding="utf-8") as f:
-                return float(f.read().strip())
-        except (OSError, ValueError):
-            return 0.0
-
-    def _record_follow(self):
-        try:
-            tmp = self._follow_state + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                f.write(str(int(time.time())))
-            os.replace(tmp, self._follow_state)
-        except OSError as e:
-            LOG.warning("could not persist follow timestamp: %s", e)
-
-    def _handle_changed_address(self, got, rx, phase, release_on_enforce):
-        """An ACK arrived whose address differs from the one we hold/request.
-
-        In follow mode: validate the address (sane, same routability class, from
-        the expected server), throttle against flap/spoof storms, then adopt it
-        (rewrite the CARP VIP). Otherwise (enforce): alarm on the mismatch.
-        Returns True if we are now bound to `got`, False if the caller should
-        re-acquire.
-        """
-        if self.follow:
-            if not _sane_ipv4(got):
-                LOG.error("%s: ACK yiaddr %r from server %s implausible -- not following",
-                          phase, got, rx.server_id)
-                return False
-            if not _same_ip_class(self.request_ip, got):
-                LOG.error("%s: refusing to follow %s -> %s across address class "
-                          "(possible spoofed ACK from %s)", phase, self.request_ip, got,
-                          rx.server_id)
-                return False
-            if phase != "REBIND" and rx.server_id and self._dhcp.server and rx.server_id != self._dhcp.server:
-                LOG.error("%s: ACK from unexpected server %s (leased from %s) -- not following",
-                          phase, rx.server_id, self._dhcp.server)
-                return False
-
-            waited = time.time() - self._last_follow_time()
-            if waited < MIN_FOLLOW_INTERVAL:
-                LOG.warning("%s: follow %s -> %s throttled (%.0fs < %ds) -- deferring",
-                            phase, self.request_ip, got, waited, MIN_FOLLOW_INTERVAL)
-                return False
-
-            LOG.warning("ISP gave %s (VIP was %s) at %s -- following: updating the CARP VIP",
-                        got, self.request_ip, phase)
-            # If the ISP also moved the gateway (a cross-subnet renumber), follow the
-            # new gateway + prefix too so outbound keeps working -- parity with what a
-            # plain DHCP interface does. Needs the new subnet mask (opt 1) to set the
-            # VIP prefix; without it we can only move the address, so warn instead.
-            self._follow_gw_args = []
-            old_router = self._dhcp.router
-            if rx.router and old_router and rx.router != old_router:
-                bits = _mask_to_bits(rx.subnet_mask)
-                if bits:
-                    LOG.warning("follow %s -> %s also moves the gateway (%s -> %s), subnet "
-                                "/%d -- following across the subnet", self.request_ip, got,
-                                old_router, rx.router, bits)
-                    self._follow_gw_args = [old_router, rx.router, str(bits)]
-                else:
-                    LOG.error("follow %s -> %s changes the gateway (%s -> %s) but the ACK "
-                              "carried no subnet mask -- updating the VIP address only; fix the "
-                              "interface prefix + System->Gateways by hand", self.request_ip,
-                              got, old_router, rx.router)
-
-            self._record_follow()
-            # _follow_update reads request_ip as the old address, so remember it
-            # (for the retry watchdog) and fire before overwriting request_ip.
-            self._follow_from = self.request_ip
-            self._follow_update(got)
-            self.request_ip = got
-            self._dhcp.adopt(rx)
-            return True
-        # Enforce: a fixed reservation must always return request_ip.
-        LOG.error("%s: IP mismatch -- server %s gave %s, requested %s (reservation problem?)",
-                  phase, rx.server_id, got, self.request_ip)
-        self._hb_mismatch(got)
-        if release_on_enforce:
-            self._dhcp.release(got, rx.server_id)
-            # DORA's OFFER phase already recorded a tentative yiaddr; drop it so
-            # the run loop re-acquires instead of renewing the refused grant.
-            self._dhcp.expire()
-        return False
-
-    def _follow_update(self, new_ip):
-        """Ask configd to rewrite the CARP VIP (and this keeper's reference) from
-        request_ip to new_ip, then reconfigure. Fire-and-forget: the resulting
-        service restart replaces this daemon with one bound to the new address."""
-        if new_ip == self._followed_ip:
-            return   # already asked for this address
-        try:
-            self._fire_follow_update(self.request_ip, new_ip)
-            # Only mark as handled once the request was actually dispatched, so a
-            # spawn failure is retried next cycle instead of getting stuck.
-            self._followed_ip = new_ip
-            LOG.info("requested CARP VIP update %s -> %s", self.request_ip, new_ip)
-        except Exception as e:
-            LOG.error("follow_update request failed: %s", e)
-
-    def _fire_follow_update(self, old_ip, new_ip):
-        """Dispatch the configd follow_update action (old -> new) and stamp the
-        retry deadline. Separate from _follow_update so the watchdog can re-drive
-        a stalled follow without tripping the _followed_ip equality guard."""
-        cmd = ["/usr/local/sbin/configctl", "-d", "carpvipdhcp", "follow_update", old_ip, new_ip]
-        cmd += self._follow_gw_args   # cross-subnet: [old_gw, new_gw, bits]; empty on a same-subnet move
-        subprocess.Popen(cmd)  # pylint: disable=consider-using-with
-        self._follow_fired_at = time.time()
-
-    def _follow_watchdog(self):
-        """Re-drive a follow that never took effect. After a successful follow,
-        follow_update restarts this daemon within a few seconds; if we are still
-        alive well past FOLLOW_RETRY_DEADLINE, its apply failed or stalled, so
-        re-dispatch it (idempotent: it reconverges whether the config already
-        moved or not, and its rc.d restart <old-id> eventually replaces us)."""
-        if not (self.follow and self._followed_ip and self._follow_from):
-            return
-        if time.time() - self._follow_fired_at < FOLLOW_RETRY_DEADLINE:
-            return
-        LOG.warning("follow %s -> %s not applied within %ds -- re-driving",
-                    self._follow_from, self._followed_ip, FOLLOW_RETRY_DEADLINE)
-        try:
-            self._fire_follow_update(self._follow_from, self._followed_ip)
-        except Exception as e:
-            LOG.error("follow_update retry failed: %s", e)
-
-    def _check_observed_follow(self):
-        """Adopt an address change first seen in the PEER's DHCP ACK (same shared
-        chaddr) without waiting for our own renewal timer. The sniffer only
-        records the observation; the follow itself runs here on the main thread,
-        through the same hardening/throttle as a first-party ACK. This collapses
-        the follow window that would otherwise leave the two nodes on different
-        VIP prefixes long enough for the backup to promote (transient
-        dual-master; see docs/single-ip-wan-carp.md section 3)."""
-        rx = self._observed_change
-        if rx is None:
-            return
-        self._observed_change = None
-        if not self.follow or not rx.yiaddr or rx.yiaddr == self._dhcp.yiaddr:
-            return
-        LOG.info("observed peer DHCP ACK for %s (we hold %s) -- following early to converge",
-                 rx.yiaddr, self._dhcp.yiaddr)
-        self._handle_changed_address(rx.yiaddr, rx, "OBSERVED", release_on_enforce=False)
+    def _on_changed_address(self, got, rx, phase, release_on_enforce):
+        """DhcpClient's changed-address hook -> the FollowPolicy decision
+        (late-bound through the attribute so tests can stub the policy)."""
+        return self._follow.on_changed_address(got, rx, phase, release_on_enforce)
 
     # ---- CARP role (master probe, transitions) ----
 
@@ -1180,10 +1208,9 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
                 LOG.info("manual ARP nudge requested (SIGUSR1)")
                 self._arp_nudge(force=True)
                 self._hb()   # publish the new nudge age right away for the status page
-            if self._observed_change is not None:
-                # A peer-ACK observation is pending -> follow now (rationale +
-                # the dual-master window it closes are in _check_observed_follow).
-                self._check_observed_follow()
+            # A pending peer-ACK observation follows now (rationale + the
+            # dual-master window it closes: FollowPolicy.check_observed).
+            self._follow.check_observed()
             # Link-return fast path: only while UNBOUND, poll carrier every few
             # seconds; a down->up edge means the WAN just came back, so stop waiting
             # and let _maintain_step re-DORA immediately (the bound path skips this).
@@ -1214,7 +1241,7 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
                 return False
             remaining -= chunk
             self._hb()
-            self._follow_watchdog()   # re-drive a follow whose apply stalled
+            self._follow.watchdog()   # re-drive a follow whose apply stalled
             self._poll_carp_role()    # backup->master? renew early + nudge now
             self._arp_nudge()
         return not self.stop
@@ -1230,7 +1257,7 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         # eth-src matters for L2 debugging but only when it differs from the chaddr.
         ethsrc = f" eth-src={self.eth_src}" if self.eth_src != self.chaddr else ""
         LOG.info("lease-keeper active on %s: chaddr=%s%s request=%s",
-                 self.iface, self.chaddr, ethsrc, self.request_ip or "any")
+                 self.iface, self.chaddr, ethsrc, self._follow.target or "any")
         time.sleep(0.5)
         while not self.stop:
             # The keeper must NEVER die on a bad DHCP state: catch any unexpected
@@ -1264,7 +1291,7 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         if not self._dhcp.yiaddr:
             self._ensure_sniffer()  # a dead sniffer would silently fail every DORA
             self._hb()  # active but not holding yet -> publish bound=-
-            if self._dhcp.acquire(self.request_ip):
+            if self._dhcp.acquire(self._follow.target):
                 LOG.info("DHCP BOUND %s (lease=%ss, expires ~%s, server=%s, gw=%s, mask=%s)",
                          self._dhcp.yiaddr, self._dhcp.lease, _clock_at(self._dhcp.lease),
                          self._dhcp.server, self._dhcp.router or "?",
@@ -1408,7 +1435,7 @@ def _claim_once(k):
     if not k._start_sniffer():
         return 3
     time.sleep(0.5)
-    ok = k._dhcp.dora(k.request_ip)
+    ok = k._dhcp.dora(k._follow.target)
     LOG.info("DHCP claim %s -> %s", k.chaddr, k._dhcp.yiaddr if ok else "FAIL")
     if ok:
         k._dhcp.release()

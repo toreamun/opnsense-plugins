@@ -616,18 +616,14 @@ def test_arp_reply_ignores_unrelated(lk):
     assert keeper._nudge.last_reply == 0.0
 
 
-def test_sniff_dispatch_routes_arp_reply(lk):
-    keeper = _nudge_keeper(lk)
-    keeper.router = "100.64.4.254"
-    keeper._on_sniff(_ArpPkt(lk, 2, "100.64.4.254", "100.64.4.7"))
-    assert keeper._nudge.last_reply > 0
-
-
-def test_arp_reply_logged_at_debug(lk, caplog):
+def test_arp_reply_stamps_reachability_and_logs(lk, caplog):
+    # A matching is-at reply from the nudge target, dispatched through the
+    # sniffer path, stamps the reachability epoch and logs at DEBUG.
     keeper = _nudge_keeper(lk)
     keeper.router = "100.64.4.1"
     with caplog.at_level("DEBUG", logger="lease-keeper"):
         keeper._on_sniff(_ArpPkt(lk, 2, "100.64.4.1", "100.64.4.7"))
+    assert keeper._nudge.last_reply > 0
     assert any("ARP reply from 100.64.4.1" in r.getMessage() for r in caplog.records)
 
 

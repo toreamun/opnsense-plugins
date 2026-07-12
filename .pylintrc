@@ -1,0 +1,32 @@
+# Pylint config aligned with this repo's flake8 settings in setup.cfg
+# (OPNsense practice: max line length 120).
+[FORMAT]
+max-line-length=120
+
+[BASIC]
+# Allow a dash in module names for this plugin's daemon, lease-keeper.py:
+# the filename is established on deployed systems (rc.d script and configd
+# actions reference it). Upstream OPNsense overwhelmingly uses plain or
+# underscored names; dashes are rare exceptions (core has a few, e.g.
+# rule-updater.py).
+module-rgx=[a-z][a-z0-9_-]*$
+# Short names idiomatic in the network code and tests:
+# p = scapy packet, rx = parsed reply, b = BOOTP layer, gw = gateway,
+# c/k/n = component instances in tests, t1/t2 = DHCP timers.
+good-names=p,rx,b,gw,c,k,n,s,t1,t2,ok,e,f,a,m,fd,pf,ap,lk
+
+[MESSAGES CONTROL]
+# broad-exception-caught: the daemons must never die on unexpected input --
+#   catch-all with logging is the documented posture (see lease-keeper.py's
+#   module docstring, "All I/O wrapped in try/except").
+# design metrics (too-many-*, too-few-public-methods): single-file daemons;
+#   constructor/loop sizes are deliberate and reviewed, not accidental.
+disable=broad-exception-caught,
+        too-many-arguments,
+        too-many-positional-arguments,
+        too-many-instance-attributes,
+        too-many-return-statements,
+        too-many-branches,
+        too-many-statements,
+        too-many-lines,
+        too-few-public-methods

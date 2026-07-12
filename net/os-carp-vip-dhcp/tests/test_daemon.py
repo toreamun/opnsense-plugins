@@ -1,4 +1,8 @@
-"""Unit tests for the lease-keeper daemon's pure helpers and follow decision."""
+"""Unit tests for the lease-keeper daemon's pure helpers and follow decision.
+
+Tests reach into private state/methods by design, and use comments over
+per-test docstrings."""
+# pylint: disable=protected-access, missing-function-docstring
 import os
 import time
 import types
@@ -26,18 +30,30 @@ def test_fs_safe(lk):
     assert lk._fs_safe("100.64.4.7") == "100_64_4_7"
 
 
+def _client(lk, id_opts=None, on_changed=None):
+    """A bare DhcpClient with stub hooks and a captured send list -- the
+    protocol tests need no Keeper."""
+    c = lk.DhcpClient("eth0", "00:00:5e:00:01:fe", "00:00:5e:00:01:fe", id_opts or [],
+                      should_stop=lambda: False,
+                      ensure_sniffer=lambda: None,
+                      on_changed_address=on_changed or (lambda *a: False))
+    c.sent = []
+    c._send_dhcp = lambda mtype, extra, ciaddr="0.0.0.0": c.sent.append((mtype, extra, ciaddr))
+    return c
+
+
 def test_timing_derived(lk):
-    keeper = lk.Keeper("eth0", "00:00:5e:00:01:fe", "100.64.4.7", hbfile=None)
-    keeper._dhcp.lease = 1800
-    assert keeper._dhcp.timing() == (900, 1575, "derived")
+    c = _client(lk)
+    c.lease = 1800
+    assert c.timing() == (900, 1575, "derived")
 
 
 def test_timing_honours_server(lk):
-    keeper = lk.Keeper("eth0", "00:00:5e:00:01:fe", "100.64.4.7", hbfile=None)
-    keeper._dhcp.lease = 1800
-    keeper._dhcp.t1_server = 600
-    keeper._dhcp.t2_server = 1200
-    assert keeper._dhcp.timing() == (600, 1200, "server")
+    c = _client(lk)
+    c.lease = 1800
+    c.t1_server = 600
+    c.t2_server = 1200
+    assert c.timing() == (600, 1200, "server")
 
 
 def test_redora_max_bounded(lk):
@@ -51,48 +67,75 @@ def test_dhcpreply_giaddr_defaults_none(lk):
     assert rx.giaddr is None
 
 
-def _reboot_keeper(lk):
-    k = lk.Keeper("eth0", "00:00:5e:00:01:fe", "100.64.4.7", hbfile=None)
-    k._ensure_sniffer = lambda: None
-    k.sent = []
-    k._dhcp._send_dhcp = lambda mtype, extra, ciaddr="0.0.0.0": k.sent.append((mtype, extra, ciaddr))
-    return k
-
-
 def test_reboot_request_shape_and_bind(lk):
-    k = _reboot_keeper(lk)
-    k._dhcp._wait_for_dhcp_reply = lambda want, timeout: lk.DhcpReply(
+    c = _client(lk)
+    c._wait_for_dhcp_reply = lambda want, timeout: lk.DhcpReply(
         lk.ACK, "100.64.4.7", "100.64.4.1", 1800, None, None, None)
-    assert k._dhcp.reboot("100.64.4.7") is True
-    assert k._dhcp.yiaddr == "100.64.4.7" and k._dhcp.server == "100.64.4.1"
-    mtype, extra, ciaddr = k.sent[0]
+    assert c.reboot("100.64.4.7") is True
+    assert c.yiaddr == "100.64.4.7" and c.server == "100.64.4.1"
+    mtype, extra, ciaddr = c.sent[0]
     assert mtype == "request" and ciaddr == "0.0.0.0"          # INIT-REBOOT: ciaddr stays 0
     assert ("requested_addr", "100.64.4.7") in extra           # option 50 = our known address
     assert not any(o[0] == "server_id" for o in extra if isinstance(o, tuple))  # RFC 4.3.2: no server-id
 
 
 def test_reboot_nak_falls_through(lk):
-    k = _reboot_keeper(lk)
-    k._dhcp._wait_for_dhcp_reply = lambda want, timeout: "NAK"
-    assert k._dhcp.reboot("100.64.4.7") is False
-    assert k._dhcp.yiaddr is None
+    c = _client(lk)
+    c._wait_for_dhcp_reply = lambda want, timeout: "NAK"
+    assert c.reboot("100.64.4.7") is False
+    assert c.yiaddr is None
 
 
 def test_reboot_skipped_without_request_ip(lk):
-    k = lk.Keeper("eth0", "00:00:5e:00:01:fe", None, hbfile=None)
-    assert k._dhcp.reboot(None) is False  # no known address -> nothing to reboot-request
+    c = _client(lk)
+    assert c.reboot(None) is False  # no known address -> nothing to reboot-request
 
 
 def test_acquire_reboot_first_then_dora(lk):
-    k = _reboot_keeper(lk)
+    c = _client(lk)
     calls = []
-    k._dhcp.reboot = lambda rip: (calls.append("reboot"), False)[1]
-    k._dhcp.dora = lambda rip=None: (calls.append("dora"), True)[1]
-    assert k._dhcp.acquire("100.64.4.7") is True
+    c.reboot = lambda rip: (calls.append("reboot"), False)[1]
+    c.dora = lambda rip=None: (calls.append("dora"), True)[1]
+    assert c.acquire("100.64.4.7") is True
     assert calls == ["reboot", "dora"]      # first acquire: INIT-REBOOT then DISCOVER fallback
     calls.clear()
-    assert k._dhcp.acquire("100.64.4.7") is True
+    assert c.acquire("100.64.4.7") is True
     assert calls == ["dora"]                # subsequent acquires: DISCOVER only
+
+
+def test_adopt_binds_and_refreshes_server(lk):
+    c = _client(lk)
+    c.server = "100.64.4.1"                                    # from the OFFER
+    ack = lk.DhcpReply(lk.ACK, "100.64.4.7", "100.64.4.2", 1800, None, None,
+                       "100.64.4.1", None, "255.255.255.0")
+    c.adopt(ack)
+    assert c.yiaddr == "100.64.4.7"
+    assert c.server == "100.64.4.2"          # ACK's server-id wins...
+    assert c.lease == 1800 and c.mask_bits == 24
+    c.adopt(lk.DhcpReply(lk.ACK, "100.64.4.8", None, 900, None, None, None))
+    assert c.server == "100.64.4.2"          # ...and is kept when the ACK has none
+
+
+def test_expire_unbinds_but_keeps_hints(lk):
+    c = _client(lk)
+    c.yiaddr, c.server, c.router = "100.64.4.7", "100.64.4.1", "100.64.4.254"
+    c.expire()
+    assert c.yiaddr is None                            # unbound -> the run loop re-acquires
+    assert c.server == "100.64.4.1" and c.router == "100.64.4.254"   # hints survive
+
+
+def test_renew_requires_binding(lk):
+    c = _client(lk)
+    assert c.renew() is False    # unbound -> nothing to renew
+    assert c.sent == []          # and nothing went on the wire
+
+
+def test_feed_wakes_the_waiting_sequence(lk):
+    c = _client(lk)
+    rx = lk.DhcpReply(lk.ACK, "100.64.4.7", "100.64.4.1", 1800, None, None, None)
+    c.feed(rx)
+    assert c._rx is rx
+    assert c._ev.is_set()        # the waiting _wait_for_dhcp_reply returns at once
 
 
 def test_fmt_reply_readable(lk):
@@ -259,7 +302,7 @@ def test_follow_throttled_within_interval(lk, tmp_path):
     assert keeper._handle_changed_address("100.64.4.61", _ack(lk, "100.64.4.61"), "DORA", True) is False
 
 
-def test_enforce_mismatch_refused(lk, tmp_path):
+def test_enforce_mismatch_refused(lk):
     keeper = lk.Keeper("eth0", "00:00:5e:00:01:fe", "100.64.4.7", hbfile=None, follow=False)
     keeper._dhcp.server = "100.64.4.1"
     keeper._dhcp.yiaddr = "100.64.4.7"
@@ -319,7 +362,7 @@ def test_observed_ignores_non_ack(lk, tmp_path):
     assert keeper._observed_change is None
 
 
-def test_observed_ignored_when_not_follow(lk, tmp_path):
+def test_observed_ignored_when_not_follow(lk):
     keeper = lk.Keeper("eth0", "00:00:5e:00:01:fe", "100.64.4.7", hbfile=None, follow=False)
     keeper._dhcp.server = "100.64.4.1"
     keeper._dhcp.yiaddr = "100.64.4.7"
@@ -405,6 +448,23 @@ def _nudge_keeper(lk, arp_nudge=240, hbfile=None, **kwargs):
     keeper._dhcp.server = "100.64.4.1"
     keeper._probe_carp_master = lambda: True   # the real probe needs ifconfig
     return keeper
+
+
+def test_arp_nudge_component_direct(lk):
+    # ArpNudge alone (no Keeper): interval floor at construction, the injected
+    # master probe gates every send, and the reachability stamp starts at 0.
+    role = {"master": True}
+    n = lk.ArpNudge("eth0", "00:00:5e:00:01:fe", 1, lambda: role["master"])
+    assert n.interval == lk.ARP_NUDGE_MIN     # floored: a typo cannot flood the segment
+    assert n.last_reply == 0.0
+
+    n.maybe_nudge("100.64.4.7", "100.64.4.1")
+    first = n.last_nudge
+    assert first > 0                          # master + due -> sent
+
+    role["master"] = False
+    n.maybe_nudge("100.64.4.7", "100.64.4.1", force=True)
+    assert n.last_nudge == first              # backup: never nudge, even forced
 
 
 def test_nudge_off_by_default(lk):
@@ -640,7 +700,7 @@ def test_sniffer_filter_captures_arp_and_honours_promisc(lk, monkeypatch):
     captured = {}
 
     class _Cap:
-        def __init__(self, *a, **k):
+        def __init__(self, *_a, **k):
             captured.update(k)
             self.thread = types.SimpleNamespace(is_alive=lambda: True)
 
@@ -708,11 +768,11 @@ def test_follow_update_action_arity():
         "conf", "actions.d", "actions_carpvipdhcp.conf")
     params = None
     in_section = False
-    with open(conf) as fh:
+    with open(conf, encoding="utf-8") as fh:
         for raw in fh:
             line = raw.strip()
             if line.startswith("[") and line.endswith("]"):
-                in_section = (line == "[follow_update]")
+                in_section = line == "[follow_update]"
             elif in_section and line.startswith("parameters:"):
                 params = line.split(":", 1)[1]
                 break
@@ -722,15 +782,10 @@ def test_follow_update_action_arity():
 
 # ---- RFC 2131/2132 compliance ----
 
-def _plain_keeper(lk):
-    return lk.Keeper("eth0", "00:00:5e:00:01:fe", "100.64.4.7", hbfile=None)
-
-
 def test_dhcp_options_include_param_req_list(lk):
     # Every DISCOVER/REQUEST must carry the Parameter Request List (RFC 2132 §9.8)
     # so the server returns the subnet mask (1) + router (3) follow-mode needs.
-    keeper = _plain_keeper(lk)
-    opts = lk._dhcp_options("discover", [("requested_addr", "100.64.4.7")], keeper._dhcp._id_opts)
+    opts = lk._dhcp_options("discover", [("requested_addr", "100.64.4.7")], [])
     assert opts[0] == ("message-type", "discover")
     assert ("param_req_list", lk.PARAM_REQ_LIST) in opts
     assert 1 in lk.PARAM_REQ_LIST and 3 in lk.PARAM_REQ_LIST
@@ -741,34 +796,31 @@ def test_dhcp_options_include_param_req_list(lk):
 def test_absorb_reply_captures_gw_and_mask(lk):
     # The PRL asks for opt 3 (router) + opt 1 (mask); _absorb_reply keeps both so
     # the BOUND log can surface them (and follow mode can use the mask).
-    keeper = _plain_keeper(lk)
+    c = _client(lk)
     rx = lk.DhcpReply(lk.ACK, "100.64.4.7", "100.64.4.1", 1800, None, None,
                       "100.64.4.1", None, "255.255.255.0")
-    keeper._dhcp._absorb_reply(rx, lk.DEFAULT_LEASE)
-    assert keeper._dhcp.router == "100.64.4.1"
-    assert keeper._dhcp.mask_bits == 24
+    c._absorb_reply(rx, lk.DEFAULT_LEASE)
+    assert c.router == "100.64.4.1"
+    assert c.mask_bits == 24
 
 
 def test_renew_omits_server_id_and_requested_addr(lk):
     # RFC 2131 §4.3.2: a RENEWING/REBINDING REQUEST MUST NOT carry server_id or
     # requested_addr, and ciaddr MUST be the client's address.
-    keeper = _plain_keeper(lk)
-    keeper._dhcp.server, keeper._dhcp.yiaddr, keeper._dhcp.lease = "100.64.4.1", "100.64.4.7", 1800
-    sent = []
-    keeper._ensure_sniffer = lambda: None
-    keeper._dhcp._send_dhcp = lambda mtype, extra, ciaddr="0.0.0.0": sent.append((mtype, extra, ciaddr))
-    keeper._dhcp._wait_for_dhcp_reply = lambda want, timeout: lk.DhcpReply(
-        lk.ACK, keeper._dhcp.yiaddr, keeper._dhcp.server, 1800, None, None, None)
-    assert keeper._dhcp.renew() is True            # RENEW (T1)
-    assert keeper._dhcp.renew(rebind=True) is True  # REBIND (T2)
-    assert sent, "renew sent nothing"
-    for mtype, extra, ciaddr in sent:
+    c = _client(lk)
+    c.server, c.yiaddr, c.lease = "100.64.4.1", "100.64.4.7", 1800
+    c._wait_for_dhcp_reply = lambda want, timeout: lk.DhcpReply(
+        lk.ACK, c.yiaddr, c.server, 1800, None, None, None)
+    assert c.renew() is True            # RENEW (T1)
+    assert c.renew(rebind=True) is True  # REBIND (T2)
+    assert c.sent, "renew sent nothing"
+    for mtype, extra, ciaddr in c.sent:
         assert mtype == "request"
         assert ciaddr == "100.64.4.7"          # ciaddr MUST be the client's address
         # assert on the ACTUAL assembled option list, not the stubbed extras
         # (which are always empty here) -- so a regression that re-added
         # server_id to renew's opts would fail this.
-        wire = [o for o in lk._dhcp_options(mtype, extra, keeper._dhcp._id_opts) if isinstance(o, tuple)]
+        wire = [o for o in lk._dhcp_options(mtype, extra, c._id_opts) if isinstance(o, tuple)]
         assert all(o[0] != "server_id" for o in wire)
         assert all(o[0] != "requested_addr" for o in wire)
 

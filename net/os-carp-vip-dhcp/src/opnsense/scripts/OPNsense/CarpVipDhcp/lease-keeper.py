@@ -61,6 +61,7 @@ import threading
 import time
 from collections import namedtuple
 from logging.handlers import RotatingFileHandler
+from typing import Any
 
 # Scapy is the one heavy third-party dependency and the usual suspect when the
 # daemon won't start (missing after an upgrade, ABI mismatch, partial install).
@@ -69,10 +70,16 @@ from logging.handlers import RotatingFileHandler
 # going to daemon(8)'s /dev/null. Capture it instead and let main() log it once
 # logging is configured.
 try:
-    from scapy.all import ARP, Ether, IP, UDP, BOOTP, DHCP, AsyncSniffer, sendp
+    from scapy.all import (  # type: ignore  # pylint: disable=import-error
+        ARP, Ether, IP, UDP, BOOTP, DHCP, AsyncSniffer, sendp)
     _SCAPY_IMPORT_ERROR = None
 except Exception as _scapy_exc:   # ImportError, or scapy's own import-time failures
     _SCAPY_IMPORT_ERROR = _scapy_exc
+    # Bind the names so the module still loads (main() exits with the captured
+    # error before any of them is used). Typed Any so type checkers do not
+    # flag every scapy call site as calling None.
+    _missing: Any = None                                # pylint: disable=invalid-name
+    ARP = Ether = IP = UDP = BOOTP = DHCP = AsyncSniffer = sendp = _missing  # pylint: disable=invalid-name
 
 LOG = logging.getLogger("lease-keeper")
 
@@ -113,6 +120,10 @@ T2_FACTOR = 0.875          # rebind by this fraction of the lease (RFC default)
 MIN_T1 = 30                # floor for the renew timer (very short leases)
 REBIND_MARGIN = 15         # ensure T2 is at least this far past T1
 BROADCAST_FLAG = 0x8000    # BOOTP flags: ask the server to broadcast OFFER/ACK
+ETHER_BROADCAST = "ff:ff:ff:ff:ff:ff"
+IPV4_BROADCAST = "255.255.255.255"   # limited broadcast (never routed off-link)
+DHCP_SERVER_PORT = 67
+DHCP_CLIENT_PORT = 68
 ARP_NUDGE_MIN = 30         # floor for --arp-nudge so a typo cannot flood the segment
 LOG_MAX_BYTES = 512 * 1024
 LOG_BACKUPS = 3
@@ -149,13 +160,12 @@ def _fmt_reply(rx):
     DEBUG (the keeper's default level), so every reply's fields (type, addresses,
     timers, gateway, mask, relay, server text) show in the log without a capture."""
     txt = _msg_text(rx.message)
-    return ("%s yiaddr=%s server=%s giaddr=%s lease=%s t1=%s t2=%s gw=%s mask=%s%s"
-            % (MTYPE_NAMES.get(rx.mtype, "type=%s" % rx.mtype), rx.yiaddr or "-",
-               rx.server_id or "-", rx.giaddr or "none",
-               rx.lease if rx.lease is not None else "-",
-               rx.t1 if rx.t1 is not None else "-", rx.t2 if rx.t2 is not None else "-",
-               rx.router or "-", rx.subnet_mask or "-",
-               (" msg=%r" % txt) if txt else ""))
+    mtype = MTYPE_NAMES.get(rx.mtype, f"type={rx.mtype}")
+    msg = f" msg={txt!r}" if txt else ""
+    return (f"{mtype} yiaddr={rx.yiaddr or '-'} server={rx.server_id or '-'} "
+            f"giaddr={rx.giaddr or 'none'} lease={'-' if rx.lease is None else rx.lease} "
+            f"t1={'-' if rx.t1 is None else rx.t1} t2={'-' if rx.t2 is None else rx.t2} "
+            f"gw={rx.router or '-'} mask={rx.subnet_mask or '-'}{msg}")
 
 
 def _parse_reply(p, yiaddr):
@@ -199,7 +209,7 @@ def _mask_to_bits(mask):
     """Dotted-quad subnet mask (DHCP option 1) -> prefix length, or None if absent
     or unparseable."""
     try:
-        return ipaddress.IPv4Network("0.0.0.0/%s" % mask).prefixlen
+        return ipaddress.IPv4Network(f"0.0.0.0/{mask}").prefixlen
     except (ValueError, TypeError):
         return None
 
@@ -212,7 +222,7 @@ _CGNAT = ipaddress.ip_network("100.64.0.0/10")
 # Static BPF capture filter: DHCP (broadcast OFFER/ACK) + ARP replies to our nudge
 # (arp[6:2]=2). A boundary, not an optimization -- it keeps everything else (incl. the
 # segment's broadcast who-has flood) out of the Python parser.
-SNIFFER_FILTER = "(udp and (port 67 or port 68)) or (arp and arp[6:2] = 2)"
+SNIFFER_FILTER = f"(udp and (port {DHCP_SERVER_PORT} or port {DHCP_CLIENT_PORT})) or (arp and arp[6:2] = 2)"
 
 
 def _sane_ipv4(ip):
@@ -261,6 +271,7 @@ def _jittered(base):
 
 
 def mac2raw(m):
+    """Colon/dash-separated MAC string -> 6 raw bytes (BOOTP chaddr)."""
     return bytes.fromhex(m.replace(":", "").replace("-", ""))
 
 
@@ -316,9 +327,9 @@ class DhcpClient:
     def _send_dhcp(self, mtype, extra, ciaddr="0.0.0.0"):
         # ciaddr is set for RENEW/REBIND (the client already owns the address);
         # the broadcast flag stays on so the reply is reliably captured by the sniffer.
-        pkt = (Ether(src=self.eth_src, dst="ff:ff:ff:ff:ff:ff") /
-               IP(src=ciaddr, dst="255.255.255.255") /
-               UDP(sport=68, dport=67) /
+        pkt = (Ether(src=self.eth_src, dst=ETHER_BROADCAST) /
+               IP(src=ciaddr, dst=IPV4_BROADCAST) /
+               UDP(sport=DHCP_CLIENT_PORT, dport=DHCP_SERVER_PORT) /
                BOOTP(chaddr=self.chraw, xid=self.xid, ciaddr=ciaddr, flags=BROADCAST_FLAG) /
                DHCP(options=_dhcp_options(mtype, extra, self._id_opts)))
         sendp(pkt, iface=self.iface, verbose=0)
@@ -339,10 +350,10 @@ class DhcpClient:
                 # Surface the server's option-56 text (why it refused) if present;
                 # it is the operator's main clue for a rejected renew.
                 txt = _msg_text(rx.message)
-                reason = " -- %s" % txt if txt else ""
+                reason = f" -- {txt}" if txt else ""
                 LOG.warning("DHCPNAK received (server %s, xid 0x%08x%s)%s",
                             rx.server_id or "unknown", self.xid,
-                            (" via relay %s" % rx.giaddr) if rx.giaddr else "", reason)
+                            f" via relay {rx.giaddr}" if rx.giaddr else "", reason)
                 return "NAK"
         return None
 
@@ -357,9 +368,11 @@ class DhcpClient:
         self.mask_bits = _mask_to_bits(rx.subnet_mask) or self.mask_bits
 
     def adopt(self, rx):
-        """Bind to the (validated) changed address in rx. The on_changed_address
-        hook calls this once its follow policy accepts the new address, so the
-        lease state stays owned here while the decision stays with the caller."""
+        """Bind to the address in rx: the ACK that completes a DORA, or a
+        validated changed address the caller's follow policy accepted (the
+        on_changed_address hook calls this, so the lease state stays owned here
+        while the decision stays with the caller). The server refreshes from
+        the ACK's server-id, keeping the previous one when the ACK has none."""
         self.yiaddr = rx.yiaddr
         self.server = rx.server_id or self.server
         self._absorb_reply(rx, DEFAULT_LEASE)
@@ -387,6 +400,7 @@ class DhcpClient:
                 if self.reboot(request_ip):
                     return True
                 LOG.info("INIT-REBOOT did not bind %s -- falling back to DISCOVER", request_ip)
+
         return self.dora(request_ip)
 
     def dora(self, request_ip=None):
@@ -394,6 +408,8 @@ class DhcpClient:
         Request, Ack. Returns True once BOUND, False on failure/NAK."""
         self.xid = random.randint(1, 0xFFFFFFFF)
         extra = [("requested_addr", request_ip)] if request_ip else []
+
+        # DISCOVER until an OFFER arrives (or the attempts run out).
         for attempt in range(1, DORA_ATTEMPTS + 1):
             if self._should_stop():
                 return False
@@ -416,6 +432,8 @@ class DhcpClient:
             time.sleep(min(_jittered(2 ** attempt), ATTEMPT_BACKOFF_CAP))
         else:
             return False
+
+        # REQUEST the offered address until the ACK lands.
         for attempt in range(1, DORA_ATTEMPTS + 1):
             if self._should_stop():
                 return False
@@ -436,8 +454,7 @@ class DhcpClient:
                 got = rx.yiaddr
                 if request_ip and got != request_ip:
                     return self._on_changed(got, rx, "DORA", True)
-                self.yiaddr = got
-                self._absorb_reply(rx, DEFAULT_LEASE)
+                self.adopt(rx)
                 return True
             LOG.info("no DHCP ACK from %s for %s (attempt %d, xid 0x%08x)",
                      self.server, self.yiaddr, attempt, self.xid)
@@ -454,6 +471,7 @@ class DhcpClient:
         NAK/timeout so the caller falls back to a full DORA."""
         if not request_ip:
             return False
+
         self.xid = random.randint(1, 0xFFFFFFFF)
         extra = [("requested_addr", request_ip)]
         for attempt in range(1, REBOOT_ATTEMPTS + 1):
@@ -484,6 +502,9 @@ class DhcpClient:
         return False
 
     def renew(self, rebind=False):
+        """REQUEST an extension of the held lease. Returns True on a fresh ACK,
+        False on NAK/timeout/unbound (the caller escalates: RENEW -> REBIND ->
+        re-acquire)."""
         # RENEWING/REBINDING (RFC 2131 4.3.2): ciaddr identifies the lease, so
         # server_id AND requested_addr MUST NOT be set in either state. We always
         # broadcast (the co-resident non-promiscuous sniffer needs the reply
@@ -492,6 +513,10 @@ class DhcpClient:
         # (via the `phase` it sets) relaxes the expected-server check in the
         # caller's on_changed_address hook, since at T2 any server may
         # legitimately answer.
+        yiaddr = self.yiaddr
+        if not yiaddr:
+            return False   # nothing bound -> nothing to renew
+
         opts = []
         for _ in range(RENEW_ATTEMPTS):
             if self._should_stop():
@@ -499,7 +524,7 @@ class DhcpClient:
             self._ensure_sniffer()
             self._rx = None
             try:
-                self._send_dhcp("request", opts, ciaddr=self.yiaddr)
+                self._send_dhcp("request", opts, ciaddr=yiaddr)
             except Exception as e:
                 LOG.error("DHCP %s send failed: %s", "REBIND" if rebind else "RENEW", e)
                 return False
@@ -526,10 +551,11 @@ class DhcpClient:
             yiaddr, server = self.yiaddr, self.server
         if not yiaddr:
             return
+
         try:
-            pkt = (Ether(src=self.eth_src, dst="ff:ff:ff:ff:ff:ff") /
-                   IP(src=yiaddr, dst=server or "255.255.255.255") /
-                   UDP(sport=68, dport=67) /
+            pkt = (Ether(src=self.eth_src, dst=ETHER_BROADCAST) /
+                   IP(src=yiaddr, dst=server or IPV4_BROADCAST) /
+                   UDP(sport=DHCP_CLIENT_PORT, dport=DHCP_SERVER_PORT) /
                    BOOTP(chaddr=self.chraw, xid=self.xid, ciaddr=yiaddr) /
                    DHCP(options=[("message-type", "release"),
                                  ("server_id", server), "end"]))
@@ -597,6 +623,7 @@ class ArpNudge:
                             "(no DHCP router option or server-id) -- cannot nudge")
                 self._warned = True
             return
+
         try:
             # This frame is shaped to satisfy three ISP access-network guards at
             # once (README "Playing nicely" section):
@@ -608,7 +635,7 @@ class ArpNudge:
             #   * sending it at all exists for gateways that never re-ARP an
             #     expired entry ("secured ARP") and would otherwise blackhole the
             #     VIP. Only the CARP master sends it (gated above).
-            sendp(Ether(src=self.chaddr, dst="ff:ff:ff:ff:ff:ff") /
+            sendp(Ether(src=self.chaddr, dst=ETHER_BROADCAST) /
                   ARP(op=1, hwsrc=self.chaddr, psrc=yiaddr,
                       hwdst="00:00:00:00:00:00", pdst=gateway),
                   iface=self.iface, verbose=0)
@@ -647,6 +674,12 @@ class ArpNudge:
 
 
 class Keeper:
+    """Policy and orchestration around the components: owns the packet sniffer
+    (feeding DHCP replies to DhcpClient and ARP replies to ArpNudge), the
+    follow/enforce decision for a changed address, the heartbeat, the CARP
+    role watch, the acquire pacing (backoff + link-return fast path) and the
+    signal-driven operator actions. The lease itself lives in DhcpClient."""
+
     def __init__(self, iface, chaddr, request_ip=None, eth_src=None,
                  hbfile=None, release_on_exit=False, vhid=None,
                  follow=False, vendor_class=None, client_id=None, hostname=None,
@@ -663,7 +696,7 @@ class Keeper:
         # keeper supplies the lease binding per nudge (_arp_nudge) and the
         # CARP-role probe (late-bound so tests can stub _probe_carp_master).
         self._nudge = ArpNudge(iface, self.chaddr, arp_nudge,
-                               lambda: self._probe_carp_master())
+                               lambda: self._probe_carp_master())  # pylint: disable=unnecessary-lambda
         # Promiscuous ARP capture: off by default (the CARP master already
         # accepts the VIP MAC, so the unicast reply reaches a normal socket).
         # Opt-in fallback for NICs that drop non-primary unicast MACs.
@@ -691,7 +724,7 @@ class Keeper:
         self._dhcp = DhcpClient(
             iface, self.chaddr, self.eth_src, id_opts,
             should_stop=lambda: self.stop,
-            ensure_sniffer=lambda: self._ensure_sniffer(),
+            ensure_sniffer=lambda: self._ensure_sniffer(),  # pylint: disable=unnecessary-lambda
             on_changed_address=self._handle_changed_address)
         self._followed_ip = None       # last address we asked configd to follow to
         self._follow_from = None       # address we followed FROM (for the retry watchdog)
@@ -699,7 +732,7 @@ class Keeper:
         self._follow_gw_args = []      # extra follow_update args on a cross-subnet move: [old_gw, new_gw, bits]
         # Follow throttle state, keyed by chaddr so it survives the follow-induced
         # restart (the request-IP-keyed runtime paths change on every follow).
-        self._follow_state = "/var/run/carpvipdhcp-follow-%s" % _fs_safe(self.chaddr)
+        self._follow_state = f"/var/run/carpvipdhcp-follow-{_fs_safe(self.chaddr)}"
         self.redora_wait = REDORA_MIN
         # Link-return fast path (only while UNBOUND): a carrier down->up edge resets
         # the backoff and re-DORAs at once, like dhclient's link-up -> state_reboot.
@@ -813,9 +846,9 @@ class Keeper:
         # Write atomically (temp + rename) so a crash mid-write can't leave a partial file.
         if not self.hbfile:
             return
-        tmp = "%s.tmp" % self.hbfile
+        tmp = f"{self.hbfile}.tmp"
         try:
-            with open(tmp, "w") as f:
+            with open(tmp, "w", encoding="utf-8") as f:
                 f.write(content)
             os.replace(tmp, self.hbfile)
         except Exception as e:
@@ -829,16 +862,16 @@ class Keeper:
         # 0 = none seen> and the current target gateway (if known).
         extra = ""
         if self._nudge.interval:
-            extra = " nudge=%d arpok=%d" % (int(self._nudge.last_nudge), int(self._nudge.last_reply))
+            extra = f" nudge={int(self._nudge.last_nudge)} arpok={int(self._nudge.last_reply)}"
             gw = self._nudge_target()
             if gw:
-                extra += " gw=%s" % gw
-        self._write_hb("%d bound=%s lease=%d t1=%d t2=%d src=%s%s\n"
-                       % (int(time.time()), self._dhcp.yiaddr or "-", self._dhcp.lease, t1, t2, src, extra))
+                extra += f" gw={gw}"
+        self._write_hb(f"{int(time.time())} bound={self._dhcp.yiaddr or '-'} "
+                       f"lease={self._dhcp.lease} t1={t1} t2={t2} src={src}{extra}\n")
 
     def _hb_mismatch(self, got):
         # Write a clear marker into the heartbeat file so a supervisor/human sees the mismatch.
-        self._write_hb("%d MISMATCH got=%s want=%s\n" % (int(time.time()), got, self.request_ip))
+        self._write_hb(f"{int(time.time())} MISMATCH got={got} want={self.request_ip}\n")
 
     # ---- follow mode (adopt a changed ISP address, with spoof hardening) ----
 
@@ -846,15 +879,16 @@ class Keeper:
         """Epoch of this chaddr's last follow (persisted so the throttle survives
         the follow-induced restart). 0 if never / unreadable."""
         try:
-            return float(open(self._follow_state).read().strip())
+            with open(self._follow_state, encoding="utf-8") as f:
+                return float(f.read().strip())
         except (OSError, ValueError):
             return 0.0
 
     def _record_follow(self):
         try:
             tmp = self._follow_state + ".tmp"
-            with open(tmp, "w") as f:
-                f.write("%d" % int(time.time()))
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(str(int(time.time())))
             os.replace(tmp, self._follow_state)
         except OSError as e:
             LOG.warning("could not persist follow timestamp: %s", e)
@@ -882,11 +916,13 @@ class Keeper:
                 LOG.error("%s: ACK from unexpected server %s (leased from %s) -- not following",
                           phase, rx.server_id, self._dhcp.server)
                 return False
+
             waited = time.time() - self._last_follow_time()
             if waited < MIN_FOLLOW_INTERVAL:
                 LOG.warning("%s: follow %s -> %s throttled (%.0fs < %ds) -- deferring",
                             phase, self.request_ip, got, waited, MIN_FOLLOW_INTERVAL)
                 return False
+
             LOG.warning("ISP gave %s (VIP was %s) at %s -- following: updating the CARP VIP",
                         got, self.request_ip, phase)
             # If the ISP also moved the gateway (a cross-subnet renumber), follow the
@@ -907,6 +943,7 @@ class Keeper:
                               "carried no subnet mask -- updating the VIP address only; fix the "
                               "interface prefix + System->Gateways by hand", self.request_ip,
                               got, old_router, rx.router)
+
             self._record_follow()
             # _follow_update reads request_ip as the old address, so remember it
             # (for the retry watchdog) and fire before overwriting request_ip.
@@ -947,7 +984,7 @@ class Keeper:
         a stalled follow without tripping the _followed_ip equality guard."""
         cmd = ["/usr/local/sbin/configctl", "-d", "carpvipdhcp", "follow_update", old_ip, new_ip]
         cmd += self._follow_gw_args   # cross-subnet: [old_gw, new_gw, bits]; empty on a same-subnet move
-        subprocess.Popen(cmd)
+        subprocess.Popen(cmd)  # pylint: disable=consider-using-with
         self._follow_fired_at = time.time()
 
     def _follow_watchdog(self):
@@ -1007,7 +1044,7 @@ class Keeper:
         out = self._ifconfig()
         if out is None:
             return None
-        return ("carp: MASTER vhid %s " % self.vhid) in out
+        return f"carp: MASTER vhid {self.vhid} " in out
 
     def _iface_link_up(self):
         """Interface carrier from ifconfig: True on 'status: active', False on a
@@ -1146,13 +1183,15 @@ class Keeper:
         return not self.stop
 
     def run(self):
+        """The daemon main loop: sniffer up, then maintain the lease until
+        stopped. Never raises; returns the process exit code."""
         # Start the packet sniffer, retrying forever: a keeper must self-heal, not
         # die, if the interface is briefly unavailable at startup.
         while not self.stop and not self._start_sniffer():
             LOG.warning("sniffer start failed -- retrying in %ds", SNIFFER_RETRY)
             self._sleep(SNIFFER_RETRY)
         # eth-src matters for L2 debugging but only when it differs from the chaddr.
-        ethsrc = (" eth-src=%s" % self.eth_src) if self.eth_src != self.chaddr else ""
+        ethsrc = f" eth-src={self.eth_src}" if self.eth_src != self.chaddr else ""
         LOG.info("lease-keeper active on %s: chaddr=%s%s request=%s",
                  self.iface, self.chaddr, ethsrc, self.request_ip or "any")
         time.sleep(0.5)
@@ -1173,7 +1212,8 @@ class Keeper:
         if self.release_on_exit:
             self._dhcp.release()
         try:
-            self._sniffer.stop()
+            if self._sniffer:
+                self._sniffer.stop()
         except Exception:
             pass
         LOG.info("stopped")
@@ -1191,7 +1231,7 @@ class Keeper:
                 LOG.info("DHCP BOUND %s (lease=%ss, expires ~%s, server=%s, gw=%s, mask=%s)",
                          self._dhcp.yiaddr, self._dhcp.lease, _clock_at(self._dhcp.lease),
                          self._dhcp.server, self._dhcp.router or "?",
-                         "/%d" % self._dhcp.mask_bits if self._dhcp.mask_bits else "none")
+                         f"/{self._dhcp.mask_bits}" if self._dhcp.mask_bits else "none")
                 self._hb()
                 self._arp_nudge(force=True)
                 self.redora_wait = REDORA_MIN
@@ -1224,6 +1264,7 @@ class Keeper:
             self._arp_nudge(force=True)
             return
         LOG.warning("DHCP RENEW failed at T1 -- trying REBIND until T2")
+
         elapsed = t1
         ok = False
         while elapsed < t2 and not self.stop:
@@ -1245,11 +1286,14 @@ class Keeper:
             self._hb()
             self._arp_nudge(force=True)
             return
+
         LOG.error("DHCP lease expired -- re-acquiring (back to DISCOVER)")
         self._dhcp.expire()
 
 
 def acquire_pidfile(path):
+    """Single-instance guard: atomically claim the pidfile, replacing a stale
+    one; exits the process if another live instance holds it."""
     if not path:
         return None
     # Atomic create (O_EXCL) so two near-simultaneous starts can't both win.
@@ -1261,7 +1305,8 @@ def acquire_pidfile(path):
             return path
         except FileExistsError:
             try:
-                old = int(open(path).read().strip())
+                with open(path, encoding="utf-8") as f:
+                    old = int(f.read().strip())
                 os.kill(old, 0)
                 LOG.error("already running (pid %d) -- exiting", old)
                 sys.exit(4)
@@ -1276,7 +1321,10 @@ def acquire_pidfile(path):
             sys.exit(5)
 
 
+# main() drives the Keeper internals directly (signal flags, the --once path).
+# pylint: disable=protected-access
 def main():
+    """CLI entry point: parse args, wire up the Keeper and signals, run."""
     ap = argparse.ArgumentParser(description="Robust DHCP lease-keeper (chaddr decoupled from the iface MAC)")
     ap.add_argument("--iface", required=True)
     ap.add_argument("--chaddr", required=True)
@@ -1302,7 +1350,7 @@ def main():
     ap.add_argument("--release-on-exit", action="store_true")
     a = ap.parse_args()
 
-    handlers = [logging.StreamHandler()]
+    handlers: list[logging.Handler] = [logging.StreamHandler()]
     if a.logfile:
         try:
             handlers.append(RotatingFileHandler(a.logfile, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUPS))
@@ -1348,13 +1396,13 @@ def main():
         # Only sets a flag; the sleep loops service it within a second, so no
         # network I/O happens inside the signal handler itself.
         k._nudge_now = True
-    signal.signal(signal.SIGUSR1, _sig_arp_nudge)
+    signal.signal(signal.SIGUSR1, _sig_arp_nudge)  # type: ignore[attr-defined]  # pylint: disable=no-member
 
     def _sig_carp(*_):
         # CARP transition (rc.syshook.d/carp/50-carpvipdhcp sends SIGUSR2). Only
         # sets a flag; the sleep loop re-checks the CARP role within a second.
         k._poll_role_now = True
-    signal.signal(signal.SIGUSR2, _sig_carp)
+    signal.signal(signal.SIGUSR2, _sig_carp)  # type: ignore[attr-defined]  # pylint: disable=no-member
 
     if a.once:
         if not k._start_sniffer():
@@ -1365,7 +1413,8 @@ def main():
         if ok:
             k._dhcp.release()
         try:
-            k._sniffer.stop()
+            if k._sniffer:
+                k._sniffer.stop()
         except Exception:
             pass
         return 0 if ok else 1

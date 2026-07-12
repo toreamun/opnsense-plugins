@@ -4,7 +4,7 @@
 # REQUIRE: LOGIN
 # KEYWORD: shutdown
 #
-# rc(8) wrapper for the CARP-VIP DHCP lease keepers (lease-keeper.py).
+# rc(8) wrapper for the CARP-VIP DHCP lease keepers (lease_keeper.py).
 # Reads /usr/local/etc/carpvipdhcp/keeper.conf (rendered by the configd template):
 # one line per enabled keeper ->
 #   REQUEST_IP|IFACE|CHADDR|DEMOTE_ON_LEASE_LOSS|VHID|FOLLOW_IP|VENDOR_CLASS|CLIENT_ID|HOSTNAME|ARP_NUDGE|ARP_LISTEN_PROMISC.
@@ -14,7 +14,7 @@
 
 name="carpvipdhcp"
 rcvar="carpvipdhcp_enable"
-keeper="/usr/local/opnsense/scripts/OPNsense/CarpVipDhcp/lease-keeper.py"
+keeper="/usr/local/opnsense/scripts/OPNsense/CarpVipDhcp/lease_keeper.py"
 conf="/usr/local/etc/carpvipdhcp/keeper.conf"
 run_dir="/var/run"
 log_dir="/var/log"
@@ -78,7 +78,7 @@ carpvipdhcp_start()
 # supervisors, whose proctitle can also contain the script path).
 _keeper_children()
 {
-    pgrep -f "python3.*OPNsense/CarpVipDhcp/lease-keeper.py" 2>/dev/null
+    pgrep -f "python3.*OPNsense/CarpVipDhcp/lease[-_]keeper.py" 2>/dev/null
 }
 
 # Signal every keeper child and its daemon(8) supervisor (the child's parent, so

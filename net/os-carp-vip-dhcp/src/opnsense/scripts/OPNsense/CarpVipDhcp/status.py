@@ -6,7 +6,7 @@ pidfile and heartbeat file. Output:
 
     {"carp_demotion": <int|null>, "keepers": [ {per-keeper status}, ... ]}
 
-The heartbeat file is written by lease-keeper.py in one of two forms:
+The heartbeat file is written by lease_keeper.py in one of two forms:
     <epoch> bound=<ip> lease=<seconds> t1=<seconds> t2=<seconds> src=<server|derived>
             [nudge=<epoch|0> arpok=<epoch|0> [gw=<ip>]]
     <epoch> MISMATCH got=<ip> want=<ip>

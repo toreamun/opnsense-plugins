@@ -207,12 +207,12 @@ def test_check_link_returned_debounce(lk, monkeypatch):
 
 def _follow_keeper(lk, tmp_path):
     keeper = lk.Keeper("eth0", "00:00:5e:00:01:fe", "100.64.4.7", hbfile=None, follow=True)
-    keeper._follow_state = str(tmp_path / "follow_state")
+    keeper._follow._state_file = str(tmp_path / "follow_state")
     keeper._dhcp.server = "100.64.4.1"
     keeper._dhcp.yiaddr = "100.64.4.7"
     keeper.fired = []
-    keeper._follow_update = keeper.fired.append
-    keeper._hb_mismatch = lambda got: None
+    keeper._follow._follow_update = keeper.fired.append
+    keeper._follow._hb_mismatch = lambda got, want: None
     keeper._dhcp.release = lambda *a: None
     return keeper
 
@@ -277,29 +277,29 @@ def test_dhcpnak_logs_reason(lk, caplog, message, expect):
 
 def test_follow_accepts_same_class(lk, tmp_path):
     keeper = _follow_keeper(lk, tmp_path)
-    assert keeper._handle_changed_address("100.64.4.60", _ack(lk, "100.64.4.60"), "DORA", True) is True
+    assert keeper._follow.on_changed_address("100.64.4.60", _ack(lk, "100.64.4.60"), "DORA", True) is True
     assert keeper.fired == ["100.64.4.60"]
-    assert keeper.request_ip == "100.64.4.60"
+    assert keeper._follow.target == "100.64.4.60"
 
 
 def test_follow_rejects_wrong_server(lk, tmp_path):
     keeper = _follow_keeper(lk, tmp_path)
     reply = _ack(lk, "100.64.4.60", server="100.64.4.9")
-    assert keeper._handle_changed_address("100.64.4.60", reply, "DORA", True) is False
+    assert keeper._follow.on_changed_address("100.64.4.60", reply, "DORA", True) is False
     assert keeper.fired == []
 
 
 def test_follow_rejects_cross_class(lk, tmp_path):
     keeper = _follow_keeper(lk, tmp_path)
-    assert keeper._handle_changed_address("8.8.8.8", _ack(lk, "8.8.8.8"), "DORA", True) is False
+    assert keeper._follow.on_changed_address("8.8.8.8", _ack(lk, "8.8.8.8"), "DORA", True) is False
     assert keeper.fired == []
 
 
 def test_follow_throttled_within_interval(lk, tmp_path):
     keeper = _follow_keeper(lk, tmp_path)
-    assert keeper._handle_changed_address("100.64.4.60", _ack(lk, "100.64.4.60"), "DORA", True) is True
+    assert keeper._follow.on_changed_address("100.64.4.60", _ack(lk, "100.64.4.60"), "DORA", True) is True
     # A second follow inside MIN_FOLLOW_INTERVAL is deferred.
-    assert keeper._handle_changed_address("100.64.4.61", _ack(lk, "100.64.4.61"), "DORA", True) is False
+    assert keeper._follow.on_changed_address("100.64.4.61", _ack(lk, "100.64.4.61"), "DORA", True) is False
 
 
 def test_enforce_mismatch_refused(lk):
@@ -308,7 +308,7 @@ def test_enforce_mismatch_refused(lk):
     keeper._dhcp.yiaddr = "100.64.4.7"
     released = []
     keeper._dhcp.release = lambda *a: released.append(a)
-    assert keeper._handle_changed_address("100.64.4.60", _ack(lk, "100.64.4.60"), "DORA", True) is False
+    assert keeper._follow.on_changed_address("100.64.4.60", _ack(lk, "100.64.4.60"), "DORA", True) is False
     assert released == [("100.64.4.60", "100.64.4.1")]  # the refused grant is released...
     assert keeper._dhcp.yiaddr is None                  # ...and not held (run loop re-acquires)
 
@@ -335,8 +335,8 @@ def test_observed_peer_ack_records_change_and_wakes(lk, tmp_path):
     keeper = _observe_keeper(lk, tmp_path)
     assert not keeper._wake.is_set()
     keeper._on_dhcp_reply(_peer_ack(lk, "100.64.4.60"))
-    assert keeper._observed_change is not None
-    assert keeper._observed_change.yiaddr == "100.64.4.60"
+    assert keeper._follow._observed is not None
+    assert keeper._follow._observed.yiaddr == "100.64.4.60"
     assert keeper._dhcp._rx is None          # the first-party slot is untouched
     assert keeper._wake.is_set()       # ...and the maintain-loop sleep is woken at once
 
@@ -344,14 +344,14 @@ def test_observed_peer_ack_records_change_and_wakes(lk, tmp_path):
 def test_ignored_observation_does_not_wake(lk, tmp_path):
     keeper = _observe_keeper(lk, tmp_path)
     keeper._on_dhcp_reply(_peer_ack(lk, "100.64.4.7"))     # same address -> no change
-    assert keeper._observed_change is None
+    assert keeper._follow._observed is None
     assert not keeper._wake.is_set()
 
 
 def test_observed_ignores_wrong_chaddr(lk, tmp_path):
     keeper = _observe_keeper(lk, tmp_path)
     keeper._on_dhcp_reply(_peer_ack(lk, "100.64.4.60", chaddr=b"\xaa\xbb\xcc\xdd\xee\xff"))
-    assert keeper._observed_change is None
+    assert keeper._follow._observed is None
 
 
 def test_observed_ignores_non_ack(lk, tmp_path):
@@ -359,7 +359,7 @@ def test_observed_ignores_non_ack(lk, tmp_path):
     keeper._on_dhcp_reply(_DhcpPkt(lk, 0x22222222,
                                    [("message-type", lk.OFFER), ("server_id", "100.64.4.1"), "end"],
                                    yiaddr="100.64.4.60"))
-    assert keeper._observed_change is None
+    assert keeper._follow._observed is None
 
 
 def test_observed_ignored_when_not_follow(lk):
@@ -368,7 +368,7 @@ def test_observed_ignored_when_not_follow(lk):
     keeper._dhcp.yiaddr = "100.64.4.7"
     keeper._dhcp.xid = 0x11111111
     keeper._on_dhcp_reply(_peer_ack(lk, "100.64.4.60"))
-    assert keeper._observed_change is None
+    assert keeper._follow._observed is None
 
 
 def test_own_xid_reply_uses_first_party_path(lk, tmp_path):
@@ -376,7 +376,7 @@ def test_own_xid_reply_uses_first_party_path(lk, tmp_path):
     keeper._on_dhcp_reply(_DhcpPkt(lk, keeper._dhcp.xid,
                                    [("message-type", lk.ACK), ("server_id", "100.64.4.1"), "end"],
                                    yiaddr="100.64.4.60"))
-    assert keeper._observed_change is None            # not the observed path
+    assert keeper._follow._observed is None            # not the observed path
     assert keeper._dhcp._rx is not None and keeper._dhcp._rx.yiaddr == "100.64.4.60"
 
 
@@ -387,10 +387,10 @@ def test_observed_latest_wins(lk, tmp_path):
     keeper = _observe_keeper(lk, tmp_path)
     keeper._on_dhcp_reply(_peer_ack(lk, "100.64.4.60"))
     keeper._on_dhcp_reply(_peer_ack(lk, "100.64.4.61"))
-    assert keeper._observed_change.yiaddr == "100.64.4.61"
-    keeper._check_observed_follow()
+    assert keeper._follow._observed.yiaddr == "100.64.4.61"
+    keeper._follow.check_observed()
     assert keeper.fired == ["100.64.4.61"]
-    assert keeper._observed_change is None
+    assert keeper._follow._observed is None
 
 
 def test_observed_same_address_after_follow_is_dropped(lk, tmp_path):
@@ -398,31 +398,31 @@ def test_observed_same_address_after_follow_is_dropped(lk, tmp_path):
     # same address is a no-op (the == self.yiaddr guard), never a double-follow.
     keeper = _observe_keeper(lk, tmp_path)
     keeper._dhcp.yiaddr = "100.64.4.61"                 # we already hold the new address
-    keeper._observed_change = _ack(lk, "100.64.4.61")
-    keeper._check_observed_follow()
+    keeper._follow._observed = _ack(lk, "100.64.4.61")
+    keeper._follow.check_observed()
     assert keeper.fired == []                     # no redundant follow
-    assert keeper._observed_change is None
+    assert keeper._follow._observed is None
 
 
 def test_check_observed_follow_drives_hardened_follow(lk, tmp_path):
     keeper = _observe_keeper(lk, tmp_path)
-    keeper._observed_change = _ack(lk, "100.64.4.60")
-    keeper._check_observed_follow()
+    keeper._follow._observed = _ack(lk, "100.64.4.60")
+    keeper._follow.check_observed()
     assert keeper.fired == ["100.64.4.60"]
-    assert keeper.request_ip == "100.64.4.60"
-    assert keeper._observed_change is None
+    assert keeper._follow.target == "100.64.4.60"
+    assert keeper._follow._observed is None
 
 
 def test_check_observed_follow_rejects_wrong_server(lk, tmp_path):
     keeper = _observe_keeper(lk, tmp_path)
-    keeper._observed_change = _ack(lk, "100.64.4.60", server="100.64.4.9")  # not our server
-    keeper._check_observed_follow()
+    keeper._follow._observed = _ack(lk, "100.64.4.60", server="100.64.4.9")  # not our server
+    keeper._follow.check_observed()
     assert keeper.fired == []          # same hardening as a first-party ACK
 
 
 def test_observed_serviced_by_maintain_loop(lk, tmp_path):
     keeper = _observe_keeper(lk, tmp_path)
-    keeper._observed_change = _ack(lk, "100.64.4.60")
+    keeper._follow._observed = _ack(lk, "100.64.4.60")
     keeper._wake.set()                 # as the sniffer would -> loop returns at once
     keeper._sleep_interruptible(1)
     assert keeper.fired == ["100.64.4.60"]
@@ -729,11 +729,11 @@ def test_follow_across_subnet_with_mask(lk, tmp_path, caplog):
     keeper = _follow_keeper(lk, tmp_path)
     keeper._dhcp.router = "100.64.4.1"
     with caplog.at_level("WARNING", logger="lease-keeper"):
-        assert keeper._handle_changed_address(
+        assert keeper._follow.on_changed_address(
             "100.64.5.60", _ack_gw(lk, "100.64.5.60", "100.64.5.1", mask="255.255.255.0"),
             "DORA", True) is True
     # gateway + prefix are handed to follow_update so outbound follows the new subnet
-    assert keeper._follow_gw_args == ["100.64.4.1", "100.64.5.1", "24"]
+    assert keeper._follow._gw_args == ["100.64.4.1", "100.64.5.1", "24"]
     assert any("following across the subnet" in r.getMessage() for r in caplog.records)
 
 
@@ -741,19 +741,19 @@ def test_follow_gateway_change_without_mask_warns(lk, tmp_path, caplog):
     keeper = _follow_keeper(lk, tmp_path)
     keeper._dhcp.router = "100.64.4.1"
     with caplog.at_level("ERROR", logger="lease-keeper"):   # no mask in the ACK
-        keeper._handle_changed_address(
+        keeper._follow.on_changed_address(
             "100.64.5.60", _ack_gw(lk, "100.64.5.60", "100.64.5.1"), "DORA", True)
     # without a mask we can't set the prefix: address-only follow + a fix-by-hand warning
-    assert keeper._follow_gw_args == []
+    assert keeper._follow._gw_args == []
     assert any("carried no subnet mask" in r.getMessage() for r in caplog.records)
 
 
 def test_follow_no_gateway_change_no_extra_args(lk, tmp_path):
     keeper = _follow_keeper(lk, tmp_path)
     keeper._dhcp.router = "100.64.4.1"
-    keeper._handle_changed_address(          # same gateway -> no cross-subnet extras
+    keeper._follow.on_changed_address(          # same gateway -> no cross-subnet extras
         "100.64.4.60", _ack_gw(lk, "100.64.4.60", "100.64.4.1"), "DORA", True)
-    assert keeper._follow_gw_args == []
+    assert keeper._follow._gw_args == []
 
 
 def test_follow_update_action_arity():

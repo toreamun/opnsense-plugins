@@ -768,6 +768,16 @@ class Keeper:
 
     # ---- CARP role (master probe, transitions) ----
 
+    def _ifconfig(self):
+        """Captured `ifconfig <iface>` text, or None if the probe failed. Shared by
+        the CARP-role probe and the carrier check so the ifconfig invocation, decode
+        and error policy live in exactly one place."""
+        try:
+            out = subprocess.check_output(["/sbin/ifconfig", self.iface], errors="replace")
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return out.decode(errors="replace") if isinstance(out, bytes) else out
+
     def _probe_carp_master(self):
         """Raw CARP-role probe for our vhid: True/False from ifconfig, None when
         the probe itself fails; no vhid configured -> True (nothing to gate on).
@@ -775,24 +785,18 @@ class Keeper:
         (no nudge unless a confirmed MASTER); the CARP-transition poll just skips."""
         if not self.vhid:
             return True
-        try:
-            out = subprocess.check_output(["/sbin/ifconfig", self.iface], errors="replace")
-            if isinstance(out, bytes):
-                out = out.decode(errors="replace")
-            return ("carp: MASTER vhid %s " % self.vhid) in out
-        except (OSError, subprocess.SubprocessError):
+        out = self._ifconfig()
+        if out is None:
             return None
+        return ("carp: MASTER vhid %s " % self.vhid) in out
 
     def _iface_link_up(self):
         """Interface carrier from ifconfig: True on 'status: active', False on a
         present-but-inactive status (no carrier / no link), None when it cannot be
         read (probe failed, or the NIC reports no status line). Used only by the
         unbound link-return fast path; a None result never disturbs the backoff."""
-        try:
-            out = subprocess.check_output(["/sbin/ifconfig", self.iface], errors="replace")
-            if isinstance(out, bytes):
-                out = out.decode(errors="replace")
-        except (OSError, subprocess.SubprocessError):
+        out = self._ifconfig()
+        if out is None:
             return None
         if "status: active" in out:
             return True

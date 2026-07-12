@@ -65,6 +65,7 @@ import sys
 import threading
 import time
 from collections import namedtuple
+from dataclasses import dataclass
 from logging.handlers import RotatingFileHandler
 from typing import Any
 
@@ -312,9 +313,26 @@ def _clock_at(offset):
     return time.strftime("%H:%M", time.localtime(time.time() + offset))
 
 
+@dataclass
+class Lease:
+    """The held DHCP binding: address, granting server, timing, and the
+    routing facts (options 3/1) the Parameter Request List asks for. During
+    a DORA it briefly holds the unconfirmed OFFER candidate; otherwise it is
+    the held (or last-held) binding. yiaddr None = unbound; expire() clears
+    only yiaddr, so the other fields survive as hints (logging, the
+    ARP-nudge target) until the next bind."""
+    yiaddr: str | None = None
+    server: str | None = None
+    lease_secs: int = DEFAULT_LEASE
+    t1_server: int | None = None   # server-provided renewal time (DHCP opt 58)
+    t2_server: int | None = None   # server-provided rebinding time (DHCP opt 59)
+    router: str | None = None      # default gateway (DHCP opt 3, fallback: server)
+    mask_bits: int | None = None   # subnet prefix length from opt 1
+
+
 class DhcpClient:  # pylint: disable=too-many-instance-attributes
-    """RFC 2131 client for one chaddr: owns the lease state (yiaddr, server,
-    lease/T1/T2, router, mask) and the stateful protocol sequences
+    """RFC 2131 client for one chaddr: owns the held binding (a Lease)
+    and the stateful protocol sequences
     (INIT-REBOOT / DORA / RENEW / REBIND / RELEASE) with their send/await
     machinery. It does NOT own the packet capture: the sniffer owner hands
     xid-matched replies to feed(). Policy stays with the caller through three
@@ -338,13 +356,7 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
         self._on_changed = on_changed_address
 
         self.xid = _new_xid()
-        self.yiaddr = None
-        self.server = None
-        self.lease = DEFAULT_LEASE
-        self.t1_server = None          # server-provided renewal time (DHCP opt 58)
-        self.t2_server = None          # server-provided rebinding time (DHCP opt 59)
-        self.router = None             # default gateway (DHCP opt 3, fallback: server_id)
-        self.mask_bits = None          # subnet prefix length from opt 1 (for logging + follow)
+        self.binding = Lease()         # the held (or last-held) DHCP binding
         self._tried_reboot = False     # the first acquire tries INIT-REBOOT before a full DISCOVER
 
         self._rx = None                # latest DhcpReply snapshot (set via feed(), sniffer thread)
@@ -396,10 +408,10 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
         -- the one place that knows which DhcpReply fields carry lease state.
         gateway + mask are what the Parameter Request List asks for; keep them for
         logging + the cross-subnet follow decision."""
-        self.lease = rx.lease or default_lease
-        self.t1_server, self.t2_server = rx.t1, rx.t2
-        self.router = rx.router or self.router
-        self.mask_bits = _mask_to_bits(rx.subnet_mask) or self.mask_bits
+        self.binding.lease_secs = rx.lease or default_lease
+        self.binding.t1_server, self.binding.t2_server = rx.t1, rx.t2
+        self.binding.router = rx.router or self.binding.router
+        self.binding.mask_bits = _mask_to_bits(rx.subnet_mask) or self.binding.mask_bits
 
     def adopt(self, rx):
         """Bind to the address in rx: the ACK that completes a DORA, or a
@@ -407,8 +419,8 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
         on_changed_address hook calls this, so the lease state stays owned here
         while the decision stays with the caller). The server refreshes from
         the ACK's server-id, keeping the previous one when the ACK has none."""
-        self.yiaddr = rx.yiaddr
-        self.server = rx.server_id or self.server
+        self.binding.yiaddr = rx.yiaddr
+        self.binding.server = rx.server_id or self.binding.server
         self._absorb_reply(rx, DEFAULT_LEASE)
 
     def expire(self):
@@ -416,7 +428,7 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
         grant the policy refused to keep): yiaddr clears so the next cycle
         re-acquires via DISCOVER; server/router stay as hints for logging and
         the caller's nudge target."""
-        self.yiaddr = None
+        self.binding.yiaddr = None
 
     def acquire(self, request_ip):
         """Get a lease. The first acquire after (re)start tries INIT-REBOOT (a
@@ -464,7 +476,7 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
             if rx == "NAK":
                 return False
             if rx:
-                self.yiaddr, self.server = rx.yiaddr, rx.server_id
+                self.binding.yiaddr, self.binding.server = rx.yiaddr, rx.server_id
                 return True
             # xid included so the exchange can be matched against a packet capture.
             LOG.info("no DHCP OFFER (attempt %d, xid 0x%08x)", attempt, self.xid)
@@ -482,7 +494,7 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
             try:
                 self._send_dhcp(
                     "request",
-                    [("server_id", self.server), ("requested_addr", self.yiaddr)],
+                    [("server_id", self.binding.server), ("requested_addr", self.binding.yiaddr)],
                 )
             except Exception as e:
                 LOG.error("DHCP REQUEST send failed: %s", e)
@@ -498,7 +510,7 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
                 self.adopt(rx)
                 return True
             LOG.info("no DHCP ACK from %s for %s (attempt %d, xid 0x%08x)",
-                     self.server, self.yiaddr, attempt, self.xid)
+                     self.binding.server, self.binding.yiaddr, attempt, self.xid)
             time.sleep(min(_jittered(2 ** attempt), ATTEMPT_BACKOFF_CAP))
         return False
 
@@ -540,8 +552,9 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
                 got = rx.yiaddr
                 if got and got != request_ip:
                     return self._on_changed(got, rx, PHASE_REBOOT, True)
-                self.yiaddr, self.server = request_ip, rx.server_id
-                self._absorb_reply(rx, DEFAULT_LEASE)
+                self.adopt(rx)
+                if not self.binding.yiaddr:
+                    self.binding.yiaddr = request_ip   # ACK without yiaddr: we asked for it
                 return True
             LOG.info("no DHCP ACK to INIT-REBOOT for %s (attempt %d, xid 0x%08x)",
                      request_ip, attempt, self.xid)
@@ -563,7 +576,7 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
         # (via the `phase` it sets) relaxes the expected-server check in the
         # caller's on_changed_address hook, since at T2 any server may
         # legitimately answer.
-        yiaddr = self.yiaddr
+        yiaddr = self.binding.yiaddr
         if not yiaddr:
             return False   # nothing bound -> nothing to renew
 
@@ -583,13 +596,13 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
                 return False   # NAK -> re-DORA
             if rx:
                 got = rx.yiaddr
-                if got and got != self.yiaddr:
+                if got and got != self.binding.yiaddr:
                     # Some dynamic servers change the address at renewal (ACK with a
                     # new yiaddr) instead of NAKing. Route it through the same
                     # follow / enforce decision (and hardening) as the initial DORA.
                     phase = PHASE_REBIND if rebind else PHASE_RENEW
                     return self._on_changed(got, rx, phase, False)
-                self._absorb_reply(rx, self.lease)
+                self._absorb_reply(rx, self.binding.lease_secs)
                 return True
         return False
 
@@ -598,7 +611,7 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
         (yiaddr, server) pair (the enforce path releases an address it was
         granted but refuses to keep)."""
         if yiaddr is None:
-            yiaddr, server = self.yiaddr, self.server
+            yiaddr, server = self.binding.yiaddr, self.binding.server
         if not yiaddr:
             return
 
@@ -620,16 +633,16 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
         Uses server-provided DHCP option 58/59 when present and sane, otherwise
         the RFC-suggested 0.5 / 0.875 of the lease time.
         """
-        lease = max(1, self.lease)
-        t1 = self.t1_server if self.t1_server else int(lease * T1_FACTOR)
-        t2 = self.t2_server if self.t2_server else int(lease * T2_FACTOR)
+        lease = max(1, self.binding.lease_secs)
+        t1 = self.binding.t1_server if self.binding.t1_server else int(lease * T1_FACTOR)
+        t2 = self.binding.t2_server if self.binding.t2_server else int(lease * T2_FACTOR)
         # Keep both timers inside the lease; only apply the MIN_T1 floor when the
         # lease is long enough to accommodate it (very short leases renew sooner).
         t1 = min(t1, lease)
         if lease > MIN_T1:
             t1 = max(MIN_T1, t1)
         t2 = min(max(t1 + REBIND_MARGIN, t2), lease)
-        src = "server" if (self.t1_server or self.t2_server) else "derived"
+        src = "server" if (self.binding.t1_server or self.binding.t2_server) else "derived"
         return t1, t2, src
 
 
@@ -790,9 +803,10 @@ class FollowPolicy:  # pylint: disable=too-many-instance-attributes
                           "(possible spoofed ACK from %s)", phase, self.target, got,
                           rx.server_id)
                 return False
-            if phase != PHASE_REBIND and rx.server_id and self._dhcp.server and rx.server_id != self._dhcp.server:
+            leased_from = self._dhcp.binding.server
+            if phase != PHASE_REBIND and rx.server_id and leased_from and rx.server_id != leased_from:
                 LOG.error("%s: ACK from unexpected server %s (leased from %s) -- not following",
-                          phase, rx.server_id, self._dhcp.server)
+                          phase, rx.server_id, leased_from)
                 return False
 
             waited = time.time() - self._last_follow_time()
@@ -808,7 +822,7 @@ class FollowPolicy:  # pylint: disable=too-many-instance-attributes
             # plain DHCP interface does. Needs the new subnet mask (opt 1) to set the
             # VIP prefix; without it we can only move the address, so warn instead.
             self._gw_args = []
-            old_router = self._dhcp.router
+            old_router = self._dhcp.binding.router
             if rx.router and old_router and rx.router != old_router:
                 bits = _mask_to_bits(rx.subnet_mask)
                 if bits:
@@ -899,10 +913,10 @@ class FollowPolicy:  # pylint: disable=too-many-instance-attributes
         if rx is None:
             return
         self._observed = None
-        if not self.follow or not rx.yiaddr or rx.yiaddr == self._dhcp.yiaddr:
+        if not self.follow or not rx.yiaddr or rx.yiaddr == self._dhcp.binding.yiaddr:
             return
         LOG.info("observed peer DHCP ACK for %s (we hold %s) -- following early to converge",
-                 rx.yiaddr, self._dhcp.yiaddr)
+                 rx.yiaddr, self._dhcp.binding.yiaddr)
         self.on_changed_address(rx.yiaddr, rx, PHASE_OBSERVED, release_on_enforce=False)
 
 
@@ -1027,7 +1041,7 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
             self._on_dhcp_reply(p)
         elif p.haslayer(ARP):
             # Gateway answering our nudge (reachability stamp).
-            self._nudge.on_arp_reply(p, self._dhcp.yiaddr, self._nudge_target())
+            self._nudge.on_arp_reply(p, self._dhcp.binding.yiaddr, self._nudge_target())
 
     def _chaddr_matches(self, b):
         """True if the reply's BOOTP client hardware address is our chaddr (the
@@ -1063,10 +1077,10 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
             # thread -- which routes it through the same follow hardening
             # (sane / same-class / expected-server / throttle) as a first-party
             # ACK and never acts on the sniffer thread.
-            if not self._follow.follow or not self._dhcp.yiaddr or not self._chaddr_matches(b):
+            if not self._follow.follow or not self._dhcp.binding.yiaddr or not self._chaddr_matches(b):
                 return
             rx = _parse_reply(p, b.yiaddr)
-            if (rx.mtype == ACK and rx.yiaddr and rx.yiaddr != self._dhcp.yiaddr
+            if (rx.mtype == ACK and rx.yiaddr and rx.yiaddr != self._dhcp.binding.yiaddr
                     and _sane_ipv4(rx.yiaddr)):
                 self._follow.observe(rx)
                 self._wake.set()   # wake the maintain-loop sleep now, don't wait for the tick
@@ -1096,8 +1110,8 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
             gw = self._nudge_target()
             if gw:
                 extra += f" gw={gw}"
-        self._write_hb(f"{int(time.time())} bound={self._dhcp.yiaddr or '-'} "
-                       f"lease={self._dhcp.lease} t1={t1} t2={t2} src={src}{extra}\n")
+        self._write_hb(f"{int(time.time())} bound={self._dhcp.binding.yiaddr or '-'} "
+                       f"lease={self._dhcp.binding.lease_secs} t1={t1} t2={t2} src={src}{extra}\n")
 
     def _hb_mismatch(self, got, want):
         # Write a clear marker into the heartbeat file so a supervisor/human sees the mismatch.
@@ -1198,12 +1212,12 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
     def _nudge_target(self):
         """The gateway whose ARP cache the nudge maintains: DHCP option 3 from
         the last ACK, falling back to the leasing server's address."""
-        return self._dhcp.router or self._dhcp.server
+        return self._dhcp.binding.router or self._dhcp.binding.server
 
     def _arp_nudge(self, force=False):
         """Hand the current lease binding (leased address, nudge target) to the
         ArpNudge component; it owns the pacing, the master gate and the send."""
-        self._nudge.maybe_nudge(self._dhcp.yiaddr, self._nudge_target(), force=force)
+        self._nudge.maybe_nudge(self._dhcp.binding.yiaddr, self._nudge_target(), force=force)
 
     # ---- operator/signal API (set flags only; the loops act within a second) ----
 
@@ -1259,7 +1273,7 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
             # Link-return fast path: only while UNBOUND, poll carrier every few
             # seconds; a down->up edge means the WAN just came back, so stop waiting
             # and let _maintain_step re-DORA immediately (the bound path skips this).
-            if self._dhcp.yiaddr is None and slept % LINK_POLL_STEP == 0 and self._check_link_returned():
+            if self._dhcp.binding.yiaddr is None and slept % LINK_POLL_STEP == 0 and self._check_link_returned():
                 self._link_returned = True
                 return not self._stop
 
@@ -1335,14 +1349,15 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         on every state transition; any exception it raises is caught by run() and
         retried, so a transient fault can never terminate the keeper."""
         # Acquire a lease if we do not hold one.
-        if not self._dhcp.yiaddr:
+        b = self._dhcp.binding
+        if not b.yiaddr:
             self._ensure_sniffer()  # a dead sniffer would silently fail every DORA
             self._hb()  # active but not holding yet -> publish bound=-
             if self._dhcp.acquire(self._follow.target):
                 LOG.info("DHCP BOUND %s (lease=%ss, expires ~%s, server=%s, gw=%s, mask=%s)",
-                         self._dhcp.yiaddr, self._dhcp.lease, _clock_at(self._dhcp.lease),
-                         self._dhcp.server, self._dhcp.router or "?",
-                         f"/{self._dhcp.mask_bits}" if self._dhcp.mask_bits else "none")
+                         b.yiaddr, b.lease_secs, _clock_at(b.lease_secs),
+                         b.server, b.router or "?",
+                         f"/{b.mask_bits}" if b.mask_bits else "none")
                 self._hb()
                 self._arp_nudge(force=True)
                 self.redora_wait = REDORA_MIN
@@ -1365,12 +1380,12 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         # "RENEW ok" already carries the lease + expiry. Raise the keeper's log
         # level to see it.
         LOG.debug("DHCP lease %ds; renew at T1=%ds (~%s), rebind by T2=%ds (~%s) (timing source: %s)",
-                  self._dhcp.lease, t1, _clock_at(t1), t2, _clock_at(t2), src)
+                  b.lease_secs, t1, _clock_at(t1), t2, _clock_at(t2), src)
         if not self._hold_lease(t1):
             return
         if self._dhcp.renew():
             LOG.info("DHCP RENEW ok %s (lease=%ss, expires ~%s)",
-                     self._dhcp.yiaddr, self._dhcp.lease, _clock_at(self._dhcp.lease))
+                     b.yiaddr, b.lease_secs, _clock_at(b.lease_secs))
             self._hb()
             self._arp_nudge(force=True)
             return
@@ -1393,7 +1408,7 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
                 break
         if ok:
             LOG.info("DHCP REBIND ok %s (lease=%ss, expires ~%s)",
-                     self._dhcp.yiaddr, self._dhcp.lease, _clock_at(self._dhcp.lease))
+                     b.yiaddr, b.lease_secs, _clock_at(b.lease_secs))
             self._hb()
             self._arp_nudge(force=True)
             return
@@ -1483,7 +1498,7 @@ def _claim_once(k):
         return 3
     time.sleep(SNIFFER_WARMUP)
     ok = k._dhcp.dora(k._follow.target)
-    LOG.info("DHCP claim %s -> %s", k.chaddr, k._dhcp.yiaddr if ok else "FAIL")
+    LOG.info("DHCP claim %s -> %s", k.chaddr, k._dhcp.binding.yiaddr if ok else "FAIL")
     if ok:
         k._dhcp.release()
     k._stop_sniffer()

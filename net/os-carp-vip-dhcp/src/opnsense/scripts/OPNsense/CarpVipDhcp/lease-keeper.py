@@ -195,6 +195,15 @@ def _dhcp_options(mtype, extra, id_opts):
             + id_opts + extra + ["end"])
 
 
+def _mask_to_bits(mask):
+    """Dotted-quad subnet mask (DHCP option 1) -> prefix length, or None if absent
+    or unparseable."""
+    try:
+        return ipaddress.IPv4Network("0.0.0.0/%s" % mask).prefixlen
+    except (ValueError, TypeError):
+        return None
+
+
 MAC_RE = re.compile(r"^([0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}$")
 
 
@@ -234,15 +243,6 @@ def _same_ip_class(a, b):
         return _is_localish(a) == _is_localish(b)
     except ValueError:
         return False
-
-
-def _mask_to_bits(mask):
-    """Dotted-quad subnet mask (DHCP option 1) -> prefix length, or None if absent
-    or unparseable."""
-    try:
-        return ipaddress.IPv4Network("0.0.0.0/%s" % mask).prefixlen
-    except (ValueError, TypeError):
-        return None
 
 
 def _fs_safe(s):

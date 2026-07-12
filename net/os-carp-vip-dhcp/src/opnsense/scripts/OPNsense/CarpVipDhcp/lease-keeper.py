@@ -98,8 +98,8 @@ ATTEMPT_BACKOFF_CAP = 8    # max wait between acquire attempts
 SEND_RETRY_DELAY = 2       # wait after a failed packet send before retrying
 REBIND_POLL_STEP = 10      # how often to re-try RENEW during the REBIND window
 REDORA_MIN = 10            # initial wait after a failed acquire
-# REDORA_MAX lowered from 300 so worst-case re-acquire lag stays ~45s even if the
-# link-return fast path (below) misses; the backoff doubles 10 -> 20 -> 40 -> 45.
+# Caps worst-case re-acquire lag at ~45s even if the link-return fast path (below)
+# is missed; the backoff doubles 10 -> 20 -> 40 -> 45.
 REDORA_MAX = 45            # max exponential-backoff wait after a failed acquire
 LINK_POLL_STEP = 3         # while UNBOUND, poll interface carrier this often (s) for the link-return fast path
 LINK_KICK_DEBOUNCE = 8     # min seconds between link-return re-DORA kicks (damps a flapping link)

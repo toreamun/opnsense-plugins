@@ -590,7 +590,12 @@ class Keeper:
         """Get a lease. The first acquire after (re)start tries INIT-REBOOT (a
         direct REQUEST for our known address) before a full DISCOVER; after that,
         the normal DORA. INIT-REBOOT is one exchange and surfaces a NAK when the
-        server is reachable but refuses the address."""
+        server is reachable but refuses the address.
+
+        Startup-only (the `_tried_reboot` latch): a genuine on-time lease expiry
+        re-acquires via DISCOVER (RFC 2131 4.4.5), NOT INIT-REBOOT. We do not track
+        lease expiry across a restart -- the server arbitrates the requested address
+        (ACK if still ours, NAK/silence -> fall back to DISCOVER)."""
         if not self._tried_reboot:
             self._tried_reboot = True
             if self.request_ip:

@@ -104,7 +104,7 @@ def test_read_keepers_arp_confirmed_fresh_and_stale(tmp_path, monkeypatch):
     _write_hb(tmp_path / "carpvipdhcp-100_64_4_8.hb", 5000, now)    # 5000s ago -> stale
     (tmp_path / "carpvipdhcp-100_64_4_9.hb").write_text(
         f"{now} bound=100.64.4.9 lease=1800 t1=900 t2=1575 src=derived"
-        f" nudge={now - 5} arpok=0 gw=100.64.4.1\n")                                          # arpok=0 -> never
+        f" nudge={now - 5} arpok=0 gw=100.64.4.1\n")   # arpok=0 -> never
     by_ip = {k["request"]: k for k in status.read_keepers({}, {})}
     assert by_ip["100.64.4.7"]["arp_confirmed"] is True
     assert by_ip["100.64.4.8"]["arp_confirmed"] is False

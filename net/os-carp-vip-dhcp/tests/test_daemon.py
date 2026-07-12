@@ -150,8 +150,14 @@ def test_fmt_reply_readable(lk):
     assert "NAK" in s2 and "giaddr=100.64.4.9" in s2 and "no free leases" in s2
 
 
+def _keeper(lk, **kw):
+    """A Keeper on the canonical test identity (iface/vMAC/VIP), hbfile off."""
+    kw.setdefault("hbfile", None)
+    return lk.Keeper("eth0", "00:00:5e:00:01:fe", "100.64.4.7", **kw)
+
+
 def _link_keeper(lk):
-    return lk.Keeper("eth0", "00:00:5e:00:01:fe", "100.64.4.7", hbfile=None)
+    return _keeper(lk)
 
 
 def test_iface_link_up_parsing(lk, monkeypatch):
@@ -206,7 +212,7 @@ def test_check_link_returned_debounce(lk, monkeypatch):
 
 
 def _follow_keeper(lk, tmp_path):
-    keeper = lk.Keeper("eth0", "00:00:5e:00:01:fe", "100.64.4.7", hbfile=None, follow=True)
+    keeper = _keeper(lk, follow=True)
     keeper._follow._state_file = str(tmp_path / "follow_state")
     keeper._dhcp.server = "100.64.4.1"
     keeper._dhcp.yiaddr = "100.64.4.7"
@@ -224,7 +230,7 @@ def _ack(lk, yiaddr, server="100.64.4.1"):
 class _DhcpPkt:
     """Minimal stand-in for a scapy DHCP reply: p[BOOTP].xid/op/yiaddr and
     p[DHCP].options, with haslayer() so _on_dhcp_reply parses it."""
-    def __init__(self, lk, xid, options, yiaddr="100.64.4.7",  # pylint: disable=R0913,R0917
+    def __init__(self, lk, xid, options, *, yiaddr="100.64.4.7",  # pylint: disable=too-many-arguments
                  chaddr=b"\x00\x00\x5e\x00\x01\xfe", op=None, giaddr="0.0.0.0"):
         self._lk = lk
         self._bootp = types.SimpleNamespace(xid=xid, op=(lk.BOOTREPLY if op is None else op),
@@ -255,7 +261,7 @@ def test_parse_reply_extracts_fields_and_relay(lk):
 
 
 def test_on_dhcp_reply_captures_option56_message(lk):
-    keeper = lk.Keeper("eth0", "00:00:5e:00:01:fe", "100.64.4.7", hbfile=None)
+    keeper = _keeper(lk)
     pkt = _DhcpPkt(lk, keeper._dhcp.xid, [("message-type", lk.NAK), ("server_id", "100.64.4.1"),
                                           ("message", "pool exhausted"), "end"])
     keeper._on_dhcp_reply(pkt)
@@ -268,7 +274,7 @@ def test_on_dhcp_reply_captures_option56_message(lk):
     (None, "DHCPNAK received"),                        # no reason -> the NAK is still logged
 ])
 def test_dhcpnak_logs_reason(lk, caplog, message, expect):
-    keeper = lk.Keeper("eth0", "00:00:5e:00:01:fe", "100.64.4.7", hbfile=None)
+    keeper = _keeper(lk)
     keeper._dhcp._rx = lk.DhcpReply(lk.NAK, None, "100.64.4.1", None, None, None, None, message)
     with caplog.at_level("WARNING", logger="lease-keeper"):
         assert keeper._dhcp._wait_for_dhcp_reply(lk.ACK, 0.2) == "NAK"
@@ -303,7 +309,7 @@ def test_follow_throttled_within_interval(lk, tmp_path):
 
 
 def test_enforce_mismatch_refused(lk):
-    keeper = lk.Keeper("eth0", "00:00:5e:00:01:fe", "100.64.4.7", hbfile=None, follow=False)
+    keeper = _keeper(lk, follow=False)
     keeper._dhcp.server = "100.64.4.1"
     keeper._dhcp.yiaddr = "100.64.4.7"
     released = []
@@ -316,7 +322,7 @@ def test_enforce_mismatch_refused(lk):
 # ---- observed peer ACK: converge follow from the peer's exchange (single-ip s.3) ----
 
 def _observe_keeper(lk, tmp_path):
-    # Same fixture as _follow_keeper (server / yiaddr / _follow_state / fired +
+    # Same fixture as _follow_keeper (server / yiaddr / _state_file / fired +
     # _follow_update stubs), plus a known in-flight xid so a peer ACK (different
     # xid) takes the observed path.
     keeper = _follow_keeper(lk, tmp_path)
@@ -363,7 +369,7 @@ def test_observed_ignores_non_ack(lk, tmp_path):
 
 
 def test_observed_ignored_when_not_follow(lk):
-    keeper = lk.Keeper("eth0", "00:00:5e:00:01:fe", "100.64.4.7", hbfile=None, follow=False)
+    keeper = _keeper(lk, follow=False)
     keeper._dhcp.server = "100.64.4.1"
     keeper._dhcp.yiaddr = "100.64.4.7"
     keeper._dhcp.xid = 0x11111111
@@ -381,7 +387,7 @@ def test_own_xid_reply_uses_first_party_path(lk, tmp_path):
 
 
 def test_observed_latest_wins(lk, tmp_path):
-    # Two peer ACKs in quick succession (the sniffer overwrites _observed_change):
+    # Two peer ACKs in quick succession (the sniffer overwrites _observed):
     # the handler acts on the LATEST address -- the older one is superseded (the
     # shared lease is now the newer address), so dropping it is correct.
     keeper = _observe_keeper(lk, tmp_path)
@@ -404,7 +410,7 @@ def test_observed_same_address_after_follow_is_dropped(lk, tmp_path):
     assert keeper._follow._observed is None
 
 
-def test_check_observed_follow_drives_hardened_follow(lk, tmp_path):
+def test_check_observed_drives_hardened_follow(lk, tmp_path):
     keeper = _observe_keeper(lk, tmp_path)
     keeper._follow._observed = _ack(lk, "100.64.4.60")
     keeper._follow.check_observed()
@@ -413,7 +419,7 @@ def test_check_observed_follow_drives_hardened_follow(lk, tmp_path):
     assert keeper._follow._observed is None
 
 
-def test_check_observed_follow_rejects_wrong_server(lk, tmp_path):
+def test_check_observed_rejects_wrong_server(lk, tmp_path):
     keeper = _observe_keeper(lk, tmp_path)
     keeper._follow._observed = _ack(lk, "100.64.4.60", server="100.64.4.9")  # not our server
     keeper._follow.check_observed()
@@ -429,21 +435,19 @@ def test_observed_serviced_by_maintain_loop(lk, tmp_path):
 
 
 def test_id_opts_empty_by_default(lk):
-    keeper = lk.Keeper("eth0", "00:00:5e:00:01:fe", "100.64.4.7", hbfile=None)
+    keeper = _keeper(lk)
     assert keeper._dhcp._id_opts == []
 
 
 def test_id_opts_built_from_args(lk):
-    keeper = lk.Keeper("eth0", "00:00:5e:00:01:fe", "100.64.4.7", hbfile=None,
-                       vendor_class="MSFT 5.0", client_id="keeper-1", hostname="vip")
+    keeper = _keeper(lk, vendor_class="MSFT 5.0", client_id="keeper-1", hostname="vip")
     assert ("vendor_class_id", "MSFT 5.0") in keeper._dhcp._id_opts
     assert ("client_id", b"keeper-1") in keeper._dhcp._id_opts
     assert ("hostname", "vip") in keeper._dhcp._id_opts
 
 
 def _nudge_keeper(lk, arp_nudge=240, hbfile=None, **kwargs):
-    keeper = lk.Keeper("eth0", "00:00:5e:00:01:fe", "100.64.4.7",
-                       hbfile=hbfile, arp_nudge=arp_nudge, **kwargs)
+    keeper = _keeper(lk, hbfile=hbfile, arp_nudge=arp_nudge, **kwargs)
     keeper._dhcp.yiaddr = "100.64.4.7"
     keeper._dhcp.server = "100.64.4.1"
     keeper._probe_carp_master = lambda: True   # the real probe needs ifconfig
@@ -468,14 +472,14 @@ def test_arp_nudge_component_direct(lk):
 
 
 def test_nudge_off_by_default(lk):
-    keeper = lk.Keeper("eth0", "00:00:5e:00:01:fe", "100.64.4.7", hbfile=None)
+    keeper = _keeper(lk)
     assert keeper._nudge.interval == 0
     keeper._arp_nudge(force=True)   # must be a no-op, not an error
     assert keeper._nudge.last_nudge == 0.0
 
 
 def test_nudge_interval_floor(lk):
-    keeper = lk.Keeper("eth0", "00:00:5e:00:01:fe", "100.64.4.7", hbfile=None, arp_nudge=1)
+    keeper = _keeper(lk, arp_nudge=1)
     assert keeper._nudge.interval == lk.ARP_NUDGE_MIN
 
 
@@ -517,15 +521,14 @@ def test_nudge_gated_to_carp_master(lk):
 
 
 def test_probe_carp_master_true_without_vhid(lk):
-    keeper = lk.Keeper("eth0", "00:00:5e:00:01:fe", "100.64.4.7", hbfile=None)
+    keeper = _keeper(lk)
     assert keeper._probe_carp_master() is True
 
 
 def test_probe_failure_skips_nudge(lk, monkeypatch):
     # A failed probe reports None, and the nudge fails closed on anything but
     # a confirmed MASTER.
-    keeper = lk.Keeper("eth0", "00:00:5e:00:01:fe", "100.64.4.7", hbfile=None,
-                       vhid=199, arp_nudge=240)
+    keeper = _keeper(lk, vhid=199, arp_nudge=240)
     keeper._dhcp.yiaddr = "100.64.4.7"
     keeper._dhcp.server = "100.64.4.1"
 
@@ -711,8 +714,7 @@ def test_sniffer_filter_captures_arp_and_honours_promisc(lk, monkeypatch):
             pass
 
     monkeypatch.setattr(lk, "AsyncSniffer", _Cap)
-    keeper = lk.Keeper("eth0", "00:00:5e:00:01:fe", "100.64.4.7", hbfile=None,
-                       arp_listen_promisc=True)
+    keeper = _keeper(lk, arp_listen_promisc=True)
     assert keeper._start_sniffer() is True
     assert "arp" in captured["filter"]        # ARP replies now reach the parser
     assert "port 67" in captured["filter"]     # ...alongside DHCP, unchanged
@@ -759,7 +761,7 @@ def test_follow_no_gateway_change_no_extra_args(lk, tmp_path):
 def test_follow_update_action_arity():
     """The configd [follow_update] action must accept as many params as the
     daemon can send: _fire_follow_update passes old_ip + new_ip plus
-    _follow_gw_args ([old_gw, new_gw, bits] on a cross-subnet move) = 5. configd
+    _gw_args ([old_gw, new_gw, bits] on a cross-subnet move) = 5. configd
     raises "Parameter mismatch" when more args than %s tokens are passed, so a
     narrower template would silently break every cross-subnet follow via
     configctl (a boundary the direct-call tests above never cross)."""

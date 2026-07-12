@@ -18,9 +18,8 @@ import subprocess
 import time
 import xml.etree.ElementTree as ET
 
-from keeperconf import keeper_lines
+from keeperconf import CONFFILE, keeper_id, keeper_lines
 
-CONFFILE = "/usr/local/etc/carpvipdhcp/keeper.conf"
 CONFIG_XML = "/conf/config.xml"
 RUN_DIR = "/var/run"
 
@@ -29,11 +28,6 @@ RUN_DIR = "/var/run"
 # intervals). Older = stale -> the GUI shows it as unconfirmed.
 ARP_CONFIRM_INTERVALS = 3
 ARP_CONFIRM_FLOOR = 90
-
-
-def keeper_id(request_ip):
-    """Filesystem-safe keeper id (same charset as the daemon uses)."""
-    return re.sub(r"[^A-Za-z0-9]", "_", request_ip)
 
 
 def pid_alive(path):
@@ -107,6 +101,7 @@ def parse_heartbeat(path):
         result["hb_age"] = int(time.time()) - result["hb_epoch"]
     except ValueError:
         return result
+
     for part in parts[1:]:
         if part == "MISMATCH":
             result["mismatch"] = True

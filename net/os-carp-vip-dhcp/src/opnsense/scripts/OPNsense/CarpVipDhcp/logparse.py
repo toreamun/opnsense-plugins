@@ -11,10 +11,9 @@ import json
 import os
 import re
 
-from keeperconf import keeper_lines
+from keeperconf import CONFFILE, keeper_id, keeper_lines
 
 LOG_GLOB = "/var/log/carpvipdhcp-*.log"
-CONFFILE = "/usr/local/etc/carpvipdhcp/keeper.conf"
 MAX_PER_FILE = 500
 LINE_RE = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})(?:,\d+)?\s+(\w+)\s+(.*)$")
 
@@ -25,7 +24,7 @@ def keeper_meta():
     for parts in keeper_lines(CONFFILE):
         request = parts[0]
         vhid = parts[4] if len(parts) > 4 else ""
-        meta[re.sub(r"[^A-Za-z0-9]", "_", request)] = {"ip": request, "vhid": vhid}
+        meta[keeper_id(request)] = {"ip": request, "vhid": vhid}
     return meta
 
 

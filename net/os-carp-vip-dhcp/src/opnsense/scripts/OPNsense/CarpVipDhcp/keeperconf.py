@@ -3,6 +3,15 @@
 Lives in the same directory as its consumers (status.py, logparse.py), which
 Python puts on sys.path when configd runs them, so no packaging is needed.
 """
+import re
+
+CONFFILE = "/usr/local/etc/carpvipdhcp/keeper.conf"
+
+
+def keeper_id(request_ip):
+    """Filesystem-safe keeper id (mirrors the daemon's _fs_safe charset; the
+    two must stay in lockstep or the per-keeper file names diverge)."""
+    return re.sub(r"[^A-Za-z0-9]", "_", request_ip)
 
 
 def keeper_lines(path):

@@ -35,7 +35,7 @@ Security posture (this daemon parses untrusted WAN traffic as root):
     the keeper needs are extracted -- no dissection of the rest (untrusted input).
   * Follow mode never rewrites the CARP VIP from a single ACK: the new address
     is validated (plausibility, routability class, expected server) and
-    rate-throttled against flap/spoof storms (see _handle_changed_address).
+    rate-throttled against flap/spoof storms (see FollowPolicy.on_changed_address).
   * A parse error in the sniffer callback is dropped (debug-logged).
 
 Cooperating with ISP access-network policing (DHCP snooping, Dynamic ARP
@@ -83,8 +83,8 @@ except Exception as _scapy_exc:   # ImportError, or scapy's own import-time fail
     # Bind the names so the module still loads (main() exits with the captured
     # error before any of them is used). Typed Any so type checkers do not
     # flag every scapy call site as calling None.
-    _missing: Any = None                                # pylint: disable=invalid-name
-    ARP = Ether = IP = UDP = BOOTP = DHCP = AsyncSniffer = sendp = _missing  # pylint: disable=invalid-name
+    _MISSING: Any = None
+    ARP = Ether = IP = UDP = BOOTP = DHCP = AsyncSniffer = sendp = _MISSING  # pylint: disable=invalid-name
 
 LOG = logging.getLogger("lease-keeper")
 
@@ -261,7 +261,8 @@ def _same_ip_class(a, b):
 
 
 def _fs_safe(s):
-    """Filesystem-safe token (same charset as the keeper id)."""
+    """Filesystem-safe token (keeperconf.keeper_id mirrors this charset for
+    the configd scripts)."""
     return re.sub(r"[^A-Za-z0-9]", "_", s or "")
 
 
@@ -278,6 +279,14 @@ def _jittered(base):
 def mac2raw(m):
     """Colon/dash-separated MAC string -> 6 raw bytes (BOOTP chaddr)."""
     return bytes.fromhex(m.replace(":", "").replace("-", ""))
+
+
+def _atomic_write(path, content):
+    """Write via tmp + rename so a crash mid-write cannot leave a partial file."""
+    tmp = f"{path}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(content)
+    os.replace(tmp, path)
 
 
 def _clock_at(offset):
@@ -298,18 +307,20 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
     release_on_enforce) -> bool for an ACK whose address differs from the
     expected one (True = the caller validated and adopted it, see adopt())."""
 
-    def __init__(self, iface, chaddr, eth_src, id_opts,  # pylint: disable=R0913,R0917
+    def __init__(self, iface, chaddr, eth_src, id_opts, *,  # pylint: disable=too-many-arguments
                  should_stop, ensure_sniffer, on_changed_address):
         self.iface = iface
         self.chaddr = chaddr
         self.chraw = mac2raw(chaddr)
         self.eth_src = eth_src
+
         # Optional DHCP request options (empty -> not sent); added to every
         # DISCOVER/REQUEST/RENEW so the server sees a consistent client identity.
         self._id_opts = id_opts
         self._should_stop = should_stop
         self._ensure_sniffer = ensure_sniffer
         self._on_changed = on_changed_address
+
         self.xid = random.randint(1, 0xFFFFFFFF)
         self.yiaddr = None
         self.server = None
@@ -319,6 +330,7 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
         self.router = None             # default gateway (DHCP opt 3, fallback: server_id)
         self.mask_bits = None          # subnet prefix length from opt 1 (for logging + follow)
         self._tried_reboot = False     # the first acquire tries INIT-REBOOT before a full DISCOVER
+
         self._rx = None                # latest DhcpReply snapshot (set via feed(), sniffer thread)
         self._ev = threading.Event()
 
@@ -348,6 +360,7 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
         while time.time() < end and not self._should_stop():
             self._ev.clear()
             self._ev.wait(min(1.0, max(0.05, end - time.time())))
+
             rx = self._rx
             if rx and rx.mtype == want:
                 return rx
@@ -619,6 +632,7 @@ class ArpNudge:  # pylint: disable=too-many-instance-attributes
         # Interval floor so a typo cannot flood the segment; 0 = disabled.
         self.interval = max(ARP_NUDGE_MIN, interval) if interval else 0
         self._is_master = is_master    # callable -> True/False/None (None = probe failed)
+
         self.last_nudge = 0.0          # epoch of the last sent nudge (0 = never)
         # Reachability: the sniffer stamps last_reply when the gateway answers
         # a nudge (a lone atomic float write); the status page surfaces its age.
@@ -636,6 +650,7 @@ class ArpNudge:  # pylint: disable=too-many-instance-attributes
             return
         if self._is_master() is not True:
             return
+
         if not gateway:
             # Enabled but no target: without this warning the nudge would be a
             # silent no-op and the operator would believe they are protected.
@@ -709,13 +724,16 @@ class FollowPolicy:  # pylint: disable=too-many-instance-attributes
         self.follow = follow
         self._dhcp = dhcp
         self._hb_mismatch = hb_mismatch
+
         self._followed_ip = None       # last address we asked configd to follow to
         self._follow_from = None       # address we followed FROM (for the retry watchdog)
         self._fired_at = 0.0           # when we last dispatched follow_update (retry deadline)
         self._gw_args = []             # extra follow_update args on a cross-subnet move: [old_gw, new_gw, bits]
+
         # Throttle state, keyed by chaddr so it survives the follow-induced
         # restart (the target-keyed runtime paths change on every follow).
         self._state_file = f"/var/run/carpvipdhcp-follow-{_fs_safe(chaddr)}"
+
         # A changed ISP address first seen in the PEER's ACK (both HA nodes run
         # an identical keeper on the same shared chaddr). The sniffer thread
         # records it via observe() -- a lone atomic ref-assign -- and the main
@@ -733,10 +751,7 @@ class FollowPolicy:  # pylint: disable=too-many-instance-attributes
 
     def _record_follow(self):
         try:
-            tmp = self._state_file + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                f.write(str(int(time.time())))
-            os.replace(tmp, self._state_file)
+            _atomic_write(self._state_file, str(int(time.time())))
         except OSError as e:
             LOG.warning("could not persist follow timestamp: %s", e)
 
@@ -883,7 +898,7 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
     operator actions. The lease lives in DhcpClient; the changed-address
     decision and the target address live in FollowPolicy."""
 
-    def __init__(self, iface, chaddr, request_ip=None, eth_src=None,  # pylint: disable=R0913,R0917
+    def __init__(self, iface, chaddr, request_ip=None, eth_src=None, *,  # pylint: disable=too-many-arguments
                  hbfile=None, release_on_exit=False, vhid=None,
                  follow=False, vendor_class=None, client_id=None, hostname=None,
                  arp_nudge=0, arp_listen_promisc=False):
@@ -893,11 +908,12 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         self.hbfile = hbfile
         self.release_on_exit = release_on_exit
         self.vhid = str(vhid) if vhid else None
+
         # ARP nudge component: owns the pacing and reachability state; the
         # keeper supplies the lease binding per nudge (_arp_nudge) and the
-        # CARP-role probe (late-bound so tests can stub _probe_carp_master).
-        self._nudge = ArpNudge(iface, self.chaddr, arp_nudge,
-                               lambda: self._probe_carp_master())  # pylint: disable=unnecessary-lambda
+        # CARP-role probe (via the _carp_master_probe shim).
+        self._nudge = ArpNudge(iface, self.chaddr, arp_nudge, self._carp_master_probe)
+
         # Promiscuous ARP capture: off by default (the CARP master already
         # accepts the VIP MAC, so the unicast reply reaches a normal socket).
         # Opt-in fallback for NICs that drop non-primary unicast MACs.
@@ -906,6 +922,7 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         self._nudge_now = False        # operator asked for an immediate nudge (SIGUSR1)
         self._poll_role_now = False    # a CARP transition fired -> re-check role now (SIGUSR2)
         self._renew_asap = False       # renew at the next _hold_lease tick instead of waiting for T1
+
         # Optional DHCP request options (empty -> not sent); built once and added to
         # every DISCOVER/REQUEST/RENEW so the server sees a consistent client identity.
         # ISP interplay: satisfies servers that only lease to a known vendor-class
@@ -918,26 +935,29 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
             id_opts.append(("client_id", client_id.encode()))
         if hostname:
             id_opts.append(("hostname", hostname))
+
         # DHCP client component: owns the lease state and the protocol sequences;
         # the keeper owns the sniffer (feeding it xid-matched replies) and the
-        # policy hooks. should_stop/ensure_sniffer are late-bound lambdas so
-        # tests can stub the keeper attributes after construction.
+        # policy hooks.
         self._dhcp = DhcpClient(
             iface, self.chaddr, self.eth_src, id_opts,
-            should_stop=lambda: self.stop,
-            ensure_sniffer=lambda: self._ensure_sniffer(),  # pylint: disable=unnecessary-lambda
+            should_stop=lambda: self._stop,
+            ensure_sniffer=self._ensure_sniffer,
             on_changed_address=self._on_changed_address)
+
         # Follow/enforce policy component: owns the target address and the
         # follow bookkeeping; drives the client via adopt()/release()/expire().
         self._follow = FollowPolicy(request_ip, follow, self.chaddr, self._dhcp,
                                     self._hb_mismatch)
+
         self.redora_wait = REDORA_MIN
         # Link-return fast path (only while UNBOUND): a carrier down->up edge resets
         # the backoff and re-DORAs at once, like dhclient's link-up -> state_reboot.
         self._link_up = None           # last carrier state seen (None = unknown / not probed)
         self._link_kick_at = 0.0       # epoch of the last link-return kick (debounce)
         self._link_returned = False    # set by _sleep_interruptible on a carrier return while unbound
-        self.stop = False
+
+        self._stop = False
         # General early-wake for the maintain-loop sleep (_sleep_interruptible): lets it
         # return before the 1s tick when there is pending work. Currently the
         # sniffer sets it on an observed address change so the follow fires in
@@ -948,13 +968,17 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         self._sniffer = None
 
     # ---- sniffer (resilient) ----
-    def _start_sniffer(self):
+    def _stop_sniffer(self):
+        """Best-effort capture stop (scapy may raise if it never ran)."""
         try:
             if self._sniffer:
-                try:
-                    self._sniffer.stop()
-                except Exception:
-                    pass
+                self._sniffer.stop()
+        except Exception:
+            pass
+
+    def _start_sniffer(self):
+        try:
+            self._stop_sniffer()
             # Non-promiscuous by default: the BOOTP broadcast flag makes the
             # server broadcast OFFER/ACK, and the gateway's unicast ARP reply to a
             # nudge reaches us because the CARP master already accepts the VIP's
@@ -1036,14 +1060,10 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
     # ---- heartbeat / status file ----
 
     def _write_hb(self, content):
-        # Write atomically (temp + rename) so a crash mid-write can't leave a partial file.
         if not self.hbfile:
             return
-        tmp = f"{self.hbfile}.tmp"
         try:
-            with open(tmp, "w", encoding="utf-8") as f:
-                f.write(content)
-            os.replace(tmp, self.hbfile)
+            _atomic_write(self.hbfile, content)
         except Exception as e:
             # The heartbeat drives CARP gating, so a write failure is worth surfacing.
             LOG.warning("heartbeat write failed (%s): %s", self.hbfile, e)
@@ -1052,7 +1072,8 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         t1, t2, src = self._dhcp.timing()
         # Publish nudge state so the status page can show it: nudge=<epoch of the
         # last sent nudge, 0 = never>, arpok=<epoch of the gateway's last ARP reply,
-        # 0 = none seen> and the current target gateway (if known).
+        # 0 = none seen> and the current target gateway (if known). status.py's
+        # _HB_TOKENS table is the reader -- keep the tokens in lockstep.
         extra = ""
         if self._nudge.interval:
             extra = f" nudge={int(self._nudge.last_nudge)} arpok={int(self._nudge.last_reply)}"
@@ -1067,8 +1088,8 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         self._write_hb(f"{int(time.time())} MISMATCH got={got} want={want}\n")
 
     def _on_changed_address(self, got, rx, phase, release_on_enforce):
-        """DhcpClient's changed-address hook -> the FollowPolicy decision
-        (late-bound through the attribute so tests can stub the policy)."""
+        """DhcpClient's changed-address hook -> the FollowPolicy decision. A
+        shim because the client is constructed before the policy exists."""
         return self._follow.on_changed_address(got, rx, phase, release_on_enforce)
 
     # ---- CARP role (master probe, transitions) ----
@@ -1094,6 +1115,11 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         if out is None:
             return None
         return f"carp: MASTER vhid {self.vhid} " in out
+
+    def _carp_master_probe(self):
+        """ArpNudge's is_master hook -> the CARP probe (late-bound through the
+        attribute so tests can stub _probe_carp_master)."""
+        return self._probe_carp_master()
 
     def _iface_link_up(self):
         """Interface carrier from ifconfig: True on 'status: active', False on a
@@ -1167,7 +1193,7 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
 
     def request_stop(self):
         """Ask the daemon to exit at the next loop tick (SIGINT/SIGTERM)."""
-        self.stop = True
+        self._stop = True
 
     def trigger_nudge(self):
         """Request an immediate ARP nudge (SIGUSR1 / configd action). Flag
@@ -1183,7 +1209,7 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
 
     def _sleep(self, secs):
         slept = 0
-        while slept < secs and not self.stop:
+        while slept < secs and not self._stop:
             time.sleep(1)
             slept += 1
         return slept
@@ -1193,13 +1219,14 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         operator-requested immediate nudge (SIGUSR1) and a CARP-transition re-check
         (SIGUSR2) so both act within a second instead of at the next heartbeat tick."""
         slept = 0
-        while slept < secs and not self.stop:
+        while slept < secs and not self._stop:
             if self._poll_role_now:
                 self._poll_role_now = False
                 # A CARP transition just fired (kernel -> devd -> rc.syshook.d/carp
                 # -> SIGUSR2); re-check the role now so a backup->master keeper
                 # nudges + renews immediately instead of at the next ~30s poll.
                 self._poll_carp_role()
+
             if self._nudge_now:
                 self._nudge_now = False
                 # Operator actions are rare and intentional -- always log them,
@@ -1208,21 +1235,24 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
                 LOG.info("manual ARP nudge requested (SIGUSR1)")
                 self._arp_nudge(force=True)
                 self._hb()   # publish the new nudge age right away for the status page
+
             # A pending peer-ACK observation follows now (rationale + the
             # dual-master window it closes: FollowPolicy.check_observed).
             self._follow.check_observed()
+
             # Link-return fast path: only while UNBOUND, poll carrier every few
             # seconds; a down->up edge means the WAN just came back, so stop waiting
             # and let _maintain_step re-DORA immediately (the bound path skips this).
             if self._dhcp.yiaddr is None and slept % LINK_POLL_STEP == 0 and self._check_link_returned():
                 self._link_returned = True
-                return not self.stop
+                return not self._stop
+
             # Event-driven sleep: return at once when the sniffer signals a fresh
             # observation, otherwise time out after ~1s to run the periodic checks.
             if self._wake.wait(1.0):
                 self._wake.clear()
             slept += 1
-        return not self.stop
+        return not self._stop
 
     def _hold_lease(self, secs):
         """Sleep up to secs while holding a lease, rewriting the heartbeat every
@@ -1230,36 +1260,40 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         the CARP demotion hook only sees heartbeat freshness). Returns False early
         on stop."""
         remaining = secs
-        while remaining > 0 and not self.stop:
+        while remaining > 0 and not self._stop:
             if self._renew_asap:
                 # Return as if T1 elapsed: the caller renews right away, which
                 # re-teaches upstream DHCP-snooping state after a master change.
                 self._renew_asap = False
-                return not self.stop
+                return not self._stop
+
             chunk = min(HB_REFRESH, remaining)
             if not self._sleep_interruptible(chunk):
                 return False
             remaining -= chunk
+
             self._hb()
             self._follow.watchdog()   # re-drive a follow whose apply stalled
             self._poll_carp_role()    # backup->master? renew early + nudge now
             self._arp_nudge()
-        return not self.stop
+        return not self._stop
 
     def run(self):
         """The daemon main loop: sniffer up, then maintain the lease until
         stopped. Never raises; returns the process exit code."""
         # Start the packet sniffer, retrying forever: a keeper must self-heal, not
         # die, if the interface is briefly unavailable at startup.
-        while not self.stop and not self._start_sniffer():
+        while not self._stop and not self._start_sniffer():
             LOG.warning("sniffer start failed -- retrying in %ds", SNIFFER_RETRY)
             self._sleep(SNIFFER_RETRY)
+
         # eth-src matters for L2 debugging but only when it differs from the chaddr.
         ethsrc = f" eth-src={self.eth_src}" if self.eth_src != self.chaddr else ""
         LOG.info("lease-keeper active on %s: chaddr=%s%s request=%s",
                  self.iface, self.chaddr, ethsrc, self._follow.target or "any")
         time.sleep(0.5)
-        while not self.stop:
+
+        while not self._stop:
             # The keeper must NEVER die on a bad DHCP state: catch any unexpected
             # error, keep the heartbeat fresh so CARP does not falsely demote us,
             # and retry after a short backoff.
@@ -1272,14 +1306,11 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
                 except Exception:
                     pass
                 self._sleep(LOOP_ERROR_BACKOFF)
+
         # shutdown
         if self.release_on_exit:
             self._dhcp.release()
-        try:
-            if self._sniffer:
-                self._sniffer.stop()
-        except Exception:
-            pass
+        self._stop_sniffer()
         LOG.info("stopped")
         return 0
 
@@ -1331,7 +1362,7 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
 
         elapsed = t1
         ok = False
-        while elapsed < t2 and not self.stop:
+        while elapsed < t2 and not self._stop:
             # Jitter the REBIND retransmit cadence: both nodes hit T2 together
             # (identical lease timers), so an un-jittered step would broadcast
             # REBIND in lockstep. Overshooting t2 slightly is harmless (the guard
@@ -1439,12 +1470,9 @@ def _claim_once(k):
     LOG.info("DHCP claim %s -> %s", k.chaddr, k._dhcp.yiaddr if ok else "FAIL")
     if ok:
         k._dhcp.release()
-    try:
-        if k._sniffer:
-            k._sniffer.stop()
-    except Exception:
-        pass
+    k._stop_sniffer()
     return 0 if ok else 1
+# pylint: enable=protected-access
 
 
 def main():

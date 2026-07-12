@@ -11,6 +11,8 @@ import json
 import os
 import re
 
+from keeperconf import keeper_lines
+
 LOG_GLOB = "/var/log/carpvipdhcp-*.log"
 CONFFILE = "/usr/local/etc/carpvipdhcp/keeper.conf"
 MAX_PER_FILE = 500
@@ -20,15 +22,7 @@ LINE_RE = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})(?:,\d+)?\s+(\w+)\s
 def keeper_meta():
     """Map the filesystem-safe keeper id to {ip, vhid} via keeper.conf."""
     meta = {}
-    try:
-        lines = open(CONFFILE).read().splitlines()
-    except OSError:
-        return meta
-    for line in lines:
-        line = line.strip()
-        if not line or line.startswith("#") or "|" not in line:
-            continue
-        parts = line.split("|")
+    for parts in keeper_lines(CONFFILE):
         request = parts[0]
         vhid = parts[4] if len(parts) > 4 else ""
         meta[re.sub(r"[^A-Za-z0-9]", "_", request)] = {"ip": request, "vhid": vhid}
@@ -36,6 +30,7 @@ def keeper_meta():
 
 
 def main():
+    """Emit the merged, newest-first JSON array of parsed log records."""
     meta = keeper_meta()
     records = []
     for path in sorted(glob.glob(LOG_GLOB)):
@@ -45,7 +40,8 @@ def main():
         keeper = info.get("ip", kid)
         vhid = info.get("vhid", "")
         try:
-            lines = open(path, errors="replace").read().splitlines()[-MAX_PER_FILE:]
+            with open(path, encoding="utf-8", errors="replace") as f:
+                lines = f.read().splitlines()[-MAX_PER_FILE:]
         except OSError:
             continue
         for line in lines:

@@ -1,7 +1,8 @@
-"""Unit tests for status.py heartbeat / keeper-id parsing."""
+"""Unit tests for status.py heartbeat / keeper-id parsing (comments over docstrings)."""
+# pylint: disable=missing-function-docstring
 import time
 
-import status
+import status  # sys.path via conftest  # type: ignore  # pylint: disable=import-error
 
 
 def test_keeper_id():
@@ -84,10 +85,10 @@ def test_read_keepers_arp_nudge_field(tmp_path, monkeypatch):
     assert keepers[1]["arp_nudge"] == 0
 
 
-def _write_hb(path, arpok_age, now, arp_nudge=240):
+def _write_hb(path, arpok_age, now):
     path.write_text(
-        "%d bound=100.64.4.7 lease=1800 t1=900 t2=1575 src=derived nudge=%d arpok=%d gw=100.64.4.1\n"
-        % (now, now - 5, now - arpok_age))
+        f"{now} bound=100.64.4.7 lease=1800 t1=900 t2=1575 src=derived"
+        f" nudge={now - 5} arpok={now - arpok_age} gw=100.64.4.1\n")
 
 
 def test_read_keepers_arp_confirmed_fresh_and_stale(tmp_path, monkeypatch):
@@ -102,8 +103,8 @@ def test_read_keepers_arp_confirmed_fresh_and_stale(tmp_path, monkeypatch):
     _write_hb(tmp_path / "carpvipdhcp-100_64_4_7.hb", 5, now)       # 5s ago -> fresh
     _write_hb(tmp_path / "carpvipdhcp-100_64_4_8.hb", 5000, now)    # 5000s ago -> stale
     (tmp_path / "carpvipdhcp-100_64_4_9.hb").write_text(
-        "%d bound=100.64.4.9 lease=1800 t1=900 t2=1575 src=derived nudge=%d arpok=0 gw=100.64.4.1\n"
-        % (now, now - 5))                                          # arpok=0 -> never
+        f"{now} bound=100.64.4.9 lease=1800 t1=900 t2=1575 src=derived"
+        f" nudge={now - 5} arpok=0 gw=100.64.4.1\n")                                          # arpok=0 -> never
     by_ip = {k["request"]: k for k in status.read_keepers({}, {})}
     assert by_ip["100.64.4.7"]["arp_confirmed"] is True
     assert by_ip["100.64.4.8"]["arp_confirmed"] is False

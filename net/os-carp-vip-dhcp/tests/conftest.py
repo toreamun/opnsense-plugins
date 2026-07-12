@@ -9,6 +9,7 @@ import importlib.util
 import os
 import sys
 import types
+from typing import Any
 
 import pytest
 
@@ -21,22 +22,23 @@ sys.path.insert(0, SCRIPT_DIR)
 def _stub_scapy():
     if "scapy.all" in sys.modules:
         return
-    scapy = types.ModuleType("scapy")
-    allmod = types.ModuleType("scapy.all")
+    # Typed Any: module attributes are assigned dynamically below.
+    scapy: Any = types.ModuleType("scapy")
+    allmod: Any = types.ModuleType("scapy.all")
 
-    class _Sniffer:
-        def __init__(self, *args, **kwargs):
+    class _Sniffer:  # pylint: disable=too-few-public-methods
+        def __init__(self, *_args, **_kwargs):
             self.thread = types.SimpleNamespace(is_alive=lambda: True)
 
         def start(self):
-            pass
+            """No-op (no capture in unit tests)."""
 
         def stop(self):
-            pass
+            """No-op."""
 
-    class _Layer:
+    class _Layer:  # pylint: disable=too-few-public-methods
         """Composable no-op protocol layer: Ether(...) / IP(...) / ... works."""
-        def __init__(self, *args, **kwargs):
+        def __init__(self, *_args, **_kwargs):
             pass
 
         def __truediv__(self, other):
@@ -59,6 +61,7 @@ _stub_scapy()
 def _load(filename, modname):
     path = os.path.join(SCRIPT_DIR, filename)
     spec = importlib.util.spec_from_file_location(modname, path)
+    assert spec and spec.loader, path
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module

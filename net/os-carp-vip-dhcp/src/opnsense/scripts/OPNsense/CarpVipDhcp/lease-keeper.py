@@ -264,6 +264,95 @@ def mac2raw(m):
     return bytes.fromhex(m.replace(":", "").replace("-", ""))
 
 
+class ArpNudge:
+    """Keep the upstream gateway's ARP entry for the leased address fresh, for
+    gateways that ignore gratuitous ARP and never re-ARP an expired entry (see
+    the README's "ARP nudge" section). Owns the nudge pacing and the gateway
+    reachability stamp; the caller supplies the current lease binding
+    (yiaddr, gateway) per call and a CARP-role probe at construction -- never
+    nudge from a backup (it would steal the VIP's traffic), so anything but a
+    confirmed MASTER fails closed (the next interval retries)."""
+
+    def __init__(self, iface, chaddr, interval, is_master):
+        self.iface = iface
+        self.chaddr = chaddr
+        # Interval floor so a typo cannot flood the segment; 0 = disabled.
+        self.interval = max(ARP_NUDGE_MIN, interval) if interval else 0
+        self._is_master = is_master    # callable -> True/False/None (None = probe failed)
+        self.last_nudge = 0.0          # epoch of the last sent nudge (0 = never)
+        # Reachability: the sniffer stamps last_reply when the gateway answers
+        # a nudge (a lone atomic float write); the status page surfaces its age.
+        self.last_reply = 0.0          # epoch of the gateway's last ARP reply (0 = none)
+        self._gw = None                # last nudge target we logged (log again on change)
+        self._warned = False           # warned once about a missing nudge target
+
+    def maybe_nudge(self, yiaddr, gateway, force=False):
+        """Refresh the gateway's ARP entry for yiaddr by broadcasting an ARP
+        request from (yiaddr, chaddr). No-op unless enabled, bound, due (or
+        forced) and CARP master."""
+        if not self.interval or not yiaddr:
+            return
+        if not force and time.time() - self.last_nudge < self.interval:
+            return
+        if self._is_master() is not True:
+            return
+        if not gateway:
+            # Enabled but no target: without this warning the nudge would be a
+            # silent no-op and the operator would believe they are protected.
+            if not self._warned:
+                LOG.warning("ARP nudge enabled but no gateway known "
+                            "(no DHCP router option or server-id) -- cannot nudge")
+                self._warned = True
+            return
+        try:
+            # This frame is shaped to satisfy three ISP access-network guards at
+            # once (README "Playing nicely" section):
+            #   * op=1 (a REQUEST, not a gratuitous announcement) -- gear that
+            #     filters unsolicited/gratuitous ARP still processes a request,
+            #     which is what refreshes the entry;
+            #   * sender (psrc=leased IP, hwsrc=chaddr=CARP MAC) is exactly the
+            #     DHCP-snooped IP<->MAC binding, so Dynamic ARP Inspection passes it;
+            #   * sending it at all exists for gateways that never re-ARP an
+            #     expired entry ("secured ARP") and would otherwise blackhole the
+            #     VIP. Only the CARP master sends it (gated above).
+            sendp(Ether(src=self.chaddr, dst="ff:ff:ff:ff:ff:ff") /
+                  ARP(op=1, hwsrc=self.chaddr, psrc=yiaddr,
+                      hwdst="00:00:00:00:00:00", pdst=gateway),
+                  iface=self.iface, verbose=0)
+            self.last_nudge = time.time()
+            # Log the first nudge (and any target change) at INFO so the default log
+            # shows the nudge is active; routine repeats at DEBUG (they fire oftener
+            # than DHCP renews). Whether the gateway actually answered is surfaced by
+            # age on the status page (via last_reply -> the heartbeat's arpok=).
+            if gateway != self._gw:
+                LOG.info("ARP nudge active: who-has %s tell %s (src %s) every %ds",
+                         gateway, yiaddr, self.chaddr, self.interval)
+                self._gw = gateway
+            else:
+                LOG.debug("ARP nudge sent: who-has %s tell %s", gateway, yiaddr)
+        except Exception as e:
+            LOG.warning("ARP nudge failed (target %s): %s", gateway, e)
+
+    def on_arp_reply(self, p, yiaddr, gateway):
+        """Stamp last_reply when the gateway answers our nudge -- a reachability
+        signal the status page surfaces by age. Only the reply to OUR who-has
+        counts: op=2 (is-at), sender = the nudge target gateway, target = our
+        leased IP. Runs on the sniffer thread; the stamp is a lone atomic write.
+        Advisory only (an on-segment attacker could forge or withhold it);
+        nothing here feeds lease/CARP/follow decisions."""
+        try:
+            arp = p[ARP]
+            if arp.op != 2:                     # 2 = is-at (reply); requests are filtered out in BPF
+                return
+            if not gateway or not yiaddr:
+                return
+            if arp.psrc == gateway and arp.pdst == yiaddr:
+                self.last_reply = time.time()
+                LOG.debug("ARP reply from %s (is-at) for %s", gateway, yiaddr)
+        except Exception as e:
+            LOG.debug("ARP reply parse error: %s", e)
+
+
 class Keeper:
     def __init__(self, iface, chaddr, request_ip=None, eth_src=None,
                  hbfile=None, release_on_exit=False, vhid=None,
@@ -278,22 +367,17 @@ class Keeper:
         self.release_on_exit = release_on_exit
         self.vhid = str(vhid) if vhid else None
         self.follow = follow
-        # ARP nudge: keep the upstream gateway's ARP entry for the leased address
-        # fresh, for gateways that ignore gratuitous ARP and never re-ARP an
-        # expired entry (see the README's "ARP nudge" section for the full story).
-        self.arp_nudge = max(ARP_NUDGE_MIN, arp_nudge) if arp_nudge else 0
+        # ARP nudge component: owns the pacing and reachability state; the
+        # keeper supplies the lease binding per nudge (_arp_nudge) and the
+        # CARP-role probe (late-bound so tests can stub _probe_carp_master).
+        self._nudge = ArpNudge(iface, self.chaddr, arp_nudge,
+                               lambda: self._probe_carp_master())
         # Promiscuous ARP capture: off by default (the CARP master already
         # accepts the VIP MAC, so the unicast reply reaches a normal socket).
         # Opt-in fallback for NICs that drop non-primary unicast MACs.
         self.arp_listen_promisc = arp_listen_promisc
         self.router = None             # default gateway (DHCP opt 3, fallback: server_id)
         self.mask_bits = None          # subnet prefix length from opt 1 (for logging + follow)
-        self._last_nudge = 0.0
-        self._nudge_gw = None          # last nudge target we logged (log again on change)
-        self._nudge_warned = False     # warned once about a missing nudge target
-        # Reachability: the sniffer stamps _last_arp_reply when the gateway answers
-        # a nudge (a lone atomic float write); the status page surfaces its age.
-        self._last_arp_reply = 0.0     # epoch of the gateway's last ARP reply (0 = none)
         self._was_master = None        # CARP role at the last nudge check (None = unknown yet)
         self._nudge_now = False        # operator asked for an immediate nudge (SIGUSR1)
         self._poll_role_now = False    # a CARP transition fired -> re-check role now (SIGUSR2)
@@ -386,27 +470,8 @@ class Keeper:
         if p.haslayer(BOOTP):
             self._on_dhcp_reply(p)
         elif p.haslayer(ARP):
-            self._on_arp_reply(p)      # gateway answering our nudge (reachability)
-
-    def _on_arp_reply(self, p):
-        """Stamp _last_arp_reply when the gateway answers our nudge -- a reachability
-        signal the status page surfaces by age. Only the reply to OUR who-has counts:
-        op=2 (is-at), sender = the nudge target gateway, target = our leased IP. Runs
-        on the sniffer thread; the stamp is a lone atomic write. Advisory only (an
-        on-segment attacker could forge or withhold it); nothing here feeds
-        lease/CARP/follow decisions."""
-        try:
-            arp = p[ARP]
-            if arp.op != 2:                     # 2 = is-at (reply); requests are filtered out in BPF
-                return
-            gw = self._nudge_target()
-            if not gw or not self.yiaddr:
-                return
-            if arp.psrc == gw and arp.pdst == self.yiaddr:
-                self._last_arp_reply = time.time()
-                LOG.debug("ARP reply from %s (is-at) for %s", gw, self.yiaddr)
-        except Exception as e:
-            LOG.debug("ARP reply parse error: %s", e)
+            # Gateway answering our nudge (reachability stamp).
+            self._nudge.on_arp_reply(p, self.yiaddr, self._nudge_target())
 
     def _chaddr_matches(self, b):
         """True if the reply's BOOTP client hardware address is our chaddr (the
@@ -707,8 +772,8 @@ class Keeper:
         # last sent nudge, 0 = never>, arpok=<epoch of the gateway's last ARP reply,
         # 0 = none seen> and the current target gateway (if known).
         extra = ""
-        if self.arp_nudge:
-            extra = " nudge=%d arpok=%d" % (int(self._last_nudge), int(self._last_arp_reply))
+        if self._nudge.interval:
+            extra = " nudge=%d arpok=%d" % (int(self._nudge.last_nudge), int(self._nudge.last_reply))
             gw = self._nudge_target()
             if gw:
                 extra += " gw=%s" % gw
@@ -951,54 +1016,9 @@ class Keeper:
         return self.router or self.server
 
     def _arp_nudge(self, force=False):
-        """Refresh the upstream gateway's ARP entry for the leased address by
-        broadcasting an ARP request from (yiaddr, chaddr). No-op unless enabled,
-        bound, due (or forced) and CARP master -- never nudge from a backup (it
-        would steal the VIP's traffic), so a failed role probe skips the nudge
-        (fails closed; the next interval retries)."""
-        if not self.arp_nudge or not self.yiaddr:
-            return
-        if not force and time.time() - self._last_nudge < self.arp_nudge:
-            return
-        if self._probe_carp_master() is not True:
-            return
-        gw = self._nudge_target()
-        if not gw:
-            # Enabled but no target: without this warning the nudge would be a
-            # silent no-op and the operator would believe they are protected.
-            if not self._nudge_warned:
-                LOG.warning("ARP nudge enabled but no gateway known "
-                            "(no DHCP router option or server-id) -- cannot nudge")
-                self._nudge_warned = True
-            return
-        try:
-            # This frame is shaped to satisfy three ISP access-network guards at
-            # once (README "Playing nicely" section):
-            #   * op=1 (a REQUEST, not a gratuitous announcement) -- gear that
-            #     filters unsolicited/gratuitous ARP still processes a request,
-            #     which is what refreshes the entry;
-            #   * sender (psrc=leased IP, hwsrc=chaddr=CARP MAC) is exactly the
-            #     DHCP-snooped IP<->MAC binding, so Dynamic ARP Inspection passes it;
-            #   * sending it at all exists for gateways that never re-ARP an
-            #     expired entry ("secured ARP") and would otherwise blackhole the
-            #     VIP. Only the CARP master sends it (gated above).
-            sendp(Ether(src=self.chaddr, dst="ff:ff:ff:ff:ff:ff") /
-                  ARP(op=1, hwsrc=self.chaddr, psrc=self.yiaddr,
-                      hwdst="00:00:00:00:00:00", pdst=gw),
-                  iface=self.iface, verbose=0)
-            self._last_nudge = time.time()
-            # Log the first nudge (and any target change) at INFO so the default log
-            # shows the nudge is active; routine repeats at DEBUG (they fire oftener
-            # than DHCP renews). Whether the gateway actually answered is surfaced by
-            # age on the status page (via _last_arp_reply -> the heartbeat's arpok=).
-            if gw != self._nudge_gw:
-                LOG.info("ARP nudge active: who-has %s tell %s (src %s) every %ds",
-                         gw, self.yiaddr, self.chaddr, self.arp_nudge)
-                self._nudge_gw = gw
-            else:
-                LOG.debug("ARP nudge sent: who-has %s tell %s", gw, self.yiaddr)
-        except Exception as e:
-            LOG.warning("ARP nudge failed (target %s): %s", gw, e)
+        """Hand the current lease binding (leased address, nudge target) to the
+        ArpNudge component; it owns the pacing, the master gate and the send."""
+        self._nudge.maybe_nudge(self.yiaddr, self._nudge_target(), force=force)
 
     # ---- main loop / sleeps ----
 

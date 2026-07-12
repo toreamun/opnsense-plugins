@@ -406,36 +406,36 @@ def _nudge_keeper(lk, arp_nudge=240, hbfile=None, **kwargs):
 
 def test_nudge_off_by_default(lk):
     keeper = lk.Keeper("eth0", "00:00:5e:00:01:fe", "100.64.4.7", hbfile=None)
-    assert keeper.arp_nudge == 0
+    assert keeper._nudge.interval == 0
     keeper._arp_nudge(force=True)   # must be a no-op, not an error
-    assert keeper._last_nudge == 0.0
+    assert keeper._nudge.last_nudge == 0.0
 
 
 def test_nudge_interval_floor(lk):
     keeper = lk.Keeper("eth0", "00:00:5e:00:01:fe", "100.64.4.7", hbfile=None, arp_nudge=1)
-    assert keeper.arp_nudge == lk.ARP_NUDGE_MIN
+    assert keeper._nudge.interval == lk.ARP_NUDGE_MIN
 
 
 def test_nudge_respects_interval_and_force(lk):
     keeper = _nudge_keeper(lk)
     keeper._arp_nudge()
-    first = keeper._last_nudge
+    first = keeper._nudge.last_nudge
     assert first > 0
     keeper._arp_nudge()             # within the interval -> skipped
-    assert keeper._last_nudge == first
+    assert keeper._nudge.last_nudge == first
     keeper._arp_nudge(force=True)   # forced (BOUND/RENEW/REBIND) -> sent
-    assert keeper._last_nudge > first
+    assert keeper._nudge.last_nudge > first
 
 
 def test_nudge_requires_gateway_and_lease(lk):
     keeper = _nudge_keeper(lk)
     keeper.server = None            # no router option and no server_id -> no target
     keeper._arp_nudge(force=True)
-    assert keeper._last_nudge == 0.0
+    assert keeper._nudge.last_nudge == 0.0
     keeper.server = "100.64.4.1"
     keeper.yiaddr = None            # not bound -> no source address
     keeper._arp_nudge(force=True)
-    assert keeper._last_nudge == 0.0
+    assert keeper._nudge.last_nudge == 0.0
 
 
 def test_nudge_works_from_router_option_alone(lk):
@@ -443,14 +443,14 @@ def test_nudge_works_from_router_option_alone(lk):
     keeper.server = None
     keeper.router = "100.64.4.254"   # DHCP option 3 alone is a valid target
     keeper._arp_nudge(force=True)
-    assert keeper._last_nudge > 0
+    assert keeper._nudge.last_nudge > 0
 
 
 def test_nudge_gated_to_carp_master(lk):
     keeper = _nudge_keeper(lk, vhid=199)
     keeper._probe_carp_master = lambda: False
     keeper._arp_nudge(force=True)
-    assert keeper._last_nudge == 0.0   # never nudge from a CARP backup
+    assert keeper._nudge.last_nudge == 0.0   # never nudge from a CARP backup
 
 
 def test_probe_carp_master_true_without_vhid(lk):
@@ -471,15 +471,15 @@ def test_probe_failure_skips_nudge(lk, monkeypatch):
     monkeypatch.setattr(lk.subprocess, "check_output", boom)
     assert keeper._probe_carp_master() is None
     keeper._arp_nudge(force=True)
-    assert keeper._last_nudge == 0.0
+    assert keeper._nudge.last_nudge == 0.0
 
 
 def test_hb_nudge_tokens_present(lk, tmp_path):
     hb = tmp_path / "hb"
     keeper = _nudge_keeper(lk, hbfile=str(hb))
     keeper.router = "100.64.4.1"
-    keeper._last_nudge = 1783350000.0
-    keeper._last_arp_reply = 1783350050.0
+    keeper._nudge.last_nudge = 1783350000.0
+    keeper._nudge.last_reply = 1783350050.0
     keeper._hb()
     content = hb.read_text()
     assert " nudge=1783350000" in content
@@ -513,14 +513,14 @@ def test_master_transition_renews_early_and_nudges(lk):
     keeper._probe_carp_master = lambda: next(states)
     keeper._poll_carp_role()             # master from the start -> no transition
     assert keeper._renew_asap is False
-    assert keeper._last_nudge == 0.0
+    assert keeper._nudge.last_nudge == 0.0
     keeper._poll_carp_role()             # backup -> remembers the role
     keeper._poll_carp_role()             # backup -> master (the forced nudge probes again)
     assert keeper._renew_asap is True
-    first = keeper._last_nudge
+    first = keeper._nudge.last_nudge
     assert first > 0
     keeper._poll_carp_role()             # still master -> nothing new
-    assert keeper._last_nudge == first
+    assert keeper._nudge.last_nudge == first
 
 
 def test_losing_master_is_logged(lk, caplog):
@@ -541,7 +541,7 @@ def test_master_transition_renews_even_with_nudge_off(lk):
     keeper._poll_carp_role()
     keeper._poll_carp_role()
     assert keeper._renew_asap is True    # the early renew is not tied to the nudge
-    assert keeper._last_nudge == 0.0     # but no nudge was sent
+    assert keeper._nudge.last_nudge == 0.0     # but no nudge was sent
 
 
 def test_hold_returns_early_for_asap_renew(lk):
@@ -559,7 +559,7 @@ def test_sigusr1_flag_services_nudge_within_a_second(lk, caplog):
     with caplog.at_level("INFO", logger="lease-keeper"):
         keeper._sleep_interruptible(1)
     assert keeper._nudge_now is False
-    assert keeper._last_nudge > 0
+    assert keeper._nudge.last_nudge > 0
     # Operator-triggered nudges must be visible in the log (the README says so).
     assert any("manual ARP nudge" in r.getMessage() for r in caplog.records)
 
@@ -578,7 +578,7 @@ def test_sigusr2_flag_rechecks_carp_role_within_a_second(lk):
     keeper._sleep_interruptible(1)                # services the flag -> re-check -> transition
     assert keeper._poll_role_now is False
     assert keeper._renew_asap is True     # backup->master: renew early
-    assert keeper._last_nudge > 0         # and nudge immediately
+    assert keeper._nudge.last_nudge > 0         # and nudge immediately
 
 
 def test_nudge_missing_gateway_warns_once(lk, caplog):
@@ -610,24 +610,24 @@ class _ArpPkt:
 def test_arp_reply_ignores_unrelated(lk):
     keeper = _nudge_keeper(lk)
     keeper.router = "100.64.4.254"
-    keeper._on_arp_reply(_ArpPkt(lk, 2, "100.64.4.9", "100.64.4.7"))    # wrong sender
-    keeper._on_arp_reply(_ArpPkt(lk, 2, "100.64.4.254", "100.64.4.99"))  # wrong target IP
-    keeper._on_arp_reply(_ArpPkt(lk, 1, "100.64.4.254", "100.64.4.7"))   # a request, not a reply
-    assert keeper._last_arp_reply == 0.0
+    keeper._on_sniff(_ArpPkt(lk, 2, "100.64.4.9", "100.64.4.7"))    # wrong sender
+    keeper._on_sniff(_ArpPkt(lk, 2, "100.64.4.254", "100.64.4.99"))  # wrong target IP
+    keeper._on_sniff(_ArpPkt(lk, 1, "100.64.4.254", "100.64.4.7"))   # a request, not a reply
+    assert keeper._nudge.last_reply == 0.0
 
 
 def test_sniff_dispatch_routes_arp_reply(lk):
     keeper = _nudge_keeper(lk)
     keeper.router = "100.64.4.254"
     keeper._on_sniff(_ArpPkt(lk, 2, "100.64.4.254", "100.64.4.7"))
-    assert keeper._last_arp_reply > 0
+    assert keeper._nudge.last_reply > 0
 
 
 def test_arp_reply_logged_at_debug(lk, caplog):
     keeper = _nudge_keeper(lk)
     keeper.router = "100.64.4.1"
     with caplog.at_level("DEBUG", logger="lease-keeper"):
-        keeper._on_arp_reply(_ArpPkt(lk, 2, "100.64.4.1", "100.64.4.7"))
+        keeper._on_sniff(_ArpPkt(lk, 2, "100.64.4.1", "100.64.4.7"))
     assert any("ARP reply from 100.64.4.1" in r.getMessage() for r in caplog.records)
 
 

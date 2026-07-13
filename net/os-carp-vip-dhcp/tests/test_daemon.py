@@ -775,7 +775,8 @@ def test_sniffer_filter_captures_arp_and_honours_promisc(lk, monkeypatch):
         def stop(self):
             pass
 
-    monkeypatch.setattr(lk, "AsyncSniffer", _Cap)
+    # ScapyCapture looks AsyncSniffer up in its own module, so patch it there.
+    monkeypatch.setattr("leasekeeper.capture_scapy.AsyncSniffer", _Cap)
     keeper = _keeper(lk, arp_listen_promisc=True)
     assert keeper._capture.start() is True
     assert "arp" in captured["filter"]        # ARP replies now reach the parser

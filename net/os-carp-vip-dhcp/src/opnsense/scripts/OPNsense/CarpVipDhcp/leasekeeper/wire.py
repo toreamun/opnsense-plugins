@@ -6,10 +6,13 @@ dhcpclient. The option (name, value) vocabulary used here is the keeper's own
 and is deliberately scapy-compatible (ScapyCapture relays outbound option lists
 to scapy verbatim).
 """
+import logging
 import re
 from collections import namedtuple
 
 from .constants import DHCP_CLIENT_PORT, DHCP_SERVER_PORT, MTYPE_NAMES, PARAM_REQ_LIST
+
+LOG = logging.getLogger("lease-keeper")
 
 # A parsed DHCP reply, snapshotted from the capture thread.
 # `message` (DHCP option 56) is the server's optional human-readable text, mainly
@@ -100,3 +103,17 @@ def _dhcp_options(mtype, extra, id_opts):
     identity options, then the per-message extras."""
     return ([("message-type", mtype), ("param_req_list", PARAM_REQ_LIST)]
             + id_opts + extra + ["end"])
+
+
+def _deliver(handler, frame):
+    """Run a keeper frame callback under its own guard: a failure in there is
+    a handler bug, not a parse error, and must neither kill the capture
+    thread nor be mislabelled as malformed input. Shared by both capture
+    backends (it lives here, the lowest layer both import, not in the capture
+    registry, to keep the backend imports acyclic)."""
+    if frame is None:
+        return
+    try:
+        handler(frame)
+    except Exception as e:  # pylint: disable=broad-exception-caught
+        LOG.debug("frame handler error: %s", e)

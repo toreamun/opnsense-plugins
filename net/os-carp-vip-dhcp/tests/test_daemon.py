@@ -4,6 +4,7 @@ Tests reach into private state/methods by design, and use comments over
 per-test docstrings."""
 # pylint: disable=protected-access, missing-function-docstring
 import os
+import re
 import time
 import types
 
@@ -769,8 +770,8 @@ def test_follow_update_fires_newwanip_hooks():
     with open(php, encoding="utf-8") as fh:
         src = fh.read()
     assert "plugins_configure('newwanip'" in src
-    assert "rc.newwanip" not in src.replace("NOT rc.newwanip", "").replace(
-        "not rc.newwanip", "")   # mentioned only as the documented non-choice
+    code = re.sub(r"/\*.*?\*/|//[^\n]*", "", src, flags=re.S)   # comments may discuss it
+    assert "rc.newwanip" not in code
 
 
 def test_follow_update_action_arity():

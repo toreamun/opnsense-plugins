@@ -136,11 +136,13 @@ When **Follow dynamic DHCP address** is on (default) and the server assigns a di
 1. In the keeper, set **Sync firewall alias** to a name (e.g. `wan_carp_vip`). The plugin creates a Host alias of that name and keeps it equal to the VIP's current address.
 2. Point your **outbound NAT** translation address — and any rule that must follow — at that **alias** instead of a literal IP. On a follow, the plugin updates the alias and reapplies the filter (state-preserving), so rules track the new address.
 
+A follow also runs the system's **newwanip hooks** for the VIP's interface, so consumers such as dynamic DNS and VPN endpoints learn the new address the same way they would after a native lease change.
+
 The alias is created/updated automatically and never deleted (it may be referenced elsewhere).
 
 **Inbound is different:** a **port-forward cannot follow** a dynamic address — the upstream only routes inbound to the address it has reserved. Follow keeps *outbound* online; inbound services need a stable reserved address.
 
-A **cross-subnet** renumber is the one case follow can't fully handle: it rewrites the VIP *address* but not the interface prefix or System → Gateways, so if the ISP also moves the gateway you must update those by hand (the keeper logs a loud warning when it sees the gateway change).
+A **cross-subnet** renumber is handled too: when the ACK moves the gateway, the plugin also updates the VIP prefix and the WAN gateway from the ACK's subnet mask and gateway, and reapplies routing. The one gap left is an ACK that changes the gateway **without** carrying a subnet mask — then only the address moves and the keeper logs a loud warning to fix the interface prefix and System → Gateways by hand.
 
 **HA note:** firewall aliases are covered by OPNsense HA config sync, so an alias update propagates to the backup too. The CARP VIP itself is intentionally *not* synced (`advskew` differs per node).
 

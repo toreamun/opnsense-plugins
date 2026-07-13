@@ -1,5 +1,5 @@
 PLUGIN_NAME=		carp-vip-dhcp
-PLUGIN_VERSION=         1.8.3
+PLUGIN_VERSION=         1.8.4
 PLUGIN_COMMENT=		Keep a DHCP lease alive for a CARP virtual IP (DHCP/CGNAT WAN failover)
 PLUGIN_MAINTAINER=	tore@amundsen.org
 # PLUGIN_PYTHON (from Mk/plugins.mk) tracks the target release's base Python,

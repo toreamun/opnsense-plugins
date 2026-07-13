@@ -8,20 +8,22 @@ traffic are handled by CARP. The BOOTP broadcast flag is set so OFFER/ACK are
 broadcast. Optionally (--arp-nudge) it refreshes the upstream gateway's ARP
 entry for the leased address, for gateways that never re-ARP an expired entry
 (traffic then silently blackholes until they get an ARP *request*). Runs on both
-HA nodes for redundancy.
+HA nodes for redundancy. Packet capture and send go through a pluggable backend
+(--capture-backend): scapy (the default), or a dependency-free raw /dev/bpf
+backend (experimental).
 
 Robustness:
   * Full DHCP lifecycle: DORA (Discover/Offer/Request/Ack) -> BOUND, RENEW at
     T1, REBIND at T2, re-DORA at expiry.
   * Single instance via pidfile; heartbeat file (fresh = the lease is renewing).
-  * Resilient sniffer: restarted if its thread dies (e.g. the interface flaps).
+  * Resilient capture: restarted if its thread dies (e.g. the interface flaps).
   * All I/O wrapped in try/except so the main loop never crashes; a non-zero
     exit lets the supervisor restart it.
   * RELEASE is NOT sent on a normal stop (SIGTERM) -- only with
     --once/--release-on-exit -- so the address is not given up needlessly.
 
 Security posture (this daemon parses untrusted WAN traffic as root):
-  * The sniffer is NOT promiscuous by default: the BOOTP broadcast flag makes
+  * The capture is NOT promiscuous by default: the BOOTP broadcast flag makes
     the server broadcast its replies to a non-promiscuous socket, and the
     gateway's unicast ARP reply to a nudge reaches us because the CARP master
     already accepts the VIP's virtual MAC. --arp-listen-promisc is an opt-in
@@ -54,12 +56,15 @@ Usage:
 # A single deployable file is a deliberate constraint of this daemon.
 # pylint: disable=too-many-lines
 import argparse
+import ctypes
 import ipaddress
 import logging
 import os
 import random
 import re
+import select
 import signal
+import struct
 import subprocess
 import sys
 import threading
@@ -69,12 +74,25 @@ from dataclasses import dataclass
 from logging.handlers import RotatingFileHandler
 from typing import Any
 
-# Scapy is the one heavy third-party dependency and the usual suspect when the
-# daemon won't start (missing after an upgrade, ABI mismatch, partial install).
+# The raw /dev/bpf backend drives its ioctls through fcntl, which does not
+# exist on non-POSIX development hosts. Import it defensively (same pattern as
+# scapy below) so the module still loads there; BpfCapture.start() reports the
+# missing module at runtime instead.
+try:
+    import fcntl as _fcntl_module
+    # Typed Any: the POSIX-only stubs would flag every ioctl call on the
+    # non-POSIX hosts this guard exists for.
+    fcntl: Any = _fcntl_module
+except ImportError:
+    fcntl = None  # pylint: disable=invalid-name
+
+# Scapy is the one heavy third-party dependency (needed only by the default
+# scapy capture backend) and the usual suspect when the daemon won't start
+# (missing after an upgrade, ABI mismatch, partial install).
 # Import it defensively: a bare module-level import that throws would kill the
 # process before any log handler exists -> a silent non-start with the traceback
 # going to daemon(8)'s /dev/null. Capture it instead and let main() log it once
-# logging is configured.
+# logging is configured (only when the scapy backend is actually selected).
 try:
     from scapy.all import (  # type: ignore  # pylint: disable=import-error
         ARP, Ether, IP, UDP, BOOTP, DHCP, AsyncSniffer, sendp)
@@ -128,6 +146,7 @@ MIN_T1 = 30                # floor for the renew timer (very short leases)
 REBIND_MARGIN = 15         # ensure T2 is at least this far past T1
 BROADCAST_FLAG = 0x8000    # BOOTP flags: ask the server to broadcast OFFER/ACK
 ETHER_BROADCAST = "ff:ff:ff:ff:ff:ff"
+ETHER_ZERO = "00:00:00:00:00:00"     # ARP "target unknown" hardware address
 IPV4_BROADCAST = "255.255.255.255"   # limited broadcast (never routed off-link)
 DHCP_SERVER_PORT = 67
 DHCP_CLIENT_PORT = 68
@@ -140,7 +159,7 @@ LOG_BACKUPS = 3
 # DhcpReply and turn a message type into an option list. The stateful protocol
 # sequences (DORA / INIT-REBOOT / renew) live in the DhcpClient class further down.
 
-# A parsed DHCP reply, snapshotted from the sniffer thread.
+# A parsed DHCP reply, snapshotted from the capture thread.
 # `message` (DHCP option 56) is the server's optional human-readable text, mainly
 # a NAK reason; `subnet_mask` (option 1) is used to follow a cross-subnet renumber;
 # `giaddr` (BOOTP header) is the relay agent, None when the server is directly
@@ -148,6 +167,19 @@ LOG_BACKUPS = 3
 # shorter constructions stay valid.
 DhcpReply = namedtuple("DhcpReply", "mtype yiaddr server_id lease t1 t2 router message subnet_mask giaddr",
                        defaults=(None, None, None))
+
+# A received BOOTP/DHCP frame in backend-neutral shape: both capture backends
+# (scapy packet / raw bytes) decode to this before the keeper sees it. chaddr
+# is raw bytes; options is a list of (name, value) tuples in the keeper's own
+# option vocabulary (the names in _OPT_ENCODERS/_OPT_DECODERS), which
+# _parse_reply reads regardless of backend. The names are deliberately
+# scapy-compatible: ScapyCapture relays outbound option lists to scapy
+# verbatim (see its docstring).
+BootpFrame = namedtuple("BootpFrame", "op xid yiaddr chaddr giaddr options")
+
+# A received ARP frame (the capture filter already narrows ARP to replies, but
+# op still travels so the handler re-checks rather than trusting the filter).
+ArpFrame = namedtuple("ArpFrame", "op psrc pdst")
 
 # Changed-address phase labels: which exchange saw the differing ACK. Log
 # text and policy input at once -- FollowPolicy relaxes its expected-server
@@ -184,12 +216,12 @@ def _fmt_reply(rx):
             f"gw={rx.router or '-'} mask={rx.subnet_mask or '-'}{msg}")
 
 
-def _parse_reply(p, yiaddr):
-    """Snapshot only the handful of DHCP options the keeper acts on into a
-    DhcpReply; the rest of the reply's option data -- untrusted, from
-    whatever answered on the wire -- is left untouched."""
+def _parse_reply(frame):
+    """Snapshot only the handful of DHCP options the keeper acts on from a
+    BootpFrame into a DhcpReply; the rest of the reply's option data --
+    untrusted, from whatever answered on the wire -- is left untouched."""
     mt = sid = lt = rt = bt = ro = msg = sm = None
-    for o in p[DHCP].options:
+    for o in frame.options:
         if isinstance(o, tuple):
             if o[0] == "message-type":
                 mt = o[1]
@@ -207,10 +239,10 @@ def _parse_reply(p, yiaddr):
                 msg = o[1]
             elif o[0] == "subnet_mask":  # option 1: to follow a cross-subnet renumber
                 sm = o[1]
-    gi = getattr(p[BOOTP], "giaddr", None)   # relay agent; 0.0.0.0 = directly attached
+    gi = frame.giaddr   # relay agent; 0.0.0.0 = directly attached
     if gi in (None, "0.0.0.0", 0):
         gi = None
-    return DhcpReply(mt, yiaddr, sid, lt, rt, bt, ro, msg, sm, gi)
+    return DhcpReply(mt, frame.yiaddr, sid, lt, rt, bt, ro, msg, sm, gi)
 
 
 def _dhcp_options(mtype, extra, id_opts):
@@ -239,6 +271,519 @@ _CGNAT = ipaddress.ip_network("100.64.0.0/10")
 # (arp[6:2]=2). A boundary, not an optimization -- it keeps everything else (incl. the
 # segment's broadcast who-has flood) out of the Python parser.
 SNIFFER_FILTER = f"(udp and (port {DHCP_SERVER_PORT} or port {DHCP_CLIENT_PORT})) or (arp and arp[6:2] = 2)"
+
+# ---- raw wire codec (bpf backend) ----
+# Hand encoders/decoders for exactly the frames the keeper exchanges, so the
+# bpf backend needs no packet library. The decoders parse untrusted WAN input:
+# every access is bounds-checked and a malformed frame decodes to None
+# (dropped) rather than raising.
+
+ETHERTYPE_IPV4 = 0x0800
+ETHERTYPE_ARP = 0x0806
+ETHER_MIN_FRAME = 60         # minimum Ethernet frame (without FCS); short ARP frames are padded
+DHCP_MAGIC = b"\x63\x82\x53\x63"   # RFC 2131 options magic cookie
+BOOTP_HDR_LEN = 236          # fixed BOOTP header before the magic cookie
+BOOTP_MIN_PAYLOAD = 300      # RFC 1542 4.1 minimum BOOTP message; reference clients pad to it
+DHCP_OPT_PAD = 0
+DHCP_OPT_END = 255
+IPPROTO_UDP = 17
+IPV4_TTL = 64                # conventional default TTL (BSD/Linux/scapy send 64)
+
+# DHCP message types the keeper SENDS, by the names the option lists carry
+# (the inverse, code -> display name, is MTYPE_NAMES above).
+_MTYPE_CODES = {"discover": 1, "request": 3, "release": 7}
+
+
+def _ip4(ip):
+    """Dotted-quad string (None -> 0.0.0.0) -> 4 raw bytes."""
+    return ipaddress.IPv4Address(ip or "0.0.0.0").packed
+
+
+def _ip4_str(raw):
+    """4 raw bytes -> dotted-quad string."""
+    return str(ipaddress.IPv4Address(bytes(raw)))
+
+
+def _opt_text(v):
+    """Text-ish option value -> bytes (client-id arrives pre-encoded)."""
+    return v if isinstance(v, bytes) else str(v).encode()
+
+
+# Outbound option encoders: option name -> (wire code, value encoder) for
+# exactly the options the keeper sends. These names ARE the keeper's option
+# vocabulary (BootpFrame.options and _dhcp_options use them).
+_OPT_ENCODERS = {
+    "message-type": (53, lambda v: bytes([_MTYPE_CODES[v]])),
+    "param_req_list": (55, bytes),        # list of option codes
+    "requested_addr": (50, _ip4),
+    "server_id": (54, _ip4),
+    "hostname": (12, _opt_text),
+    "vendor_class_id": (60, _opt_text),
+    "client_id": (61, _opt_text),
+}
+
+
+def _encode_dhcp_options(options):
+    """A scapy-style option list (name/value tuples + "end") -> the raw options
+    field. Options with a None value are dropped (a broadcast RELEASE carries
+    no server-id); the end option is always appended."""
+    out = bytearray()
+    for o in options:
+        if not isinstance(o, tuple) or o[1] is None:
+            continue   # the "end" marker (appended below) or a valueless option
+        code, encode = _OPT_ENCODERS[o[0]]
+        raw = encode(o[1])
+        out += bytes([code, len(raw)]) + raw
+    out.append(DHCP_OPT_END)
+    return bytes(out)
+
+
+def _encode_bootp_request(chaddr, xid, ciaddr, flags, options):
+    """A BOOTREQUEST payload: fixed BOOTP header + cookie + options, padded to
+    the RFC 1542 minimum message size (some servers drop shorter ones)."""
+    hdr = struct.pack("!4BIHH", 1, 1, 6, 0, xid, 0, flags)   # op htype hlen hops xid secs flags
+    hdr += _ip4(ciaddr) + b"\x00" * 12                       # ciaddr, then yiaddr/siaddr/giaddr zero
+    hdr += chaddr.ljust(16, b"\x00")[:16]                    # chaddr field (16 bytes)
+    hdr += b"\x00" * 192                                     # sname (64) + file (128), unused
+    payload = hdr + DHCP_MAGIC + _encode_dhcp_options(options)
+    return payload.ljust(BOOTP_MIN_PAYLOAD, b"\x00")
+
+
+def _inet_checksum(data):
+    """RFC 1071 ones-complement sum over 16-bit words (odd length zero-padded)."""
+    if len(data) % 2:
+        data += b"\x00"
+    total = sum(int.from_bytes(data[i:i + 2], "big") for i in range(0, len(data), 2))
+    while total >> 16:
+        total = (total & 0xFFFF) + (total >> 16)
+    return ~total & 0xFFFF
+
+
+def _encode_ipv4_udp(src, dst, sport, dport, payload):
+    """An IPv4+UDP datagram around payload, checksums computed. A UDP checksum
+    of 0 means "none sent", so a sum that works out to 0 transmits as 0xFFFF
+    (RFC 768)."""
+    udp_len = 8 + len(payload)
+    pseudo = _ip4(src) + _ip4(dst) + struct.pack("!BBH", 0, IPPROTO_UDP, udp_len)
+    udp_hdr = struct.pack("!4H", sport, dport, udp_len, 0)
+    cksum = _inet_checksum(pseudo + udp_hdr + payload) or 0xFFFF
+    udp_hdr = struct.pack("!4H", sport, dport, udp_len, cksum)
+    # version/ihl, tos, total, id, flags/frag, ttl, proto, checksum (zeroed, then patched)
+    ip_hdr = struct.pack("!BBHHHBBH", 0x45, 0, 20 + udp_len, 0, 0, IPV4_TTL, IPPROTO_UDP, 0) + _ip4(src) + _ip4(dst)
+    ip_hdr = ip_hdr[:10] + _inet_checksum(ip_hdr).to_bytes(2, "big") + ip_hdr[12:]
+    return ip_hdr + udp_hdr + payload
+
+
+def _encode_ether(dst, src, ethertype, payload):
+    """An Ethernet II frame."""
+    return mac2raw(dst) + mac2raw(src) + ethertype.to_bytes(2, "big") + payload
+
+
+# The fixed Ethernet/IPv4 ARP header prefix (htype/ptype/hlen/plen), shared by
+# the encoder and the decoder so the two cannot drift.
+_ARP_ETH_IPV4 = struct.pack("!HHBB", 1, ETHERTYPE_IPV4, 6, 4)
+
+
+def _encode_arp_request(hwsrc, psrc, pdst):
+    """An ARP who-has pdst tell psrc with sender hardware hwsrc (the nudge
+    frame; the shaping rationale lives at the ArpNudge call site)."""
+    return (_ARP_ETH_IPV4 + struct.pack("!H", 1)
+            + mac2raw(hwsrc) + _ip4(psrc) + mac2raw(ETHER_ZERO) + _ip4(pdst))
+
+
+def _u32(v):
+    """4-byte big-endian option value -> int (a shorter value is malformed)."""
+    if len(v) < 4:
+        raise ValueError("short integer option")
+    return int.from_bytes(v[:4], "big")
+
+
+def _first_ip(v):
+    """First IPv4 address in an option value (option 3 may list several)."""
+    if len(v) < 4:
+        raise ValueError("short address option")
+    return _ip4_str(v[:4])
+
+
+# Inbound option decoders: wire code -> (option name, value decoder) for
+# exactly the options _parse_reply acts on; everything else is skipped unread
+# (untrusted input, narrow surface).
+_OPT_DECODERS = {
+    1: ("subnet_mask", _first_ip),
+    3: ("router", _first_ip),
+    51: ("lease_time", _u32),
+    53: ("message-type", lambda v: v[0]),
+    54: ("server_id", _first_ip),
+    56: ("message", bytes),
+    58: ("renewal_time", _u32),
+    59: ("rebinding_time", _u32),
+}
+
+
+def _decode_dhcp_options(data):
+    """Bounds-checked TLV walk over the options field of an untrusted reply.
+    Unknown options are skipped without decoding; any truncation ends the walk
+    with what was parsed so far. Never raises on malformed input."""
+    out = []
+    i = 0
+    while i < len(data):
+        code = data[i]
+        if code == DHCP_OPT_PAD:
+            i += 1
+            continue
+        if code == DHCP_OPT_END:
+            break
+        if i + 2 > len(data):    # length byte missing
+            break
+        length = data[i + 1]
+        value = data[i + 2:i + 2 + length]
+        if len(value) < length:  # value truncated
+            break
+        known = _OPT_DECODERS.get(code)
+        if known:
+            try:
+                out.append((known[0], known[1](value)))
+            except (ValueError, IndexError):
+                pass             # malformed value inside a known option -> skip it
+        i += 2 + length
+    return out
+
+
+def _decode_arp(pkt):
+    """Raw ARP payload -> ArpFrame, or None unless it is a well-formed
+    Ethernet/IPv4 ARP."""
+    if len(pkt) < 28 or pkt[:6] != _ARP_ETH_IPV4:
+        return None
+    return ArpFrame(int.from_bytes(pkt[6:8], "big"), _ip4_str(pkt[14:18]), _ip4_str(pkt[24:28]))
+
+
+def _decode_ipv4_bootp(pkt):
+    """Raw IPv4 payload of an Ethernet frame -> BootpFrame, or None unless it
+    is an unfragmented UDP datagram carrying a plausible BOOTP message with
+    the DHCP cookie. Every bound is checked (untrusted WAN input)."""
+    if len(pkt) < 20 or pkt[0] >> 4 != 4:
+        return None
+    ihl = (pkt[0] & 0x0F) * 4
+    total = int.from_bytes(pkt[2:4], "big")
+    if ihl < 20 or total < ihl + 8 or len(pkt) < ihl + 8:
+        return None
+    if pkt[9] != IPPROTO_UDP:
+        return None
+    if int.from_bytes(pkt[6:8], "big") & 0x3FFF:   # MF set or a fragment continuation
+        return None
+    bootp = pkt[ihl + 8:min(total, len(pkt))]      # UDP payload, minus any link padding
+    if len(bootp) < BOOTP_HDR_LEN + 4 or bootp[BOOTP_HDR_LEN:BOOTP_HDR_LEN + 4] != DHCP_MAGIC:
+        return None
+    # The options walk only pays off for server replies; on a shared segment
+    # the filter also passes other clients' broadcast BOOTREQUESTs, which the
+    # keeper drops on op anyway -- skip their TLV walk in this hot path.
+    op = bootp[0]
+    return BootpFrame(op=op,
+                      xid=int.from_bytes(bootp[4:8], "big"),
+                      yiaddr=_ip4_str(bootp[16:20]),
+                      chaddr=bytes(bootp[28:44]),
+                      giaddr=_ip4_str(bootp[24:28]),
+                      options=_decode_dhcp_options(bootp[BOOTP_HDR_LEN + 4:]) if op == BOOTREPLY else [])
+
+
+# ---- /dev/bpf plumbing (bpf backend) ----
+# FreeBSD ioctl codes for the LP64 platforms OPNsense ships on (amd64/aarch64),
+# precomputed from net/bpf.h so no C headers are needed at runtime.
+BIOCGBLEN = 0x40044266       # _IOR('B', 102, u_int): kernel capture buffer size
+BIOCSETF = 0x80104267        # _IOW('B', 103, struct bpf_program): attach the filter
+BIOCPROMISC = 0x20004269     # _IO('B', 105): promiscuous mode
+BIOCSETIF = 0x8020426C       # _IOW('B', 108, struct ifreq): bind to the interface
+BIOCIMMEDIATE = 0x80044270   # _IOW('B', 112, u_int): deliver per packet, not per full buffer
+BIOCSHDRCMPLT = 0x80044275   # _IOW('B', 117, u_int): we supply the Ethernet source MAC
+BPF_ALIGNMENT = 8            # capture records align to sizeof(long)
+BPF_HDR_FIXED = 26           # bh_tstamp(16) + bh_caplen(4) + bh_datalen(4) + bh_hdrlen(2)
+
+# SNIFFER_FILTER compiled to classic-BPF opcodes, embedded so the daemon needs
+# no runtime filter compiler. MUST stay in lockstep with SNIFFER_FILTER;
+# regenerate on any FreeBSD/OPNsense host with:
+#   tcpdump -i <ethernet-iface> -dd '(udp and (port 67 or port 68)) or (arp and arp[6:2] = 2)'
+_BPF_FILTER = (
+    (0x28, 0, 0, 0x0000000C),
+    (0x15, 0, 10, 0x00000800),
+    (0x30, 0, 0, 0x00000017),
+    (0x15, 0, 21, 0x00000011),
+    (0x28, 0, 0, 0x00000014),
+    (0x45, 19, 0, 0x00001FFF),
+    (0xB1, 0, 0, 0x0000000E),
+    (0x48, 0, 0, 0x0000000E),
+    (0x15, 15, 0, 0x00000043),
+    (0x15, 14, 0, 0x00000044),
+    (0x48, 0, 0, 0x00000010),
+    (0x15, 12, 8, 0x00000043),
+    (0x15, 0, 8, 0x000086DD),
+    (0x30, 0, 0, 0x00000014),
+    (0x15, 0, 10, 0x00000011),
+    (0x28, 0, 0, 0x00000036),
+    (0x15, 7, 0, 0x00000043),
+    (0x15, 6, 0, 0x00000044),
+    (0x28, 0, 0, 0x00000038),
+    (0x15, 4, 0, 0x00000043),
+    (0x15, 3, 4, 0x00000044),
+    (0x15, 0, 3, 0x00000806),
+    (0x28, 0, 0, 0x00000014),
+    (0x15, 0, 1, 0x00000002),
+    (0x6, 0, 0, 0x00040000),
+    (0x6, 0, 0, 0x00000000),
+)
+
+
+def _bpf_frames(data):
+    """Walk a raw BPF read buffer, yielding each record's captured bytes.
+    Records are struct bpf_hdr framed and BPF_ALIGNMENT-padded; a malformed
+    record stops the walk rather than misparse the rest."""
+    i = 0
+    while i + BPF_HDR_FIXED <= len(data):
+        caplen, _datalen, hdrlen = struct.unpack_from("=IIH", data, i + 16)
+        if hdrlen < BPF_HDR_FIXED or i + hdrlen + caplen > len(data):
+            break
+        yield data[i + hdrlen:i + hdrlen + caplen]
+        i += (hdrlen + caplen + BPF_ALIGNMENT - 1) & ~(BPF_ALIGNMENT - 1)
+
+
+# ---- capture backends ----
+# Both backends expose the same surface: start/stop/alive for the capture
+# side (decoded BootpFrame/ArpFrame handed to the constructor callbacks on
+# the capture thread) and send_dhcp/send_arp_request for the send side.
+
+def _deliver(handler, frame):
+    """Run a keeper frame callback under its own guard: a failure in there is
+    a handler bug, not a parse error, and must neither kill the capture
+    thread nor be mislabelled as malformed input."""
+    if frame is None:
+        return
+    try:
+        handler(frame)
+    except Exception as e:
+        LOG.debug("frame handler error: %s", e)
+
+
+class ScapyCapture:
+    """Capture/send via scapy (AsyncSniffer + sendp): the default backend.
+    Decodes scapy packets into the same neutral frames as the bpf backend, so
+    the rest of the keeper never touches a packet object. Outbound option
+    lists are relayed to scapy verbatim, which is why the keeper's option
+    vocabulary must stay scapy-compatible."""
+
+    def __init__(self, iface, promisc, on_bootp, on_arp):
+        self.iface = iface
+        self.promisc = promisc
+        self._on_bootp = on_bootp
+        self._on_arp = on_arp
+        self._sniffer = None
+
+    def start(self):
+        """(Re)start the sniffer. False on failure (the caller retries)."""
+        try:
+            self.stop()
+            # Non-promiscuous by default: the BOOTP broadcast flag makes the
+            # server broadcast OFFER/ACK, and the gateway's unicast ARP reply to a
+            # nudge reaches us because the CARP master already accepts the VIP's
+            # virtual MAC. promisc is the opt-in fallback for NICs that
+            # drop non-primary unicast (widens capture -- warned at startup).
+            self._sniffer = AsyncSniffer(
+                iface=self.iface, filter=SNIFFER_FILTER,
+                prn=self._on_packet, store=0, promisc=self.promisc)
+            self._sniffer.start()
+            return True
+        except Exception as e:
+            LOG.error("DHCP-reply sniffer start failed: %s", e)
+            return False
+
+    def stop(self):
+        """Best-effort capture stop (scapy may raise if it never ran)."""
+        try:
+            if self._sniffer:
+                self._sniffer.stop()
+        except Exception:
+            pass
+
+    def alive(self):
+        """True while the sniffer thread is running."""
+        thread = getattr(self._sniffer, "thread", None)
+        return thread is not None and thread.is_alive()
+
+    def _on_packet(self, p):
+        """Sniffer callback: scapy packet -> neutral frame -> keeper callback
+        (via _deliver, so a handler failure is labelled as such). A parse
+        error in the untrusted input is dropped (debug-logged)."""
+        frame = handler = None
+        try:
+            if p.haslayer(BOOTP) and p.haslayer(DHCP):
+                b = p[BOOTP]
+                try:
+                    chaddr = bytes(getattr(b, "chaddr", b"") or b"")
+                except (TypeError, ValueError):
+                    chaddr = b""
+                frame = BootpFrame(b.op, b.xid, b.yiaddr, chaddr,
+                                   getattr(b, "giaddr", None), p[DHCP].options)
+                handler = self._on_bootp
+            elif p.haslayer(ARP):
+                arp = p[ARP]
+                frame, handler = ArpFrame(arp.op, arp.psrc, arp.pdst), self._on_arp
+        except Exception as e:
+            LOG.debug("sniffed packet parse error: %s", e)
+            return
+        _deliver(handler, frame)
+
+    # The DHCP wire tuple: one parameter per field that goes on the wire.
+    def send_dhcp(self, *, eth_src, ip_src, ip_dst, chaddr,  # pylint: disable=too-many-arguments
+                  xid, ciaddr, flags, options):
+        """Broadcast one DHCP client message as scapy layers."""
+        sendp(Ether(src=eth_src, dst=ETHER_BROADCAST) /
+              IP(src=ip_src, dst=ip_dst) /
+              UDP(sport=DHCP_CLIENT_PORT, dport=DHCP_SERVER_PORT) /
+              BOOTP(chaddr=chaddr, xid=xid, ciaddr=ciaddr, flags=flags) /
+              DHCP(options=options),
+              iface=self.iface, verbose=0)
+
+    def send_arp_request(self, hwsrc, psrc, pdst):
+        """Broadcast an ARP who-has pdst tell psrc from hwsrc."""
+        sendp(Ether(src=hwsrc, dst=ETHER_BROADCAST) /
+              ARP(op=1, hwsrc=hwsrc, psrc=psrc,
+                  hwdst=ETHER_ZERO, pdst=pdst),
+              iface=self.iface, verbose=0)
+
+
+class BpfCapture:  # pylint: disable=too-many-instance-attributes
+    """Capture/send on a raw /dev/bpf descriptor -- no packet library. A
+    reader thread walks the BPF buffer and hands decoded neutral frames to
+    the same callbacks the scapy backend feeds. FreeBSD-only (OPNsense's
+    platform); selected with --capture-backend bpf (experimental)."""
+
+    def __init__(self, iface, promisc, on_bootp, on_arp):
+        self.iface = iface
+        self.promisc = promisc
+        self._on_bootp = on_bootp
+        self._on_arp = on_arp
+        self._fd = None
+        self._buflen = 0               # set from BIOCGBLEN in _configure
+        self._thread = None
+        self._closing = False
+
+    def start(self):
+        """(Re)open /dev/bpf bound + filtered to the interface and start the
+        reader thread. False on any failure (the caller retries)."""
+        if fcntl is None:
+            LOG.error("bpf backend unavailable: no fcntl module on this platform")
+            return False
+        try:
+            self.stop()
+            self._closing = False
+            fd = os.open("/dev/bpf", os.O_RDWR)
+            try:
+                self._configure(fd)
+            except Exception:
+                os.close(fd)
+                raise
+            self._fd = fd
+            self._thread = threading.Thread(target=self._read_loop, args=(fd,),
+                                            name="bpf-capture", daemon=True)
+            self._thread.start()
+            return True
+        except Exception as e:
+            LOG.error("bpf capture start failed on %s: %s", self.iface, e)
+            return False
+
+    def _configure(self, fd):
+        """Bind, tune and filter a fresh bpf descriptor."""
+        fcntl.ioctl(fd, BIOCSETIF, struct.pack("16s16x", self.iface.encode()))
+        # Immediate mode: hand packets over as they arrive; the DHCP exchanges
+        # wait on second-scale timeouts, so buffering a full block is not an option.
+        fcntl.ioctl(fd, BIOCIMMEDIATE, struct.pack("I", 1))
+        # Header-complete: our frames carry the CARP vMAC as the Ethernet
+        # source; without this the kernel would overwrite it with the NIC MAC.
+        fcntl.ioctl(fd, BIOCSHDRCMPLT, struct.pack("I", 1))
+        if self.promisc:
+            fcntl.ioctl(fd, BIOCPROMISC)
+        insns = b"".join(struct.pack("HBBI", *insn) for insn in _BPF_FILTER)
+        buf = ctypes.create_string_buffer(insns)   # the kernel copies it during the ioctl
+        # struct bpf_program: u_int bf_len + insn pointer ("@IQ" pads to native layout)
+        fcntl.ioctl(fd, BIOCSETF, struct.pack("@IQ", len(_BPF_FILTER), ctypes.addressof(buf)))
+        # bpf read(2) calls must request exactly the kernel buffer size.
+        self._buflen = struct.unpack("I", fcntl.ioctl(fd, BIOCGBLEN, b"\x00" * 4))[0]
+
+    def stop(self):
+        """Close the descriptor (the kernel detaches filter/promisc) and
+        collect the reader thread; the closing flag stops its select loop."""
+        self._closing = True
+        fd, self._fd = self._fd, None
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        thread, self._thread = self._thread, None
+        if thread and thread.is_alive():
+            thread.join(timeout=2)
+
+    def alive(self):
+        """True while the descriptor is open and the reader thread runs."""
+        return bool(self._fd is not None and self._thread and self._thread.is_alive())
+
+    def _read_loop(self, fd):
+        """Reader thread: select with a timeout so stop() (which closes the
+        fd) is noticed within a second, then walk the BPF buffer records."""
+        while not self._closing:
+            try:
+                ready, _, _ = select.select([fd], [], [], 1.0)
+                if not ready:
+                    continue
+                data = os.read(fd, self._buflen)
+            except (OSError, ValueError):
+                if not self._closing:
+                    LOG.warning("bpf read failed -- capture thread exiting")
+                return
+            for frame in _bpf_frames(data):
+                self._dispatch(frame)
+
+    def _dispatch(self, frame):
+        """Decode one captured Ethernet frame and route it by ethertype to the
+        keeper callback (via _deliver, so a handler failure is labelled as
+        such). A parse error in the untrusted input is dropped (debug-logged)."""
+        decoded = handler = None
+        try:
+            if len(frame) >= 14:
+                ethertype = int.from_bytes(frame[12:14], "big")
+                if ethertype == ETHERTYPE_ARP:
+                    decoded, handler = _decode_arp(frame[14:]), self._on_arp
+                elif ethertype == ETHERTYPE_IPV4:
+                    decoded, handler = _decode_ipv4_bootp(frame[14:]), self._on_bootp
+        except Exception as e:
+            LOG.debug("bpf frame parse error: %s", e)
+            return
+        _deliver(handler, decoded)
+
+    def _write(self, frame):
+        """Inject one raw Ethernet frame on the interface."""
+        fd = self._fd
+        if fd is None:
+            raise OSError("bpf capture not started")
+        os.write(fd, frame)
+
+    # The DHCP wire tuple: one parameter per field that goes on the wire.
+    def send_dhcp(self, *, eth_src, ip_src, ip_dst, chaddr,  # pylint: disable=too-many-arguments
+                  xid, ciaddr, flags, options):
+        """Broadcast one DHCP client message as raw encoded frames."""
+        payload = _encode_bootp_request(chaddr, xid, ciaddr, flags, options)
+        dgram = _encode_ipv4_udp(ip_src, ip_dst, DHCP_CLIENT_PORT, DHCP_SERVER_PORT, payload)
+        self._write(_encode_ether(ETHER_BROADCAST, eth_src, ETHERTYPE_IPV4, dgram))
+
+    def send_arp_request(self, hwsrc, psrc, pdst):
+        """Broadcast an ARP who-has pdst tell psrc from hwsrc."""
+        frame = _encode_ether(ETHER_BROADCAST, hwsrc, ETHERTYPE_ARP,
+                              _encode_arp_request(hwsrc, psrc, pdst))
+        self._write(frame.ljust(ETHER_MIN_FRAME, b"\x00"))   # runt guard: ARP is 42 bytes bare
+
+
+# The capture-backend registry: flag value -> implementation. The argparse
+# choices and Keeper's lookup both read this, so a future backend is added in
+# exactly one place (plus its rc.conf documentation).
+CAPTURE_BACKENDS = {"scapy": ScapyCapture, "bpf": BpfCapture}
 
 
 def _sane_ipv4(ip):
@@ -334,16 +879,17 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
     """RFC 2131 client for one chaddr: owns the held binding (a Lease)
     and the stateful protocol sequences
     (INIT-REBOOT / DORA / RENEW / REBIND / RELEASE) with their send/await
-    machinery. It does NOT own the packet capture: the sniffer owner hands
-    xid-matched replies to feed(). Policy stays with the caller through three
+    machinery. It does NOT own the packet capture: sends travel through the
+    injected capture backend, and the capture owner hands xid-matched replies
+    to feed(). Policy stays with the caller through three
     injected hooks: should_stop (abort mid-sequence), ensure_sniffer (capture
     must be alive before a send), and on_changed_address(got, rx, phase,
     release_on_enforce) -> bool for an ACK whose address differs from the
     expected one (True = the caller validated and adopted it, see adopt())."""
 
-    def __init__(self, iface, chaddr, eth_src, id_opts, *,  # pylint: disable=too-many-arguments
+    def __init__(self, capture, chaddr, eth_src, id_opts, *,  # pylint: disable=too-many-arguments
                  should_stop, ensure_sniffer, on_changed_address):
-        self.iface = iface
+        self._capture = capture
         self.chaddr = chaddr
         self.chraw = mac2raw(chaddr)
         self.eth_src = eth_src
@@ -372,12 +918,10 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
     def _send_dhcp(self, mtype, extra, ciaddr="0.0.0.0"):
         # ciaddr is set for RENEW/REBIND (the client already owns the address);
         # the broadcast flag stays on so the reply is reliably captured by the sniffer.
-        pkt = (Ether(src=self.eth_src, dst=ETHER_BROADCAST) /
-               IP(src=ciaddr, dst=IPV4_BROADCAST) /
-               UDP(sport=DHCP_CLIENT_PORT, dport=DHCP_SERVER_PORT) /
-               BOOTP(chaddr=self.chraw, xid=self.xid, ciaddr=ciaddr, flags=BROADCAST_FLAG) /
-               DHCP(options=_dhcp_options(mtype, extra, self._id_opts)))
-        sendp(pkt, iface=self.iface, verbose=0)
+        self._capture.send_dhcp(
+            eth_src=self.eth_src, ip_src=ciaddr, ip_dst=IPV4_BROADCAST,
+            chaddr=self.chraw, xid=self.xid, ciaddr=ciaddr, flags=BROADCAST_FLAG,
+            options=_dhcp_options(mtype, extra, self._id_opts))
 
     def _wait_for_dhcp_reply(self, want, timeout):
         """Wait up to timeout for a reply of message-type `want`. Returns the
@@ -616,13 +1160,11 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
             return
 
         try:
-            pkt = (Ether(src=self.eth_src, dst=ETHER_BROADCAST) /
-                   IP(src=yiaddr, dst=server or IPV4_BROADCAST) /
-                   UDP(sport=DHCP_CLIENT_PORT, dport=DHCP_SERVER_PORT) /
-                   BOOTP(chaddr=self.chraw, xid=self.xid, ciaddr=yiaddr) /
-                   DHCP(options=[("message-type", "release"),
-                                 ("server_id", server), "end"]))
-            sendp(pkt, iface=self.iface, verbose=0)
+            # No broadcast flag: RELEASE expects no reply to capture.
+            self._capture.send_dhcp(
+                eth_src=self.eth_src, ip_src=yiaddr, ip_dst=server or IPV4_BROADCAST,
+                chaddr=self.chraw, xid=self.xid, ciaddr=yiaddr, flags=0,
+                options=[("message-type", "release"), ("server_id", server), "end"])
             LOG.info("DHCP RELEASE of lease %s sent (server %s)", yiaddr, server or "broadcast")
         except Exception as e:
             LOG.error("RELEASE failed: %s", e)
@@ -655,8 +1197,8 @@ class ArpNudge:  # pylint: disable=too-many-instance-attributes
     nudge from a backup (it would steal the VIP's traffic), so anything but a
     confirmed MASTER fails closed (the next interval retries)."""
 
-    def __init__(self, iface, chaddr, interval, is_master):
-        self.iface = iface
+    def __init__(self, capture, chaddr, interval, is_master):
+        self._capture = capture
         self.chaddr = chaddr
         # Interval floor so a typo cannot flood the segment; 0 = disabled.
         self.interval = max(ARP_NUDGE_MIN, interval) if interval else 0
@@ -700,10 +1242,7 @@ class ArpNudge:  # pylint: disable=too-many-instance-attributes
             #   * sending it at all exists for gateways that never re-ARP an
             #     expired entry ("secured ARP") and would otherwise blackhole the
             #     VIP. Only the CARP master sends it (gated above).
-            sendp(Ether(src=self.chaddr, dst=ETHER_BROADCAST) /
-                  ARP(op=1, hwsrc=self.chaddr, psrc=yiaddr,
-                      hwdst="00:00:00:00:00:00", pdst=gateway),
-                  iface=self.iface, verbose=0)
+            self._capture.send_arp_request(self.chaddr, yiaddr, gateway)
             self.last_nudge = time.time()
             # Log the first nudge (and any target change) at INFO so the default log
             # shows the nudge is active; routine repeats at DEBUG (they fire oftener
@@ -718,24 +1257,20 @@ class ArpNudge:  # pylint: disable=too-many-instance-attributes
         except Exception as e:
             LOG.warning("ARP nudge failed (target %s): %s", gateway, e)
 
-    def on_arp_reply(self, p, yiaddr, gateway):
+    def on_arp_reply(self, frame, yiaddr, gateway):
         """Stamp last_reply when the gateway answers our nudge -- a reachability
         signal the status page surfaces by age. Only the reply to OUR who-has
         counts: op=2 (is-at), sender = the nudge target gateway, target = our
-        leased IP. Runs on the sniffer thread; the stamp is a lone atomic write.
+        leased IP. Runs on the capture thread; the stamp is a lone atomic write.
         Advisory only (an on-segment attacker could forge or withhold it);
         nothing here feeds lease/CARP/follow decisions."""
-        try:
-            arp = p[ARP]
-            if arp.op != 2:                     # 2 = is-at (reply); requests are filtered out in BPF
-                return
-            if not gateway or not yiaddr:
-                return
-            if arp.psrc == gateway and arp.pdst == yiaddr:
-                self.last_reply = time.time()
-                LOG.debug("ARP reply from %s (is-at) for %s", gateway, yiaddr)
-        except Exception as e:
-            LOG.debug("ARP reply parse error: %s", e)
+        if frame.op != 2:                       # 2 = is-at (reply); requests are filtered out in BPF
+            return
+        if not gateway or not yiaddr:
+            return
+        if frame.psrc == gateway and frame.pdst == yiaddr:
+            self.last_reply = time.time()
+            LOG.debug("ARP reply from %s (is-at) for %s", gateway, yiaddr)
 
 
 class FollowPolicy:  # pylint: disable=too-many-instance-attributes
@@ -921,7 +1456,7 @@ class FollowPolicy:  # pylint: disable=too-many-instance-attributes
 
 
 class Keeper:  # pylint: disable=too-many-instance-attributes
-    """Orchestration around the components: owns the packet sniffer (feeding
+    """Orchestration around the components: owns the capture backend (feeding
     DHCP replies to DhcpClient, ARP replies to ArpNudge and peer-ACK
     observations to FollowPolicy), the heartbeat, the CARP role watch, the
     acquire pacing (backoff + link-return fast path) and the signal-driven
@@ -931,7 +1466,7 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
     def __init__(self, iface, chaddr, request_ip=None, eth_src=None, *,  # pylint: disable=too-many-arguments
                  hbfile=None, release_on_exit=False, vhid=None,
                  follow=False, vendor_class=None, client_id=None, hostname=None,
-                 arp_nudge=0, arp_listen_promisc=False):
+                 arp_nudge=0, arp_listen_promisc=False, capture_backend="scapy"):
         self.iface = iface
         self.chaddr = chaddr.lower()
         self.eth_src = (eth_src or chaddr).lower()
@@ -939,38 +1474,30 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         self.release_on_exit = release_on_exit
         self.vhid = str(vhid) if vhid else None
 
+        # Capture backend component: owns the capture socket/thread and the
+        # wire codec on both directions, and hands decoded neutral frames
+        # back (DHCP replies and ARP replies, routed below). Promiscuous
+        # capture is off by default; the rationale lives in the module
+        # docstring's security section.
+        self._capture = CAPTURE_BACKENDS[capture_backend](
+            iface, arp_listen_promisc, self._on_dhcp_reply, self._on_arp_reply)
+
         # ARP nudge component: owns the pacing and reachability state; the
         # keeper supplies the lease binding per nudge (_arp_nudge) and the
         # CARP-role probe (via the _carp_master_probe shim).
-        self._nudge = ArpNudge(iface, self.chaddr, arp_nudge, self._carp_master_probe)
+        self._nudge = ArpNudge(self._capture, self.chaddr, arp_nudge, self._carp_master_probe)
 
-        # Promiscuous ARP capture: off by default (the CARP master already
-        # accepts the VIP MAC, so the unicast reply reaches a normal socket).
-        # Opt-in fallback for NICs that drop non-primary unicast MACs.
-        self.arp_listen_promisc = arp_listen_promisc
         self._was_master = None        # CARP role at the last nudge check (None = unknown yet)
         self._nudge_now = False        # operator asked for an immediate nudge (SIGUSR1)
         self._poll_role_now = False    # a CARP transition fired -> re-check role now (SIGUSR2)
         self._renew_asap = False       # renew at the next _hold_lease tick instead of waiting for T1
 
-        # Optional DHCP request options (empty -> not sent); built once and added to
-        # every DISCOVER/REQUEST/RENEW so the server sees a consistent client identity.
-        # ISP interplay: satisfies servers that only lease to a known vendor-class
-        # (opt 60), client-id (61) or hostname (12) -- the "client identity checks"
-        # row of the README's ISP-security section.
-        id_opts = []
-        if vendor_class:
-            id_opts.append(("vendor_class_id", vendor_class))
-        if client_id:
-            id_opts.append(("client_id", client_id.encode()))
-        if hostname:
-            id_opts.append(("hostname", hostname))
-
         # DHCP client component: owns the lease state and the protocol sequences;
-        # the keeper owns the sniffer (feeding it xid-matched replies) and the
+        # the keeper owns the capture (feeding it xid-matched replies) and the
         # policy hooks.
         self._dhcp = DhcpClient(
-            iface, self.chaddr, self.eth_src, id_opts,
+            self._capture, self.chaddr, self.eth_src,
+            _identity_options(vendor_class, client_id, hostname),
             should_stop=lambda: self._stop,
             ensure_sniffer=self._ensure_sniffer,
             on_changed_address=self._on_changed_address)
@@ -992,100 +1519,57 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         # return before the 1s tick when there is pending work. Currently the
         # sniffer sets it on an observed address change so the follow fires in
         # milliseconds; a future fast-wake need should reuse this rather than mint
-        # a second event. Set only by the sniffer thread; waited/cleared only by
+        # a second event. Set only by the capture thread; waited/cleared only by
         # the main thread.
         self._wake = threading.Event()
-        self._sniffer = None
 
-    # ---- sniffer (resilient) ----
-    def _stop_sniffer(self):
-        """Best-effort capture stop (scapy may raise if it never ran)."""
-        try:
-            if self._sniffer:
-                self._sniffer.stop()
-        except Exception:
-            pass
-
-    def _start_sniffer(self):
-        try:
-            self._stop_sniffer()
-            # Non-promiscuous by default: the BOOTP broadcast flag makes the
-            # server broadcast OFFER/ACK, and the gateway's unicast ARP reply to a
-            # nudge reaches us because the CARP master already accepts the VIP's
-            # virtual MAC. arp_listen_promisc is the opt-in fallback for NICs that
-            # drop non-primary unicast (widens capture -- warned at startup).
-            self._sniffer = AsyncSniffer(
-                iface=self.iface, filter=SNIFFER_FILTER,
-                prn=self._on_sniff, store=0, promisc=self.arp_listen_promisc)
-            self._sniffer.start()
-            return True
-        except Exception as e:
-            LOG.error("DHCP-reply sniffer start failed: %s", e)
-            return False
-
-    def _sniffer_alive(self):
-        t = getattr(self._sniffer, "thread", None)
-        return bool(self._sniffer and t is not None and t.is_alive())
-
+    # ---- capture (resilient) ----
     def _ensure_sniffer(self):
-        if not self._sniffer_alive():
-            LOG.warning("DHCP-reply sniffer down -- (re)starting")
-            self._start_sniffer()
+        if not self._capture.alive():
+            LOG.warning("DHCP-reply capture down -- (re)starting")
+            self._capture.start()
             time.sleep(1)
 
-    def _on_sniff(self, p):
-        # One sniffer feeds two parsers; keep the DHCP and ARP concerns separate.
-        # The BPF filter already narrowed traffic to DHCP + ARP replies, so this
-        # only routes by layer -- each handler does its own validation/guarding.
-        if p.haslayer(BOOTP):
-            self._on_dhcp_reply(p)
-        elif p.haslayer(ARP):
-            # Gateway answering our nudge (reachability stamp).
-            self._nudge.on_arp_reply(p, self._dhcp.binding.yiaddr, self._nudge_target())
+    def _on_arp_reply(self, frame):
+        """Capture-backend ARP callback: the gateway answering our nudge
+        (reachability stamp); the nudge component does the matching."""
+        self._nudge.on_arp_reply(frame, self._dhcp.binding.yiaddr, self._nudge_target())
 
-    def _chaddr_matches(self, b):
+    def _chaddr_matches(self, frame):
         """True if the reply's BOOTP client hardware address is our chaddr (the
         CARP virtual MAC). Used to accept the PEER's ACK on the shared chaddr:
         the peer node runs an identical keeper on the very same chaddr."""
-        try:
-            raw = bytes(getattr(b, "chaddr", b"") or b"")
-        except (TypeError, ValueError):
-            return False
-        return raw[:6] == self._dhcp.chraw
+        return frame.chaddr[:6] == self._dhcp.chraw
 
-    def _on_dhcp_reply(self, p):
-        try:
-            if not (p.haslayer(BOOTP) and p.haslayer(DHCP)):
-                return
-            b = p[BOOTP]
-            if b.op != BOOTREPLY:
-                return
-            # First-party path: a reply to OUR in-flight exchange (random xid,
-            # regenerated per DORA). Parsed and fed to the waiting client sequence.
-            if b.xid == self._dhcp.xid:
-                self._dhcp.feed(_parse_reply(p, b.yiaddr))
-                return
-            # Not our xid. In follow mode, still watch for the PEER's ACK: both HA
-            # nodes run an identical keeper on the SAME chaddr (the CARP virtual
-            # MAC), so the peer's ACK reveals a changed ISP address one exchange
-            # sooner than our own renewal timer -- closing the window where the
-            # two nodes hold different VIP prefixes long enough for CARP to
-            # dual-master (see docs/single-ip-wan-carp.md, section 3). This is a
-            # deliberately narrow relaxation of the xid trust gate: it requires
-            # our chaddr and an ACK for a plausible, different address, and it
-            # only RECORDS the observation (one atomic ref write) for the main
-            # thread -- which routes it through the same follow hardening
-            # (sane / same-class / expected-server / throttle) as a first-party
-            # ACK and never acts on the sniffer thread.
-            if not self._follow.follow or not self._dhcp.binding.yiaddr or not self._chaddr_matches(b):
-                return
-            rx = _parse_reply(p, b.yiaddr)
-            if (rx.mtype == ACK and rx.yiaddr and rx.yiaddr != self._dhcp.binding.yiaddr
-                    and _sane_ipv4(rx.yiaddr)):
-                self._follow.observe(rx)
-                self._wake.set()   # wake the maintain-loop sleep now, don't wait for the tick
-        except Exception as e:
-            LOG.debug("DHCP reply parse error: %s", e)
+    def _on_dhcp_reply(self, frame):
+        # Runs on the capture thread under the backend's handler guard
+        # (_deliver), so an unexpected failure here is logged and dropped there.
+        if frame.op != BOOTREPLY:
+            return
+        # First-party path: a reply to OUR in-flight exchange (random xid,
+        # regenerated per DORA). Parsed and fed to the waiting client sequence.
+        if frame.xid == self._dhcp.xid:
+            self._dhcp.feed(_parse_reply(frame))
+            return
+        # Not our xid. In follow mode, still watch for the PEER's ACK: both HA
+        # nodes run an identical keeper on the SAME chaddr (the CARP virtual
+        # MAC), so the peer's ACK reveals a changed ISP address one exchange
+        # sooner than our own renewal timer -- closing the window where the
+        # two nodes hold different VIP prefixes long enough for CARP to
+        # dual-master (see docs/single-ip-wan-carp.md, section 3). This is a
+        # deliberately narrow relaxation of the xid trust gate: it requires
+        # our chaddr and an ACK for a plausible, different address, and it
+        # only RECORDS the observation (one atomic ref write) for the main
+        # thread -- which routes it through the same follow hardening
+        # (sane / same-class / expected-server / throttle) as a first-party
+        # ACK and never acts on the capture thread.
+        if not self._follow.follow or not self._dhcp.binding.yiaddr or not self._chaddr_matches(frame):
+            return
+        rx = _parse_reply(frame)
+        if (rx.mtype == ACK and rx.yiaddr and rx.yiaddr != self._dhcp.binding.yiaddr
+                and _sane_ipv4(rx.yiaddr)):
+            self._follow.observe(rx)
+            self._wake.set()   # wake the maintain-loop sleep now, don't wait for the tick
 
     # ---- heartbeat / status file ----
 
@@ -1310,12 +1794,12 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         return not self._stop
 
     def run(self):
-        """The daemon main loop: sniffer up, then maintain the lease until
+        """The daemon main loop: capture up, then maintain the lease until
         stopped. Never raises; returns the process exit code."""
-        # Start the packet sniffer, retrying forever: a keeper must self-heal, not
+        # Start the packet capture, retrying forever: a keeper must self-heal, not
         # die, if the interface is briefly unavailable at startup.
-        while not self._stop and not self._start_sniffer():
-            LOG.warning("sniffer start failed -- retrying in %ds", SNIFFER_RETRY)
+        while not self._stop and not self._capture.start():
+            LOG.warning("capture start failed -- retrying in %ds", SNIFFER_RETRY)
             self._sleep(SNIFFER_RETRY)
 
         # eth-src matters for L2 debugging but only when it differs from the chaddr.
@@ -1341,7 +1825,7 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         # shutdown
         if self.release_on_exit:
             self._dhcp.release()
-        self._stop_sniffer()
+        self._capture.stop()
         LOG.info("stopped")
         return 0
 
@@ -1445,6 +1929,22 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
                 self.redora_wait = min(self.redora_wait * 2, REDORA_MAX)
 
 
+def _identity_options(vendor_class, client_id, hostname):
+    """Optional DHCP identity options (empty -> not sent), added to every
+    DISCOVER/REQUEST/RENEW so the server sees a consistent client identity.
+    ISP interplay: satisfies servers that only lease to a known vendor-class
+    (opt 60), client-id (61) or hostname (12) -- the "client identity checks"
+    row of the README's ISP-security section."""
+    id_opts = []
+    if vendor_class:
+        id_opts.append(("vendor_class_id", vendor_class))
+    if client_id:
+        id_opts.append(("client_id", client_id.encode()))
+    if hostname:
+        id_opts.append(("hostname", hostname))
+    return id_opts
+
+
 def acquire_pidfile(path):
     """Single-instance guard: atomically claim the pidfile, replacing a stale
     one; exits the process if another live instance holds it."""
@@ -1498,6 +1998,9 @@ def _build_arg_parser():
                     help="put the capture socket in promiscuous mode so the gateway's "
                          "unicast ARP reply is seen on NICs that filter non-primary "
                          "unicast MACs (default off; only needed if replies aren't seen)")
+    ap.add_argument("--capture-backend", choices=sorted(CAPTURE_BACKENDS), default="scapy",
+                    help="packet capture/send backend: scapy (default), or bpf -- a raw "
+                         "/dev/bpf backend with no packet-library dependency (experimental)")
     ap.add_argument("--once", action="store_true")
     ap.add_argument("--release-on-exit", action="store_true")
     return ap
@@ -1522,14 +2025,14 @@ def _setup_logging(logfile):
 # pylint: disable=protected-access
 def _claim_once(k):
     """--once mode: claim, report, release -- a wiring test, not service mode."""
-    if not k._start_sniffer():
+    if not k._capture.start():
         return 3
     time.sleep(SNIFFER_WARMUP)
     ok = k._dhcp.dora(k._follow.target)
     LOG.info("DHCP claim %s -> %s", k.chaddr, k._dhcp.binding.yiaddr if ok else "FAIL")
     if ok:
         k._dhcp.release()
-    k._stop_sniffer()
+    k._capture.stop()
     return 0 if ok else 1
 # pylint: enable=protected-access
 
@@ -1539,11 +2042,12 @@ def main():
     a = _build_arg_parser().parse_args()
     _setup_logging(a.logfile)
 
-    if _SCAPY_IMPORT_ERROR is not None:
+    if a.capture_backend == "scapy" and _SCAPY_IMPORT_ERROR is not None:
         LOG.critical("cannot import scapy -- the lease keeper cannot run: %s. "
                      "Install the matching py3<minor>-scapy package (see the plugin "
                      "docs) and restart the service.", _SCAPY_IMPORT_ERROR)
         return 3
+    LOG.info("capture backend: %s", a.capture_backend)
 
     for label, mac in (("chaddr", a.chaddr), ("eth-src", a.eth_src)):
         if mac and not MAC_RE.match(mac):
@@ -1554,7 +2058,8 @@ def main():
                hbfile=a.hbfile, release_on_exit=a.release_on_exit or a.once,
                vhid=a.vhid, follow=a.follow,
                vendor_class=a.vendor_class, client_id=a.client_id, hostname=a.hostname,
-               arp_nudge=a.arp_nudge, arp_listen_promisc=a.arp_listen_promisc)
+               arp_nudge=a.arp_nudge, arp_listen_promisc=a.arp_listen_promisc,
+               capture_backend=a.capture_backend)
 
     if a.arp_listen_promisc:
         LOG.warning("ARP listen: PROMISCUOUS capture enabled on %s -- the daemon now "

@@ -67,6 +67,10 @@ carpvipdhcp_start()
         [ -n "${arpnudge}" ] && set -- "$@" --arp-nudge "${arpnudge}"
         # Promiscuous ARP capture is an opt-in fallback (default off).
         [ "${arplistenpromisc}" = "1" ] && set -- "$@" --arp-listen-promisc
+        # Experimental capture-backend override (host-wide dark flag): set
+        # carpvipdhcp_backend=bpf in rc.conf (sysrc carpvipdhcp_backend=bpf)
+        # to run the keepers on the raw /dev/bpf backend instead of scapy.
+        [ -n "${carpvipdhcp_backend}" ] && set -- "$@" --capture-backend "${carpvipdhcp_backend}"
         # -f detach; -r supervise/restart on crash; -R 5 restart delay; -P supervisor pidfile.
         /usr/sbin/daemon -f -r -R 5 -P "${pidfile}" -t "${name}-${id}" "${keeper}" "$@"
         count=$((count + 1))
@@ -187,6 +191,7 @@ carpvipdhcp_status()
 
 load_rc_config "${name}"
 : "${carpvipdhcp_enable:=YES}"
+: "${carpvipdhcp_backend:=}"
 # Optional 2nd arg = a single keeper id to act on (start/stop/restart just that
 # one, e.g. the Services overview per-row buttons and follow_update's re-bounce).
 # Empty = act on all keepers, exactly as before -- this is what boot (syshook)

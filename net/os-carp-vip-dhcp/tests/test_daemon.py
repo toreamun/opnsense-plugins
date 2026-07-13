@@ -7,8 +7,11 @@ import os
 import re
 import time
 import types
+from typing import Any
 
 import pytest
+
+from conftest import CHADDR, CHADDR_STR
 
 
 def test_sane_ipv4(lk):
@@ -33,8 +36,8 @@ def test_fs_safe(lk):
 
 def _client(lk, id_opts=None, on_changed=None):
     """A bare DhcpClient with stub hooks and a captured send list -- the
-    protocol tests need no Keeper."""
-    c = lk.DhcpClient("eth0", "00:00:5e:00:01:fe", "00:00:5e:00:01:fe", id_opts or [],
+    protocol tests need no Keeper and no capture backend."""
+    c = lk.DhcpClient(None, CHADDR_STR, CHADDR_STR, id_opts or [],
                       should_stop=lambda: False,
                       ensure_sniffer=lambda: None,
                       on_changed_address=on_changed or (lambda *a: False))
@@ -154,7 +157,7 @@ def test_fmt_reply_readable(lk):
 def _keeper(lk, **kw):
     """A Keeper on the canonical test identity (iface/vMAC/VIP), hbfile off."""
     kw.setdefault("hbfile", None)
-    return lk.Keeper("eth0", "00:00:5e:00:01:fe", "100.64.4.7", **kw)
+    return lk.Keeper("eth0", CHADDR_STR, "100.64.4.7", **kw)
 
 
 def _link_keeper(lk):
@@ -287,44 +290,34 @@ def _ack(lk, yiaddr, server="100.64.4.1"):
     return lk.DhcpReply(5, yiaddr, server, 1800, None, None, None)
 
 
-class _DhcpPkt:
-    """Minimal stand-in for a scapy DHCP reply: p[BOOTP].xid/op/yiaddr and
-    p[DHCP].options, with haslayer() so _on_dhcp_reply parses it."""
-    def __init__(self, lk, xid, options, *, yiaddr="100.64.4.7",  # pylint: disable=too-many-arguments
-                 chaddr=b"\x00\x00\x5e\x00\x01\xfe", op=None, giaddr="0.0.0.0"):
-        self._lk = lk
-        self._bootp = types.SimpleNamespace(xid=xid, op=(lk.BOOTREPLY if op is None else op),
-                                            yiaddr=yiaddr, chaddr=chaddr, giaddr=giaddr)
-        self._dhcp = types.SimpleNamespace(options=options)
-
-    def haslayer(self, layer):
-        return layer in (self._lk.BOOTP, self._lk.DHCP)
-
-    def __getitem__(self, layer):
-        return self._bootp if layer is self._lk.BOOTP else self._dhcp
+def _dhcp_frame(lk, xid, options, *, yiaddr="100.64.4.7",  # pylint: disable=too-many-arguments
+                chaddr=CHADDR, op=None, giaddr="0.0.0.0"):
+    """A backend-neutral BootpFrame as either capture backend would hand it
+    to the keeper."""
+    return lk.BootpFrame(lk.BOOTREPLY if op is None else op, xid, yiaddr, chaddr, giaddr, options)
 
 
 def test_parse_reply_extracts_fields_and_relay(lk):
     # The pure wire decoder pulls the acted-on options into a DhcpReply and maps
     # the relay giaddr (0.0.0.0 -> None when directly attached).
-    pkt = _DhcpPkt(lk, 0x1234, [("message-type", lk.ACK), ("server_id", "100.64.4.1"),
-                                ("lease_time", 1800), ("router", "100.64.4.1"),
-                                ("subnet_mask", "255.255.255.0"), "end"],
-                   yiaddr="100.64.4.7", giaddr="100.64.4.9")
-    rx = lk._parse_reply(pkt, "100.64.4.7")
+    frame = _dhcp_frame(lk, 0x1234, [("message-type", lk.ACK), ("server_id", "100.64.4.1"),
+                                     ("lease_time", 1800), ("router", "100.64.4.1"),
+                                     ("subnet_mask", "255.255.255.0"), "end"],
+                        yiaddr="100.64.4.7", giaddr="100.64.4.9")
+    rx = lk._parse_reply(frame)
     assert rx.mtype == lk.ACK and rx.yiaddr == "100.64.4.7"
     assert rx.server_id == "100.64.4.1" and rx.lease == 1800
     assert rx.router == "100.64.4.1" and rx.subnet_mask == "255.255.255.0"
     assert rx.giaddr == "100.64.4.9"           # relay in path
-    directly_attached = _DhcpPkt(lk, 0x1234, [("message-type", lk.ACK), "end"], giaddr="0.0.0.0")
-    assert lk._parse_reply(directly_attached, "100.64.4.7").giaddr is None
+    directly_attached = _dhcp_frame(lk, 0x1234, [("message-type", lk.ACK), "end"], giaddr="0.0.0.0")
+    assert lk._parse_reply(directly_attached).giaddr is None
 
 
 def test_on_dhcp_reply_captures_option56_message(lk):
     keeper = _keeper(lk)
-    pkt = _DhcpPkt(lk, keeper._dhcp.xid, [("message-type", lk.NAK), ("server_id", "100.64.4.1"),
-                                          ("message", "pool exhausted"), "end"])
-    keeper._on_dhcp_reply(pkt)
+    frame = _dhcp_frame(lk, keeper._dhcp.xid, [("message-type", lk.NAK), ("server_id", "100.64.4.1"),
+                                               ("message", "pool exhausted"), "end"])
+    keeper._on_dhcp_reply(frame)
     assert keeper._dhcp._rx.message == "pool exhausted"
 
 
@@ -391,10 +384,10 @@ def _observe_keeper(lk, tmp_path):
 
 
 def _peer_ack(lk, yiaddr, xid=0x22222222, server="100.64.4.1",
-              chaddr=b"\x00\x00\x5e\x00\x01\xfe"):
+              chaddr=CHADDR):
     """A DHCP ACK on our shared chaddr but a DIFFERENT xid -- i.e. the peer's."""
-    return _DhcpPkt(lk, xid, [("message-type", lk.ACK), ("server_id", server),
-                              ("lease_time", 1800), "end"], yiaddr=yiaddr, chaddr=chaddr)
+    return _dhcp_frame(lk, xid, [("message-type", lk.ACK), ("server_id", server),
+                                 ("lease_time", 1800), "end"], yiaddr=yiaddr, chaddr=chaddr)
 
 
 def test_observed_peer_ack_records_change_and_wakes(lk, tmp_path):
@@ -422,9 +415,9 @@ def test_observed_ignores_wrong_chaddr(lk, tmp_path):
 
 def test_observed_ignores_non_ack(lk, tmp_path):
     keeper = _observe_keeper(lk, tmp_path)
-    keeper._on_dhcp_reply(_DhcpPkt(lk, 0x22222222,
-                                   [("message-type", lk.OFFER), ("server_id", "100.64.4.1"), "end"],
-                                   yiaddr="100.64.4.60"))
+    keeper._on_dhcp_reply(_dhcp_frame(lk, 0x22222222,
+                                      [("message-type", lk.OFFER), ("server_id", "100.64.4.1"), "end"],
+                                      yiaddr="100.64.4.60"))
     assert keeper._follow._observed is None
 
 
@@ -439,9 +432,9 @@ def test_observed_ignored_when_not_follow(lk):
 
 def test_own_xid_reply_uses_first_party_path(lk, tmp_path):
     keeper = _observe_keeper(lk, tmp_path)
-    keeper._on_dhcp_reply(_DhcpPkt(lk, keeper._dhcp.xid,
-                                   [("message-type", lk.ACK), ("server_id", "100.64.4.1"), "end"],
-                                   yiaddr="100.64.4.60"))
+    keeper._on_dhcp_reply(_dhcp_frame(lk, keeper._dhcp.xid,
+                                      [("message-type", lk.ACK), ("server_id", "100.64.4.1"), "end"],
+                                      yiaddr="100.64.4.60"))
     assert keeper._follow._observed is None   # not the observed path
     assert keeper._dhcp._rx is not None and keeper._dhcp._rx.yiaddr == "100.64.4.60"
 
@@ -518,13 +511,17 @@ def test_arp_nudge_component_direct(lk):
     # ArpNudge alone (no Keeper): interval floor at construction, the injected
     # master probe gates every send, and the reachability stamp starts at 0.
     role = {"master": True}
-    n = lk.ArpNudge("eth0", "00:00:5e:00:01:fe", 1, lambda: role["master"])
+    sent = []
+    capture = types.SimpleNamespace(send_arp_request=lambda *a: sent.append(a))
+    n = lk.ArpNudge(capture, CHADDR_STR, 1, lambda: role["master"])
     assert n.interval == lk.ARP_NUDGE_MIN     # floored: a typo cannot flood the segment
     assert n.last_reply == 0.0
 
     n.maybe_nudge("100.64.4.7", "100.64.4.1")
     first = n.last_nudge
     assert first > 0   # master + due -> sent
+    # the who-has goes out from (chaddr, leased IP) toward the gateway
+    assert sent == [(CHADDR_STR, "100.64.4.7", "100.64.4.1")]
 
     role["master"] = False
     n.maybe_nudge("100.64.4.7", "100.64.4.1", force=True)
@@ -719,36 +716,22 @@ def test_nudge_missing_gateway_warns_once(lk, caplog):
 
 # ---- ARP-reply listening (reachability confirmation) ----
 
-class _ArpPkt:
-    """Minimal stand-in for a scapy ARP packet: p[ARP] -> op/psrc/pdst/hwsrc, and
-    haslayer(ARP) so the sniffer dispatcher routes it."""
-    def __init__(self, lk, op, psrc, pdst, hwsrc=""):
-        self._lk = lk
-        self._arp = types.SimpleNamespace(op=op, psrc=psrc, pdst=pdst, hwsrc=hwsrc)
-
-    def haslayer(self, layer):
-        return layer is self._lk.ARP
-
-    def __getitem__(self, layer):
-        return self._arp
-
-
 def test_arp_reply_ignores_unrelated(lk):
     keeper = _nudge_keeper(lk)
     keeper._dhcp.binding.router = "100.64.4.254"
-    keeper._on_sniff(_ArpPkt(lk, 2, "100.64.4.9", "100.64.4.7"))    # wrong sender
-    keeper._on_sniff(_ArpPkt(lk, 2, "100.64.4.254", "100.64.4.99"))  # wrong target IP
-    keeper._on_sniff(_ArpPkt(lk, 1, "100.64.4.254", "100.64.4.7"))   # a request, not a reply
+    keeper._on_arp_reply(lk.ArpFrame(2, "100.64.4.9", "100.64.4.7"))     # wrong sender
+    keeper._on_arp_reply(lk.ArpFrame(2, "100.64.4.254", "100.64.4.99"))  # wrong target IP
+    keeper._on_arp_reply(lk.ArpFrame(1, "100.64.4.254", "100.64.4.7"))   # a request, not a reply
     assert keeper._nudge.last_reply == 0.0
 
 
 def test_arp_reply_stamps_reachability_and_logs(lk, caplog):
     # A matching is-at reply from the nudge target, dispatched through the
-    # sniffer path, stamps the reachability epoch and logs at DEBUG.
+    # capture callback, stamps the reachability epoch and logs at DEBUG.
     keeper = _nudge_keeper(lk)
     keeper._dhcp.binding.router = "100.64.4.1"
     with caplog.at_level("DEBUG", logger="lease-keeper"):
-        keeper._on_sniff(_ArpPkt(lk, 2, "100.64.4.1", "100.64.4.7"))
+        keeper._on_arp_reply(lk.ArpFrame(2, "100.64.4.1", "100.64.4.7"))
     assert keeper._nudge.last_reply > 0
     assert any("ARP reply from 100.64.4.1" in r.getMessage() for r in caplog.records)
 
@@ -775,10 +758,83 @@ def test_sniffer_filter_captures_arp_and_honours_promisc(lk, monkeypatch):
 
     monkeypatch.setattr(lk, "AsyncSniffer", _Cap)
     keeper = _keeper(lk, arp_listen_promisc=True)
-    assert keeper._start_sniffer() is True
+    assert keeper._capture.start() is True
     assert "arp" in captured["filter"]        # ARP replies now reach the parser
     assert "port 67" in captured["filter"]     # ...alongside DHCP, unchanged
     assert captured["promisc"] is True         # opt-in flag reaches the socket
+
+
+# ---- capture backends: selection and the scapy packet -> frame adapter ----
+
+def test_backend_selection_defaults_scapy(lk):
+    assert isinstance(_keeper(lk)._capture, lk.ScapyCapture)
+    assert isinstance(_keeper(lk, capture_backend="bpf")._capture, lk.BpfCapture)
+
+
+class _ScapyDhcpPkt:
+    """Minimal stand-in for a scapy DHCP reply: p[BOOTP].xid/op/yiaddr/chaddr/
+    giaddr and p[DHCP].options, with haslayer() -- what ScapyCapture decodes.
+    chaddr is typed Any: one test hands it a non-bytes value on purpose."""
+    def __init__(self, lk, xid, options, *, yiaddr="100.64.4.7",  # pylint: disable=too-many-arguments
+                 chaddr: Any = CHADDR, op=None, giaddr="0.0.0.0"):
+        self._lk = lk
+        self._bootp = types.SimpleNamespace(xid=xid, op=(lk.BOOTREPLY if op is None else op),
+                                            yiaddr=yiaddr, chaddr=chaddr, giaddr=giaddr)
+        self._dhcp = types.SimpleNamespace(options=options)
+
+    def haslayer(self, layer):
+        return layer in (self._lk.BOOTP, self._lk.DHCP)
+
+    def __getitem__(self, layer):
+        return self._bootp if layer is self._lk.BOOTP else self._dhcp
+
+
+class _ScapyArpPkt:
+    """Minimal stand-in for a scapy ARP packet: p[ARP] -> op/psrc/pdst."""
+    def __init__(self, lk, op, psrc, pdst):
+        self._lk = lk
+        self._arp = types.SimpleNamespace(op=op, psrc=psrc, pdst=pdst)
+
+    def haslayer(self, layer):
+        return layer is self._lk.ARP
+
+    def __getitem__(self, layer):
+        return self._arp
+
+
+def _capture_pair(lk):
+    """A ScapyCapture wired to recording callbacks."""
+    frames = {"bootp": [], "arp": []}
+    cap = lk.ScapyCapture("eth0", False, frames["bootp"].append, frames["arp"].append)
+    return cap, frames
+
+
+def test_scapy_adapter_decodes_dhcp_to_frame(lk):
+    cap, frames = _capture_pair(lk)
+    cap._on_packet(_ScapyDhcpPkt(lk, 0x1234, [("message-type", lk.ACK), "end"],
+                                 yiaddr="100.64.4.7", giaddr="100.64.4.9"))
+    frame = frames["bootp"][0]
+    assert frame.op == lk.BOOTREPLY and frame.xid == 0x1234
+    assert frame.yiaddr == "100.64.4.7" and frame.giaddr == "100.64.4.9"
+    assert frame.chaddr[:6] == CHADDR
+    assert ("message-type", lk.ACK) in frame.options
+    assert not frames["arp"]
+
+
+def test_scapy_adapter_decodes_arp_to_frame(lk):
+    cap, frames = _capture_pair(lk)
+    cap._on_packet(_ScapyArpPkt(lk, 2, "100.64.4.1", "100.64.4.7"))
+    assert frames["arp"] == [lk.ArpFrame(2, "100.64.4.1", "100.64.4.7")]
+    assert not frames["bootp"]
+
+
+def test_scapy_adapter_tolerates_malformed_chaddr(lk):
+    # An unconvertible chaddr must not drop the reply: it decodes to empty
+    # bytes (the frame still reaches the first-party xid path).
+    cap, frames = _capture_pair(lk)
+    cap._on_packet(_ScapyDhcpPkt(lk, 0x1234, [("message-type", lk.ACK), "end"],
+                                 chaddr="not-raw-bytes"))   # bytes(str) raises TypeError
+    assert frames["bootp"][0].chaddr == b""
 
 
 # ---- follow across a changed gateway (cross-subnet renumber) ----

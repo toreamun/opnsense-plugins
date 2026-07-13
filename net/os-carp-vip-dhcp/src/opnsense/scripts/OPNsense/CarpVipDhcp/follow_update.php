@@ -111,20 +111,15 @@ if (isset($config['virtualip']['vip']) && is_array($config['virtualip']['vip']))
 // 2. Update every keeper that referenced the old address. Use direct assignment
 // (not a &reference to the subtree) so write_config serializes the change.
 if (isset($config['OPNsense']['CarpVipDhcp']['keepers']['keeper'])) {
+    // Same single-entry quirk as the VIPs above; normalize to a list once.
     $keepers = $config['OPNsense']['CarpVipDhcp']['keepers']['keeper'];
     if (isset($keepers['carpVip']) || isset($keepers['@attributes'])) {
-        // single keeper (associative)
-        if (($keepers['carpVip'] ?? '') === $old_ip) {
-            $config['OPNsense']['CarpVipDhcp']['keepers']['keeper']['carpVip'] = $new_ip;
+        $config['OPNsense']['CarpVipDhcp']['keepers']['keeper'] = [$keepers];
+    }
+    foreach ($config['OPNsense']['CarpVipDhcp']['keepers']['keeper'] as $k => $entry) {
+        if (($entry['carpVip'] ?? '') === $old_ip) {
+            $config['OPNsense']['CarpVipDhcp']['keepers']['keeper'][$k]['carpVip'] = $new_ip;
             $keeper_changed = true;
-        }
-    } else {
-        // list of keepers
-        foreach ($keepers as $k => $entry) {
-            if (($entry['carpVip'] ?? '') === $old_ip) {
-                $config['OPNsense']['CarpVipDhcp']['keepers']['keeper'][$k]['carpVip'] = $new_ip;
-                $keeper_changed = true;
-            }
         }
     }
 }
@@ -282,6 +277,8 @@ if ($rc !== 0) {
 if ($old_vip_iface !== '') {
     // Marker BEFORE the hooks: a hook that hangs or gets the action killed
     // must not hide that the chain was reached.
+    // The stable 'carpvipdhcp' ident is a greppable contract (the lab
+    // regression suite asserts the marker); log_msg would ident differently.
     openlog('carpvipdhcp', LOG_ODELAY, LOG_USER);
     syslog(LOG_NOTICE, "running newwanip hooks for {$old_vip_iface} after follow {$old_ip} -> {$new_ip}");
     require_once("plugins.inc");

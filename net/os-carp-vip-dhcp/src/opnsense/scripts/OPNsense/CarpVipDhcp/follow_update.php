@@ -86,6 +86,14 @@ $vip_changed = false;
 $keeper_changed = false;
 $old_vip_iface = '';
 
+// A single VIP deserializes as one associative array, not a list of one
+// (the same quirk the keeper section below handles). Normalize to a list so
+// the loops here and the already-migrated re-check see actual VIP entries;
+// write_config serializes a one-element list back to identical XML.
+if (isset($config['virtualip']['vip']['mode'])) {
+    $config['virtualip']['vip'] = [$config['virtualip']['vip']];
+}
+
 // 1. Rewrite the CARP VIP whose current subnet is old_ip.
 if (isset($config['virtualip']['vip']) && is_array($config['virtualip']['vip'])) {
     foreach ($config['virtualip']['vip'] as $idx => $vip) {

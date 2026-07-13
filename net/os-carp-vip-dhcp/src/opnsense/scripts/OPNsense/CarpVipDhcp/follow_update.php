@@ -226,6 +226,15 @@ if (!$rendered_ok) {
     exit(1);
 }
 
+// Release the follow lock BEFORE starting daemons: PHP file descriptors are
+// not close-on-exec, so a keeper started below would inherit the lock fd and
+// hold the lock for its whole lifetime -- silently skipping every later
+// follow on this node. The section the lock protects (config write,
+// reconfigure, template render) is complete and consistent here; the restart
+// tail below is idempotent, so a racing late runner converges harmlessly.
+flock($lockfh, LOCK_UN);
+fclose($lockfh);
+
 // Replace only the keeper that just changed address, not every keeper on the
 // node. The daemon is keyed by a filesystem-safe id derived from its request IP,
 // so a follow renames it old_id -> new_id. We must stop old_id and start new_id

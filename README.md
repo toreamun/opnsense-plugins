@@ -175,7 +175,7 @@ Carrier access gear (BNG / access switches / OLTs) polices subscribers with mech
 
 - **IPv4 DHCP only.** DHCPv6 / IPv6 Neighbor Discovery are out of scope. The v6 side (e.g. a DHCPv6-PD prefix) does **not** float with the VIP, so after an IPv4 failover expect broken/asymmetric IPv6 on the surviving node until it re-acquires — plan v6 HA separately.
 - WAN is the typical — not required — placement.
-- Requires **root** (raw L2/BPF socket) and depends on **Scapy**.
+- Requires **root** (raw L2/BPF socket) and depends on **Scapy**. An experimental `bpf` capture backend (since 1.9.0) runs on a raw `/dev/bpf` descriptor with no Scapy dependency: opt in per host with `sysrc carpvipdhcp_backend=bpf` plus a service restart, and remove the variable (`sysrc -x carpvipdhcp_backend`) to return to the default Scapy backend.
 - **Shared-L2 exposure:** follow mode trusts the DHCP ACK, so on a genuinely shared segment a neighbour who can read the CARP adverts could forge one to relocate the VIP (the same untrusted-shared-L2 risk a plain firewall shares). Moot where the ISP isolates you per VLAN/port; pin the address (follow off) on a shared L2 otherwise.
 
 *Deliberately not included:* DHCP option 82 (inserted by the ISP, not the client); RFC 5227 address-conflict detection/arbitration (a rogue host claiming the VIP is beyond a subscriber device's control); DAI rate-limit pacing (one nudge / 120 s is orders of magnitude under any limit); a unicast-RENEW mode (the broadcast flag makes RFC-2131 servers broadcast OFFER/ACK to a non-promiscuous socket; a server that unicasts to the CARP MAC is still received on the master).

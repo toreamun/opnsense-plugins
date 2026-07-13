@@ -18,6 +18,11 @@ SCRIPT_DIR = os.path.abspath(os.path.join(
     "src", "opnsense", "scripts", "OPNsense", "CarpVipDhcp"))
 sys.path.insert(0, SCRIPT_DIR)
 
+# The canonical test identity (CARP vMAC for vhid 0xfe), shared by the test
+# modules so the fixture MAC lives in exactly one place.
+CHADDR_STR = "00:00:5e:00:01:fe"
+CHADDR = bytes.fromhex(CHADDR_STR.replace(":", ""))
+
 
 def _stub_scapy():
     if "scapy.all" in sys.modules:

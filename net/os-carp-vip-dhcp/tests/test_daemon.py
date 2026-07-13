@@ -758,6 +758,21 @@ def test_follow_no_gateway_change_no_extra_args(lk, tmp_path):
     assert keeper._follow._gw_args == []
 
 
+def test_follow_update_fires_newwanip_hooks():
+    """A follow must run the newwanip plugin hooks for the VIP's interface
+    (dynamic DNS, VPN endpoints learn the new address -- the parity promise),
+    and must NOT invoke rc.newwanip, which would re-run interface_configure
+    and disturb a dhcp-configured WAN's native lease."""
+    php = os.path.join(
+        os.path.dirname(__file__), "..", "src", "opnsense", "scripts",
+        "OPNsense", "CarpVipDhcp", "follow_update.php")
+    with open(php, encoding="utf-8") as fh:
+        src = fh.read()
+    assert "plugins_configure('newwanip'" in src
+    assert "rc.newwanip" not in src.replace("NOT rc.newwanip", "").replace(
+        "not rc.newwanip", "")   # mentioned only as the documented non-choice
+
+
 def test_follow_update_action_arity():
     """The configd [follow_update] action must accept as many params as the
     daemon can send: _fire_follow_update passes old_ip + new_ip plus

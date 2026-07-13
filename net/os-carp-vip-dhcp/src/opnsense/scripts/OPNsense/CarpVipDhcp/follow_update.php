@@ -14,6 +14,16 @@
  * new prefix length: the VIP's subnet_bits and the WAN gateway are updated too
  * and routing is reapplied, so outbound keeps working (parity with a plain DHCP
  * interface). Same-subnet moves omit those args and touch only the address.
+ *
+ * After the move the registered newwanip plugin hooks run for the VIP's
+ * interface (dynamic DNS, VPN endpoints, ...), completing the parity: those
+ * consumers learn about the new address just as they would after a native
+ * lease change. "newwanip" is a historical name: the chain is per-interface
+ * and the consumers self-select on the interface argument, so firing it is
+ * correct wherever the VIP lives (native DHCP on a non-WAN interface fires
+ * the same chain). Deliberately NOT rc.newwanip: on a dhcp-configured
+ * interface that would re-run interface_configure and disturb the native
+ * lease; the hook chain is the part the consumers need.
  */
 
 require_once("config.inc");
@@ -246,6 +256,20 @@ if ($rc !== 0) {
     // Non-fatal: the address has followed and CARP is advertising it; only the
     // firewall alias mirror lags. Surface it so `sync_aliases` can be re-run.
     fwrite(STDERR, "manage_alias failed (rc={$rc}): " . implode(' | ', $out) . "\n");
+}
+
+// Parity with a native address change: run the newwanip hooks for the VIP's
+// interface now that the VIP, routing, keepers and alias all agree (see the
+// header for why this is the hook chain and not rc.newwanip). Non-fatal: the
+// address has followed either way.
+if ($old_vip_iface !== '') {
+    // Marker BEFORE the hooks: a hook that hangs or gets the action killed
+    // must not hide that the chain was reached.
+    openlog('carpvipdhcp', LOG_ODELAY, LOG_USER);
+    syslog(LOG_NOTICE, "running newwanip hooks for {$old_vip_iface} after follow {$old_ip} -> {$new_ip}");
+    require_once("plugins.inc");
+    plugins_configure('newwanip', false, array($old_vip_iface));
+    syslog(LOG_NOTICE, "newwanip hooks for {$old_vip_iface} completed");
 }
 
 $msg = "updated CARP VIP {$old_ip} -> {$new_ip}";

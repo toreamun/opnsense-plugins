@@ -151,6 +151,9 @@ if (!$vip_changed && !$keeper_changed && !$gw_changed) {
     foreach ($config['virtualip']['vip'] ?? [] as $vip) {
         if (($vip['mode'] ?? '') === 'carp' && ($vip['subnet'] ?? '') === $new_ip) {
             $already_migrated = true;
+            // The retry must also run the notification tail below (a crashed
+            // original may have died before it), so learn the interface here.
+            $old_vip_iface = $vip['interface'] ?? '';
             break;
         }
     }
@@ -202,6 +205,11 @@ if ($gw_changed) {
     } else {
         exec('/usr/local/sbin/configctl interface routes configure 2>&1');
     }
+    // The gateway moved: retarget its monitor too, or dpinger keeps probing
+    // the OLD gateway and flags it down (core's post-address-change sequence
+    // fires monitor alongside newwanip when the gateway changes).
+    require_once("plugins.inc");
+    plugins_configure('monitor');
 }
 
 // Re-render keeper.conf, then WAIT until it actually reflects new_ip before

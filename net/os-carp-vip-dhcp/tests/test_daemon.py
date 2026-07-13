@@ -107,6 +107,25 @@ def test_acquire_reboot_first_then_dora(lk):
     assert calls == ["dora"]   # subsequent acquires: DISCOVER only
 
 
+def test_absorb_reply_floors_lease(lk):
+    # A tiny (or spoofed) opt-51 must not drive a tight renew spin: the accepted
+    # lease is floored at MIN_LEASE, while a normal lease passes through.
+    c = _client(lk)
+    c.adopt(lk.DhcpReply(lk.ACK, "100.64.4.7", "100.64.4.1", 1, None, None, None))
+    assert c.binding.lease_secs == lk.MIN_LEASE
+    c.adopt(lk.DhcpReply(lk.ACK, "100.64.4.7", "100.64.4.1", 3600, None, None, None))
+    assert c.binding.lease_secs == 3600
+
+
+def test_msg_text_scrubs_control_chars(lk):
+    # Option-56 text is attacker-controlled and hits the log: newlines and
+    # escape sequences are neutralized, printable content is kept.
+    assert lk._msg_text(b"no leases") == "no leases"
+    assert lk._msg_text(b"line1\nJul 1 forged") == "line1?Jul 1 forged"
+    assert lk._msg_text(b"\x1b[2Jwipe") == "?[2Jwipe"
+    assert lk._msg_text(b"") == ""
+
+
 def test_adopt_binds_and_refreshes_server(lk):
     c = _client(lk)
     c.binding.server = "100.64.4.1"   # from the OFFER

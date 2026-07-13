@@ -111,7 +111,7 @@ RENEW_TIMEOUT = 3          # wait for an ACK during renew
 ATTEMPT_BACKOFF_CAP = 8    # max wait between acquire attempts
 SEND_RETRY_DELAY = 2       # wait after a failed packet send before retrying
 REBIND_POLL_STEP = 10      # how often to re-try RENEW during the REBIND window
-REDORA_MIN = 10            # initial wait after a failed acquire
+REDORA_MIN = 10            # initial wait after a failed acquire; also the hold-poll cadence while no carrier
 # Caps worst-case re-acquire lag at ~45s even if the link-return fast path (below)
 # is missed; the backoff doubles 10 -> 20 -> 40 -> 45.
 REDORA_MAX = 45            # max exponential-backoff wait after a failed acquire
@@ -1154,8 +1154,9 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
     def _iface_link_up(self):
         """Interface carrier from ifconfig: True on 'status: active', False on a
         present-but-inactive status (no carrier / no link), None when it cannot be
-        read (probe failed, or the NIC reports no status line). Used only by the
-        unbound link-return fast path; a None result never disturbs the backoff."""
+        read (probe failed, or the NIC reports no status line). Used by the
+        unbound link-return fast path and the acquire carrier gate; a None
+        result never disturbs the backoff and never holds an acquire."""
         out = self._ifconfig()
         if out is None:
             return None
@@ -1348,31 +1349,11 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         """One iteration of the maintain loop. Returns to run() (which loops again)
         on every state transition; any exception it raises is caught by run() and
         retried, so a transient fault can never terminate the keeper."""
-        # Acquire a lease if we do not hold one.
         b = self._dhcp.binding
         if not b.yiaddr:
-            self._ensure_sniffer()  # a dead sniffer would silently fail every DORA
-            self._hb()  # active but not holding yet -> publish bound=-
-            if self._dhcp.acquire(self._follow.target):
-                LOG.info("DHCP BOUND %s (lease=%ss, expires ~%s, server=%s, gw=%s, mask=%s)",
-                         b.yiaddr, b.lease_secs, _clock_at(b.lease_secs),
-                         b.server, b.router or "?",
-                         f"/{b.mask_bits}" if b.mask_bits else "none")
-                self._hb()
-                self._arp_nudge(force=True)
-                self.redora_wait = REDORA_MIN
-            else:
-                LOG.warning("DHCP acquire (DISCOVER/REQUEST) failed -- retrying in %ds", self.redora_wait)
-                self._link_returned = False
-                self._sleep_interruptible(_jittered(self.redora_wait))
-                if self._link_returned:
-                    # WAN carrier returned mid-backoff: re-acquire now instead of
-                    # waiting out the next backoff (matches native dhclient).
-                    LOG.info("WAN link returned while unbound -- re-acquiring now")
-                    self.redora_wait = REDORA_MIN
-                else:
-                    self.redora_wait = min(self.redora_wait * 2, REDORA_MAX)
+            self._acquire_step()
             return
+
         # Maintain: wait until T1, then RENEW; bail early on stop.
         t1, t2, src = self._dhcp.timing()
         # The renew/rebind plan is verbose and identical every cycle for a stable
@@ -1415,6 +1396,53 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
 
         LOG.error("DHCP lease expired -- re-acquiring (back to DISCOVER)")
         self._dhcp.expire()
+
+    def _acquire_step(self):
+        """The unbound arm of the maintain loop: hold while there is no
+        carrier, otherwise try one acquire with the jittered re-DORA backoff;
+        the link-return fast path cuts either wait short."""
+        self._ensure_sniffer()  # a dead sniffer would silently fail every DORA
+        self._hb()  # active but not holding yet -> publish bound=-
+
+        # No point broadcasting DISCOVERs on a dead link (native dhclient
+        # does not either): wait for the carrier instead of burning DORA
+        # attempts. The unbound sleep polls the link and the link-return
+        # fast path resumes within seconds of it coming back. Fail open:
+        # only a confirmed "no carrier" (False) holds the acquire; an
+        # unreadable probe (None) never blocks it.
+        if self._iface_link_up() is False:
+            if self._link_up is not False:   # log once per down-episode
+                LOG.info("no carrier on %s -- waiting for the link before the DHCP acquire",
+                         self.iface)
+            self._link_up = False
+            self._link_returned = False
+            self._sleep_interruptible(REDORA_MIN)
+            if self._link_returned:
+                LOG.info("WAN link returned while unbound -- re-acquiring now")
+                self.redora_wait = REDORA_MIN
+            return
+
+        b = self._dhcp.binding
+        if self._dhcp.acquire(self._follow.target):
+            self._link_up = True   # a completed DORA proves carrier
+            LOG.info("DHCP BOUND %s (lease=%ss, expires ~%s, server=%s, gw=%s, mask=%s)",
+                     b.yiaddr, b.lease_secs, _clock_at(b.lease_secs),
+                     b.server, b.router or "?",
+                     f"/{b.mask_bits}" if b.mask_bits else "none")
+            self._hb()
+            self._arp_nudge(force=True)
+            self.redora_wait = REDORA_MIN
+        else:
+            LOG.warning("DHCP acquire (DISCOVER/REQUEST) failed -- retrying in %ds", self.redora_wait)
+            self._link_returned = False
+            self._sleep_interruptible(_jittered(self.redora_wait))
+            if self._link_returned:
+                # WAN carrier returned mid-backoff: re-acquire now instead of
+                # waiting out the next backoff (matches native dhclient).
+                LOG.info("WAN link returned while unbound -- re-acquiring now")
+                self.redora_wait = REDORA_MIN
+            else:
+                self.redora_wait = min(self.redora_wait * 2, REDORA_MAX)
 
 
 def acquire_pidfile(path):

@@ -202,6 +202,65 @@ def test_check_link_returned_edge(lk):
     assert k._check_link_returned() is False
 
 
+def _gate_keeper(lk, carrier):
+    """Unbound keeper with a stubbed carrier probe and recorded acquire calls."""
+    k = _keeper(lk)
+    k._ensure_sniffer = lambda: None
+    k.acquired = []
+    k._dhcp.acquire = lambda rip: (k.acquired.append(rip), False)[1]
+    k._iface_link_up = lambda: carrier
+    k._sleep_interruptible = lambda secs: True
+    return k
+
+
+def test_maintain_holds_acquire_without_carrier(lk, caplog):
+    k = _gate_keeper(lk, carrier=False)
+    with caplog.at_level("INFO", logger="lease-keeper"):
+        k._maintain_step()
+        k._maintain_step()
+    assert k.acquired == []                  # no DISCOVER burned on a dead link
+    assert k._link_up is False
+    # one INFO per down-episode, not per loop pass
+    waits = [r for r in caplog.records if "no carrier" in r.getMessage()]
+    assert len(waits) == 1
+
+
+def test_maintain_acquire_fails_open_on_unreadable_carrier(lk):
+    k = _gate_keeper(lk, carrier=None)
+    k._maintain_step()
+    assert k.acquired == ["100.64.4.7"]      # None never blocks the acquire
+
+
+def test_maintain_acquires_with_carrier(lk):
+    k = _gate_keeper(lk, carrier=True)
+    k._maintain_step()
+    assert k.acquired == ["100.64.4.7"]
+
+
+def test_bound_marks_carrier_up(lk):
+    # A completed DORA proves carrier: the last-carrier-state invariant stays
+    # honest so the next down-episode always logs its hold line.
+    k = _gate_keeper(lk, carrier=True)
+    k._link_up = False                       # stale from an earlier down-episode
+    k._dhcp.acquire = lambda rip: True
+    k._maintain_step()
+    assert k._link_up is True
+
+
+def test_carrier_wait_resumes_via_link_return(lk, caplog):
+    k = _gate_keeper(lk, carrier=False)
+    k.redora_wait = 40
+
+    def sleep_with_return(_secs):
+        k._link_returned = True              # what the fast path sets on the edge
+        return True
+    k._sleep_interruptible = sleep_with_return
+    with caplog.at_level("INFO", logger="lease-keeper"):
+        k._maintain_step()
+    assert any("re-acquiring now" in r.getMessage() for r in caplog.records)
+    assert k.redora_wait == lk.REDORA_MIN    # backoff reset for the immediate retry
+
+
 def test_check_link_returned_debounce(lk, monkeypatch):
     k = _link_keeper(lk)
     monkeypatch.setattr(lk.time, "time", lambda: 1000.0)

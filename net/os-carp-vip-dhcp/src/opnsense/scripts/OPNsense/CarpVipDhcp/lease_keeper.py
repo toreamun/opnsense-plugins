@@ -143,6 +143,7 @@ FOLLOW_RETRY_DEADLINE = 120  # re-drive follow_update if we are not restarted wi
 T1_FACTOR = 0.5            # renew at this fraction of the lease (RFC default)
 T2_FACTOR = 0.875          # rebind by this fraction of the lease (RFC default)
 MIN_T1 = 30                # floor for the renew timer (very short leases)
+MIN_LEASE = 2 * MIN_T1     # floor for an accepted lease time, so a tiny (even hostile) opt-51 can't spin renews
 REBIND_MARGIN = 15         # ensure T2 is at least this far past T1
 BROADCAST_FLAG = 0x8000    # BOOTP flags: ask the server to broadcast OFFER/ACK
 ETHER_BROADCAST = "ff:ff:ff:ff:ff:ff"
@@ -196,11 +197,18 @@ MTYPE_NAMES = {1: "DISCOVER", 2: "OFFER", 3: "REQUEST", 4: "DECLINE",
 
 
 def _msg_text(msg):
-    """DHCP option-56 server text (usually a NAK reason) as a stripped str, or ""
-    when absent. Option 56 may arrive as bytes or str depending on the server."""
+    """DHCP option-56 server text (usually a NAK reason) as a sanitized str, or
+    "" when absent. Option 56 may arrive as bytes or str depending on the server.
+
+    The text is attacker-controlled (any host on the segment can race a NAK with
+    a matching xid) and is written to the log, so strip control characters --
+    newlines that would forge log lines and terminal escape sequences -- before
+    it goes anywhere. Printable content is preserved."""
     if isinstance(msg, bytes):
         msg = msg.decode(errors="replace")
-    return str(msg).strip() if msg else ""
+    if not msg:
+        return ""
+    return re.sub(r"[\x00-\x1f\x7f]", "?", str(msg)).strip()
 
 
 def _fmt_reply(rx):
@@ -423,30 +431,36 @@ _OPT_DECODERS = {
 def _decode_dhcp_options(data):
     """Bounds-checked TLV walk over the options field of an untrusted reply.
     Unknown options are skipped without decoding; any truncation ends the walk
-    with what was parsed so far. Never raises on malformed input."""
-    out = []
-    i = 0
-    while i < len(data):
-        code = data[i]
-        if code == DHCP_OPT_PAD:
-            i += 1
+    with what was parsed so far. Never raises on malformed input.
+
+    Option overload (option 52), where a server continues its options into the
+    BOOTP sname/file fields, is deliberately NOT handled: with the keeper's
+    6-entry parameter request list every reply fits the options field many
+    times over, so no server the keeper talks to overloads."""
+    options = []
+    pos = 0
+    while pos < len(data):
+        code = data[pos]
+        if code == DHCP_OPT_PAD:        # a single padding byte, no length/value
+            pos += 1
             continue
-        if code == DHCP_OPT_END:
+        if code == DHCP_OPT_END:        # explicit end of options
             break
-        if i + 2 > len(data):    # length byte missing
+        if pos + 2 > len(data):         # the length byte itself is missing
             break
-        length = data[i + 1]
-        value = data[i + 2:i + 2 + length]
-        if len(value) < length:  # value truncated
+        length = data[pos + 1]
+        value = data[pos + 2:pos + 2 + length]
+        if len(value) < length:         # the value runs past the end of the buffer
             break
-        known = _OPT_DECODERS.get(code)
-        if known:
+        decoder = _OPT_DECODERS.get(code)
+        if decoder is not None:
+            name, decode_value = decoder
             try:
-                out.append((known[0], known[1](value)))
+                options.append((name, decode_value(value)))
             except (ValueError, IndexError):
-                pass             # malformed value inside a known option -> skip it
-        i += 2 + length
-    return out
+                pass                    # malformed value in a known option: skip, keep walking
+        pos += 2 + length
+    return options
 
 
 def _decode_arp(pkt):
@@ -467,11 +481,20 @@ def _decode_ipv4_bootp(pkt):
     total = int.from_bytes(pkt[2:4], "big")
     if ihl < 20 or total < ihl + 8 or len(pkt) < ihl + 8:
         return None
-    if pkt[9] != IPPROTO_UDP:
+    is_udp = pkt[9] == IPPROTO_UDP
+    is_unfragmented = (int.from_bytes(pkt[6:8], "big") & 0x3FFF) == 0   # no MF bit, no frag offset
+    if not (is_udp and is_unfragmented):
         return None
-    if int.from_bytes(pkt[6:8], "big") & 0x3FFF:   # MF set or a fragment continuation
+    # Bound the BOOTP slice by the UDP length too, not just the IP total: a
+    # datagram whose UDP length is shorter than the IP payload would otherwise
+    # let trailing bytes be parsed as DHCP options. Trust the smallest of the
+    # three lengths (untrusted input); a UDP length shorter than its own header
+    # is malformed.
+    udp_len = int.from_bytes(pkt[ihl + 4:ihl + 6], "big")
+    if udp_len < 8:
         return None
-    bootp = pkt[ihl + 8:min(total, len(pkt))]      # UDP payload, minus any link padding
+    end = min(total, ihl + udp_len, len(pkt))
+    bootp = pkt[ihl + 8:end]                        # UDP payload, minus any link padding
     if len(bootp) < BOOTP_HDR_LEN + 4 or bootp[BOOTP_HDR_LEN:BOOTP_HDR_LEN + 4] != DHCP_MAGIC:
         return None
     # The options walk only pays off for server replies; on a shared segment
@@ -492,9 +515,11 @@ def _decode_ipv4_bootp(pkt):
 BIOCGBLEN = 0x40044266       # _IOR('B', 102, u_int): kernel capture buffer size
 BIOCSETF = 0x80104267        # _IOW('B', 103, struct bpf_program): attach the filter
 BIOCPROMISC = 0x20004269     # _IO('B', 105): promiscuous mode
+BIOCGDLT = 0x4004426A        # _IOR('B', 106, u_int): the interface's data-link type
 BIOCSETIF = 0x8020426C       # _IOW('B', 108, struct ifreq): bind to the interface
 BIOCIMMEDIATE = 0x80044270   # _IOW('B', 112, u_int): deliver per packet, not per full buffer
 BIOCSHDRCMPLT = 0x80044275   # _IOW('B', 117, u_int): we supply the Ethernet source MAC
+DLT_EN10MB = 1               # Ethernet: the only link type this codec's offsets assume
 BPF_ALIGNMENT = 8            # capture records align to sizeof(long)
 BPF_HDR_FIXED = 26           # bh_tstamp(16) + bh_caplen(4) + bh_datalen(4) + bh_hdrlen(2)
 
@@ -502,47 +527,65 @@ BPF_HDR_FIXED = 26           # bh_tstamp(16) + bh_caplen(4) + bh_datalen(4) + bh
 # no runtime filter compiler. MUST stay in lockstep with SNIFFER_FILTER;
 # regenerate on any FreeBSD/OPNsense host with:
 #   tcpdump -i <ethernet-iface> -dd '(udp and (port 67 or port 68)) or (arp and arp[6:2] = 2)'
+# The trailing comment on each row is the `tcpdump -d` mnemonic so the table can
+# be audited by eye against the filter string without a FreeBSD box; jump
+# targets are absolute instruction indices (tcpdump's relative jt/jf + here+1).
+# A bench test (testbench repo) asserts `tcpdump -ddd SNIFFER_FILTER` still
+# equals this table, turning the lockstep requirement into an enforced invariant.
 _BPF_FILTER = (
-    (0x28, 0, 0, 0x0000000C),
-    (0x15, 0, 10, 0x00000800),
-    (0x30, 0, 0, 0x00000017),
-    (0x15, 0, 21, 0x00000011),
-    (0x28, 0, 0, 0x00000014),
-    (0x45, 19, 0, 0x00001FFF),
-    (0xB1, 0, 0, 0x0000000E),
-    (0x48, 0, 0, 0x0000000E),
-    (0x15, 15, 0, 0x00000043),
-    (0x15, 14, 0, 0x00000044),
-    (0x48, 0, 0, 0x00000010),
-    (0x15, 12, 8, 0x00000043),
-    (0x15, 0, 8, 0x000086DD),
-    (0x30, 0, 0, 0x00000014),
-    (0x15, 0, 10, 0x00000011),
-    (0x28, 0, 0, 0x00000036),
-    (0x15, 7, 0, 0x00000043),
-    (0x15, 6, 0, 0x00000044),
-    (0x28, 0, 0, 0x00000038),
-    (0x15, 4, 0, 0x00000043),
-    (0x15, 3, 4, 0x00000044),
-    (0x15, 0, 3, 0x00000806),
-    (0x28, 0, 0, 0x00000014),
-    (0x15, 0, 1, 0x00000002),
-    (0x6, 0, 0, 0x00040000),
-    (0x6, 0, 0, 0x00000000),
+    (0x28, 0, 0, 0x0000000C),   # 00 ldh  [12]                 ; ethertype
+    (0x15, 0, 10, 0x00000800),  # 01 jeq  #0x800  -> 02, ->12  ; IPv4?
+    (0x30, 0, 0, 0x00000017),   # 02 ldb  [23]                 ; IPv4 proto
+    (0x15, 0, 21, 0x00000011),  # 03 jeq  #17     -> 04, ->25  ; UDP?
+    (0x28, 0, 0, 0x00000014),   # 04 ldh  [20]                 ; flags+frag
+    (0x45, 19, 0, 0x00001FFF),  # 05 jset #0x1fff ->25, -> 06  ; fragment? drop
+    (0xB1, 0, 0, 0x0000000E),   # 06 ldxb 4*([14]&0xf)         ; X = IP hdr len
+    (0x48, 0, 0, 0x0000000E),   # 07 ldh  [x+14]               ; UDP src port
+    (0x15, 15, 0, 0x00000043),  # 08 jeq  #67     ->24, -> 09  ; sport 67? accept
+    (0x15, 14, 0, 0x00000044),  # 09 jeq  #68     ->24, -> 10  ; sport 68? accept
+    (0x48, 0, 0, 0x00000010),   # 10 ldh  [x+16]               ; UDP dst port
+    (0x15, 12, 8, 0x00000043),  # 11 jeq  #67     ->24, ->20   ; dport 67? accept
+    (0x15, 0, 8, 0x000086DD),   # 12 jeq  #0x86dd -> 13, ->21  ; IPv6? (else ARP)
+    (0x30, 0, 0, 0x00000014),   # 13 ldb  [20]                 ; IPv6 next header
+    (0x15, 0, 10, 0x00000011),  # 14 jeq  #17     -> 15, ->25  ; UDP?
+    (0x28, 0, 0, 0x00000036),   # 15 ldh  [54]                 ; UDP src port (14+40)
+    (0x15, 7, 0, 0x00000043),   # 16 jeq  #67     ->24, -> 17  ; sport 67? accept
+    (0x15, 6, 0, 0x00000044),   # 17 jeq  #68     ->24, -> 18  ; sport 68? accept
+    (0x28, 0, 0, 0x00000038),   # 18 ldh  [56]                 ; UDP dst port
+    (0x15, 4, 0, 0x00000043),   # 19 jeq  #67     ->24, ->20   ; dport 67? accept
+    (0x15, 3, 4, 0x00000044),   # 20 jeq  #68     ->24, ->25   ; dport 68? accept
+    (0x15, 0, 3, 0x00000806),   # 21 jeq  #0x806  -> 22, ->25  ; ARP?
+    (0x28, 0, 0, 0x00000014),   # 22 ldh  [20]                 ; ARP opcode
+    (0x15, 0, 1, 0x00000002),   # 23 jeq  #2      ->24, ->25   ; is-at reply?
+    (0x6, 0, 0, 0x00040000),    # 24 ret  #262144              ; ACCEPT (snap len)
+    (0x6, 0, 0, 0x00000000),    # 25 ret  #0                   ; DROP
 )
 
 
+def _bpf_align(nbytes):
+    """Round a record length up to the BPF record alignment (sizeof(long))."""
+    return (nbytes + BPF_ALIGNMENT - 1) & ~(BPF_ALIGNMENT - 1)
+
+
 def _bpf_frames(data):
-    """Walk a raw BPF read buffer, yielding each record's captured bytes.
-    Records are struct bpf_hdr framed and BPF_ALIGNMENT-padded; a malformed
-    record stops the walk rather than misparse the rest."""
-    i = 0
-    while i + BPF_HDR_FIXED <= len(data):
-        caplen, _datalen, hdrlen = struct.unpack_from("=IIH", data, i + 16)
-        if hdrlen < BPF_HDR_FIXED or i + hdrlen + caplen > len(data):
+    """Yield each captured Ethernet frame from a raw BPF read buffer.
+
+    One read(2) can return several packets back to back, each prefixed by a
+    struct bpf_hdr and padded to the record alignment. bh_tstamp occupies the
+    first 16 bytes; bh_caplen, bh_datalen and bh_hdrlen follow. A record whose
+    header or length is inconsistent ends the walk rather than risk misparsing
+    the rest of the buffer (it is only as trustworthy as the kernel handed it
+    over)."""
+    pos = 0
+    while pos + BPF_HDR_FIXED <= len(data):
+        # bh_caplen (u_int), bh_datalen (u_int), bh_hdrlen (u_short), in host
+        # byte order, immediately after the 16-byte bh_tstamp.
+        caplen, _datalen, hdrlen = struct.unpack_from("=IIH", data, pos + 16)
+        record_end = pos + hdrlen + caplen
+        if hdrlen < BPF_HDR_FIXED or record_end > len(data):
             break
-        yield data[i + hdrlen:i + hdrlen + caplen]
-        i += (hdrlen + caplen + BPF_ALIGNMENT - 1) & ~(BPF_ALIGNMENT - 1)
+        yield data[pos + hdrlen:record_end]
+        pos += _bpf_align(hdrlen + caplen)
 
 
 # ---- capture backends ----
@@ -595,10 +638,19 @@ class ScapyCapture:
             return False
 
     def stop(self):
-        """Best-effort capture stop (scapy may raise if it never ran)."""
+        """Best-effort capture stop (scapy may raise if it never ran).
+
+        Join with a bound: scapy's own stop() joins the sniffer thread with no
+        timeout, so a sniffer that fails to break its loop would hang the main
+        thread here -- and because this runs from _ensure_sniffer mid-sequence,
+        that would freeze the heartbeat and trip a false CARP demotion. Ask it
+        not to join, then join the thread ourselves with a ceiling."""
         try:
             if self._sniffer:
-                self._sniffer.stop()
+                self._sniffer.stop(join=False)
+                thread = getattr(self._sniffer, "thread", None)
+                if thread is not None:
+                    thread.join(timeout=2)
         except Exception:
             pass
 
@@ -653,99 +705,163 @@ class BpfCapture:  # pylint: disable=too-many-instance-attributes
     """Capture/send on a raw /dev/bpf descriptor -- no packet library. A
     reader thread walks the BPF buffer and hands decoded neutral frames to
     the same callbacks the scapy backend feeds. FreeBSD-only (OPNsense's
-    platform); selected with --capture-backend bpf (experimental)."""
+    platform); selected with --capture-backend bpf (experimental).
+
+    Shutdown uses a self-pipe rather than a poll timeout: the reader blocks in
+    select() on both the bpf fd and a wake pipe, and stop() writes one byte to
+    the pipe so the reader returns at once (no periodic wakeups, no up-to-1s
+    stop latency). The stop signal and the wake pipe are created fresh per
+    start(), and the reader owns and closes its own bpf fd on exit, so a reader
+    that outlives its stop() (e.g. stalled in a slow log write) can neither be
+    revived by the next start() nor have its fd number reused underneath it."""
 
     def __init__(self, iface, promisc, on_bootp, on_arp):
         self.iface = iface
         self.promisc = promisc
         self._on_bootp = on_bootp
         self._on_arp = on_arp
-        self._fd = None
-        self._buflen = 0               # set from BIOCGBLEN in _configure
-        self._thread = None
-        self._closing = False
+        self._fd = None                # the live capture fd, or None when stopped
+        self._buflen = 0               # kernel buffer size, from BIOCGBLEN in _configure
+        self._thread = None            # the current reader thread
+        self._stop_event = None        # set to ask the current reader to exit
+        self._wake_writer = None       # write end of this generation's wake pipe
 
     def start(self):
-        """(Re)open /dev/bpf bound + filtered to the interface and start the
-        reader thread. False on any failure (the caller retries)."""
+        """(Re)open /dev/bpf, bind + filter it to the interface, and start the
+        reader thread. Returns False on any failure (the caller retries)."""
         if fcntl is None:
             LOG.error("bpf backend unavailable: no fcntl module on this platform")
             return False
+        self.stop()
+        wake_reader, wake_writer = os.pipe()
         try:
-            self.stop()
-            self._closing = False
             fd = os.open("/dev/bpf", os.O_RDWR)
-            try:
-                self._configure(fd)
-            except Exception:
-                os.close(fd)
-                raise
-            self._fd = fd
-            self._thread = threading.Thread(target=self._read_loop, args=(fd,),
-                                            name="bpf-capture", daemon=True)
-            self._thread.start()
-            return True
-        except Exception as e:
+        except OSError as e:
+            os.close(wake_reader)
+            os.close(wake_writer)
             LOG.error("bpf capture start failed on %s: %s", self.iface, e)
             return False
+        try:
+            self._configure(fd)
+        except Exception as e:
+            os.close(fd)
+            os.close(wake_reader)
+            os.close(wake_writer)
+            LOG.error("bpf capture start failed on %s: %s", self.iface, e)
+            return False
+        stop_event = threading.Event()
+        # The reader owns fd and wake_reader and closes them when it exits.
+        self._thread = threading.Thread(
+            target=self._read_loop, args=(fd, wake_reader, stop_event),
+            name="bpf-capture", daemon=True)
+        self._fd = fd
+        self._stop_event = stop_event
+        self._wake_writer = wake_writer
+        self._thread.start()
+        return True
 
     def _configure(self, fd):
-        """Bind, tune and filter a fresh bpf descriptor."""
+        """Bind, tune and filter a fresh bpf descriptor.
+
+        BIOCSETIF (bind) has to come first -- it is what libpcap does and what
+        BIOCGDLT needs -- so the filter is attached immediately after, keeping
+        the window in which the descriptor would accept unfiltered traffic to a
+        single ioctl."""
         fcntl.ioctl(fd, BIOCSETIF, struct.pack("16s16x", self.iface.encode()))
+        # The codec's frame offsets assume Ethernet; a PPPoE/tun WAN would make
+        # both capture and injection meaningless. Fail loudly instead of leaving
+        # only a "no DHCP OFFER" symptom.
+        dlt = struct.unpack("I", fcntl.ioctl(fd, BIOCGDLT, b"\x00" * 4))[0]
+        if dlt != DLT_EN10MB:
+            raise OSError(f"{self.iface} is not Ethernet (bpf data-link type {dlt}); "
+                          "the bpf backend supports Ethernet only")
+        # Attach the capture filter right after the bind (and before the rest of
+        # the tuning) so almost no unfiltered traffic can enter the buffer.
+        program = b"".join(struct.pack("HBBI", *insn) for insn in _BPF_FILTER)
+        program_buf = ctypes.create_string_buffer(program)   # kernel copies it during the ioctl
+        # struct bpf_program is { u_int bf_len; struct bpf_insn *bf_insns; };
+        # "@IQ" gives the native u_int + pointer layout on LP64.
+        fcntl.ioctl(fd, BIOCSETF,
+                    struct.pack("@IQ", len(_BPF_FILTER), ctypes.addressof(program_buf)))
         # Immediate mode: hand packets over as they arrive; the DHCP exchanges
         # wait on second-scale timeouts, so buffering a full block is not an option.
         fcntl.ioctl(fd, BIOCIMMEDIATE, struct.pack("I", 1))
-        # Header-complete: our frames carry the CARP vMAC as the Ethernet
-        # source; without this the kernel would overwrite it with the NIC MAC.
+        # Header-complete: our frames carry the CARP vMAC as the Ethernet source;
+        # without this the kernel would overwrite it with the NIC's own MAC.
         fcntl.ioctl(fd, BIOCSHDRCMPLT, struct.pack("I", 1))
         if self.promisc:
             fcntl.ioctl(fd, BIOCPROMISC)
-        insns = b"".join(struct.pack("HBBI", *insn) for insn in _BPF_FILTER)
-        buf = ctypes.create_string_buffer(insns)   # the kernel copies it during the ioctl
-        # struct bpf_program: u_int bf_len + insn pointer ("@IQ" pads to native layout)
-        fcntl.ioctl(fd, BIOCSETF, struct.pack("@IQ", len(_BPF_FILTER), ctypes.addressof(buf)))
         # bpf read(2) calls must request exactly the kernel buffer size.
         self._buflen = struct.unpack("I", fcntl.ioctl(fd, BIOCGBLEN, b"\x00" * 4))[0]
 
     def stop(self):
-        """Close the descriptor (the kernel detaches filter/promisc) and
-        collect the reader thread; the closing flag stops its select loop."""
-        self._closing = True
-        fd, self._fd = self._fd, None
-        if fd is not None:
+        """Ask the current reader to exit and wait briefly for it. The reader
+        closes its own fd, so stop() only signals and joins; a reader still
+        alive after the join (stuck in a slow callback) is left to exit on its
+        own -- it holds its own fd, so nothing here can be reused under it."""
+        thread = self._thread
+        stop_event = self._stop_event
+        wake_writer = self._wake_writer
+        self._fd = None
+        self._thread = None
+        self._stop_event = None
+        self._wake_writer = None
+
+        if stop_event is not None:
+            stop_event.set()
+        if wake_writer is not None:
             try:
-                os.close(fd)
+                os.write(wake_writer, b"\x00")   # wake the reader's select() at once
             except OSError:
                 pass
-        thread, self._thread = self._thread, None
-        if thread and thread.is_alive():
+            try:
+                os.close(wake_writer)
+            except OSError:
+                pass
+        if thread is not None and thread.is_alive():
             thread.join(timeout=2)
+            if thread.is_alive():
+                LOG.warning("bpf reader did not exit within 2s -- leaving it to "
+                            "finish; its fd is not reused")
 
     def alive(self):
         """True while the descriptor is open and the reader thread runs."""
-        return bool(self._fd is not None and self._thread and self._thread.is_alive())
+        return self._fd is not None and self._thread is not None and self._thread.is_alive()
 
-    def _read_loop(self, fd):
-        """Reader thread: select with a timeout so stop() (which closes the
-        fd) is noticed within a second, then walk the BPF buffer records."""
-        while not self._closing:
-            try:
-                ready, _, _ = select.select([fd], [], [], 1.0)
-                if not ready:
+    def _read_loop(self, fd, wake_reader, stop_event):
+        """Reader thread: block in select() on the bpf fd and the wake pipe;
+        stop() writes to the pipe to end the wait. Owns fd and wake_reader and
+        closes both on exit, so the fd's lifetime ends exactly when this thread
+        does."""
+        try:
+            while not stop_event.is_set():
+                try:
+                    readable, _, _ = select.select([fd, wake_reader], [], [])
+                except OSError:
+                    return
+                if wake_reader in readable:      # stop() rang -- loop condition ends us
                     continue
-                data = os.read(fd, self._buflen)
-            except (OSError, ValueError):
-                if not self._closing:
-                    LOG.warning("bpf read failed -- capture thread exiting")
-                return
-            for frame in _bpf_frames(data):
-                self._dispatch(frame)
+                try:
+                    data = os.read(fd, self._buflen)
+                except (OSError, ValueError):
+                    if not stop_event.is_set():
+                        LOG.warning("bpf read failed -- capture thread exiting")
+                    return
+                for frame in _bpf_frames(data):
+                    self._dispatch(frame)
+        finally:
+            for owned_fd in (fd, wake_reader):
+                try:
+                    os.close(owned_fd)
+                except OSError:
+                    pass
 
     def _dispatch(self, frame):
         """Decode one captured Ethernet frame and route it by ethertype to the
         keeper callback (via _deliver, so a handler failure is labelled as
         such). A parse error in the untrusted input is dropped (debug-logged)."""
-        decoded = handler = None
+        decoded = None
+        handler = None
         try:
             if len(frame) >= 14:
                 ethertype = int.from_bytes(frame[12:14], "big")
@@ -759,7 +875,8 @@ class BpfCapture:  # pylint: disable=too-many-instance-attributes
         _deliver(handler, decoded)
 
     def _write(self, frame):
-        """Inject one raw Ethernet frame on the interface."""
+        """Inject one raw Ethernet frame on the interface. Main-thread only (the
+        capture thread never sends), so reading self._fd needs no lock."""
         fd = self._fd
         if fd is None:
             raise OSError("bpf capture not started")
@@ -951,8 +1068,10 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
         """Adopt lease timing, gateway (opt 3) and subnet mask (opt 1) from an ACK
         -- the one place that knows which DhcpReply fields carry lease state.
         gateway + mask are what the Parameter Request List asks for; keep them for
-        logging + the cross-subnet follow decision."""
-        self.binding.lease_secs = rx.lease or default_lease
+        logging + the cross-subnet follow decision. The lease time is floored at
+        MIN_LEASE so a server (or a spoofed ACK) offering a 1-second lease cannot
+        drive the renew loop into a tight broadcast/CPU spin."""
+        self.binding.lease_secs = max(rx.lease or default_lease, MIN_LEASE)
         self.binding.t1_server, self.binding.t2_server = rx.t1, rx.t2
         self.binding.router = rx.router or self.binding.router
         self.binding.mask_bits = _mask_to_bits(rx.subnet_mask) or self.binding.mask_bits
@@ -1034,6 +1153,7 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
         for attempt in range(1, DORA_ATTEMPTS + 1):
             if self._should_stop():
                 return False
+            self._ensure_sniffer()   # an interface flap between OFFER and here would leave us deaf
             self._rx = None
             try:
                 self._send_dhcp(
@@ -1432,8 +1552,13 @@ class FollowPolicy:  # pylint: disable=too-many-instance-attributes
             LOG.error("follow_update retry failed: %s", e)
 
     def observe(self, rx):
-        """Record a peer-ACK observation (sniffer thread; a lone ref-assign);
-        the main loop consumes it in check_observed()."""
+        """Record a peer-ACK observation (capture thread; a lone ref-assign);
+        the main loop consumes it in check_observed().
+
+        The read-then-clear in check_observed is not atomic against this store,
+        so a peer ACK landing in that narrow window can be dropped. Accepted:
+        the next peer ACK or our own renewal re-detects the change, and the 1s
+        maintain tick keeps polling -- convergence is delayed, never lost."""
         self._observed = rx
 
     def check_observed(self):

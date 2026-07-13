@@ -162,6 +162,30 @@ def test_decode_ipv4_bootp_end_to_end(lk):
     assert rx.subnet_mask == "255.255.255.0" and rx.giaddr == "100.64.4.9"
 
 
+def test_decode_ipv4_bootp_bounds_by_udp_length(lk):
+    # A UDP length shorter than the IP payload must not let trailing bytes be
+    # parsed as options: bytes past udp_len are dropped like link padding.
+    payload = _bootp_reply(lk, options=bytes([53, 1, 5, 255]))
+    dgram = bytearray(lk._encode_ipv4_udp("100.64.4.1", "255.255.255.255", 67, 68, payload))
+    ihl = (dgram[0] & 0x0F) * 4
+    # append attacker bytes that look like an option, then shrink UDP length to exclude them
+    dgram += bytes([54, 4, 9, 9, 9, 9])
+    dgram[2:4] = (len(dgram)).to_bytes(2, "big")                 # IP total covers the extra bytes
+    true_udp_len = ihl + 8 + len(payload) - ihl                 # = 8 + len(payload)
+    dgram[ihl + 4:ihl + 6] = (8 + len(payload)).to_bytes(2, "big")
+    frame = lk._decode_ipv4_bootp(bytes(dgram))
+    assert dict(frame.options) == {"message-type": 5}           # the trailing option is excluded
+    assert true_udp_len == 8 + len(payload)
+
+
+def test_decode_ipv4_bootp_rejects_short_udp_length(lk):
+    payload = _bootp_reply(lk, options=bytes([53, 1, 5, 255]))
+    dgram = bytearray(lk._encode_ipv4_udp("100.64.4.1", "255.255.255.255", 67, 68, payload))
+    ihl = (dgram[0] & 0x0F) * 4
+    dgram[ihl + 4:ihl + 6] = (4).to_bytes(2, "big")             # UDP length < its own 8-byte header
+    assert lk._decode_ipv4_bootp(bytes(dgram)) is None
+
+
 def test_decode_ipv4_bootp_trims_link_padding(lk):
     # Ethernet pads short frames: bytes past the IP total length must not
     # leak into the options walk.

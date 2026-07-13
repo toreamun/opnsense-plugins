@@ -16,6 +16,28 @@ jobs:
       # byte-compile every script as a syntax safety net
       - run: python -m compileall -q net
 
+  python-strict:
+    name: Python (pylint 10/10 + pyright)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      # pytest is imported by the test modules, so pylint/pyright need it to
+      # resolve; scapy stays intentionally absent (the code carries the
+      # pragmas for that).
+      - run: pip install pylint pyright pytest
+      # The repo .pylintrc holds the project conventions; every deviation from
+      # the strict defaults is an inline pragma at its site. Any message fails
+      # the job (10.00/10 is the bar). useless-suppression audits the pragmas
+      # themselves; it reports as information and does not fail the run.
+      - name: pylint
+        run: |
+          pylint --rcfile=.pylintrc --enable=useless-suppression             net/os-carp-vip-dhcp/src/opnsense/scripts/OPNsense/CarpVipDhcp/*.py             net/os-carp-vip-dhcp/tests/*.py
+      - name: pyright
+        run: pyright net/os-carp-vip-dhcp
+
   pytest:
     name: Python unit tests
     runs-on: ubuntu-latest

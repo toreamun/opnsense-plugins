@@ -107,178 +107,24 @@ except Exception as _scapy_exc:   # ImportError, or scapy's own import-time fail
 
 LOG = logging.getLogger("lease-keeper")
 
-# DHCP message types (RFC 2131).
-OFFER, ACK, NAK = 2, 5, 6
-BOOTREPLY = 2              # BOOTP op field: a server->client reply (unrelated to OFFER)
+from leasekeeper.constants import (
+    ACK, ARP_NUDGE_MIN, ATTEMPT_BACKOFF_CAP, BOOTREPLY, BROADCAST_FLAG,
+    DEFAULT_LEASE, DHCP_CLIENT_PORT, DHCP_SERVER_PORT, DORA_ATTEMPTS,
+    ETHER_BROADCAST, ETHER_ZERO, FOLLOW_RETRY_DEADLINE, HB_REFRESH,
+    IPV4_BROADCAST, LINK_KICK_DEBOUNCE, LINK_POLL_STEP, LOG_BACKUPS,
+    LOG_MAX_BYTES, LOOP_ERROR_BACKOFF, MIN_FOLLOW_INTERVAL, MIN_LEASE, MIN_T1,
+    MTYPE_NAMES, NAK, OFFER, PARAM_REQ_LIST, PHASE_DORA, PHASE_OBSERVED,
+    PHASE_REBIND, PHASE_REBOOT, PHASE_RENEW, REBIND_MARGIN, REBIND_POLL_STEP,
+    REBOOT_ATTEMPTS, REDORA_MAX, REDORA_MIN, RENEW_ATTEMPTS, RENEW_TIMEOUT,
+    REPLY_TIMEOUT, SEND_RETRY_DELAY, SNIFFER_RETRY, SNIFFER_WARMUP, T1_FACTOR,
+    T2_FACTOR)
+from leasekeeper.util import (
+    MAC_RE, _atomic_write, _clock_at, _fs_safe, _is_localish, _jittered,
+    _mask_to_bits, _new_xid, _same_ip_class, _sane_ipv4, mac2raw)
+from leasekeeper.wire import (
+    ArpFrame, BootpFrame, DhcpReply, SNIFFER_FILTER, _dhcp_options, _fmt_reply,
+    _msg_text, _parse_reply)
 
-# Options we ask the server to include on every DISCOVER/REQUEST (RFC 2132 option
-# 55, Parameter Request List). Subnet mask (1) + router (3) drive follow mode's
-# cross-subnet decision; lease/server-id/T1/T2 (51/54/58/59) drive renew timing.
-# Many servers return ONLY options named in the PRL, so without this the keeper
-# can silently miss the mask/router it needs to follow a cross-subnet renumber.
-PARAM_REQ_LIST = [1, 3, 51, 54, 58, 59]
-
-# Timing / retry tunables (seconds unless noted).
-HB_REFRESH = 30            # rewrite the heartbeat at least this often while holding a lease
-DEFAULT_LEASE = 3600       # fallback lease time if the server sends none
-DORA_ATTEMPTS = 5          # DISCOVER and REQUEST attempts per acquire
-REBOOT_ATTEMPTS = 2        # INIT-REBOOT REQUEST attempts before falling back to a full DISCOVER
-RENEW_ATTEMPTS = 3         # REQUEST attempts per renew
-REPLY_TIMEOUT = 4          # wait for an OFFER/ACK during acquire
-RENEW_TIMEOUT = 3          # wait for an ACK during renew
-ATTEMPT_BACKOFF_CAP = 8    # max wait between acquire attempts
-SEND_RETRY_DELAY = 2       # wait after a failed packet send before retrying
-REBIND_POLL_STEP = 10      # how often to re-try RENEW during the REBIND window
-REDORA_MIN = 10            # initial wait after a failed acquire; also the hold-poll cadence while no carrier
-# Caps worst-case re-acquire lag at ~45s even if the link-return fast path (below)
-# is missed; the backoff doubles 10 -> 20 -> 40 -> 45.
-REDORA_MAX = 45            # max exponential-backoff wait after a failed acquire
-LINK_POLL_STEP = 3         # while UNBOUND, poll interface carrier this often (s) for the link-return fast path
-LINK_KICK_DEBOUNCE = 8     # min seconds between link-return re-DORA kicks (damps a flapping link)
-SNIFFER_RETRY = 5          # wait before retrying a failed packet-sniffer start
-SNIFFER_WARMUP = 0.5       # let the capture thread attach before the first send
-LOOP_ERROR_BACKOFF = 10    # wait after an unexpected main-loop error before retrying
-MIN_FOLLOW_INTERVAL = 60   # min seconds between follow (VIP rewrite) events -- damps flap/spoof storms
-FOLLOW_RETRY_DEADLINE = 120  # re-drive follow_update if we are not restarted within this after firing
-T1_FACTOR = 0.5            # renew at this fraction of the lease (RFC default)
-T2_FACTOR = 0.875          # rebind by this fraction of the lease (RFC default)
-MIN_T1 = 30                # floor for the renew timer (very short leases)
-MIN_LEASE = 2 * MIN_T1     # floor for an accepted lease time, so a tiny (even hostile) opt-51 can't spin renews
-REBIND_MARGIN = 15         # ensure T2 is at least this far past T1
-BROADCAST_FLAG = 0x8000    # BOOTP flags: ask the server to broadcast OFFER/ACK
-ETHER_BROADCAST = "ff:ff:ff:ff:ff:ff"
-ETHER_ZERO = "00:00:00:00:00:00"     # ARP "target unknown" hardware address
-IPV4_BROADCAST = "255.255.255.255"   # limited broadcast (never routed off-link)
-DHCP_SERVER_PORT = 67
-DHCP_CLIENT_PORT = 68
-ARP_NUDGE_MIN = 30         # floor for --arp-nudge so a typo cannot flood the segment
-LOG_MAX_BYTES = 512 * 1024
-LOG_BACKUPS = 3
-
-# ---- DHCP wire format: parse / format / build ----
-# Pure encode/decode helpers with no client state: they turn scapy packets into a
-# DhcpReply and turn a message type into an option list. The stateful protocol
-# sequences (DORA / INIT-REBOOT / renew) live in the DhcpClient class further down.
-
-# A parsed DHCP reply, snapshotted from the capture thread.
-# `message` (DHCP option 56) is the server's optional human-readable text, mainly
-# a NAK reason; `subnet_mask` (option 1) is used to follow a cross-subnet renumber;
-# `giaddr` (BOOTP header) is the relay agent, None when the server is directly
-# attached (no relay in path). The trailing fields are defaulted so existing
-# shorter constructions stay valid.
-DhcpReply = namedtuple("DhcpReply", "mtype yiaddr server_id lease t1 t2 router message subnet_mask giaddr",
-                       defaults=(None, None, None))
-
-# A received BOOTP/DHCP frame in backend-neutral shape: both capture backends
-# (scapy packet / raw bytes) decode to this before the keeper sees it. chaddr
-# is raw bytes; options is a list of (name, value) tuples in the keeper's own
-# option vocabulary (the names in _OPT_ENCODERS/_OPT_DECODERS), which
-# _parse_reply reads regardless of backend. The names are deliberately
-# scapy-compatible: ScapyCapture relays outbound option lists to scapy
-# verbatim (see its docstring).
-BootpFrame = namedtuple("BootpFrame", "op xid yiaddr chaddr giaddr options")
-
-# A received ARP frame (the capture filter already narrows ARP to replies, but
-# op still travels so the handler re-checks rather than trusting the filter).
-ArpFrame = namedtuple("ArpFrame", "op psrc pdst")
-
-# Changed-address phase labels: which exchange saw the differing ACK. Log
-# text and policy input at once -- FollowPolicy relaxes its expected-server
-# check on PHASE_REBIND (at T2 any server may legitimately answer).
-PHASE_DORA = "DORA"
-PHASE_REBOOT = "REBOOT"
-PHASE_RENEW = "RENEW"
-PHASE_REBIND = "REBIND"
-PHASE_OBSERVED = "OBSERVED"
-
-# DHCP message-type names (option 53), for readable reply logging.
-MTYPE_NAMES = {1: "DISCOVER", 2: "OFFER", 3: "REQUEST", 4: "DECLINE",
-               5: "ACK", 6: "NAK", 7: "RELEASE", 8: "INFORM"}
-
-
-def _msg_text(msg):
-    """DHCP option-56 server text (usually a NAK reason) as a sanitized str, or
-    "" when absent. Option 56 may arrive as bytes or str depending on the server.
-
-    The text is attacker-controlled (any host on the segment can race a NAK with
-    a matching xid) and is written to the log, so strip control characters --
-    newlines that would forge log lines and terminal escape sequences -- before
-    it goes anywhere. Printable content is preserved."""
-    if isinstance(msg, bytes):
-        msg = msg.decode(errors="replace")
-    if not msg:
-        return ""
-    return re.sub(r"[\x00-\x1f\x7f]", "?", str(msg)).strip()
-
-
-def _fmt_reply(rx):
-    """One readable line decoding a received first-party DHCP reply. Logged at
-    DEBUG (the keeper's default level), so every reply's fields (type, addresses,
-    timers, gateway, mask, relay, server text) show in the log without a capture."""
-    txt = _msg_text(rx.message)
-    mtype = MTYPE_NAMES.get(rx.mtype, f"type={rx.mtype}")
-    msg = f" msg={txt!r}" if txt else ""
-    return (f"{mtype} yiaddr={rx.yiaddr or '-'} server={rx.server_id or '-'} "
-            f"giaddr={rx.giaddr or 'none'} lease={'-' if rx.lease is None else rx.lease} "
-            f"t1={'-' if rx.t1 is None else rx.t1} t2={'-' if rx.t2 is None else rx.t2} "
-            f"gw={rx.router or '-'} mask={rx.subnet_mask or '-'}{msg}")
-
-
-def _parse_reply(frame):
-    """Snapshot only the handful of DHCP options the keeper acts on from a
-    BootpFrame into a DhcpReply; the rest of the reply's option data --
-    untrusted, from whatever answered on the wire -- is left untouched."""
-    mt = sid = lt = rt = bt = ro = msg = sm = None
-    for o in frame.options:
-        if isinstance(o, tuple):
-            if o[0] == "message-type":
-                mt = o[1]
-            elif o[0] == "server_id":
-                sid = o[1]
-            elif o[0] == "lease_time":
-                lt = o[1]
-            elif o[0] == "renewal_time":
-                rt = o[1]
-            elif o[0] == "rebinding_time":
-                bt = o[1]
-            elif o[0] == "router":
-                ro = o[1]
-            elif o[0] == "message":     # option 56: server's text (e.g. a NAK reason)
-                msg = o[1]
-            elif o[0] == "subnet_mask":  # option 1: to follow a cross-subnet renumber
-                sm = o[1]
-    gi = frame.giaddr   # relay agent; 0.0.0.0 = directly attached
-    if gi in (None, "0.0.0.0", 0):
-        gi = None
-    return DhcpReply(mt, frame.yiaddr, sid, lt, rt, bt, ro, msg, sm, gi)
-
-
-def _dhcp_options(mtype, extra, id_opts):
-    """The DHCP option list for a message: type, our Parameter Request List
-    (so the server returns the mask/router/timers the keeper acts on), the
-    identity options, then the per-message extras."""
-    return ([("message-type", mtype), ("param_req_list", PARAM_REQ_LIST)]
-            + id_opts + extra + ["end"])
-
-
-def _mask_to_bits(mask):
-    """Dotted-quad subnet mask (DHCP option 1) -> prefix length, or None if absent
-    or unparseable."""
-    try:
-        return ipaddress.IPv4Network(f"0.0.0.0/{mask}").prefixlen
-    except (ValueError, TypeError):
-        return None
-
-
-MAC_RE = re.compile(r"^([0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}$")
-
-
-_CGNAT = ipaddress.ip_network("100.64.0.0/10")
-
-# Static BPF capture filter: DHCP (broadcast OFFER/ACK) + ARP replies to our nudge
-# (arp[6:2]=2). A boundary, not an optimization -- it keeps everything else (incl. the
-# segment's broadcast who-has flood) out of the Python parser.
-SNIFFER_FILTER = f"(udp and (port {DHCP_SERVER_PORT} or port {DHCP_CLIENT_PORT})) or (arp and arp[6:2] = 2)"
 
 # ---- raw wire codec (bpf backend) ----
 # Hand encoders/decoders for exactly the frames the keeper exchanges, so the
@@ -902,77 +748,6 @@ class BpfCapture:  # pylint: disable=too-many-instance-attributes
 # exactly one place (plus its rc.conf documentation).
 CAPTURE_BACKENDS = {"scapy": ScapyCapture, "bpf": BpfCapture}
 
-
-def _sane_ipv4(ip):
-    """True for a plausible host IPv4 lease address (rejects 0.0.0.0, multicast,
-    reserved, loopback and link-local) -- used to avoid rewriting the CARP VIP
-    from a malformed or rogue ACK."""
-    try:
-        addr = ipaddress.ip_address(ip)
-    except ValueError:
-        return False
-    return (addr.version == 4 and not addr.is_unspecified and not addr.is_multicast
-            and not addr.is_reserved and not addr.is_loopback and not addr.is_link_local)
-
-
-def _is_localish(ip):
-    """True if the address is private (RFC 1918) or CGNAT (RFC 6598) -- i.e. not a
-    globally routable public address (independent of the Python version's view of
-    CGNAT)."""
-    addr = ipaddress.ip_address(ip)
-    return addr.is_private or addr in _CGNAT
-
-
-def _same_ip_class(a, b):
-    """True if a and b are in the same routability class (both local-ish or both
-    public). A follow that crosses classes (e.g. CGNAT -> a public IP) is almost
-    certainly a spoofed/rogue ACK, not a legitimate reassignment."""
-    try:
-        return _is_localish(a) == _is_localish(b)
-    except ValueError:
-        return False
-
-
-def _fs_safe(s):
-    """Filesystem-safe token (keeperconf.keeper_id mirrors this charset for
-    the configd scripts)."""
-    return re.sub(r"[^A-Za-z0-9]", "_", s or "")
-
-
-def _new_xid():
-    """A fresh random transaction id (nonzero 32-bit, regenerated per exchange
-    so stale replies cannot match)."""
-    return random.randint(1, 0xFFFFFFFF)
-
-
-def _jittered(base):
-    """A retransmit/backoff delay with +/-25% uniform jitter (RFC 2131 4.1
-    recommends a randomized backoff). Both HA nodes share the chaddr, so
-    jittering the acquire and REBIND retransmit cadences keeps them from
-    broadcasting in lockstep and colliding at the server. (The T1/T2 lease
-    timers are deterministic and shared too, but jittering those is a
-    lease-timing change, not a 4.1 retransmit concern, so they stay exact.)"""
-    return base * random.uniform(0.75, 1.25)
-
-
-def mac2raw(m):
-    """Colon/dash-separated MAC string -> 6 raw bytes (BOOTP chaddr)."""
-    return bytes.fromhex(m.replace(":", "").replace("-", ""))
-
-
-def _atomic_write(path, content):
-    """Write via tmp + rename so a crash mid-write cannot leave a partial file."""
-    tmp = f"{path}.tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(content)
-    os.replace(tmp, path)
-
-
-def _clock_at(offset):
-    """Local wall-clock HH:MM of a moment `offset` seconds from now. Log
-    lines state future moments (renew/rebind/lease expiry) as relative
-    durations; the clock time saves the reader the mental arithmetic."""
-    return time.strftime("%H:%M", time.localtime(time.time() + offset))
 
 
 @dataclass

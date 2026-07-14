@@ -5,10 +5,10 @@ wires up and runs the Keeper defined here. Modules, leaf-first:
 
   constants  -- protocol codes, timing tunables, phase/message-type tables
   util       -- pure helpers (MAC/IP/mask, jitter, atomic write, clock)
-  wire       -- neutral BootpFrame/ArpFrame, DhcpReply, reply parse/format
+  wire       -- neutral BootpFrame/ArpFrame, DhcpReply/DhcpSend, reply parse/format/build
   codec      -- raw wire encode/decode + the embedded BPF filter (bpf backend)
   capture_scapy / capture_bpf -- the two capture backends
-  capture    -- the backend registry
+  capture    -- the Capture protocol + the backend registry
   dhcpclient -- Lease + the RFC 2131 client (DORA/renew/release)
   policy     -- ArpNudge + FollowPolicy
   keeper     -- Keeper orchestration

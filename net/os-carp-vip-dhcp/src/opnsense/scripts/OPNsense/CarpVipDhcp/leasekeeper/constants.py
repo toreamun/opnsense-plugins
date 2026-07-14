@@ -65,6 +65,28 @@ class DhcpOpt(IntEnum):
     END = 255
 
 
+class DhcpOptName(StrEnum):
+    """The keeper's option-name vocabulary: the (name, value) keys in
+    BootpFrame.options, built by _dhcp_options and read by _parse_reply. These
+    ARE scapy's own option names (ScapyCapture relays the outbound list verbatim),
+    so the values must match scapy; a StrEnum keeps them scapy-compatible (each
+    member IS the string) while giving one typo-proof source instead of literals
+    repeated across the codec tables, _parse_reply and the client."""
+    MESSAGE_TYPE = "message-type"
+    PARAM_REQ_LIST = "param_req_list"
+    REQUESTED_ADDR = "requested_addr"
+    SERVER_ID = "server_id"
+    HOSTNAME = "hostname"
+    VENDOR_CLASS_ID = "vendor_class_id"
+    CLIENT_ID = "client_id"
+    SUBNET_MASK = "subnet_mask"
+    ROUTER = "router"
+    LEASE_TIME = "lease_time"
+    RENEWAL_TIME = "renewal_time"
+    REBINDING_TIME = "rebinding_time"
+    MESSAGE = "message"
+
+
 def mtype_name(code):
     """Readable DHCP message-type name for logging; falls back to type=<n> for a
     code not in MsgType (the reply is untrusted wire input)."""

@@ -12,7 +12,7 @@ import time
 from .capture import CAPTURE_BACKENDS
 from .constants import (
     LOGGER_NAME,
-    ACK, BootpOp, HB_REFRESH, LINK_KICK_DEBOUNCE, LINK_POLL_STEP,
+    ACK, BootpOp, DhcpOptName, HB_REFRESH, LINK_KICK_DEBOUNCE, LINK_POLL_STEP,
     LOOP_ERROR_BACKOFF, REBIND_POLL_STEP, REDORA_MAX, REDORA_MIN, SNIFFER_RETRY,
     SNIFFER_WARMUP)
 from .dhcpclient import DhcpClient
@@ -618,9 +618,9 @@ def _identity_options(vendor_class, client_id, hostname):
     row of the README's ISP-security section."""
     id_opts = []
     if vendor_class:
-        id_opts.append(("vendor_class_id", vendor_class))
+        id_opts.append((DhcpOptName.VENDOR_CLASS_ID, vendor_class))
     if client_id:
-        id_opts.append(("client_id", client_id.encode()))
+        id_opts.append((DhcpOptName.CLIENT_ID, client_id.encode()))
     if hostname:
-        id_opts.append(("hostname", hostname))
+        id_opts.append((DhcpOptName.HOSTNAME, hostname))
     return id_opts

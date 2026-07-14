@@ -8,7 +8,7 @@ access is bounds-checked and a malformed frame decodes to None (dropped).
 import ipaddress
 import struct
 
-from .constants import ArpOp, BootpOp, DhcpOpt, ETHER_ZERO, MsgType
+from .constants import ArpOp, BootpOp, DhcpOpt, DhcpOptName, ETHER_ZERO, MsgType
 from .util import mac2raw
 from .wire import ArpFrame, BootpFrame
 
@@ -58,13 +58,13 @@ def _opt_text(v):
 # exactly the options the keeper sends. These names ARE the keeper's option
 # vocabulary (BootpFrame.options and _dhcp_options use them).
 _OPT_ENCODERS = {
-    "message-type": (DhcpOpt.MESSAGE_TYPE, lambda v: bytes([_MTYPE_CODES[v]])),
-    "param_req_list": (DhcpOpt.PARAM_REQ_LIST, bytes),   # list of option codes
-    "requested_addr": (DhcpOpt.REQUESTED_ADDR, _ip4),
-    "server_id": (DhcpOpt.SERVER_ID, _ip4),
-    "hostname": (DhcpOpt.HOSTNAME, _opt_text),
-    "vendor_class_id": (DhcpOpt.VENDOR_CLASS_ID, _opt_text),
-    "client_id": (DhcpOpt.CLIENT_ID, _opt_text),
+    DhcpOptName.MESSAGE_TYPE: (DhcpOpt.MESSAGE_TYPE, lambda v: bytes([_MTYPE_CODES[v]])),
+    DhcpOptName.PARAM_REQ_LIST: (DhcpOpt.PARAM_REQ_LIST, bytes),   # list of option codes
+    DhcpOptName.REQUESTED_ADDR: (DhcpOpt.REQUESTED_ADDR, _ip4),
+    DhcpOptName.SERVER_ID: (DhcpOpt.SERVER_ID, _ip4),
+    DhcpOptName.HOSTNAME: (DhcpOpt.HOSTNAME, _opt_text),
+    DhcpOptName.VENDOR_CLASS_ID: (DhcpOpt.VENDOR_CLASS_ID, _opt_text),
+    DhcpOptName.CLIENT_ID: (DhcpOpt.CLIENT_ID, _opt_text),
 }
 
 
@@ -165,14 +165,14 @@ def _first_ip(v):
 # exactly the options _parse_reply acts on; everything else is skipped unread
 # (untrusted input, narrow surface).
 _OPT_DECODERS = {
-    DhcpOpt.SUBNET_MASK: ("subnet_mask", _first_ip),
-    DhcpOpt.ROUTER: ("router", _first_ip),
-    DhcpOpt.LEASE_TIME: ("lease_time", _u32),
-    DhcpOpt.MESSAGE_TYPE: ("message-type", lambda v: v[0]),
-    DhcpOpt.SERVER_ID: ("server_id", _first_ip),
-    DhcpOpt.MESSAGE: ("message", bytes),
-    DhcpOpt.RENEWAL_TIME: ("renewal_time", _u32),
-    DhcpOpt.REBINDING_TIME: ("rebinding_time", _u32),
+    DhcpOpt.SUBNET_MASK: (DhcpOptName.SUBNET_MASK, _first_ip),
+    DhcpOpt.ROUTER: (DhcpOptName.ROUTER, _first_ip),
+    DhcpOpt.LEASE_TIME: (DhcpOptName.LEASE_TIME, _u32),
+    DhcpOpt.MESSAGE_TYPE: (DhcpOptName.MESSAGE_TYPE, lambda v: v[0]),
+    DhcpOpt.SERVER_ID: (DhcpOptName.SERVER_ID, _first_ip),
+    DhcpOpt.MESSAGE: (DhcpOptName.MESSAGE, bytes),
+    DhcpOpt.RENEWAL_TIME: (DhcpOptName.RENEWAL_TIME, _u32),
+    DhcpOpt.REBINDING_TIME: (DhcpOptName.REBINDING_TIME, _u32),
 }
 
 

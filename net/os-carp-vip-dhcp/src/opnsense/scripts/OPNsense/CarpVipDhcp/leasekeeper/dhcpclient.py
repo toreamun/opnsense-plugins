@@ -10,7 +10,7 @@ from dataclasses import dataclass
 
 from .constants import (
     LOGGER_NAME,
-    ACK, ATTEMPT_BACKOFF_CAP, BROADCAST_FLAG, DEFAULT_LEASE, DORA_ATTEMPTS,
+    ACK, ATTEMPT_BACKOFF_CAP, BROADCAST_FLAG, DEFAULT_LEASE, DhcpOptName, DORA_ATTEMPTS,
     IPV4_BROADCAST, MIN_LEASE, MIN_T1, NAK, OFFER, Phase, REBIND_MARGIN,
     REBOOT_ATTEMPTS, RENEW_ATTEMPTS,
     RENEW_TIMEOUT, REPLY_TIMEOUT, SEND_RETRY_DELAY, T1_FACTOR, T2_FACTOR)
@@ -173,7 +173,7 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
     def _discover(self, request_ip):
         """SELECTING: broadcast DISCOVER until a server OFFERs; record the
         offered address and server. False on NAK/timeout/stop."""
-        extra = [("requested_addr", request_ip)] if request_ip else []
+        extra = [(DhcpOptName.REQUESTED_ADDR, request_ip)] if request_ip else []
         for attempt in range(1, DORA_ATTEMPTS + 1):
             if self._should_stop():
                 return False
@@ -208,7 +208,7 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
             try:
                 self._send_dhcp(
                     "request",
-                    [("server_id", self.binding.server), ("requested_addr", self.binding.yiaddr)],
+                    [(DhcpOptName.SERVER_ID, self.binding.server), (DhcpOptName.REQUESTED_ADDR, self.binding.yiaddr)],
                 )
             except Exception as e:
                 LOG.error("DHCP REQUEST send failed: %s", e)
@@ -247,7 +247,7 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
             return False
 
         self.xid = _new_xid()
-        extra = [("requested_addr", request_ip)]
+        extra = [(DhcpOptName.REQUESTED_ADDR, request_ip)]
         for attempt in range(1, REBOOT_ATTEMPTS + 1):
             if self._should_stop():
                 return False
@@ -334,7 +334,7 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
             self._capture.send_dhcp(DhcpSend(
                 eth_src=self.eth_src, ip_src=yiaddr, ip_dst=server or IPV4_BROADCAST,
                 chaddr=self.chraw, xid=self.xid, ciaddr=yiaddr, flags=0,
-                options=[("message-type", "release"), ("server_id", server), "end"]))
+                options=[(DhcpOptName.MESSAGE_TYPE, "release"), (DhcpOptName.SERVER_ID, server), "end"]))
             LOG.info("DHCP RELEASE of lease %s sent (server %s)", yiaddr, server or "broadcast")
         except Exception as e:
             LOG.error("RELEASE failed: %s", e)

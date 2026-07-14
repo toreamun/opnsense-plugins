@@ -10,7 +10,8 @@ import logging
 import re
 from typing import NamedTuple
 
-from .constants import LOGGER_NAME, DHCP_CLIENT_PORT, DHCP_SERVER_PORT, PARAM_REQ_LIST, mtype_name
+from .constants import (
+    LOGGER_NAME, DHCP_CLIENT_PORT, DHCP_SERVER_PORT, DhcpOptName, PARAM_REQ_LIST, mtype_name)
 
 LOG = logging.getLogger(LOGGER_NAME)
 
@@ -122,18 +123,18 @@ def _parse_reply(frame) -> DhcpReply:
     if gi in (None, "0.0.0.0", 0):
         gi = None
     return DhcpReply(
-        mtype=opts.get("message-type"), yiaddr=frame.yiaddr,
-        server_id=opts.get("server_id"), lease=opts.get("lease_time"),
-        t1=opts.get("renewal_time"), t2=opts.get("rebinding_time"),
-        router=opts.get("router"), message=opts.get("message"),
-        subnet_mask=opts.get("subnet_mask"), giaddr=gi)
+        mtype=opts.get(DhcpOptName.MESSAGE_TYPE), yiaddr=frame.yiaddr,
+        server_id=opts.get(DhcpOptName.SERVER_ID), lease=opts.get(DhcpOptName.LEASE_TIME),
+        t1=opts.get(DhcpOptName.RENEWAL_TIME), t2=opts.get(DhcpOptName.REBINDING_TIME),
+        router=opts.get(DhcpOptName.ROUTER), message=opts.get(DhcpOptName.MESSAGE),
+        subnet_mask=opts.get(DhcpOptName.SUBNET_MASK), giaddr=gi)
 
 
 def _dhcp_options(mtype, extra, id_opts):
     """The DHCP option list for a message: type, our Parameter Request List
     (so the server returns the mask/router/timers the keeper acts on), the
     identity options, then the per-message extras."""
-    return ([("message-type", mtype), ("param_req_list", PARAM_REQ_LIST)]
+    return ([(DhcpOptName.MESSAGE_TYPE, mtype), (DhcpOptName.PARAM_REQ_LIST, PARAM_REQ_LIST)]
             + id_opts + extra + ["end"])
 
 

@@ -93,7 +93,7 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         # follow bookkeeping; drives the client via adopt()/release()/expire().
         self._follow = FollowPolicy(request_ip, follow, self.chaddr, self._dhcp,
                                     self._hb_mismatch,
-                                    fire_follow_update=self._dispatch_follow_update)
+                                    dispatch=self._dispatch_follow_update)
 
         self.redora_wait = REDORA_MIN
         # Link-return fast path (only while UNBOUND): a carrier down->up edge resets

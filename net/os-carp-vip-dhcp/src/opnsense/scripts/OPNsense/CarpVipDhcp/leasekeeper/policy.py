@@ -136,15 +136,16 @@ class FollowPolicy:  # pylint: disable=too-many-instance-attributes
     apply-retry watchdog and the peer-ACK observation handoff."""
 
     def __init__(self, target, follow, chaddr, dhcp, hb_mismatch,  # pylint: disable=too-many-arguments
-                 *, fire_follow_update):
+                 *, dispatch):
         self.target = target           # the address this keeper is meant to hold
         self.follow = follow
         self._dhcp = dhcp
         self._hb_mismatch = hb_mismatch
-        # Injected side-effect seam: dispatch the CARP-VIP rewrite (old, new,
-        # gw_args). Kept out of this decision module so the system coupling
-        # (configd) lives in the orchestration layer, like the other hooks.
-        self._dispatch_follow_update = fire_follow_update
+        # Injected side-effect seam: the callable that dispatches the CARP-VIP
+        # rewrite (old, new, gw_args). Kept out of this decision module so the
+        # system coupling (configd) lives in the orchestration layer, like the
+        # other hooks.
+        self._dispatch = dispatch
 
         self._attempt = _FollowAttempt()   # the in-flight follow (watchdog re-drive state)
 
@@ -272,7 +273,7 @@ class FollowPolicy:  # pylint: disable=too-many-instance-attributes
         deadline. Separate from _follow_update so the watchdog can re-drive a
         stalled follow without tripping the followed_ip equality guard."""
         # gw_args: cross-subnet [old_gw, new_gw, bits]; empty on a same-subnet move.
-        self._dispatch_follow_update(old_ip, new_ip, self._attempt.gw_args)
+        self._dispatch(old_ip, new_ip, self._attempt.gw_args)
         self._attempt.fired_at = time.time()
 
     def watchdog(self):

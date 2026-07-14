@@ -11,13 +11,18 @@ import time
 from .capture import CAPTURE_BACKENDS
 from .constants import (
     ACK, BOOTREPLY, HB_REFRESH, LINK_KICK_DEBOUNCE, LINK_POLL_STEP,
-    LOOP_ERROR_BACKOFF, REDORA_MAX, REDORA_MIN, SNIFFER_RETRY, SNIFFER_WARMUP)
+    LOOP_ERROR_BACKOFF, REBIND_POLL_STEP, REDORA_MAX, REDORA_MIN, SNIFFER_RETRY,
+    SNIFFER_WARMUP)
 from .dhcpclient import DhcpClient
 from .policy import ArpNudge, FollowPolicy
 from .util import _atomic_write, _clock_at, _jittered, _sane_ipv4
 from .wire import _parse_reply
 
 LOG = logging.getLogger("lease-keeper")
+
+# Daemon log-and-continue posture: broad catch-alls are deliberate (see the
+# package docstring / module docstrings).
+# pylint: disable=broad-exception-caught
 
 
 class Keeper:  # pylint: disable=too-many-instance-attributes
@@ -394,6 +399,20 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         LOG.info("stopped")
         return 0
 
+    def claim_once(self):
+        """--once mode: claim, report, release -- a wiring test, not service
+        mode. Lives on the keeper so it uses the components directly instead of
+        the entry point reaching into private attributes."""
+        if not self._capture.start():
+            return 3
+        time.sleep(SNIFFER_WARMUP)
+        ok = self._dhcp.dora(self._follow.target)
+        LOG.info("DHCP claim %s -> %s", self.chaddr, self._dhcp.binding.yiaddr if ok else "FAIL")
+        if ok:
+            self._dhcp.release()
+        self._capture.stop()
+        return 0 if ok else 1
+
     def _maintain_step(self):
         """One iteration of the maintain loop. Returns to run() (which loops again)
         on every state transition; any exception it raises is caught by run() and
@@ -508,4 +527,3 @@ def _identity_options(vendor_class, client_id, hostname):
     if hostname:
         id_opts.append(("hostname", hostname))
     return id_opts
-

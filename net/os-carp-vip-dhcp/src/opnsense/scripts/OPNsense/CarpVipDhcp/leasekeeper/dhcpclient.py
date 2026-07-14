@@ -18,6 +18,10 @@ from .wire import _dhcp_options, _fmt_reply, _msg_text
 
 LOG = logging.getLogger("lease-keeper")
 
+# Daemon log-and-continue posture: broad catch-alls are deliberate (see the
+# package docstring / module docstrings).
+# pylint: disable=broad-exception-caught
+
 
 @dataclass
 class Lease:
@@ -350,4 +354,3 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
         t2 = min(max(t1 + REBIND_MARGIN, t2), lease)
         src = "server" if (self.binding.t1_server or self.binding.t2_server) else "derived"
         return t1, t2, src
-

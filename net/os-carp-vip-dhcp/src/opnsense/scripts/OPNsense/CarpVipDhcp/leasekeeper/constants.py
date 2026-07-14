@@ -1,11 +1,49 @@
-"""Protocol codes, timing tunables and the phase / message-type tables.
+"""Protocol codes, timing tunables and the phase labels.
 
-Pure literals with no imports, so every other module can depend on this one.
+Only the stdlib enum import; every other module depends on this one.
 """
+from enum import IntEnum
 
-# DHCP message types (RFC 2131).
-OFFER, ACK, NAK = 2, 5, 6
+
+class MsgType(IntEnum):
+    """DHCP message types (RFC 2131 option 53). One table serves the wire code,
+    the readable name (logging, via mtype_name) and equality checks -- replacing
+    the old parallel OFFER/ACK/NAK constants, MTYPE_NAMES dict and send-side
+    code map."""
+    DISCOVER = 1
+    OFFER = 2
+    REQUEST = 3
+    DECLINE = 4
+    ACK = 5
+    NAK = 6
+    RELEASE = 7
+    INFORM = 8
+
+
+# Aliases for the types the code compares against by bare name.
+OFFER, ACK, NAK = MsgType.OFFER, MsgType.ACK, MsgType.NAK
 BOOTREPLY = 2              # BOOTP op field: a server->client reply (unrelated to OFFER)
+
+
+class ArpOp(IntEnum):
+    """ARP operation codes (RFC 826): the nudge sends a REQUEST, and only a
+    REPLY (is-at) counts as the gateway's reachability confirmation."""
+    REQUEST = 1
+    REPLY = 2
+
+
+def mtype_name(code):
+    """Readable DHCP message-type name for logging; falls back to type=<n> for a
+    code not in MsgType (the reply is untrusted wire input)."""
+    try:
+        return MsgType(code).name
+    except ValueError:
+        return f"type={code}"
+
+
+# Bound for joining a helper thread on stop (both capture backends): a stuck
+# reader/sniffer is left to exit on its own rather than hang the main thread.
+THREAD_JOIN_TIMEOUT = 2
 
 # Options we ask the server to include on every DISCOVER/REQUEST (RFC 2132 option
 # 55, Parameter Request List). Subnet mask (1) + router (3) drive follow mode's
@@ -59,7 +97,3 @@ PHASE_REBOOT = "REBOOT"
 PHASE_RENEW = "RENEW"
 PHASE_REBIND = "REBIND"
 PHASE_OBSERVED = "OBSERVED"
-
-# DHCP message-type names (option 53), for readable reply logging.
-MTYPE_NAMES = {1: "DISCOVER", 2: "OFFER", 3: "REQUEST", 4: "DECLINE",
-               5: "ACK", 6: "NAK", 7: "RELEASE", 8: "INFORM"}

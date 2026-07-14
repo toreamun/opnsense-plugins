@@ -10,7 +10,7 @@ import logging
 import re
 from collections import namedtuple
 
-from .constants import DHCP_CLIENT_PORT, DHCP_SERVER_PORT, MTYPE_NAMES, PARAM_REQ_LIST
+from .constants import DHCP_CLIENT_PORT, DHCP_SERVER_PORT, PARAM_REQ_LIST, mtype_name
 
 LOG = logging.getLogger("lease-keeper")
 
@@ -60,7 +60,7 @@ def _fmt_reply(rx):
     DEBUG (the keeper's default level), so every reply's fields (type, addresses,
     timers, gateway, mask, relay, server text) show in the log without a capture."""
     txt = _msg_text(rx.message)
-    mtype = MTYPE_NAMES.get(rx.mtype, f"type={rx.mtype}")
+    mtype = mtype_name(rx.mtype)
     msg = f" msg={txt!r}" if txt else ""
     return (f"{mtype} yiaddr={rx.yiaddr or '-'} server={rx.server_id or '-'} "
             f"giaddr={rx.giaddr or 'none'} lease={'-' if rx.lease is None else rx.lease} "

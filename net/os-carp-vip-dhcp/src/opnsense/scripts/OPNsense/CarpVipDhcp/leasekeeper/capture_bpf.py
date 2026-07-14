@@ -11,7 +11,8 @@ import struct
 import threading
 from typing import Any
 
-from .constants import DHCP_CLIENT_PORT, DHCP_SERVER_PORT, ETHER_BROADCAST
+from .constants import (
+    DHCP_CLIENT_PORT, DHCP_SERVER_PORT, ETHER_BROADCAST, THREAD_JOIN_TIMEOUT)
 from .codec import (BIOCGBLEN, BIOCGDLT, BIOCIMMEDIATE, BIOCPROMISC, BIOCSETF,
                     BIOCSETIF, BIOCSHDRCMPLT, DLT_EN10MB, ETHERTYPE_ARP,
                     ETHERTYPE_IPV4, ETHER_MIN_FRAME, _BPF_FILTER, _bpf_frames,
@@ -20,6 +21,10 @@ from .codec import (BIOCGBLEN, BIOCGDLT, BIOCIMMEDIATE, BIOCPROMISC, BIOCSETF,
 from .wire import _deliver
 
 LOG = logging.getLogger("lease-keeper")
+
+# Daemon log-and-continue posture: broad catch-alls are deliberate (see the
+# package docstring / module docstrings).
+# pylint: disable=broad-exception-caught
 
 
 # The raw /dev/bpf backend drives its ioctls through fcntl, which does not
@@ -153,7 +158,7 @@ class BpfCapture:  # pylint: disable=too-many-instance-attributes
             except OSError:
                 pass
         if thread is not None and thread.is_alive():
-            thread.join(timeout=2)
+            thread.join(timeout=THREAD_JOIN_TIMEOUT)
             if thread.is_alive():
                 LOG.warning("bpf reader did not exit within 2s -- leaving it to "
                             "finish; its fd is not reused")

@@ -8,7 +8,7 @@ access is bounds-checked and a malformed frame decodes to None (dropped).
 import ipaddress
 import struct
 
-from .constants import BOOTREPLY, ETHER_ZERO
+from .constants import ArpOp, BOOTREPLY, ETHER_ZERO, MsgType
 from .util import mac2raw
 from .wire import ArpFrame, BootpFrame
 
@@ -29,10 +29,14 @@ DHCP_OPT_PAD = 0
 DHCP_OPT_END = 255
 IPPROTO_UDP = 17
 IPV4_TTL = 64                # conventional default TTL (BSD/Linux/scapy send 64)
+IP_HDR_LEN = 20             # fixed IPv4 header we build (no options)
+UDP_HDR_LEN = 8             # UDP header (src/dst port, length, checksum)
 
-# DHCP message types the keeper SENDS, by the names the option lists carry
-# (the inverse, code -> display name, is MTYPE_NAMES above).
-_MTYPE_CODES = {"discover": 1, "request": 3, "release": 7}
+# The DHCP message types the keeper SENDS, keyed by the scapy-style option names
+# the outbound option lists carry (only these three are sent). Values come from
+# MsgType so the code is defined once.
+_MTYPE_CODES = {"discover": MsgType.DISCOVER, "request": MsgType.REQUEST,
+                "release": MsgType.RELEASE}
 
 
 def _ip4(ip):
@@ -104,13 +108,14 @@ def _encode_ipv4_udp(src, dst, sport, dport, payload):
     """An IPv4+UDP datagram around payload, checksums computed. A UDP checksum
     of 0 means "none sent", so a sum that works out to 0 transmits as 0xFFFF
     (RFC 768)."""
-    udp_len = 8 + len(payload)
+    udp_len = UDP_HDR_LEN + len(payload)
     pseudo = _ip4(src) + _ip4(dst) + struct.pack("!BBH", 0, IPPROTO_UDP, udp_len)
     udp_hdr = struct.pack("!4H", sport, dport, udp_len, 0)
     cksum = _inet_checksum(pseudo + udp_hdr + payload) or 0xFFFF
     udp_hdr = struct.pack("!4H", sport, dport, udp_len, cksum)
     # version/ihl, tos, total, id, flags/frag, ttl, proto, checksum (zeroed, then patched)
-    ip_hdr = struct.pack("!BBHHHBBH", 0x45, 0, 20 + udp_len, 0, 0, IPV4_TTL, IPPROTO_UDP, 0) + _ip4(src) + _ip4(dst)
+    ip_hdr = (struct.pack("!BBHHHBBH", 0x45, 0, IP_HDR_LEN + udp_len, 0, 0, IPV4_TTL, IPPROTO_UDP, 0)
+              + _ip4(src) + _ip4(dst))
     ip_hdr = ip_hdr[:10] + _inet_checksum(ip_hdr).to_bytes(2, "big") + ip_hdr[12:]
     return ip_hdr + udp_hdr + payload
 
@@ -128,7 +133,7 @@ _ARP_ETH_IPV4 = struct.pack("!HHBB", 1, ETHERTYPE_IPV4, 6, 4)
 def _encode_arp_request(hwsrc, psrc, pdst):
     """An ARP who-has pdst tell psrc with sender hardware hwsrc (the nudge
     frame; the shaping rationale lives at the ArpNudge call site)."""
-    return (_ARP_ETH_IPV4 + struct.pack("!H", 1)
+    return (_ARP_ETH_IPV4 + struct.pack("!H", ArpOp.REQUEST)
             + mac2raw(hwsrc) + _ip4(psrc) + mac2raw(ETHER_ZERO) + _ip4(pdst))
 
 
@@ -208,11 +213,11 @@ def _decode_ipv4_bootp(pkt):
     """Raw IPv4 payload of an Ethernet frame -> BootpFrame, or None unless it
     is an unfragmented UDP datagram carrying a plausible BOOTP message with
     the DHCP cookie. Every bound is checked (untrusted WAN input)."""
-    if len(pkt) < 20 or pkt[0] >> 4 != 4:
+    if len(pkt) < IP_HDR_LEN or pkt[0] >> 4 != 4:
         return None
     ihl = (pkt[0] & 0x0F) * 4
     total = int.from_bytes(pkt[2:4], "big")
-    if ihl < 20 or total < ihl + 8 or len(pkt) < ihl + 8:
+    if ihl < IP_HDR_LEN or total < ihl + UDP_HDR_LEN or len(pkt) < ihl + UDP_HDR_LEN:
         return None
     is_udp = pkt[9] == IPPROTO_UDP
     is_unfragmented = (int.from_bytes(pkt[6:8], "big") & 0x3FFF) == 0   # no MF bit, no frag offset
@@ -224,10 +229,10 @@ def _decode_ipv4_bootp(pkt):
     # three lengths (untrusted input); a UDP length shorter than its own header
     # is malformed.
     udp_len = int.from_bytes(pkt[ihl + 4:ihl + 6], "big")
-    if udp_len < 8:
+    if udp_len < UDP_HDR_LEN:
         return None
     end = min(total, ihl + udp_len, len(pkt))
-    bootp = pkt[ihl + 8:end]                        # UDP payload, minus any link padding
+    bootp = pkt[ihl + UDP_HDR_LEN:end]              # UDP payload, minus any link padding
     if len(bootp) < BOOTP_HDR_LEN + 4 or bootp[BOOTP_HDR_LEN:BOOTP_HDR_LEN + 4] != DHCP_MAGIC:
         return None
     # The options walk only pays off for server replies; on a shared segment

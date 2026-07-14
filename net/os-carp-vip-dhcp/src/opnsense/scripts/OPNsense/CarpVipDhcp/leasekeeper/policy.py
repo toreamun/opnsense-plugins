@@ -4,7 +4,6 @@ to do when the server grants a different address than the VIP -- follow and
 rewrite the VIP, or alarm and refuse).
 """
 import logging
-import subprocess
 import time
 
 from .constants import (
@@ -17,6 +16,11 @@ LOG = logging.getLogger("lease-keeper")
 # Daemon log-and-continue posture: broad catch-alls are deliberate (see the
 # package docstring / module docstrings).
 # pylint: disable=broad-exception-caught
+
+# "CARP-master value not supplied by the caller" sentinel: the maintain loop
+# passes the role it already probed this tick, but None is itself a valid probe
+# result (probe failed), so a distinct sentinel means "probe it yourself".
+_UNSET = object()
 
 
 class ArpNudge:  # pylint: disable=too-many-instance-attributes
@@ -42,15 +46,19 @@ class ArpNudge:  # pylint: disable=too-many-instance-attributes
         self._gw = None                # last nudge target we logged (log again on change)
         self._warned = False           # warned once about a missing nudge target
 
-    def maybe_nudge(self, yiaddr, gateway, force=False):
+    def maybe_nudge(self, yiaddr, gateway, force=False, master=_UNSET):
         """Refresh the gateway's ARP entry for yiaddr by broadcasting an ARP
         request from (yiaddr, chaddr). No-op unless enabled, bound, due (or
-        forced) and CARP master."""
+        forced) and CARP master. `master` lets a caller that already probed the
+        CARP role this tick pass it in (avoiding a duplicate ifconfig); omitted,
+        the nudge probes via its own hook."""
         if not self.interval or not yiaddr:
             return
         if not force and time.time() - self.last_nudge < self.interval:
             return
-        if self._is_master() is not True:
+        if master is _UNSET:
+            master = self._is_master()
+        if master is not True:
             return
 
         if not gateway:
@@ -114,11 +122,16 @@ class FollowPolicy:  # pylint: disable=too-many-instance-attributes
     (rewritten on a successful follow), the persisted follow throttle, the
     apply-retry watchdog and the peer-ACK observation handoff."""
 
-    def __init__(self, target, follow, chaddr, dhcp, hb_mismatch):
+    def __init__(self, target, follow, chaddr, dhcp, hb_mismatch,  # pylint: disable=too-many-arguments
+                 *, fire_follow_update):
         self.target = target           # the address this keeper is meant to hold
         self.follow = follow
         self._dhcp = dhcp
         self._hb_mismatch = hb_mismatch
+        # Injected side-effect seam: dispatch the CARP-VIP rewrite (old, new,
+        # gw_args). Kept out of this decision module so the system coupling
+        # (configd) lives in the orchestration layer, like the other hooks.
+        self._dispatch_follow_update = fire_follow_update
 
         self._followed_ip = None       # last address we asked configd to follow to
         self._follow_from = None       # address we followed FROM (for the retry watchdog)
@@ -244,12 +257,12 @@ class FollowPolicy:  # pylint: disable=too-many-instance-attributes
             LOG.error("follow_update request failed: %s", e)
 
     def _fire_follow_update(self, old_ip, new_ip):
-        """Dispatch the configd follow_update action (old -> new) and stamp the
-        retry deadline. Separate from _follow_update so the watchdog can re-drive
-        a stalled follow without tripping the _followed_ip equality guard."""
-        cmd = ["/usr/local/sbin/configctl", "-d", "carpvipdhcp", "follow_update", old_ip, new_ip]
-        cmd += self._gw_args   # cross-subnet: [old_gw, new_gw, bits]; empty on a same-subnet move
-        subprocess.Popen(cmd)  # pylint: disable=consider-using-with
+        """Dispatch the follow_update side effect (old -> new, plus any
+        cross-subnet gw args) through the injected hook and stamp the retry
+        deadline. Separate from _follow_update so the watchdog can re-drive a
+        stalled follow without tripping the _followed_ip equality guard."""
+        # gw_args: cross-subnet [old_gw, new_gw, bits]; empty on a same-subnet move.
+        self._dispatch_follow_update(old_ip, new_ip, self._gw_args)
         self._fired_at = time.time()
 
     def watchdog(self):

@@ -14,7 +14,7 @@ from .constants import (
     REBOOT_ATTEMPTS, RENEW_ATTEMPTS,
     RENEW_TIMEOUT, REPLY_TIMEOUT, SEND_RETRY_DELAY, T1_FACTOR, T2_FACTOR)
 from .util import _jittered, _mask_to_bits, _new_xid, mac2raw
-from .wire import _dhcp_options, _fmt_reply, _msg_text
+from .wire import DhcpReply, _dhcp_options, _fmt_reply, _msg_text
 
 LOG = logging.getLogger("lease-keeper")
 
@@ -88,11 +88,12 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
             chaddr=self.chraw, xid=self.xid, ciaddr=ciaddr, flags=BROADCAST_FLAG,
             options=_dhcp_options(mtype, extra, self._id_opts))
 
-    def _wait_for_dhcp_reply(self, want, timeout):
+    def _wait_for_dhcp_reply(self, want, timeout) -> DhcpReply | None:
         """Wait up to timeout for a reply of message-type `want`. Returns the
-        DhcpReply on match, the string "NAK" on DHCPNAK, or None on timeout.
-        Returning the snapshot avoids re-reading self._rx (set by the sniffer
-        thread) after the wait."""
+        DhcpReply on a match OR on a DHCPNAK (the caller checks rx.mtype == NAK
+        to tell them apart -- a NAK ends the attempt, a match proceeds), or None
+        on timeout. Returning the snapshot avoids re-reading self._rx (set by the
+        sniffer thread) after the wait."""
         end = time.time() + timeout
         while time.time() < end and not self._should_stop():
             self._ev.clear()
@@ -109,7 +110,7 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
                 LOG.warning("DHCPNAK received (server %s, xid 0x%08x%s)%s",
                             rx.server_id or "unknown", self.xid,
                             f" via relay {rx.giaddr}" if rx.giaddr else "", reason)
-                return "NAK"
+                return rx
         return None
 
     def _absorb_reply(self, rx, default_lease):
@@ -184,7 +185,7 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
                 time.sleep(SEND_RETRY_DELAY)
                 continue
             rx = self._wait_for_dhcp_reply(OFFER, REPLY_TIMEOUT)
-            if rx == "NAK":
+            if rx and rx.mtype == NAK:
                 return False
             if rx:
                 self.binding.yiaddr, self.binding.server = rx.yiaddr, rx.server_id
@@ -213,7 +214,7 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
                 time.sleep(SEND_RETRY_DELAY)
                 continue
             rx = self._wait_for_dhcp_reply(ACK, REPLY_TIMEOUT)
-            if rx == "NAK":
+            if rx and rx.mtype == NAK:
                 return False   # NAK -> back to INIT; the run loop re-acquires (DISCOVER)
             if rx:
                 got = rx.yiaddr
@@ -258,7 +259,7 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
                 time.sleep(SEND_RETRY_DELAY)
                 continue
             rx = self._wait_for_dhcp_reply(ACK, REPLY_TIMEOUT)
-            if rx == "NAK":
+            if rx and rx.mtype == NAK:
                 return False   # server refused our known address -> full DISCOVER
             if rx:
                 got = rx.yiaddr
@@ -292,19 +293,19 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
         if not yiaddr:
             return False   # nothing bound -> nothing to renew
 
-        opts = []
         for _ in range(RENEW_ATTEMPTS):
             if self._should_stop():
                 return False
             self._ensure_sniffer()
             self._rx = None
             try:
-                self._send_dhcp("request", opts, ciaddr=yiaddr)
+                # RENEW/REBIND carry no extra options -- ciaddr identifies the lease.
+                self._send_dhcp("request", [], ciaddr=yiaddr)
             except Exception as e:
                 LOG.error("DHCP %s send failed: %s", Phase.REBIND if rebind else Phase.RENEW, e)
                 return False
             rx = self._wait_for_dhcp_reply(ACK, RENEW_TIMEOUT)
-            if rx == "NAK":
+            if rx and rx.mtype == NAK:
                 return False   # NAK -> re-DORA
             if rx:
                 got = rx.yiaddr

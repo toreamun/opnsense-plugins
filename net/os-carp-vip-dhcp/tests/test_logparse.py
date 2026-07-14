@@ -1,6 +1,6 @@
 """Unit tests for logparse.py log-line parsing (comments over docstrings)."""
 # pylint: disable=missing-function-docstring
-import logparse  # sys.path via conftest  # type: ignore  # pylint: disable=import-error
+import logparse  # sys.path via conftest  # type: ignore
 
 
 def test_line_re_matches_standard_line():

@@ -234,7 +234,3 @@ class BpfCapture:  # pylint: disable=too-many-instance-attributes
         frame = _encode_ether(ETHER_BROADCAST, hwsrc, ETHERTYPE_ARP,
                               _encode_arp_request(hwsrc, psrc, pdst))
         self._write(frame.ljust(ETHER_MIN_FRAME, b"\x00"))   # runt guard: ARP is 42 bytes bare
-
-
-# The capture-backend registry: flag value -> implementation. The argparse
-# choices and Keeper's lookup both read this, so a future backend is added in

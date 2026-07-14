@@ -93,8 +93,12 @@ def acquire_pidfile(path):
                 # Stale pidfile (dead/foreign pid): remove it and retry the create.
                 try:
                     os.unlink(path)
-                except OSError:
-                    pass
+                except OSError as e:
+                    # If the stale file cannot be removed (e.g. a permission
+                    # problem that will not self-heal), exit instead of spinning
+                    # the create/unlink loop forever with no log.
+                    LOG.error("cannot remove stale pidfile %s: %s -- exiting", path, e)
+                    sys.exit(5)
         except OSError as e:
             LOG.error("cannot write pidfile %s: %s", path, e)
             sys.exit(5)
@@ -137,13 +141,20 @@ def _setup_logging(logfile):
     by default, and its filter reveals it -- so "turning up the log level"
     needs no daemon restart."""
     handlers: list[logging.Handler] = [logging.StreamHandler()]
+    logfile_error = None
     if logfile:
         try:
             handlers.append(RotatingFileHandler(logfile, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUPS))
-        except Exception:
-            pass
+        except Exception as e:  # pylint: disable=broad-exception-caught
+            # No log sink is configured yet, so stash the reason and emit it
+            # once logging is up -- otherwise a bad --logfile (unwritable dir,
+            # bad path) leaves an empty log with no explanation.
+            logfile_error = e
     logging.basicConfig(level=logging.DEBUG, handlers=handlers,
                         format="%(asctime)s %(levelname)s %(message)s")
+    if logfile_error is not None:
+        LOG.warning("could not open log file %s: %s -- logging to stderr only",
+                    logfile, logfile_error)
 
 
 def main():
@@ -176,7 +187,9 @@ def main():
                     "drop the gateway's unicast ARP reply otherwise)", a.iface)
 
     def _sig(*_):
-        LOG.info("signal received -- stopping")
+        # Flag only -- no logging or other non-async-signal-safe work in the
+        # handler (like the SIGUSR1/2 handlers below). set_wakeup_fd wakes the
+        # loop at once; run() logs "stopped" when it exits.
         k.request_stop()
     signal.signal(signal.SIGINT, _sig)
     signal.signal(signal.SIGTERM, _sig)
@@ -194,10 +207,20 @@ def main():
     if a.once:
         return k.claim_once()
 
+    # Wake the maintain-loop sleep the instant a signal is delivered: Python's
+    # C-level signal machinery writes the signal number to this fd, which is
+    # async-signal-safe and needs no work in the handler (the _sig* handlers
+    # above only set a flag). The loop selects on the read end and drains it.
+    signal.set_wakeup_fd(k.wake_fileno())
+
     pf = acquire_pidfile(a.pidfile)
     try:
         return k.run()
     finally:
+        # Stop the C-level signal machinery from writing to the wake socket
+        # before run() closes it; otherwise a signal in the shutdown window
+        # writes to a closed fd (harmless, but noisy on stderr).
+        signal.set_wakeup_fd(-1)
         if pf and os.path.exists(pf):
             try:
                 os.unlink(pf)

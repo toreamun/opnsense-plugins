@@ -9,7 +9,7 @@ import time
 
 from .constants import (
     ARP_NUDGE_MIN, ArpOp, FOLLOW_RETRY_DEADLINE, MIN_FOLLOW_INTERVAL,
-    PHASE_OBSERVED, PHASE_REBIND)
+    Phase)
 from .util import _atomic_write, _fs_safe, _mask_to_bits, _same_ip_class, _sane_ipv4
 
 LOG = logging.getLogger("lease-keeper")
@@ -141,7 +141,14 @@ class FollowPolicy:  # pylint: disable=too-many-instance-attributes
         try:
             with open(self._state_file, encoding="utf-8") as f:
                 return float(f.read().strip())
-        except (OSError, ValueError):
+        except FileNotFoundError:
+            return 0.0          # never followed yet -- the normal first-run case
+        except (OSError, ValueError) as e:
+            # A present-but-corrupt/unreadable state file returns 0.0, which
+            # disarms the MIN_FOLLOW_INTERVAL spoof-storm throttle on the next
+            # changed-address ACK; log it so the corrupt case is not silent.
+            LOG.debug("follow-throttle state %s unreadable (%s) -- treating as never followed",
+                      self._state_file, e)
             return 0.0
 
     def _record_follow(self):
@@ -170,7 +177,7 @@ class FollowPolicy:  # pylint: disable=too-many-instance-attributes
                           rx.server_id)
                 return False
             leased_from = self._dhcp.binding.server
-            if phase != PHASE_REBIND and rx.server_id and leased_from and rx.server_id != leased_from:
+            if phase != Phase.REBIND and rx.server_id and leased_from and rx.server_id != leased_from:
                 LOG.error("%s: ACK from unexpected server %s (leased from %s) -- not following",
                           phase, rx.server_id, leased_from)
                 return False
@@ -288,4 +295,4 @@ class FollowPolicy:  # pylint: disable=too-many-instance-attributes
             return
         LOG.info("observed peer DHCP ACK for %s (we hold %s) -- following early to converge",
                  rx.yiaddr, self._dhcp.binding.yiaddr)
-        self.on_changed_address(rx.yiaddr, rx, PHASE_OBSERVED, release_on_enforce=False)
+        self.on_changed_address(rx.yiaddr, rx, Phase.OBSERVED, release_on_enforce=False)

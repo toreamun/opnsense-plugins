@@ -4,8 +4,9 @@ the heartbeat, the CARP role watch, the acquire pacing and the signal-driven
 operator actions.
 """
 import logging
+import select
+import socket
 import subprocess
-import threading
 import time
 
 from .capture import CAPTURE_BACKENDS
@@ -23,6 +24,13 @@ LOG = logging.getLogger("lease-keeper")
 # Daemon log-and-continue posture: broad catch-alls are deliberate (see the
 # package docstring / module docstrings).
 # pylint: disable=broad-exception-caught
+
+# The keeper's dependency on ifconfig(8) output text, named in one place. The
+# trailing space in the CARP format is load-bearing: it stops vhid 1 matching
+# "vhid 11".
+CARP_MASTER_FMT = "carp: MASTER vhid {vhid} "
+IFCONFIG_STATUS_ACTIVE = "status: active"    # carrier up
+IFCONFIG_STATUS = "status: "                 # any status line present (up or down)
 
 
 class Keeper:  # pylint: disable=too-many-instance-attributes
@@ -81,23 +89,33 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         # Link-return fast path (only while UNBOUND): a carrier down->up edge resets
         # the backoff and re-DORAs at once, like dhclient's link-up -> state_reboot.
         self._link_up = None           # last carrier state seen (None = unknown / not probed)
+        self._ifconfig_failed = False  # ifconfig probe episode gate (log the failure once)
         self._link_kick_at = 0.0       # epoch of the last link-return kick (debounce)
         self._link_returned = False    # set by _sleep_interruptible on a carrier return while unbound
 
         self._stop = False
-        # General early-wake for the maintain-loop sleep (_sleep_interruptible): lets it
-        # return before the 1s tick when there is pending work. Currently the
-        # sniffer sets it on an observed address change so the follow fires in
-        # milliseconds; a future fast-wake need should reuse this rather than mint
-        # a second event. Set only by the capture thread; waited/cleared only by
-        # the main thread.
-        self._wake = threading.Event()
+        # Wake pipe for the maintain-loop sleep: _sleep_interruptible selects on
+        # the read end, and _signal_wake() writes one byte to make it return at
+        # once instead of waiting out the 1s tick. Woken from two places: the
+        # capture thread on an observed peer ACK (so the follow fires in
+        # milliseconds), and the operator signal handlers (SIGTERM/USR1/USR2) so
+        # stop/nudge/carp-recheck act at once. A socketpair (not os.pipe) so
+        # select() works on every platform, incl. the test host; os.write on the
+        # fd is async-signal-safe, unlike threading.Event.set().
+        self._wake_r, self._wake_w = socket.socketpair()
+        self._wake_r.setblocking(False)
+        self._wake_w.setblocking(False)
 
     # ---- capture (resilient) ----
     def _ensure_sniffer(self):
         if not self._capture.alive():
             LOG.warning("DHCP-reply capture down -- (re)starting")
-            self._capture.start()
+            if not self._capture.start():
+                # The backend already logged why at ERROR; make the persistent
+                # case explicit so the preceding "(re)starting" is not read as
+                # success -- until the capture recovers, every exchange times out.
+                LOG.error("DHCP-reply capture restart failed -- exchanges will "
+                          "time out until it recovers")
             time.sleep(1)
 
     def _on_arp_reply(self, frame):
@@ -139,7 +157,7 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         if (rx.mtype == ACK and rx.yiaddr and rx.yiaddr != self._dhcp.binding.yiaddr
                 and _sane_ipv4(rx.yiaddr)):
             self._follow.observe(rx)
-            self._wake.set()   # wake the maintain-loop sleep now, don't wait for the tick
+            self._signal_wake()   # wake the maintain-loop sleep now, don't wait for the tick
 
     # ---- heartbeat / status file ----
 
@@ -181,11 +199,23 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
     def _ifconfig(self):
         """Captured `ifconfig <iface>` text, or None if the probe failed. Shared by
         the CARP-role probe and the carrier check so the ifconfig invocation, decode
-        and error policy live in exactly one place."""
+        and error policy live in exactly one place.
+
+        A persistent probe failure silently degrades both callers (the CARP
+        nudge fails closed, the transition poll skips), so warn once per failure
+        episode -- otherwise a wrong --iface or a broken ifconfig looks identical
+        to a healthy backup in the log."""
         try:
             out = subprocess.check_output(["/sbin/ifconfig", self.iface], errors="replace")
-        except (OSError, subprocess.SubprocessError):
+        except (OSError, subprocess.SubprocessError) as e:
+            if not self._ifconfig_failed:
+                LOG.warning("ifconfig %s probe failed (%s) -- CARP role and carrier "
+                            "state unknown until it recovers", self.iface, e)
+                self._ifconfig_failed = True
             return None
+        if self._ifconfig_failed:
+            LOG.info("ifconfig %s probe recovered", self.iface)
+            self._ifconfig_failed = False
         return out.decode(errors="replace") if isinstance(out, bytes) else out
 
     def _probe_carp_master(self):
@@ -198,7 +228,7 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         out = self._ifconfig()
         if out is None:
             return None
-        return f"carp: MASTER vhid {self.vhid} " in out
+        return CARP_MASTER_FMT.format(vhid=self.vhid) in out
 
     def _carp_master_probe(self):
         """ArpNudge's is_master hook -> the CARP probe (late-bound through the
@@ -214,9 +244,9 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         out = self._ifconfig()
         if out is None:
             return None
-        if "status: active" in out:
+        if IFCONFIG_STATUS_ACTIVE in out:
             return True
-        if "status: " in out:
+        if IFCONFIG_STATUS in out:
             return False
         return None
 
@@ -274,20 +304,41 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         ArpNudge component; it owns the pacing, the master gate and the send."""
         self._nudge.maybe_nudge(self._dhcp.binding.yiaddr, self._nudge_target(), force=force)
 
-    # ---- operator/signal API (set flags only; the loops act within a second) ----
+    # ---- operator/signal API (signal handlers set a flag only; the loop wakes
+    # via the wake socket -- from the capture thread through _signal_wake, and
+    # from signal delivery through signal.set_wakeup_fd(wake_fileno) wired in
+    # main(), which is async-signal-safe C-level machinery) ----
+
+    def wake_fileno(self):
+        """The wake socket's write-end fd, for signal.set_wakeup_fd() so any
+        delivered signal wakes the maintain-loop sleep at once."""
+        return self._wake_w.fileno()
+
+    def _signal_wake(self):
+        """Wake the maintain-loop sleep by sending one byte to the wake socket.
+        Called from the capture thread (a normal thread) on a peer-ACK
+        observation; socket.send works on every platform. The operator SIGNAL
+        path does not call this (socket.send is not async-signal-safe) -- it
+        relies on set_wakeup_fd instead. A full buffer just drops the byte, the
+        loop still wakes on its 1s tick."""
+        try:
+            self._wake_w.send(b"\x00")
+        except (BlockingIOError, OSError):
+            pass
 
     def request_stop(self):
-        """Ask the daemon to exit at the next loop tick (SIGINT/SIGTERM)."""
+        """Ask the daemon to exit (SIGINT/SIGTERM). Flag only; set_wakeup_fd
+        wakes the loop so it exits at once."""
         self._stop = True
 
     def trigger_nudge(self):
-        """Request an immediate ARP nudge (SIGUSR1 / configd action). Flag
-        only: no network I/O happens in signal context."""
+        """Request an immediate ARP nudge (SIGUSR1 / configd action). Flag only;
+        no network I/O in signal context."""
         self._nudge_now = True
 
     def recheck_carp_role(self):
-        """Re-check the CARP role within a second (SIGUSR2 from the CARP
-        syshook) instead of waiting for the next ~30s poll."""
+        """Re-check the CARP role now (SIGUSR2 from the CARP syshook) instead of
+        waiting for the next ~30s poll. Flag only."""
         self._poll_role_now = True
 
     # ---- main loop / sleeps ----
@@ -332,10 +383,15 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
                 self._link_returned = True
                 return not self._stop
 
-            # Event-driven sleep: return at once when the sniffer signals a fresh
-            # observation, otherwise time out after ~1s to run the periodic checks.
-            if self._wake.wait(1.0):
-                self._wake.clear()
+            # Event-driven sleep: return at once when the wake socket is written
+            # (a fresh observation or an operator signal), otherwise time out
+            # after ~1s to run the periodic checks.
+            ready, _, _ = select.select([self._wake_r], [], [], 1.0)
+            if ready:
+                try:
+                    self._wake_r.recv(4096)   # drain the wake byte(s)
+                except (BlockingIOError, OSError):
+                    pass
             slept += 1
         return not self._stop
 
@@ -396,6 +452,8 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         if self.release_on_exit:
             self._dhcp.release()
         self._capture.stop()
+        self._wake_r.close()
+        self._wake_w.close()
         LOG.info("stopped")
         return 0
 

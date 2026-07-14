@@ -50,79 +50,25 @@ Usage:
   lease_keeper.py --iface <if> --chaddr <mac> --request <ip>
   lease_keeper.py ... --once            # one-shot claim+verify+release (test)
 """
-# The daemon must never die on unexpected input: catch-all with logging is
-# the documented posture (see "All I/O wrapped in try/except" above).
+
+# The daemon must never die on unexpected input: the components log-and-continue
+# on a catch-all (see the docstring); main() and one-shot mode do the same.
 # pylint: disable=broad-exception-caught
-# A single deployable file is a deliberate constraint of this daemon.
-# pylint: disable=too-many-lines
 import argparse
-import ctypes
-import ipaddress
 import logging
 import os
-import random
-import re
-import select
 import signal
-import struct
-import subprocess
 import sys
-import threading
-import time
-from collections import namedtuple
-from dataclasses import dataclass
 from logging.handlers import RotatingFileHandler
-from typing import Any
-
-
-LOG = logging.getLogger("lease-keeper")
-
-from leasekeeper.constants import (
-    ACK, ARP_NUDGE_MIN, ATTEMPT_BACKOFF_CAP, BOOTREPLY, BROADCAST_FLAG,
-    DEFAULT_LEASE, DHCP_CLIENT_PORT, DHCP_SERVER_PORT, DORA_ATTEMPTS,
-    ETHER_BROADCAST, ETHER_ZERO, FOLLOW_RETRY_DEADLINE, HB_REFRESH,
-    IPV4_BROADCAST, LINK_KICK_DEBOUNCE, LINK_POLL_STEP, LOG_BACKUPS,
-    LOG_MAX_BYTES, LOOP_ERROR_BACKOFF, MIN_FOLLOW_INTERVAL, MIN_LEASE, MIN_T1,
-    MTYPE_NAMES, NAK, OFFER, PARAM_REQ_LIST, PHASE_DORA, PHASE_OBSERVED,
-    PHASE_REBIND, PHASE_REBOOT, PHASE_RENEW, REBIND_MARGIN, REBIND_POLL_STEP,
-    REBOOT_ATTEMPTS, REDORA_MAX, REDORA_MIN, RENEW_ATTEMPTS, RENEW_TIMEOUT,
-    REPLY_TIMEOUT, SEND_RETRY_DELAY, SNIFFER_RETRY, SNIFFER_WARMUP, T1_FACTOR,
-    T2_FACTOR)
-from leasekeeper.util import (
-    MAC_RE, _atomic_write, _clock_at, _fs_safe, _is_localish, _jittered,
-    _mask_to_bits, _new_xid, _same_ip_class, _sane_ipv4, mac2raw)
-from leasekeeper.wire import (
-    ArpFrame, BootpFrame, DhcpReply, SNIFFER_FILTER, _dhcp_options, _fmt_reply,
-    _msg_text, _parse_reply)
 
 from leasekeeper.capture import CAPTURE_BACKENDS
 from leasekeeper.capture_scapy import _SCAPY_IMPORT_ERROR
-# Transitional re-exports: the tests reach these via the lease_keeper module
-# (lk.*); they move to importing from leasekeeper.* directly in the final
-# commit of the split, when these lines go away.
-from leasekeeper.capture_scapy import (  # noqa: F401  pylint: disable=unused-import
-    ARP, BOOTP, DHCP, Ether, IP, UDP, AsyncSniffer, sendp, ScapyCapture)
-from leasekeeper.capture_bpf import BpfCapture  # noqa: F401  pylint: disable=unused-import
-from leasekeeper.codec import (  # noqa: F401  pylint: disable=unused-import
-    BOOTP_HDR_LEN, BOOTP_MIN_PAYLOAD, BPF_ALIGNMENT, BPF_HDR_FIXED, DHCP_MAGIC,
-    ETHERTYPE_ARP, ETHERTYPE_IPV4, ETHER_MIN_FRAME, IPPROTO_UDP, _BPF_FILTER,
-    _bpf_frames, _decode_arp, _decode_dhcp_options, _decode_ipv4_bootp,
-    _encode_arp_request, _encode_bootp_request, _encode_dhcp_options,
-    _encode_ether, _encode_ipv4_udp, _inet_checksum, _ip4)
-
-
-
-
-
-
-# exactly one place (plus its rc.conf documentation).
-
-
-
+from leasekeeper.constants import LOG_BACKUPS, LOG_MAX_BYTES
 from leasekeeper.keeper import Keeper
-# Transitional re-exports (removed when the tests import from leasekeeper.*):
-from leasekeeper.dhcpclient import DhcpClient, Lease  # noqa: F401  pylint: disable=unused-import
-from leasekeeper.policy import ArpNudge, FollowPolicy  # noqa: F401  pylint: disable=unused-import
+from leasekeeper.util import MAC_RE
+
+LOG = logging.getLogger("lease-keeper")
+
 
 def acquire_pidfile(path):
     """Single-instance guard: atomically claim the pidfile, replacing a stale
@@ -200,22 +146,6 @@ def _setup_logging(logfile):
                         format="%(asctime)s %(levelname)s %(message)s")
 
 
-# The one-shot mode drives the Keeper/DhcpClient internals directly.
-# pylint: disable=protected-access
-def _claim_once(k):
-    """--once mode: claim, report, release -- a wiring test, not service mode."""
-    if not k._capture.start():
-        return 3
-    time.sleep(SNIFFER_WARMUP)
-    ok = k._dhcp.dora(k._follow.target)
-    LOG.info("DHCP claim %s -> %s", k.chaddr, k._dhcp.binding.yiaddr if ok else "FAIL")
-    if ok:
-        k._dhcp.release()
-    k._capture.stop()
-    return 0 if ok else 1
-# pylint: enable=protected-access
-
-
 def main():
     """CLI entry point: parse args, wire up the Keeper and signals, run."""
     a = _build_arg_parser().parse_args()
@@ -262,7 +192,7 @@ def main():
     signal.signal(signal.SIGUSR2, _sig_carp)  # type: ignore[attr-defined]  # pylint: disable=no-member
 
     if a.once:
-        return _claim_once(k)
+        return k.claim_once()
 
     pf = acquire_pidfile(a.pidfile)
     try:

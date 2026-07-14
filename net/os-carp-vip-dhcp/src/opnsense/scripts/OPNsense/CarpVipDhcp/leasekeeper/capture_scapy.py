@@ -7,10 +7,16 @@ The scapy import is guarded so the module still loads where scapy is absent
 import logging
 from typing import Any
 
-from .constants import DHCP_CLIENT_PORT, DHCP_SERVER_PORT, ETHER_BROADCAST, ETHER_ZERO
+from .constants import (
+    ArpOp, DHCP_CLIENT_PORT, DHCP_SERVER_PORT, ETHER_BROADCAST, ETHER_ZERO,
+    THREAD_JOIN_TIMEOUT)
 from .wire import ArpFrame, BootpFrame, SNIFFER_FILTER, _deliver
 
 LOG = logging.getLogger("lease-keeper")
+
+# Daemon log-and-continue posture: broad catch-alls are deliberate (see the
+# package docstring / module docstrings).
+# pylint: disable=broad-exception-caught
 
 
 # Scapy is the one heavy third-party dependency (needed only by the default
@@ -78,7 +84,7 @@ class ScapyCapture:
                 self._sniffer.stop(join=False)
                 thread = getattr(self._sniffer, "thread", None)
                 if thread is not None:
-                    thread.join(timeout=2)
+                    thread.join(timeout=THREAD_JOIN_TIMEOUT)
         except Exception:
             pass
 
@@ -124,7 +130,6 @@ class ScapyCapture:
     def send_arp_request(self, hwsrc, psrc, pdst):
         """Broadcast an ARP who-has pdst tell psrc from hwsrc."""
         sendp(Ether(src=hwsrc, dst=ETHER_BROADCAST) /
-              ARP(op=1, hwsrc=hwsrc, psrc=psrc,
+              ARP(op=ArpOp.REQUEST, hwsrc=hwsrc, psrc=psrc,
                   hwdst=ETHER_ZERO, pdst=pdst),
               iface=self.iface, verbose=0)
-

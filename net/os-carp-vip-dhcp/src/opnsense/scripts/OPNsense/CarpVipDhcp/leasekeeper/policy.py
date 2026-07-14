@@ -8,11 +8,15 @@ import subprocess
 import time
 
 from .constants import (
-    ARP_NUDGE_MIN, FOLLOW_RETRY_DEADLINE, MIN_FOLLOW_INTERVAL, PHASE_OBSERVED,
-    PHASE_REBIND)
+    ARP_NUDGE_MIN, ArpOp, FOLLOW_RETRY_DEADLINE, MIN_FOLLOW_INTERVAL,
+    PHASE_OBSERVED, PHASE_REBIND)
 from .util import _atomic_write, _fs_safe, _mask_to_bits, _same_ip_class, _sane_ipv4
 
 LOG = logging.getLogger("lease-keeper")
+
+# Daemon log-and-continue posture: broad catch-alls are deliberate (see the
+# package docstring / module docstrings).
+# pylint: disable=broad-exception-caught
 
 
 class ArpNudge:  # pylint: disable=too-many-instance-attributes
@@ -91,7 +95,7 @@ class ArpNudge:  # pylint: disable=too-many-instance-attributes
         leased IP. Runs on the capture thread; the stamp is a lone atomic write.
         Advisory only (an on-segment attacker could forge or withhold it);
         nothing here feeds lease/CARP/follow decisions."""
-        if frame.op != 2:                       # 2 = is-at (reply); requests are filtered out in BPF
+        if frame.op != ArpOp.REPLY:            # is-at reply; requests are filtered out in BPF
             return
         if not gateway or not yiaddr:
             return
@@ -285,4 +289,3 @@ class FollowPolicy:  # pylint: disable=too-many-instance-attributes
         LOG.info("observed peer DHCP ACK for %s (we hold %s) -- following early to converge",
                  rx.yiaddr, self._dhcp.binding.yiaddr)
         self.on_changed_address(rx.yiaddr, rx, PHASE_OBSERVED, release_on_enforce=False)
-

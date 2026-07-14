@@ -77,5 +77,25 @@ def _load(filename, modname):
 
 @pytest.fixture(scope="session")
 def lk():
-    """The lease_keeper daemon module (loaded via importlib so scapy stays stubbed)."""
-    return _load("lease_keeper.py", "lease_keeper")
+    """Facade over the leasekeeper package: every public name from the submodules
+    under one namespace, so the tests reach them as lk.* without the daemon
+    entry point (../lease_keeper.py) re-exporting its whole API. Also exposes the
+    subprocess and time modules the tests monkeypatch. scapy stays stubbed
+    (registered above before capture_scapy imports it)."""
+    # Imported lazily (inside the fixture) so _stub_scapy() has already run when
+    # capture_scapy is first imported -- hence the intentional import-outside-toplevel.
+    import subprocess  # pylint: disable=import-outside-toplevel
+    import time  # pylint: disable=import-outside-toplevel
+    from leasekeeper import (  # pylint: disable=import-outside-toplevel
+        capture, capture_bpf, capture_scapy, codec, constants, dhcpclient,
+        keeper, policy, util, wire)
+
+    ns = types.SimpleNamespace()
+    for mod in (constants, util, wire, codec, capture, capture_scapy,
+                capture_bpf, dhcpclient, policy, keeper):
+        for name in dir(mod):
+            if not name.startswith("__"):
+                setattr(ns, name, getattr(mod, name))
+    ns.subprocess = subprocess
+    ns.time = time
+    return ns

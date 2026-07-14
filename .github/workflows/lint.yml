@@ -34,9 +34,15 @@ jobs:
       # themselves; it reports as information and does not fail the run.
       - name: pylint
         run: |
-          pylint --rcfile=.pylintrc --enable=useless-suppression             net/os-carp-vip-dhcp/src/opnsense/scripts/OPNsense/CarpVipDhcp/*.py             net/os-carp-vip-dhcp/tests/*.py
+          pylint --rcfile=.pylintrc --enable=useless-suppression \
+            net/os-carp-vip-dhcp/src/opnsense/scripts/OPNsense/CarpVipDhcp/*.py \
+            net/os-carp-vip-dhcp/src/opnsense/scripts/OPNsense/CarpVipDhcp/leasekeeper/*.py \
+            net/os-carp-vip-dhcp/tests/*.py
+      # --project so pyright reads net/os-carp-vip-dhcp/pyrightconfig.json, whose
+      # extraPaths puts the scripts dir on the search path (the leasekeeper
+      # package and sibling script modules run with it on sys.path).
       - name: pyright
-        run: pyright net/os-carp-vip-dhcp
+        run: pyright --project net/os-carp-vip-dhcp
 
   pytest:
     name: Python unit tests

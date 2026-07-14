@@ -8,11 +8,12 @@ import logging
 from typing import Any
 
 from .constants import (
+    LOGGER_NAME,
     ArpOp, DHCP_CLIENT_PORT, DHCP_SERVER_PORT, ETHER_BROADCAST, ETHER_ZERO,
     THREAD_JOIN_TIMEOUT)
 from .wire import ArpFrame, BootpFrame, SNIFFER_FILTER, _deliver
 
-LOG = logging.getLogger("lease-keeper")
+LOG = logging.getLogger(LOGGER_NAME)
 
 # Daemon log-and-continue posture: broad catch-alls are deliberate (see the
 # package docstring / module docstrings).
@@ -125,15 +126,13 @@ class ScapyCapture:
             return
         _deliver(handler, frame)
 
-    # The DHCP wire tuple: one parameter per field that goes on the wire.
-    def send_dhcp(self, *, eth_src, ip_src, ip_dst, chaddr,  # pylint: disable=too-many-arguments
-                  xid, ciaddr, flags, options):
-        """Broadcast one DHCP client message as scapy layers."""
-        sendp(Ether(src=eth_src, dst=ETHER_BROADCAST) /
-              IP(src=ip_src, dst=ip_dst) /
+    def send_dhcp(self, msg):
+        """Broadcast one DHCP client message (a DhcpSend) as scapy layers."""
+        sendp(Ether(src=msg.eth_src, dst=ETHER_BROADCAST) /
+              IP(src=msg.ip_src, dst=msg.ip_dst) /
               UDP(sport=DHCP_CLIENT_PORT, dport=DHCP_SERVER_PORT) /
-              BOOTP(chaddr=chaddr, xid=xid, ciaddr=ciaddr, flags=flags) /
-              DHCP(options=options),
+              BOOTP(chaddr=msg.chaddr, xid=msg.xid, ciaddr=msg.ciaddr, flags=msg.flags) /
+              DHCP(options=msg.options),
               iface=self.iface, verbose=0)
 
     def send_arp_request(self, hwsrc, psrc, pdst):

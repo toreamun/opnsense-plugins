@@ -5,13 +5,15 @@ rewrite the VIP, or alarm and refuse).
 """
 import logging
 import time
+from dataclasses import dataclass, field
 
 from .constants import (
+    LOGGER_NAME,
     ARP_NUDGE_MIN, ArpOp, FOLLOW_RETRY_DEADLINE, MIN_FOLLOW_INTERVAL,
     Phase)
 from .util import _atomic_write, _fs_safe, _mask_to_bits, _same_ip_class, _sane_ipv4
 
-LOG = logging.getLogger("lease-keeper")
+LOG = logging.getLogger(LOGGER_NAME)
 
 # Daemon log-and-continue posture: broad catch-alls are deliberate (see the
 # package docstring / module docstrings).
@@ -112,6 +114,17 @@ class ArpNudge:  # pylint: disable=too-many-instance-attributes
             LOG.debug("ARP reply from %s (is-at) for %s", gateway, yiaddr)
 
 
+@dataclass
+class _FollowAttempt:
+    """The in-flight follow (the current VIP rewrite the watchdog may re-drive):
+    the address we asked configd to move TO, the address we moved FROM, when we
+    last dispatched it (the retry deadline), and any cross-subnet gateway args."""
+    followed_ip: str | None = None   # last address we asked configd to follow to
+    follow_from: str | None = None   # address we followed FROM (for the retry watchdog)
+    fired_at: float = 0.0            # when we last dispatched follow_update (retry deadline)
+    gw_args: list = field(default_factory=list)  # [old_gw, new_gw, bits] cross-subnet; else []
+
+
 class FollowPolicy:  # pylint: disable=too-many-instance-attributes
     """Decides what happens when the server grants a DIFFERENT address than
     the target this keeper exists to hold. In follow mode: validate the new
@@ -133,10 +146,7 @@ class FollowPolicy:  # pylint: disable=too-many-instance-attributes
         # (configd) lives in the orchestration layer, like the other hooks.
         self._dispatch_follow_update = fire_follow_update
 
-        self._followed_ip = None       # last address we asked configd to follow to
-        self._follow_from = None       # address we followed FROM (for the retry watchdog)
-        self._fired_at = 0.0           # when we last dispatched follow_update (retry deadline)
-        self._gw_args = []             # extra follow_update args on a cross-subnet move: [old_gw, new_gw, bits]
+        self._attempt = _FollowAttempt()   # the in-flight follow (watchdog re-drive state)
 
         # Throttle state, keyed by chaddr so it survives the follow-induced
         # restart (the target-keyed runtime paths change on every follow).
@@ -207,7 +217,7 @@ class FollowPolicy:  # pylint: disable=too-many-instance-attributes
             # new gateway + prefix too so outbound keeps working -- parity with what a
             # plain DHCP interface does. Needs the new subnet mask (opt 1) to set the
             # VIP prefix; without it we can only move the address, so warn instead.
-            self._gw_args = []
+            self._attempt.gw_args = []
             old_router = self._dhcp.binding.router
             if rx.router and old_router and rx.router != old_router:
                 bits = _mask_to_bits(rx.subnet_mask)
@@ -215,7 +225,7 @@ class FollowPolicy:  # pylint: disable=too-many-instance-attributes
                     LOG.warning("follow %s -> %s also moves the gateway (%s -> %s), subnet "
                                 "/%d -- following across the subnet", self.target, got,
                                 old_router, rx.router, bits)
-                    self._gw_args = [old_router, rx.router, str(bits)]
+                    self._attempt.gw_args = [old_router, rx.router, str(bits)]
                 else:
                     LOG.error("follow %s -> %s changes the gateway (%s -> %s) but the ACK "
                               "carried no subnet mask -- updating the VIP address only; fix the "
@@ -225,7 +235,7 @@ class FollowPolicy:  # pylint: disable=too-many-instance-attributes
             self._record_follow()
             # _follow_update reads target as the old address, so remember it
             # (for the retry watchdog) and fire before overwriting target.
-            self._follow_from = self.target
+            self._attempt.follow_from = self.target
             self._follow_update(got)
             self.target = got
             self._dhcp.adopt(rx)
@@ -245,13 +255,13 @@ class FollowPolicy:  # pylint: disable=too-many-instance-attributes
         """Ask configd to rewrite the CARP VIP (and this keeper's reference) from
         the target to new_ip, then reconfigure. Fire-and-forget: the resulting
         service restart replaces this daemon with one bound to the new address."""
-        if new_ip == self._followed_ip:
+        if new_ip == self._attempt.followed_ip:
             return   # already asked for this address
         try:
             self._fire_follow_update(self.target, new_ip)
             # Only mark as handled once the request was actually dispatched, so a
             # spawn failure is retried next cycle instead of getting stuck.
-            self._followed_ip = new_ip
+            self._attempt.followed_ip = new_ip
             LOG.info("requested CARP VIP update %s -> %s", self.target, new_ip)
         except Exception as e:
             LOG.error("follow_update request failed: %s", e)
@@ -260,10 +270,10 @@ class FollowPolicy:  # pylint: disable=too-many-instance-attributes
         """Dispatch the follow_update side effect (old -> new, plus any
         cross-subnet gw args) through the injected hook and stamp the retry
         deadline. Separate from _follow_update so the watchdog can re-drive a
-        stalled follow without tripping the _followed_ip equality guard."""
+        stalled follow without tripping the followed_ip equality guard."""
         # gw_args: cross-subnet [old_gw, new_gw, bits]; empty on a same-subnet move.
-        self._dispatch_follow_update(old_ip, new_ip, self._gw_args)
-        self._fired_at = time.time()
+        self._dispatch_follow_update(old_ip, new_ip, self._attempt.gw_args)
+        self._attempt.fired_at = time.time()
 
     def watchdog(self):
         """Re-drive a follow that never took effect. After a successful follow,
@@ -271,14 +281,15 @@ class FollowPolicy:  # pylint: disable=too-many-instance-attributes
         alive well past FOLLOW_RETRY_DEADLINE, its apply failed or stalled, so
         re-dispatch it (idempotent: it reconverges whether the config already
         moved or not, and its rc.d restart <old-id> eventually replaces us)."""
-        if not (self.follow and self._followed_ip and self._follow_from):
+        att = self._attempt
+        if not (self.follow and att.followed_ip and att.follow_from):
             return
-        if time.time() - self._fired_at < FOLLOW_RETRY_DEADLINE:
+        if time.time() - att.fired_at < FOLLOW_RETRY_DEADLINE:
             return
         LOG.warning("follow %s -> %s not applied within %ds -- re-driving",
-                    self._follow_from, self._followed_ip, FOLLOW_RETRY_DEADLINE)
+                    att.follow_from, att.followed_ip, FOLLOW_RETRY_DEADLINE)
         try:
-            self._fire_follow_update(self._follow_from, self._followed_ip)
+            self._fire_follow_update(att.follow_from, att.followed_ip)
         except Exception as e:
             LOG.error("follow_update retry failed: %s", e)
 

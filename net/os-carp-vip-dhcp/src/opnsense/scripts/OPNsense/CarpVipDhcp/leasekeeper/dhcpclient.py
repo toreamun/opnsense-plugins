@@ -9,14 +9,15 @@ import time
 from dataclasses import dataclass
 
 from .constants import (
+    LOGGER_NAME,
     ACK, ATTEMPT_BACKOFF_CAP, BROADCAST_FLAG, DEFAULT_LEASE, DORA_ATTEMPTS,
     IPV4_BROADCAST, MIN_LEASE, MIN_T1, NAK, OFFER, Phase, REBIND_MARGIN,
     REBOOT_ATTEMPTS, RENEW_ATTEMPTS,
     RENEW_TIMEOUT, REPLY_TIMEOUT, SEND_RETRY_DELAY, T1_FACTOR, T2_FACTOR)
 from .util import _jittered, _mask_to_bits, _new_xid, mac2raw
-from .wire import DhcpReply, _dhcp_options, _fmt_reply, _msg_text
+from .wire import DhcpReply, DhcpSend, _dhcp_options, _fmt_reply, _msg_text
 
-LOG = logging.getLogger("lease-keeper")
+LOG = logging.getLogger(LOGGER_NAME)
 
 # Daemon log-and-continue posture: broad catch-alls are deliberate (see the
 # package docstring / module docstrings).
@@ -83,10 +84,10 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
     def _send_dhcp(self, mtype, extra, ciaddr="0.0.0.0"):
         # ciaddr is set for RENEW/REBIND (the client already owns the address);
         # the broadcast flag stays on so the reply is reliably captured by the sniffer.
-        self._capture.send_dhcp(
+        self._capture.send_dhcp(DhcpSend(
             eth_src=self.eth_src, ip_src=ciaddr, ip_dst=IPV4_BROADCAST,
             chaddr=self.chraw, xid=self.xid, ciaddr=ciaddr, flags=BROADCAST_FLAG,
-            options=_dhcp_options(mtype, extra, self._id_opts))
+            options=_dhcp_options(mtype, extra, self._id_opts)))
 
     def _wait_for_dhcp_reply(self, want, timeout) -> DhcpReply | None:
         """Wait up to timeout for a reply of message-type `want`. Returns the
@@ -330,10 +331,10 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
 
         try:
             # No broadcast flag: RELEASE expects no reply to capture.
-            self._capture.send_dhcp(
+            self._capture.send_dhcp(DhcpSend(
                 eth_src=self.eth_src, ip_src=yiaddr, ip_dst=server or IPV4_BROADCAST,
                 chaddr=self.chraw, xid=self.xid, ciaddr=yiaddr, flags=0,
-                options=[("message-type", "release"), ("server_id", server), "end"])
+                options=[("message-type", "release"), ("server_id", server), "end"]))
             LOG.info("DHCP RELEASE of lease %s sent (server %s)", yiaddr, server or "broadcast")
         except Exception as e:
             LOG.error("RELEASE failed: %s", e)

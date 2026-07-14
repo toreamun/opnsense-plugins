@@ -12,15 +12,17 @@ import threading
 from typing import Any
 
 from .constants import (
+    LOGGER_NAME,
     DHCP_CLIENT_PORT, DHCP_SERVER_PORT, ETHER_BROADCAST, THREAD_JOIN_TIMEOUT)
 from .codec import (BIOCGBLEN, BIOCGDLT, BIOCIMMEDIATE, BIOCPROMISC, BIOCSETF,
-                    BIOCSETIF, BIOCSHDRCMPLT, DLT_EN10MB, ETHERTYPE_ARP,
-                    ETHERTYPE_IPV4, ETHER_MIN_FRAME, _BPF_FILTER, _bpf_frames,
-                    _decode_arp, _decode_ipv4_bootp, _encode_arp_request,
-                    _encode_bootp_request, _encode_ether, _encode_ipv4_udp)
+                    BIOCSETIF, BIOCSHDRCMPLT, DLT_EN10MB, ETHER_HDR_LEN,
+                    ETHER_MIN_FRAME, ETHERTYPE_ARP, ETHERTYPE_IPV4, ETHERTYPE_OFF,
+                    _BPF_FILTER, _bpf_frames, _decode_arp, _decode_ipv4_bootp,
+                    _encode_arp_request, _encode_bootp_request, _encode_ether,
+                    _encode_ipv4_udp)
 from .wire import _deliver
 
-LOG = logging.getLogger("lease-keeper")
+LOG = logging.getLogger(LOGGER_NAME)
 
 # Daemon log-and-continue posture: broad catch-alls are deliberate (see the
 # package docstring / module docstrings).
@@ -42,7 +44,7 @@ except ImportError:
 
 class BpfCapture:  # pylint: disable=too-many-instance-attributes
     """Capture/send on a raw /dev/bpf descriptor -- no packet library. A
-    reader thread walks the BPF buffer and hands decoded neutral frames to
+    reader thread walks the bpf buffer and hands decoded neutral frames to
     the same callbacks the scapy backend feeds. FreeBSD-only (OPNsense's
     platform); selected with --capture-backend bpf (experimental).
 
@@ -214,12 +216,12 @@ class BpfCapture:  # pylint: disable=too-many-instance-attributes
         decoded = None
         handler = None
         try:
-            if len(frame) >= 14:
-                ethertype = int.from_bytes(frame[12:14], "big")
+            if len(frame) >= ETHER_HDR_LEN:
+                ethertype = int.from_bytes(frame[ETHERTYPE_OFF:ETHER_HDR_LEN], "big")
                 if ethertype == ETHERTYPE_ARP:
-                    decoded, handler = _decode_arp(frame[14:]), self._on_arp
+                    decoded, handler = _decode_arp(frame[ETHER_HDR_LEN:]), self._on_arp
                 elif ethertype == ETHERTYPE_IPV4:
-                    decoded, handler = _decode_ipv4_bootp(frame[14:]), self._on_bootp
+                    decoded, handler = _decode_ipv4_bootp(frame[ETHER_HDR_LEN:]), self._on_bootp
         except Exception as e:
             LOG.debug("bpf frame parse error: %s", e)
             return
@@ -233,13 +235,11 @@ class BpfCapture:  # pylint: disable=too-many-instance-attributes
             raise OSError("bpf capture not started")
         os.write(fd, frame)
 
-    # The DHCP wire tuple: one parameter per field that goes on the wire.
-    def send_dhcp(self, *, eth_src, ip_src, ip_dst, chaddr,  # pylint: disable=too-many-arguments
-                  xid, ciaddr, flags, options):
-        """Broadcast one DHCP client message as raw encoded frames."""
-        payload = _encode_bootp_request(chaddr, xid, ciaddr, flags, options)
-        dgram = _encode_ipv4_udp(ip_src, ip_dst, DHCP_CLIENT_PORT, DHCP_SERVER_PORT, payload)
-        self._write(_encode_ether(ETHER_BROADCAST, eth_src, ETHERTYPE_IPV4, dgram))
+    def send_dhcp(self, msg):
+        """Broadcast one DHCP client message (a DhcpSend) as raw encoded frames."""
+        payload = _encode_bootp_request(msg.chaddr, msg.xid, msg.ciaddr, msg.flags, msg.options)
+        dgram = _encode_ipv4_udp(msg.ip_src, msg.ip_dst, DHCP_CLIENT_PORT, DHCP_SERVER_PORT, payload)
+        self._write(_encode_ether(ETHER_BROADCAST, msg.eth_src, ETHERTYPE_IPV4, dgram))
 
     def send_arp_request(self, hwsrc, psrc, pdst):
         """Broadcast an ARP who-has pdst tell psrc from hwsrc."""

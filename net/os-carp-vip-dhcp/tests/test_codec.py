@@ -264,9 +264,10 @@ def test_bpf_send_dhcp_round_trips(lk):
     # What send_dhcp writes must decode back through our own defensive parser:
     # broadcast Ethernet/IP framing, the right ports, and the option list intact.
     cap, frames = _bpf_capture(lk)
-    cap.send_dhcp(eth_src="00:00:5e:00:01:fe", ip_src="0.0.0.0", ip_dst="255.255.255.255",
-                  chaddr=CHADDR, xid=0xABCD, ciaddr="0.0.0.0", flags=lk.BROADCAST_FLAG,
-                  options=[("message-type", "discover"), ("requested_addr", "100.64.4.7"), "end"])
+    cap.send_dhcp(lk.DhcpSend(
+        eth_src="00:00:5e:00:01:fe", ip_src="0.0.0.0", ip_dst="255.255.255.255",
+        chaddr=CHADDR, xid=0xABCD, ciaddr="0.0.0.0", flags=lk.BROADCAST_FLAG,
+        options=[("message-type", "discover"), ("requested_addr", "100.64.4.7"), "end"]))
     frame = frames["sent"][0]
     assert frame[:6] == b"\xff" * 6 and frame[6:12] == CHADDR
     assert frame[12:14] == b"\x08\x00"

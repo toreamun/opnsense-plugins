@@ -10,9 +10,9 @@ import logging
 import re
 from typing import NamedTuple
 
-from .constants import DHCP_CLIENT_PORT, DHCP_SERVER_PORT, PARAM_REQ_LIST, mtype_name
+from .constants import LOGGER_NAME, DHCP_CLIENT_PORT, DHCP_SERVER_PORT, PARAM_REQ_LIST, mtype_name
 
-LOG = logging.getLogger("lease-keeper")
+LOG = logging.getLogger(LOGGER_NAME)
 
 
 class DhcpReply(NamedTuple):
@@ -55,6 +55,22 @@ class ArpFrame(NamedTuple):
     op: int
     psrc: str
     pdst: str
+
+
+class DhcpSend(NamedTuple):
+    """One outbound DHCP client message in backend-neutral shape: the fields
+    that go on the wire (Ethernet source, IP src/dst, the BOOTP
+    chaddr/xid/ciaddr/flags, and the option list). DhcpClient builds it; the
+    backend either encodes it (bpf) or relays it to scapy. The send-side
+    counterpart to the received BootpFrame."""
+    eth_src: str
+    ip_src: str
+    ip_dst: str
+    chaddr: bytes
+    xid: int
+    ciaddr: str
+    flags: int
+    options: list
 
 
 # Static BPF capture filter: DHCP (broadcast OFFER/ACK) + ARP replies to our nudge

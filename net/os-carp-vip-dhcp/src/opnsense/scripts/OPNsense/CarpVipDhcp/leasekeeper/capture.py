@@ -7,6 +7,7 @@ from typing import Any, Callable, Protocol
 
 from .capture_bpf import BpfCapture
 from .capture_scapy import ScapyCapture
+from .wire import DhcpSend
 
 
 class Capture(Protocol):
@@ -15,9 +16,8 @@ class Capture(Protocol):
     driven by the keeper (start/stop/alive + the two send methods), with a
     static availability probe main() checks before starting. Typing the registry
     against this catches a backend that drifts from the shape the keeper drives."""
-    # Interface stubs: the class docstring documents the contract, and the
-    # send_* arity mirrors the concrete backends' own too-many-arguments waiver.
-    # pylint: disable=missing-function-docstring,too-many-arguments
+    # Interface stubs: the class docstring documents the contract.
+    # pylint: disable=missing-function-docstring
 
     def __init__(self, iface: str, promisc: bool,
                  on_bootp: "Callable[[Any], None]", on_arp: "Callable[[Any], None]") -> None: ...
@@ -31,7 +31,7 @@ class Capture(Protocol):
 
     def alive(self) -> bool: ...
 
-    def send_dhcp(self, *, eth_src, ip_src, ip_dst, chaddr, xid, ciaddr, flags, options) -> None: ...
+    def send_dhcp(self, msg: DhcpSend) -> None: ...
 
     def send_arp_request(self, hwsrc, psrc, pdst) -> None: ...
 

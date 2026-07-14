@@ -53,6 +53,15 @@ class ScapyCapture:
         self._on_arp = on_arp
         self._sniffer = None
 
+    @staticmethod
+    def unavailable_reason() -> "str | None":
+        """Why this backend cannot run on this host, or None if it can. scapy is
+        the one heavy optional dependency; report the captured import error (with
+        the install hint) instead of dying on first use."""
+        if _SCAPY_IMPORT_ERROR is None:
+            return None
+        return f"cannot import scapy: {_SCAPY_IMPORT_ERROR} -- install the matching py3<minor>-scapy package"
+
     def start(self):
         """(Re)start the sniffer. False on failure (the caller retries)."""
         try:

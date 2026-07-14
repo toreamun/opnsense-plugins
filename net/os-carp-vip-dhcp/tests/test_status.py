@@ -2,7 +2,7 @@
 # pylint: disable=missing-function-docstring
 import time
 
-import status  # sys.path via conftest  # type: ignore  # pylint: disable=import-error
+import status  # sys.path via conftest  # type: ignore
 
 
 def test_keeper_id():

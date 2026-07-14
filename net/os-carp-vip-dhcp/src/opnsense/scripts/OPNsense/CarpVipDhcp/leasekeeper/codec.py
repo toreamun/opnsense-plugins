@@ -8,7 +8,7 @@ access is bounds-checked and a malformed frame decodes to None (dropped).
 import ipaddress
 import struct
 
-from .constants import ArpOp, BOOTREPLY, ETHER_ZERO, MsgType
+from .constants import ArpOp, BootpOp, DhcpOpt, ETHER_ZERO, MsgType
 from .util import mac2raw
 from .wire import ArpFrame, BootpFrame
 
@@ -25,8 +25,6 @@ ETHER_MIN_FRAME = 60         # minimum Ethernet frame (without FCS); short ARP f
 DHCP_MAGIC = b"\x63\x82\x53\x63"   # RFC 2131 options magic cookie
 BOOTP_HDR_LEN = 236          # fixed BOOTP header before the magic cookie
 BOOTP_MIN_PAYLOAD = 300      # RFC 1542 4.1 minimum BOOTP message; reference clients pad to it
-DHCP_OPT_PAD = 0
-DHCP_OPT_END = 255
 IPPROTO_UDP = 17
 IPV4_TTL = 64                # conventional default TTL (BSD/Linux/scapy send 64)
 IP_HDR_LEN = 20             # fixed IPv4 header we build (no options)
@@ -58,13 +56,13 @@ def _opt_text(v):
 # exactly the options the keeper sends. These names ARE the keeper's option
 # vocabulary (BootpFrame.options and _dhcp_options use them).
 _OPT_ENCODERS = {
-    "message-type": (53, lambda v: bytes([_MTYPE_CODES[v]])),
-    "param_req_list": (55, bytes),        # list of option codes
-    "requested_addr": (50, _ip4),
-    "server_id": (54, _ip4),
-    "hostname": (12, _opt_text),
-    "vendor_class_id": (60, _opt_text),
-    "client_id": (61, _opt_text),
+    "message-type": (DhcpOpt.MESSAGE_TYPE, lambda v: bytes([_MTYPE_CODES[v]])),
+    "param_req_list": (DhcpOpt.PARAM_REQ_LIST, bytes),   # list of option codes
+    "requested_addr": (DhcpOpt.REQUESTED_ADDR, _ip4),
+    "server_id": (DhcpOpt.SERVER_ID, _ip4),
+    "hostname": (DhcpOpt.HOSTNAME, _opt_text),
+    "vendor_class_id": (DhcpOpt.VENDOR_CLASS_ID, _opt_text),
+    "client_id": (DhcpOpt.CLIENT_ID, _opt_text),
 }
 
 
@@ -79,14 +77,17 @@ def _encode_dhcp_options(options):
         code, encode = _OPT_ENCODERS[o[0]]
         raw = encode(o[1])
         out += bytes([code, len(raw)]) + raw
-    out.append(DHCP_OPT_END)
+    out.append(DhcpOpt.END)
     return bytes(out)
 
 
 def _encode_bootp_request(chaddr, xid, ciaddr, flags, options):
     """A BOOTREQUEST payload: fixed BOOTP header + cookie + options, padded to
     the RFC 1542 minimum message size (some servers drop shorter ones)."""
-    hdr = struct.pack("!4BIHH", 1, 1, 6, 0, xid, 0, flags)   # op htype hlen hops xid secs flags
+    # BOOTP header, network byte order: op/htype/hlen/hops as 4 u8 (4B), xid as
+    # u32 (I), secs and flags as u16 each (HH). htype=1 (Ethernet), hlen=6 (MAC
+    # length), hops=0, secs=0.
+    hdr = struct.pack("!4BIHH", BootpOp.REQUEST, 1, 6, 0, xid, 0, flags)
     hdr += _ip4(ciaddr) + b"\x00" * 12                       # ciaddr, then yiaddr/siaddr/giaddr zero
     hdr += chaddr.ljust(16, b"\x00")[:16]                    # chaddr field (16 bytes)
     hdr += b"\x00" * 192                                     # sname (64) + file (128), unused
@@ -109,11 +110,17 @@ def _encode_ipv4_udp(src, dst, sport, dport, payload):
     of 0 means "none sent", so a sum that works out to 0 transmits as 0xFFFF
     (RFC 768)."""
     udp_len = UDP_HDR_LEN + len(payload)
+    # UDP checksum pseudo-header (RFC 768): src+dst IPs, then a zero byte, the
+    # protocol number and the UDP length -- u8/u8/u16 (BBH).
     pseudo = _ip4(src) + _ip4(dst) + struct.pack("!BBH", 0, IPPROTO_UDP, udp_len)
-    udp_hdr = struct.pack("!4H", sport, dport, udp_len, 0)
+    # UDP header: src port, dst port, length, checksum -- four u16 (4H). Built
+    # once with a zero checksum to sum over, then rebuilt with the real one.
+    udp_fmt = "!4H"
+    udp_hdr = struct.pack(udp_fmt, sport, dport, udp_len, 0)
     cksum = _inet_checksum(pseudo + udp_hdr + payload) or 0xFFFF
-    udp_hdr = struct.pack("!4H", sport, dport, udp_len, cksum)
-    # version/ihl, tos, total, id, flags/frag, ttl, proto, checksum (zeroed, then patched)
+    udp_hdr = struct.pack(udp_fmt, sport, dport, udp_len, cksum)
+    # IPv4 header, u8/u8/u16*3/u8/u8/u16 (BBHHHBBH): version/ihl, tos, total
+    # length, id, flags/frag, ttl, proto, checksum (zeroed here, patched below).
     ip_hdr = (struct.pack("!BBHHHBBH", 0x45, 0, IP_HDR_LEN + udp_len, 0, 0, IPV4_TTL, IPPROTO_UDP, 0)
               + _ip4(src) + _ip4(dst))
     ip_hdr = ip_hdr[:10] + _inet_checksum(ip_hdr).to_bytes(2, "big") + ip_hdr[12:]
@@ -155,14 +162,14 @@ def _first_ip(v):
 # exactly the options _parse_reply acts on; everything else is skipped unread
 # (untrusted input, narrow surface).
 _OPT_DECODERS = {
-    1: ("subnet_mask", _first_ip),
-    3: ("router", _first_ip),
-    51: ("lease_time", _u32),
-    53: ("message-type", lambda v: v[0]),
-    54: ("server_id", _first_ip),
-    56: ("message", bytes),
-    58: ("renewal_time", _u32),
-    59: ("rebinding_time", _u32),
+    DhcpOpt.SUBNET_MASK: ("subnet_mask", _first_ip),
+    DhcpOpt.ROUTER: ("router", _first_ip),
+    DhcpOpt.LEASE_TIME: ("lease_time", _u32),
+    DhcpOpt.MESSAGE_TYPE: ("message-type", lambda v: v[0]),
+    DhcpOpt.SERVER_ID: ("server_id", _first_ip),
+    DhcpOpt.MESSAGE: ("message", bytes),
+    DhcpOpt.RENEWAL_TIME: ("renewal_time", _u32),
+    DhcpOpt.REBINDING_TIME: ("rebinding_time", _u32),
 }
 
 
@@ -179,10 +186,10 @@ def _decode_dhcp_options(data):
     pos = 0
     while pos < len(data):
         code = data[pos]
-        if code == DHCP_OPT_PAD:        # a single padding byte, no length/value
+        if code == DhcpOpt.PAD:         # a single padding byte, no length/value
             pos += 1
             continue
-        if code == DHCP_OPT_END:        # explicit end of options
+        if code == DhcpOpt.END:         # explicit end of options
             break
         if pos + 2 > len(data):         # the length byte itself is missing
             break
@@ -201,7 +208,7 @@ def _decode_dhcp_options(data):
     return options
 
 
-def _decode_arp(pkt):
+def _decode_arp(pkt) -> "ArpFrame | None":
     """Raw ARP payload -> ArpFrame, or None unless it is a well-formed
     Ethernet/IPv4 ARP."""
     if len(pkt) < 28 or pkt[:6] != _ARP_ETH_IPV4:
@@ -209,7 +216,7 @@ def _decode_arp(pkt):
     return ArpFrame(int.from_bytes(pkt[6:8], "big"), _ip4_str(pkt[14:18]), _ip4_str(pkt[24:28]))
 
 
-def _decode_ipv4_bootp(pkt):
+def _decode_ipv4_bootp(pkt) -> "BootpFrame | None":
     """Raw IPv4 payload of an Ethernet frame -> BootpFrame, or None unless it
     is an unfragmented UDP datagram carrying a plausible BOOTP message with
     the DHCP cookie. Every bound is checked (untrusted WAN input)."""
@@ -244,7 +251,7 @@ def _decode_ipv4_bootp(pkt):
                       yiaddr=_ip4_str(bootp[16:20]),
                       chaddr=bytes(bootp[28:44]),
                       giaddr=_ip4_str(bootp[24:28]),
-                      options=_decode_dhcp_options(bootp[BOOTP_HDR_LEN + 4:]) if op == BOOTREPLY else [])
+                      options=_decode_dhcp_options(bootp[BOOTP_HDR_LEN + 4:]) if op == BootpOp.REPLY else [])
 
 
 # ---- /dev/bpf plumbing (bpf backend) ----

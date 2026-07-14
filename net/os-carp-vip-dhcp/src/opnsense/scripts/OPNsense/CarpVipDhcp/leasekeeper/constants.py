@@ -21,7 +21,15 @@ class MsgType(IntEnum):
 
 # Aliases for the types the code compares against by bare name.
 OFFER, ACK, NAK = MsgType.OFFER, MsgType.ACK, MsgType.NAK
-BOOTREPLY = 2              # BOOTP op field: a server->client reply (unrelated to OFFER)
+
+
+class BootpOp(IntEnum):
+    """BOOTP op field (RFC 951): client-to-server messages are REQUEST, the
+    server's answers are REPLY. Distinct from the DHCP message type -- every
+    DORA packet is a BOOTREQUEST whether it is a DISCOVER or a REQUEST, so a
+    received frame must carry REPLY to be one of ours."""
+    REQUEST = 1
+    REPLY = 2
 
 
 class ArpOp(IntEnum):
@@ -29,6 +37,28 @@ class ArpOp(IntEnum):
     REPLY (is-at) counts as the gateway's reachability confirmation."""
     REQUEST = 1
     REPLY = 2
+
+
+class DhcpOpt(IntEnum):
+    """DHCP option codes (RFC 2132) for exactly the options the keeper sends or
+    reads, plus the two options-field markers (PAD/END). Names the wire numbers
+    that would otherwise be magic literals in the codec's encoder/decoder tables
+    and the parameter request list."""
+    PAD = 0
+    SUBNET_MASK = 1
+    ROUTER = 3
+    HOSTNAME = 12
+    REQUESTED_ADDR = 50
+    LEASE_TIME = 51
+    MESSAGE_TYPE = 53
+    SERVER_ID = 54
+    PARAM_REQ_LIST = 55
+    MESSAGE = 56
+    RENEWAL_TIME = 58
+    REBINDING_TIME = 59
+    VENDOR_CLASS_ID = 60
+    CLIENT_ID = 61
+    END = 255
 
 
 def mtype_name(code):
@@ -45,11 +75,12 @@ def mtype_name(code):
 THREAD_JOIN_TIMEOUT = 2
 
 # Options we ask the server to include on every DISCOVER/REQUEST (RFC 2132 option
-# 55, Parameter Request List). Subnet mask (1) + router (3) drive follow mode's
-# cross-subnet decision; lease/server-id/T1/T2 (51/54/58/59) drive renew timing.
-# Many servers return ONLY options named in the PRL, so without this the keeper
-# can silently miss the mask/router it needs to follow a cross-subnet renumber.
-PARAM_REQ_LIST = [1, 3, 51, 54, 58, 59]
+# 55, Parameter Request List). Subnet mask + router drive follow mode's
+# cross-subnet decision; lease/server-id/T1/T2 drive renew timing. Many servers
+# return ONLY options named in the PRL, so without this the keeper can silently
+# miss the mask/router it needs to follow a cross-subnet renumber.
+PARAM_REQ_LIST = [DhcpOpt.SUBNET_MASK, DhcpOpt.ROUTER, DhcpOpt.LEASE_TIME,
+                  DhcpOpt.SERVER_ID, DhcpOpt.RENEWAL_TIME, DhcpOpt.REBINDING_TIME]
 
 # Timing / retry tunables (seconds unless noted).
 HB_REFRESH = 30            # rewrite the heartbeat at least this often while holding a lease
@@ -85,8 +116,6 @@ IPV4_BROADCAST = "255.255.255.255"   # limited broadcast (never routed off-link)
 DHCP_SERVER_PORT = 67
 DHCP_CLIENT_PORT = 68
 ARP_NUDGE_MIN = 30         # floor for --arp-nudge so a typo cannot flood the segment
-LOG_MAX_BYTES = 512 * 1024
-LOG_BACKUPS = 3
 
 
 class Phase(StrEnum):

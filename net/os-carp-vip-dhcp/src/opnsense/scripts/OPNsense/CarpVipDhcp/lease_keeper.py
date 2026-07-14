@@ -62,12 +62,16 @@ import sys
 from logging.handlers import RotatingFileHandler
 
 from leasekeeper.capture import CAPTURE_BACKENDS
-from leasekeeper.capture_scapy import _SCAPY_IMPORT_ERROR
-from leasekeeper.constants import LOG_BACKUPS, LOG_MAX_BYTES
 from leasekeeper.keeper import Keeper
 from leasekeeper.util import MAC_RE
 
 LOG = logging.getLogger("lease-keeper")
+
+# Rotating log-file sizing for _setup_logging. Logging infrastructure for the
+# entry point, not DHCP protocol or a daemon tunable, so it lives here with its
+# only consumer rather than in the shared constants module.
+LOG_MAX_BYTES = 512 * 1024
+LOG_BACKUPS = 3
 
 
 def acquire_pidfile(path):
@@ -86,19 +90,32 @@ def acquire_pidfile(path):
             try:
                 with open(path, encoding="utf-8") as f:
                     old = int(f.read().strip())
-                os.kill(old, 0)
-                LOG.error("already running (pid %d) -- exiting", old)
-                sys.exit(4)
-            except (ValueError, ProcessLookupError, PermissionError):
-                # Stale pidfile (dead/foreign pid): remove it and retry the create.
+            except (OSError, ValueError):
+                old = None      # unreadable / garbage pidfile content -> treat as stale
+            if old is not None:
                 try:
-                    os.unlink(path)
-                except OSError as e:
-                    # If the stale file cannot be removed (e.g. a permission
-                    # problem that will not self-heal), exit instead of spinning
-                    # the create/unlink loop forever with no log.
-                    LOG.error("cannot remove stale pidfile %s: %s -- exiting", path, e)
-                    sys.exit(5)
+                    os.kill(old, 0)
+                except ProcessLookupError:
+                    pass        # dead pid -> stale, fall through to remove and retry
+                except PermissionError:
+                    # The pid exists but is owned by another user: a LIVE process,
+                    # not a stale file. Removing its pidfile would let a second
+                    # instance start, so exit instead.
+                    LOG.error("pidfile %s held by a live process (pid %d, foreign "
+                              "owner) -- exiting", path, old)
+                    sys.exit(4)
+                else:
+                    LOG.error("already running (pid %d) -- exiting", old)
+                    sys.exit(4)
+            # Stale (dead pid or unreadable content): remove it and retry the create.
+            try:
+                os.unlink(path)
+            except OSError as e:
+                # If the stale file cannot be removed (e.g. a permission problem
+                # that will not self-heal), exit instead of spinning the
+                # create/unlink loop forever with no log.
+                LOG.error("cannot remove stale pidfile %s: %s -- exiting", path, e)
+                sys.exit(5)
         except OSError as e:
             LOG.error("cannot write pidfile %s: %s", path, e)
             sys.exit(5)
@@ -162,10 +179,13 @@ def main():
     a = _build_arg_parser().parse_args()
     _setup_logging(a.logfile)
 
-    if a.capture_backend == "scapy" and _SCAPY_IMPORT_ERROR is not None:
-        LOG.critical("cannot import scapy -- the lease keeper cannot run: %s. "
-                     "Install the matching py3<minor>-scapy package (see the plugin "
-                     "docs) and restart the service.", _SCAPY_IMPORT_ERROR)
+    # Fail fast (with a logged reason) if the selected backend cannot run on
+    # this host -- checked uniformly through the registry so a future backend
+    # with an optional dependency is covered without a special case here.
+    reason = CAPTURE_BACKENDS[a.capture_backend].unavailable_reason()
+    if reason is not None:
+        LOG.critical("capture backend %r cannot run: %s -- the lease keeper cannot start",
+                     a.capture_backend, reason)
         return 3
     LOG.info("capture backend: %s", a.capture_backend)
 

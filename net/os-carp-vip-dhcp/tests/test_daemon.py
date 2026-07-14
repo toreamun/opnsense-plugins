@@ -2,7 +2,7 @@
 
 Tests reach into private state/methods by design, and use comments over
 per-test docstrings."""
-# pylint: disable=protected-access, missing-function-docstring
+# pylint: disable=protected-access, missing-function-docstring, too-many-lines
 import os
 import re
 import select
@@ -92,7 +92,8 @@ def test_reboot_request_shape_and_bind(lk):
 
 def test_reboot_nak_falls_through(lk):
     c = _client(lk)
-    c._wait_for_dhcp_reply = lambda want, timeout: "NAK"
+    c._wait_for_dhcp_reply = lambda want, timeout: lk.DhcpReply(
+        lk.NAK, None, None, None, None, None, None)
     assert c.reboot("100.64.4.7") is False
     assert c.binding.yiaddr is None
 
@@ -320,7 +321,7 @@ def _dhcp_frame(lk, xid, options, *, yiaddr="100.64.4.7",  # pylint: disable=too
                 chaddr=CHADDR, op=None, giaddr="0.0.0.0"):
     """A backend-neutral BootpFrame as either capture backend would hand it
     to the keeper."""
-    return lk.BootpFrame(lk.BOOTREPLY if op is None else op, xid, yiaddr, chaddr, giaddr, options)
+    return lk.BootpFrame(lk.BootpOp.REPLY if op is None else op, xid, yiaddr, chaddr, giaddr, options)
 
 
 def test_parse_reply_extracts_fields_and_relay(lk):
@@ -356,7 +357,7 @@ def test_dhcpnak_logs_reason(lk, caplog, message, expect):
     keeper = _keeper(lk)
     keeper._dhcp._rx = lk.DhcpReply(lk.NAK, None, "100.64.4.1", None, None, None, None, message)
     with caplog.at_level("WARNING", logger="lease-keeper"):
-        assert keeper._dhcp._wait_for_dhcp_reply(lk.ACK, 0.2) == "NAK"
+        assert keeper._dhcp._wait_for_dhcp_reply(lk.ACK, 0.2).mtype == lk.NAK
     assert any(expect in r.getMessage() for r in caplog.records)
 
 
@@ -583,6 +584,47 @@ def test_nudge_off_by_default(lk):
     assert keeper._nudge.interval == 0
     keeper._arp_nudge(force=True)   # must be a no-op, not an error
     assert keeper._nudge.last_nudge == 0.0
+
+
+def test_maybe_nudge_uses_supplied_master_skipping_probe(lk):
+    # When the maintain loop passes the CARP role it already probed this tick,
+    # the nudge uses that value and does NOT consult its own probe hook -- the
+    # sharing that avoids a duplicate ifconfig spawn per bound tick.
+    probed = []
+    sent = []
+    capture = types.SimpleNamespace(send_arp_request=lambda *a: sent.append(a))
+    n = lk.ArpNudge(capture, CHADDR_STR, 1, lambda: probed.append(1) or False)
+    n.maybe_nudge("100.64.4.7", "100.64.4.1", master=True)   # supplied True wins over the (False) hook
+    assert sent and not probed          # sent, and the hook was never called
+    n.last_nudge = 0.0
+    n.maybe_nudge("100.64.4.7", "100.64.4.1", master=None)   # probe-failed value -> no nudge, still no hook
+    assert len(sent) == 1 and not probed
+
+
+def test_backend_unavailable_reason_contract(lk, monkeypatch):
+    # scapy: None when the import succeeded, a reason (with the install hint) when it failed.
+    assert lk.ScapyCapture.unavailable_reason() is None    # scapy is present in the test env
+    monkeypatch.setattr("leasekeeper.capture_scapy._SCAPY_IMPORT_ERROR", ImportError("boom"))
+    reason = lk.ScapyCapture.unavailable_reason()
+    assert reason and "boom" in reason and "scapy" in reason
+    # bpf: a reason when fcntl is missing (non-POSIX), None when present.
+    monkeypatch.setattr("leasekeeper.capture_bpf.fcntl", None)
+    assert lk.BpfCapture.unavailable_reason() is not None
+    monkeypatch.setattr("leasekeeper.capture_bpf.fcntl", object())
+    assert lk.BpfCapture.unavailable_reason() is None
+
+
+def test_dispatch_follow_update_builds_configctl_command(lk, monkeypatch):
+    # The injected follow dispatch (moved out of FollowPolicy into the keeper)
+    # builds the configd command: old + new, plus the cross-subnet gw args.
+    calls = []
+    monkeypatch.setattr(lk.subprocess, "Popen", lambda cmd, *a, **k: calls.append(cmd))
+    keeper = _keeper(lk)
+    keeper._dispatch_follow_update("100.64.4.7", "100.64.4.60", [])
+    keeper._dispatch_follow_update("100.64.4.7", "203.0.113.9", ["100.64.4.1", "203.0.113.1", "24"])
+    assert calls[0] == ["/usr/local/sbin/configctl", "-d", "carpvipdhcp", "follow_update",
+                        "100.64.4.7", "100.64.4.60"]
+    assert calls[1][-3:] == ["100.64.4.1", "203.0.113.1", "24"]   # gw args appended
 
 
 def test_nudge_interval_floor(lk):
@@ -863,7 +905,7 @@ class _ScapyDhcpPkt:
     def __init__(self, lk, xid, options, *, yiaddr="100.64.4.7",  # pylint: disable=too-many-arguments
                  chaddr: Any = CHADDR, op=None, giaddr="0.0.0.0"):
         self._lk = lk
-        self._bootp = types.SimpleNamespace(xid=xid, op=(lk.BOOTREPLY if op is None else op),
+        self._bootp = types.SimpleNamespace(xid=xid, op=(lk.BootpOp.REPLY if op is None else op),
                                             yiaddr=yiaddr, chaddr=chaddr, giaddr=giaddr)
         self._dhcp = types.SimpleNamespace(options=options)
 
@@ -899,7 +941,7 @@ def test_scapy_adapter_decodes_dhcp_to_frame(lk):
     cap._on_packet(_ScapyDhcpPkt(lk, 0x1234, [("message-type", lk.ACK), "end"],
                                  yiaddr="100.64.4.7", giaddr="100.64.4.9"))
     frame = frames["bootp"][0]
-    assert frame.op == lk.BOOTREPLY and frame.xid == 0x1234
+    assert frame.op == lk.BootpOp.REPLY and frame.xid == 0x1234
     assert frame.yiaddr == "100.64.4.7" and frame.giaddr == "100.64.4.9"
     assert frame.chaddr[:6] == CHADDR
     assert ("message-type", lk.ACK) in frame.options

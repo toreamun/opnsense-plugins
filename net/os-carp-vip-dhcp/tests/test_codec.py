@@ -152,7 +152,7 @@ def test_decode_arp(lk):
 def test_decode_ipv4_bootp_end_to_end(lk):
     payload = _bootp_reply(lk, options=_ack_options(lk), giaddr="100.64.4.9")
     frame = lk._decode_ipv4_bootp(lk._encode_ipv4_udp("100.64.4.1", "255.255.255.255", 67, 68, payload))
-    assert frame.op == lk.BOOTREPLY and frame.xid == 0x1234
+    assert frame.op == lk.BootpOp.REPLY and frame.xid == 0x1234
     assert frame.yiaddr == "100.64.4.7" and frame.giaddr == "100.64.4.9"
     assert frame.chaddr[:6] == CHADDR
     # ...and the frame satisfies the backend-neutral reply parser end to end.

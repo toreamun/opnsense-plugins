@@ -65,11 +65,21 @@ class BpfCapture:  # pylint: disable=too-many-instance-attributes
         self._stop_event = None        # set to ask the current reader to exit
         self._wake_writer = None       # write end of this generation's wake pipe
 
+    @staticmethod
+    def unavailable_reason() -> "str | None":
+        """Why this backend cannot run on this host, or None if it can. The raw
+        /dev/bpf backend drives its ioctls through fcntl, which exists only on
+        POSIX (the daemon's platform is FreeBSD)."""
+        if fcntl is None:
+            return "no fcntl module on this platform (the bpf backend is FreeBSD-only)"
+        return None
+
     def start(self):
         """(Re)open /dev/bpf, bind + filter it to the interface, and start the
         reader thread. Returns False on any failure (the caller retries)."""
-        if fcntl is None:
-            LOG.error("bpf backend unavailable: no fcntl module on this platform")
+        reason = self.unavailable_reason()
+        if reason is not None:
+            LOG.error("bpf backend unavailable: %s", reason)
             return False
         self.stop()
         wake_reader, wake_writer = os.pipe()
@@ -106,6 +116,8 @@ class BpfCapture:  # pylint: disable=too-many-instance-attributes
         BIOCGDLT needs -- so the filter is attached immediately after, keeping
         the window in which the descriptor would accept unfiltered traffic to a
         single ioctl."""
+        # struct ifreq: the interface name in ifr_name[16] (16s) followed by the
+        # 16-byte ifr_ifru union, unused here (16x pad).
         fcntl.ioctl(fd, BIOCSETIF, struct.pack("16s16x", self.iface.encode()))
         # The codec's frame offsets assume Ethernet; a PPPoE/tun WAN would make
         # both capture and injection meaningless. Fail loudly instead of leaving

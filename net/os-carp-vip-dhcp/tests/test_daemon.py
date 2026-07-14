@@ -1019,7 +1019,7 @@ def test_follow_update_fires_newwanip_hooks():
 def test_follow_update_action_arity():
     """The configd [follow_update] action must accept as many params as the
     daemon can send: _fire_follow_update passes old_ip + new_ip plus
-    _gw_args ([old_gw, new_gw, bits] on a cross-subnet move) = 5. configd
+    _attempt.gw_args ([old_gw, new_gw, bits] on a cross-subnet move) = 5. configd
     raises "Parameter mismatch" when more args than %s tokens are passed, so a
     narrower template would silently break every cross-subnet follow via
     configctl (a boundary the direct-call tests above never cross)."""

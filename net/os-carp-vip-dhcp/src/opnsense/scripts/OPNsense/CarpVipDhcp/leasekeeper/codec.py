@@ -21,6 +21,8 @@ from .wire import ArpFrame, BootpFrame
 
 ETHERTYPE_IPV4 = 0x0800
 ETHERTYPE_ARP = 0x0806
+ETHER_HDR_LEN = 14           # Ethernet II header: 6 dst + 6 src + 2 ethertype
+ETHERTYPE_OFF = 12           # the ethertype field sits at bytes 12-13 (end of the header)
 ETHER_MIN_FRAME = 60         # minimum Ethernet frame (without FCS); short ARP frames are padded
 DHCP_MAGIC = b"\x63\x82\x53\x63"   # RFC 2131 options magic cookie
 BOOTP_HDR_LEN = 236          # fixed BOOTP header before the magic cookie
@@ -135,6 +137,7 @@ def _encode_ether(dst, src, ethertype, payload):
 # The fixed Ethernet/IPv4 ARP header prefix (htype/ptype/hlen/plen), shared by
 # the encoder and the decoder so the two cannot drift.
 _ARP_ETH_IPV4 = struct.pack("!HHBB", 1, ETHERTYPE_IPV4, 6, 4)
+ARP_PKT_LEN = 28             # a full Ethernet/IPv4 ARP packet (6-byte prefix + op + 2 MACs + 2 IPs)
 
 
 def _encode_arp_request(hwsrc, psrc, pdst):
@@ -211,8 +214,9 @@ def _decode_dhcp_options(data):
 def _decode_arp(pkt) -> "ArpFrame | None":
     """Raw ARP payload -> ArpFrame, or None unless it is a well-formed
     Ethernet/IPv4 ARP."""
-    if len(pkt) < 28 or pkt[:6] != _ARP_ETH_IPV4:
+    if len(pkt) < ARP_PKT_LEN or pkt[:len(_ARP_ETH_IPV4)] != _ARP_ETH_IPV4:
         return None
+    # ARP field offsets: op 6:8, sender-IP (spa) 14:18, target-IP (tpa) 24:28.
     return ArpFrame(int.from_bytes(pkt[6:8], "big"), _ip4_str(pkt[14:18]), _ip4_str(pkt[24:28]))
 
 
@@ -240,7 +244,8 @@ def _decode_ipv4_bootp(pkt) -> "BootpFrame | None":
         return None
     end = min(total, ihl + udp_len, len(pkt))
     bootp = pkt[ihl + UDP_HDR_LEN:end]              # UDP payload, minus any link padding
-    if len(bootp) < BOOTP_HDR_LEN + 4 or bootp[BOOTP_HDR_LEN:BOOTP_HDR_LEN + 4] != DHCP_MAGIC:
+    if len(bootp) < BOOTP_HDR_LEN + len(DHCP_MAGIC) or \
+            bootp[BOOTP_HDR_LEN:BOOTP_HDR_LEN + len(DHCP_MAGIC)] != DHCP_MAGIC:
         return None
     # The options walk only pays off for server replies; on a shared segment
     # the filter also passes other clients' broadcast BOOTREQUESTs, which the
@@ -251,7 +256,8 @@ def _decode_ipv4_bootp(pkt) -> "BootpFrame | None":
                       yiaddr=_ip4_str(bootp[16:20]),
                       chaddr=bytes(bootp[28:44]),
                       giaddr=_ip4_str(bootp[24:28]),
-                      options=_decode_dhcp_options(bootp[BOOTP_HDR_LEN + 4:]) if op == BootpOp.REPLY else [])
+                      options=(_decode_dhcp_options(bootp[BOOTP_HDR_LEN + len(DHCP_MAGIC):])
+                               if op == BootpOp.REPLY else []))
 
 
 # ---- /dev/bpf plumbing (bpf backend) ----

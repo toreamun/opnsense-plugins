@@ -978,7 +978,7 @@ def test_follow_across_subnet_with_mask(lk, tmp_path, caplog):
             "100.64.5.60", _ack_gw(lk, "100.64.5.60", "100.64.5.1", mask="255.255.255.0"),
             "DORA", True) is True
     # gateway + prefix are handed to follow_update so outbound follows the new subnet
-    assert keeper._follow._gw_args == ["100.64.4.1", "100.64.5.1", "24"]
+    assert keeper._follow._attempt.gw_args == ["100.64.4.1", "100.64.5.1", "24"]
     assert any("following across the subnet" in r.getMessage() for r in caplog.records)
 
 
@@ -989,7 +989,7 @@ def test_follow_gateway_change_without_mask_warns(lk, tmp_path, caplog):
         keeper._follow.on_changed_address(
             "100.64.5.60", _ack_gw(lk, "100.64.5.60", "100.64.5.1"), "DORA", True)
     # without a mask we can't set the prefix: address-only follow + a fix-by-hand warning
-    assert keeper._follow._gw_args == []
+    assert keeper._follow._attempt.gw_args == []
     assert any("carried no subnet mask" in r.getMessage() for r in caplog.records)
 
 
@@ -998,7 +998,7 @@ def test_follow_no_gateway_change_no_extra_args(lk, tmp_path):
     keeper._dhcp.binding.router = "100.64.4.1"
     keeper._follow.on_changed_address(          # same gateway -> no cross-subnet extras
         "100.64.4.60", _ack_gw(lk, "100.64.4.60", "100.64.4.1"), "DORA", True)
-    assert keeper._follow._gw_args == []
+    assert keeper._follow._attempt.gw_args == []
 
 
 def test_follow_update_fires_newwanip_hooks():

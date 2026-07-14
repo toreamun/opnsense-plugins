@@ -4,6 +4,10 @@ Only the stdlib enum import; every other module depends on this one.
 """
 from enum import IntEnum, StrEnum
 
+# The daemon's single shared logger name; getLogger(LOGGER_NAME) in every
+# module, so a mistyped literal cannot spawn a second handler-less logger.
+LOGGER_NAME = "lease-keeper"
+
 
 class MsgType(IntEnum):
     """DHCP message types (RFC 2131 option 53). One table serves the wire code,
@@ -102,19 +106,26 @@ LINK_KICK_DEBOUNCE = 8     # min seconds between link-return re-DORA kicks (damp
 SNIFFER_RETRY = 5          # wait before retrying a failed packet-sniffer start
 SNIFFER_WARMUP = 0.5       # let the capture thread attach before the first send
 LOOP_ERROR_BACKOFF = 10    # wait after an unexpected main-loop error before retrying
+
+# Follow (VIP-rewrite) throttle + apply-retry.
 MIN_FOLLOW_INTERVAL = 60   # min seconds between follow (VIP rewrite) events -- damps flap/spoof storms
 FOLLOW_RETRY_DEADLINE = 120  # re-drive follow_update if we are not restarted within this after firing
+
+# Lease-timer math (RFC 2131 defaults + floors).
 T1_FACTOR = 0.5            # renew at this fraction of the lease (RFC default)
 T2_FACTOR = 0.875          # rebind by this fraction of the lease (RFC default)
 MIN_T1 = 30                # floor for the renew timer (very short leases)
 MIN_LEASE = 2 * MIN_T1     # floor for an accepted lease time, so a tiny (even hostile) opt-51 can't spin renews
 REBIND_MARGIN = 15         # ensure T2 is at least this far past T1
+
+# Wire constants (BOOTP flags, Ethernet/IPv4 broadcast, DHCP ports).
 BROADCAST_FLAG = 0x8000    # BOOTP flags: ask the server to broadcast OFFER/ACK
 ETHER_BROADCAST = "ff:ff:ff:ff:ff:ff"
 ETHER_ZERO = "00:00:00:00:00:00"     # ARP "target unknown" hardware address
 IPV4_BROADCAST = "255.255.255.255"   # limited broadcast (never routed off-link)
 DHCP_SERVER_PORT = 67
 DHCP_CLIENT_PORT = 68
+
 ARP_NUDGE_MIN = 30         # floor for --arp-nudge so a typo cannot flood the segment
 
 

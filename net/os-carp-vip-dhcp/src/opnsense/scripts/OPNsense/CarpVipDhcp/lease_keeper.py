@@ -62,10 +62,11 @@ import sys
 from logging.handlers import RotatingFileHandler
 
 from leasekeeper.capture import CAPTURE_BACKENDS
+from leasekeeper.constants import LOGGER_NAME
 from leasekeeper.keeper import Keeper
 from leasekeeper.util import MAC_RE
 
-LOG = logging.getLogger("lease-keeper")
+LOG = logging.getLogger(LOGGER_NAME)
 
 # Rotating log-file sizing for _setup_logging. Logging infrastructure for the
 # entry point, not DHCP protocol or a daemon tunable, so it lives here with its
@@ -162,7 +163,7 @@ def _setup_logging(logfile):
     if logfile:
         try:
             handlers.append(RotatingFileHandler(logfile, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUPS))
-        except Exception as e:  # pylint: disable=broad-exception-caught
+        except Exception as e:
             # No log sink is configured yet, so stash the reason and emit it
             # once logging is up -- otherwise a bad --logfile (unwritable dir,
             # bad path) leaves an empty log with no explanation.

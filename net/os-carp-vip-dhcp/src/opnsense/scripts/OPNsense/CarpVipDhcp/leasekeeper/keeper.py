@@ -11,6 +11,7 @@ import time
 
 from .capture import CAPTURE_BACKENDS
 from .constants import (
+    LOGGER_NAME,
     ACK, BootpOp, HB_REFRESH, LINK_KICK_DEBOUNCE, LINK_POLL_STEP,
     LOOP_ERROR_BACKOFF, REBIND_POLL_STEP, REDORA_MAX, REDORA_MIN, SNIFFER_RETRY,
     SNIFFER_WARMUP)
@@ -19,7 +20,7 @@ from .policy import ArpNudge, FollowPolicy
 from .util import _atomic_write, _clock_at, _jittered, _sane_ipv4
 from .wire import _parse_reply
 
-LOG = logging.getLogger("lease-keeper")
+LOG = logging.getLogger(LOGGER_NAME)
 
 # Daemon log-and-continue posture: broad catch-alls are deliberate (see the
 # package docstring / module docstrings).
@@ -136,6 +137,7 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         """True if the reply's BOOTP client hardware address is our chaddr (the
         CARP virtual MAC). Used to accept the PEER's ACK on the shared chaddr:
         the peer node runs an identical keeper on the very same chaddr."""
+        # The BOOTP chaddr field is 16 bytes; compare only the 6-byte MAC.
         return frame.chaddr[:6] == self._dhcp.chraw
 
     def _on_dhcp_reply(self, frame):

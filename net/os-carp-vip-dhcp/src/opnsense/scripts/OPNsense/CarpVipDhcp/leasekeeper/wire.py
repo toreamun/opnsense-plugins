@@ -8,31 +8,54 @@ to scapy verbatim).
 """
 import logging
 import re
-from collections import namedtuple
+from typing import NamedTuple
 
 from .constants import DHCP_CLIENT_PORT, DHCP_SERVER_PORT, PARAM_REQ_LIST, mtype_name
 
 LOG = logging.getLogger("lease-keeper")
 
-# A parsed DHCP reply, snapshotted from the capture thread.
-# `message` (DHCP option 56) is the server's optional human-readable text, mainly
-# a NAK reason; `subnet_mask` (option 1) is used to follow a cross-subnet renumber;
-# `giaddr` (BOOTP header) is the relay agent, None when the server is directly
-# attached (no relay in path). The trailing fields are defaulted so existing
-# shorter constructions stay valid.
-DhcpReply = namedtuple("DhcpReply", "mtype yiaddr server_id lease t1 t2 router message subnet_mask giaddr",
-                       defaults=(None, None, None))
 
-# A received BOOTP/DHCP frame in backend-neutral shape: both capture backends
-# (scapy packet / raw bytes) decode to this before the keeper sees it. chaddr
-# is raw bytes; options is a list of (name, value) tuples in the keeper's own
-# option vocabulary (the names in codec's _OPT_ENCODERS/_OPT_DECODERS), which
-# _parse_reply reads regardless of backend.
-BootpFrame = namedtuple("BootpFrame", "op xid yiaddr chaddr giaddr options")
+class DhcpReply(NamedTuple):
+    """A parsed DHCP reply, snapshotted from the capture thread.
 
-# A received ARP frame (the capture filter already narrows ARP to replies, but
-# op still travels so the handler re-checks rather than trusting the filter).
-ArpFrame = namedtuple("ArpFrame", "op psrc pdst")
+    `message` (option 56) is the server's optional text, mainly a NAK reason;
+    `subnet_mask` (option 1) drives the cross-subnet follow; `giaddr` (BOOTP
+    header) is the relay agent, None when the server is directly attached. The
+    trailing three default so shorter constructions stay valid."""
+    mtype: int | None
+    yiaddr: str | None
+    server_id: str | None
+    lease: int | None
+    t1: int | None
+    t2: int | None
+    router: str | None
+    message: bytes | str | None = None
+    subnet_mask: str | None = None
+    giaddr: str | None = None
+
+
+class BootpFrame(NamedTuple):
+    """A received BOOTP/DHCP frame in backend-neutral shape: both capture
+    backends (scapy packet / raw bytes) decode to this before the keeper sees
+    it. `chaddr` is raw bytes; `options` is a list of (name, value) tuples in
+    the keeper's own option vocabulary (the names in codec's
+    _OPT_ENCODERS/_OPT_DECODERS), which _parse_reply reads regardless of
+    backend."""
+    op: int
+    xid: int
+    yiaddr: str
+    chaddr: bytes
+    giaddr: str | None
+    options: list
+
+
+class ArpFrame(NamedTuple):
+    """A received ARP frame (the capture filter already narrows ARP to replies,
+    but op still travels so the handler re-checks rather than trusting it)."""
+    op: int
+    psrc: str
+    pdst: str
+
 
 # Static BPF capture filter: DHCP (broadcast OFFER/ACK) + ARP replies to our nudge
 # (arp[6:2]=2). A boundary, not an optimization -- it keeps everything else (incl. the
@@ -94,7 +117,8 @@ def _parse_reply(frame):
     gi = frame.giaddr   # relay agent; 0.0.0.0 = directly attached
     if gi in (None, "0.0.0.0", 0):
         gi = None
-    return DhcpReply(mt, frame.yiaddr, sid, lt, rt, bt, ro, msg, sm, gi)
+    return DhcpReply(mtype=mt, yiaddr=frame.yiaddr, server_id=sid, lease=lt, t1=rt,
+                     t2=bt, router=ro, message=msg, subnet_mask=sm, giaddr=gi)
 
 
 def _dhcp_options(mtype, extra, id_opts):

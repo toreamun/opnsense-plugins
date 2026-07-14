@@ -10,8 +10,8 @@ from dataclasses import dataclass
 
 from .constants import (
     ACK, ATTEMPT_BACKOFF_CAP, BROADCAST_FLAG, DEFAULT_LEASE, DORA_ATTEMPTS,
-    IPV4_BROADCAST, MIN_LEASE, MIN_T1, NAK, OFFER, PHASE_DORA, PHASE_REBIND,
-    PHASE_REBOOT, PHASE_RENEW, REBIND_MARGIN, REBOOT_ATTEMPTS, RENEW_ATTEMPTS,
+    IPV4_BROADCAST, MIN_LEASE, MIN_T1, NAK, OFFER, Phase, REBIND_MARGIN,
+    REBOOT_ATTEMPTS, RENEW_ATTEMPTS,
     RENEW_TIMEOUT, REPLY_TIMEOUT, SEND_RETRY_DELAY, T1_FACTOR, T2_FACTOR)
 from .util import _jittered, _mask_to_bits, _new_xid, mac2raw
 from .wire import _dhcp_options, _fmt_reply, _msg_text
@@ -218,7 +218,7 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
             if rx:
                 got = rx.yiaddr
                 if request_ip and got != request_ip:
-                    return self._on_changed(got, rx, PHASE_DORA, True)
+                    return self._on_changed(got, rx, Phase.DORA, True)
                 self.adopt(rx)
                 return True
             LOG.info("no DHCP ACK from %s for %s (attempt %d, xid 0x%08x)",
@@ -263,7 +263,7 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
             if rx:
                 got = rx.yiaddr
                 if got and got != request_ip:
-                    return self._on_changed(got, rx, PHASE_REBOOT, True)
+                    return self._on_changed(got, rx, Phase.REBOOT, True)
                 self.adopt(rx)
                 if not self.binding.yiaddr:
                     self.binding.yiaddr = request_ip   # ACK without yiaddr: we asked for it
@@ -301,7 +301,7 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
             try:
                 self._send_dhcp("request", opts, ciaddr=yiaddr)
             except Exception as e:
-                LOG.error("DHCP %s send failed: %s", PHASE_REBIND if rebind else PHASE_RENEW, e)
+                LOG.error("DHCP %s send failed: %s", Phase.REBIND if rebind else Phase.RENEW, e)
                 return False
             rx = self._wait_for_dhcp_reply(ACK, RENEW_TIMEOUT)
             if rx == "NAK":
@@ -312,7 +312,7 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
                     # Some dynamic servers change the address at renewal (ACK with a
                     # new yiaddr) instead of NAKing. Route it through the same
                     # follow / enforce decision (and hardening) as the initial DORA.
-                    phase = PHASE_REBIND if rebind else PHASE_RENEW
+                    phase = Phase.REBIND if rebind else Phase.RENEW
                     return self._on_changed(got, rx, phase, False)
                 self._absorb_reply(rx, self.binding.lease_secs)
                 return True

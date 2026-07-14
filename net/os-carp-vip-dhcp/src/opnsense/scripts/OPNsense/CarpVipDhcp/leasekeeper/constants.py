@@ -2,14 +2,13 @@
 
 Only the stdlib enum import; every other module depends on this one.
 """
-from enum import IntEnum
+from enum import IntEnum, StrEnum
 
 
 class MsgType(IntEnum):
     """DHCP message types (RFC 2131 option 53). One table serves the wire code,
-    the readable name (logging, via mtype_name) and equality checks -- replacing
-    the old parallel OFFER/ACK/NAK constants, MTYPE_NAMES dict and send-side
-    code map."""
+    the readable name (logging, via mtype_name) and equality checks; codec's
+    send-side code map derives its values from here too."""
     DISCOVER = 1
     OFFER = 2
     REQUEST = 3
@@ -89,11 +88,14 @@ ARP_NUDGE_MIN = 30         # floor for --arp-nudge so a typo cannot flood the se
 LOG_MAX_BYTES = 512 * 1024
 LOG_BACKUPS = 3
 
-# Changed-address phase labels: which exchange saw the differing ACK. Log
-# text and policy input at once -- FollowPolicy relaxes its expected-server
-# check on PHASE_REBIND (at T2 any server may legitimately answer).
-PHASE_DORA = "DORA"
-PHASE_REBOOT = "REBOOT"
-PHASE_RENEW = "RENEW"
-PHASE_REBIND = "REBIND"
-PHASE_OBSERVED = "OBSERVED"
+
+class Phase(StrEnum):
+    """Which exchange saw a changed ACK -- log text and policy input at once.
+    FollowPolicy relaxes its expected-server check on REBIND (at T2 any server
+    may legitimately answer). A StrEnum so the member both compares by value and
+    formats to its label in log lines."""
+    DORA = "DORA"
+    REBOOT = "REBOOT"
+    RENEW = "RENEW"
+    REBIND = "REBIND"
+    OBSERVED = "OBSERVED"

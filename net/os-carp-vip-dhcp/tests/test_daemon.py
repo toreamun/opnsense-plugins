@@ -5,6 +5,7 @@ per-test docstrings."""
 # pylint: disable=protected-access, missing-function-docstring
 import os
 import re
+import select
 import time
 import types
 from typing import Any
@@ -12,6 +13,12 @@ from typing import Any
 import pytest
 
 from conftest import CHADDR, CHADDR_STR
+
+
+def _woken(keeper):
+    """True if the keeper's wake socket has a pending byte (the loop would
+    return at once). Non-destructive peek via select."""
+    return bool(select.select([keeper._wake_r], [], [], 0)[0])
 
 
 def test_sane_ipv4(lk):
@@ -411,19 +418,19 @@ def _peer_ack(lk, yiaddr, xid=0x22222222, server="100.64.4.1",
 
 def test_observed_peer_ack_records_change_and_wakes(lk, tmp_path):
     keeper = _observe_keeper(lk, tmp_path)
-    assert not keeper._wake.is_set()
+    assert not _woken(keeper)
     keeper._on_dhcp_reply(_peer_ack(lk, "100.64.4.60"))
     assert keeper._follow._observed is not None
     assert keeper._follow._observed.yiaddr == "100.64.4.60"
     assert keeper._dhcp._rx is None          # the first-party slot is untouched
-    assert keeper._wake.is_set()       # ...and the maintain-loop sleep is woken at once
+    assert _woken(keeper)       # ...and the maintain-loop sleep is woken at once
 
 
 def test_ignored_observation_does_not_wake(lk, tmp_path):
     keeper = _observe_keeper(lk, tmp_path)
     keeper._on_dhcp_reply(_peer_ack(lk, "100.64.4.7"))     # same address -> no change
     assert keeper._follow._observed is None
-    assert not keeper._wake.is_set()
+    assert not _woken(keeper)
 
 
 def test_observed_ignores_wrong_chaddr(lk, tmp_path):
@@ -501,9 +508,33 @@ def test_check_observed_rejects_wrong_server(lk, tmp_path):
 def test_observed_serviced_by_maintain_loop(lk, tmp_path):
     keeper = _observe_keeper(lk, tmp_path)
     keeper._follow._observed = _ack(lk, "100.64.4.60")
-    keeper._wake.set()   # as the sniffer would -> loop returns at once
+    keeper._signal_wake()   # as the sniffer would -> loop returns at once
     keeper._sleep_interruptible(1)
     assert keeper.fired == ["100.64.4.60"]
+    assert not _woken(keeper)   # the wake byte was drained -> the loop paces at 1s again
+
+
+def test_peer_ack_wakes_and_is_serviced_end_to_end(lk, tmp_path):
+    """The whole self-pipe chain in one go: a peer ACK arriving on the capture
+    thread records the observation AND wakes the loop, the next
+    _sleep_interruptible services the follow, and the wake byte is drained so
+    the loop does not then busy-spin (a leftover byte would make every
+    subsequent select return at once)."""
+    keeper = _observe_keeper(lk, tmp_path)
+    keeper._on_dhcp_reply(_peer_ack(lk, "100.64.4.60"))   # real observe + real _signal_wake
+    assert _woken(keeper)                    # the capture thread woke the loop
+    keeper._sleep_interruptible(1)
+    assert keeper.fired == ["100.64.4.60"]   # ...and the loop serviced the follow
+    assert not _woken(keeper)                # ...and drained the wake byte
+
+
+def test_wake_fileno_is_the_nonblocking_write_end(lk):
+    """set_wakeup_fd (wired in main()) needs the socket's write end and requires
+    a non-blocking fd. Guard both: the wrong end would drop delivered signals to
+    the 1s tick, and a blocking fd would make main() raise at startup."""
+    keeper = _keeper(lk)
+    assert keeper.wake_fileno() == keeper._wake_w.fileno()
+    assert keeper._wake_w.getblocking() is False
 
 
 def test_id_opts_empty_by_default(lk):
@@ -614,6 +645,29 @@ def test_probe_failure_skips_nudge(lk, monkeypatch):
     assert keeper._probe_carp_master() is None
     keeper._arp_nudge(force=True)
     assert keeper._nudge.last_nudge == 0.0
+
+
+def test_ifconfig_probe_failure_warns_once_then_logs_recovery(lk, monkeypatch, caplog):
+    # A persistent ifconfig failure silently disables the nudge and the
+    # transition poll, so it must be visible -- but logged once per episode,
+    # not on every 30s probe.
+    keeper = _keeper(lk, vhid=199)
+    calls = {"fail": True}
+
+    def flaky(*_a, **_k):
+        if calls["fail"]:
+            raise OSError("ifconfig unavailable")
+        return "\tcarp: MASTER vhid 199 advbase 1\n\tstatus: active\n"
+    monkeypatch.setattr(lk.subprocess, "check_output", flaky)
+
+    with caplog.at_level("INFO", logger="lease-keeper"):
+        assert keeper._ifconfig() is None      # first failure
+        assert keeper._ifconfig() is None      # still failing
+        warns = [r for r in caplog.records if "probe failed" in r.getMessage()]
+        assert len(warns) == 1                 # once per episode, not per call
+        calls["fail"] = False
+        assert keeper._ifconfig() is not None  # recovered
+        assert any("probe recovered" in r.getMessage() for r in caplog.records)
 
 
 def test_hb_nudge_tokens_present(lk, tmp_path):
@@ -782,6 +836,17 @@ def test_sniffer_filter_captures_arp_and_honours_promisc(lk, monkeypatch):
     assert "arp" in captured["filter"]        # ARP replies now reach the parser
     assert "port 67" in captured["filter"]     # ...alongside DHCP, unchanged
     assert captured["promisc"] is True         # opt-in flag reaches the socket
+
+
+def test_ensure_sniffer_logs_when_restart_fails(lk, monkeypatch, caplog):
+    # A restart that does not take must not read as success (the "(re)starting"
+    # warning precedes it): the persistent-failure ERROR makes it explicit.
+    keeper = _keeper(lk)
+    keeper._capture = types.SimpleNamespace(alive=lambda: False, start=lambda: False)
+    monkeypatch.setattr(lk.time, "sleep", lambda *_a: None)
+    with caplog.at_level("ERROR", logger="lease-keeper"):
+        keeper._ensure_sniffer()
+    assert any("capture restart failed" in r.getMessage() for r in caplog.records)
 
 
 # ---- capture backends: selection and the scapy packet -> frame adapter ----

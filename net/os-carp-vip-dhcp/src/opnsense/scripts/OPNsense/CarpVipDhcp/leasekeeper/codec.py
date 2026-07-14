@@ -32,11 +32,11 @@ IPV4_TTL = 64                # conventional default TTL (BSD/Linux/scapy send 64
 IP_HDR_LEN = 20             # fixed IPv4 header we build (no options)
 UDP_HDR_LEN = 8             # UDP header (src/dst port, length, checksum)
 
-# The DHCP message types the keeper SENDS, keyed by the scapy-style option names
-# the outbound option lists carry (only these three are sent). Values come from
-# MsgType so the code is defined once.
-_MTYPE_CODES = {"discover": MsgType.DISCOVER, "request": MsgType.REQUEST,
-                "release": MsgType.RELEASE}
+# The DHCP message types the keeper SENDS, keyed by the scapy-style option name
+# the outbound option lists carry (the lowercased MsgType name -- "discover"
+# etc.). Derived from MsgType so nothing is hand-duplicated; only these three
+# are ever sent.
+_MTYPE_CODES = {m.name.lower(): m for m in (MsgType.DISCOVER, MsgType.REQUEST, MsgType.RELEASE)}
 
 
 def _ip4(ip):

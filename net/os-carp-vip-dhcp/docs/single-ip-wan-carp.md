@@ -223,7 +223,7 @@ flowchart LR
     class T2,USE2 t2
 ```
 
-- **1 × WAN**, **1 × SYNC** - the two gateways live on separate interfaces. Not two
+- **1 × WAN**, **1 × SYNC**: the two gateways live on separate interfaces. Not two
   WAN lines.
 - `PEER_SYNC` points at the peer's **fixed** SYNC IP (A: `10.2.2.2`,
   B: `10.2.2.1`) - per-node config, avoids a "the VIP is local to me" loop.

@@ -43,7 +43,7 @@ If your WAN is static or PPPoE, you don't need this plugin.
 On the OPNsense box, as **root**:
 
 1. **Create a CARP VirtualIP** on the WAN (Interfaces ‣ Virtual IPs).
-2. **Install** - resolves the latest signed release, verifies its maintainer signature, and installs Scapy + the plugin:
+2. **Install:** resolves the latest signed release, verifies its maintainer signature, and installs Scapy + the plugin:
    ```sh
    fetch -o - https://raw.githubusercontent.com/toreamun/opnsense-plugins/main/install.sh | sh
    ```
@@ -54,7 +54,7 @@ That's it - the VIP now holds a live lease. The defaults are sensible: it follow
 
 **Point your traffic at the VIP.** Keeping the lease alive is only half the job: to actually *use* the failover-capable VIP, your NAT and rules must reference **it**, not a single node's own WAN address:
 
-- **Outbound NAT** *(recommended for HA; required for a single-IP WAN)* - set **Firewall ‣ NAT ‣ Outbound** to translate to the **CARP VIP**, so outbound connections source from the VIP and keep working after a failover (a rule left translating to the node's own WAN IP does not fail over).
+- **Outbound NAT** *(recommended for HA; required for a single-IP WAN)*: set **Firewall ‣ NAT ‣ Outbound** to translate to the **CARP VIP**, so outbound connections source from the VIP and keep working after a failover (a rule left translating to the node's own WAN IP does not fail over).
 - **Dynamic address?** Set **Sync firewall alias** on the keeper and point outbound NAT - and any rule that must follow - at that **alias** instead of a literal IP, so it tracks the address automatically on a follow. See *Following a dynamic address* below.
 
 **You'll know it's working when**, on the **Status** page (or the dashboard widget): the keeper shows **bound** to the VIP's address, the node it runs on is CARP **master**, and gateway reachability shows a **green check** (the gateway is answering the ARP nudge). On the backup you'll instead see it **standing by** (or holding its own lease, depending on mode) - that's expected. A persistent problem raises a **dashboard banner**.
@@ -104,14 +104,14 @@ This is the **mental model, not a setup checklist** - single-IP needs the privat
 
 All per-keeper; sensible defaults mean most setups only pick a CARP VIP and enable.
 
-- **Follow a dynamic address** *(default on)* - if the server assigns a different address than the configured VIP, the keeper adopts it and rewrites the CARP VIP to match, so the VIP stays online on a dynamic line. Turn **off** to *enforce* a fixed reservation (a mismatch then alarms).
-- **Sync a firewall alias** *(optional)* - name a Host alias and the plugin keeps it set to the VIP's current address, so outbound NAT/rules pointed at the alias follow a dynamic address. See *Following a dynamic address*.
-- **ARP nudge** *(default on)* - keeps the upstream gateway's ARP entry for the VIP fresh and listens for the reply as a reachability signal. See *ARP nudge &amp; reachability*.
-- **CARP failover on lease loss** *(optional)* - demote this node (hand the VIP to the peer) if the keeper stops holding the correct lease.
-- **DHCP identity options** *(advanced)* - set a vendor-class (opt 60), client-id (61) or hostname (12) for servers that only lease to a known value. On a server that keys the lease on the **client-id** (not the chaddr), **both HA nodes must present the *same* client-id** - a divergent one gets them different addresses and breaks the shared VIP. HA config-sync keeps it identical.
-- **Capture backend** *(advanced, experimental)* - pick the packet-capture engine per keeper: **Default** (follow the host-wide `carpvipdhcp_backend` rc.conf flag if set, else Scapy), **scapy**, or **bpf** (the dependency-free raw `/dev/bpf` backend). Lets a bpf rollout be staged one VIP at a time; leave on Default unless you are testing bpf.
-- **HA config sync** *(optional)* - replicate the keeper config to the peer (System ‣ High Availability ‣ Settings), so you configure once on the master. Safe: the config is node-agnostic.
-- **Self-healing & health banner** - the daemon never exits on a transient fault (it keeps its heartbeat fresh so CARP doesn't falsely demote the node), and a GUI banner warns if any enabled keeper stops holding its lease - closing the silent-failure gap on a redundant spare.
+- **Follow a dynamic address** *(default on)*: if the server assigns a different address than the configured VIP, the keeper adopts it and rewrites the CARP VIP to match, so the VIP stays online on a dynamic line. Turn **off** to *enforce* a fixed reservation (a mismatch then alarms).
+- **Sync a firewall alias** *(optional)*: name a Host alias and the plugin keeps it set to the VIP's current address, so outbound NAT/rules pointed at the alias follow a dynamic address. See *Following a dynamic address*.
+- **ARP nudge** *(default on)*: keeps the upstream gateway's ARP entry for the VIP fresh and listens for the reply as a reachability signal. See *ARP nudge &amp; reachability*.
+- **CARP failover on lease loss** *(optional)*: demote this node (hand the VIP to the peer) if the keeper stops holding the correct lease.
+- **DHCP identity options** *(advanced)*: set a vendor-class (opt 60), client-id (61) or hostname (12) for servers that only lease to a known value. On a server that keys the lease on the **client-id** (not the chaddr), **both HA nodes must present the *same* client-id** - a divergent one gets them different addresses and breaks the shared VIP. HA config-sync keeps it identical.
+- **Capture backend** *(advanced, experimental)*: pick the packet-capture engine per keeper: **Default** (follow the host-wide `carpvipdhcp_backend` rc.conf flag if set, else Scapy), **scapy**, or **bpf** (the dependency-free raw `/dev/bpf` backend). Lets a bpf rollout be staged one VIP at a time; leave on Default unless you are testing bpf.
+- **HA config sync** *(optional)*: replicate the keeper config to the peer (System ‣ High Availability ‣ Settings), so you configure once on the master. Safe: the config is node-agnostic.
+- **Self-healing & health banner:** the daemon never exits on a transient fault (it keeps its heartbeat fresh so CARP doesn't falsely demote the node), and a GUI banner warns if any enabled keeper stops holding its lease - closing the silent-failure gap on a redundant spare.
 
 </details>
 

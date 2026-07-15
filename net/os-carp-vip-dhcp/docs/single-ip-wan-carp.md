@@ -64,7 +64,7 @@ The facts that drive the design:
   this address.
 - **Backup state suppresses the VIP.** A vhid address in `BACKUP` state is not active
   on the interface, so the backup has no address in the VIP's subnet and **no
-  connected route to the ISP gateway**. This - not source-address selection - is the
+  connected route to the ISP gateway**. This, not source-address selection, is the
   real reason the backup's gateway monitor fails, which is what drives the gateway
   group (§6.2).
 - **Important:** OpenBSD's warning that the carp device must share a subnet with
@@ -199,7 +199,7 @@ flowchart TB
 
 ---
 
-## 6  The backup's internet - gateway group
+## 6  The backup's internet: the gateway group
 
 The backup cannot reach `123.123.123.1` (it does not own the VIP), so it routes its
 own traffic (pkg/NTP/DNS/dpinger) through the master over SYNC. **No hook** -
@@ -252,7 +252,7 @@ flowchart LR
     class B2 warn
 ```
 
-> **The linchpin - lab-validated, mechanism corrected.** The master's monitor to
+> **The linchpin: lab-validated, mechanism corrected.** The master's monitor to
 > `123.123.123.1` reports UP and the backup's reports DOWN, so the tiering engages with
 > no hook. The reason is **not** dpinger's source address - it's that CARP **suppresses
 > the VIP in backup state** (§2): the backup has no active address in the ISP's subnet
@@ -348,7 +348,7 @@ sequenceDiagram
   `pfctl -sr | grep carp` after the VIPs are set. (Observed on a working CGNAT
   two-node setup; **not** yet confirmed in this exact single-IP topology.)
 - **Node IP:** the private node IP (`10.1.1.1/2`) is only the CARP advertisement
-  source and never reaches the internet - the VIP does, via NAT. A `/30` RFC 1918
+  source and never reaches the internet; the VIP does, via NAT. A `/30` RFC 1918
   link is the well-supported choice.
 - **Gateway-monitor noise (dpinger):** the backup always logs `WAN_ISP` as DOWN -
   that *is* the mechanism, not a fault.
@@ -381,7 +381,7 @@ sequenceDiagram
   **not** touch the interface prefix or System ‣ Gateways. A **same-subnet** change is
   seamless. A **cross-subnet** move leaves the default route pointing at the old
   gateway, so outbound dies despite a "successful" follow. The keeper now logs a loud
-  error when the ACK's gateway (DHCP option 3) changes - read it as "update the prefix
+  error when the ACK's gateway (DHCP option 3) changes: read it as "update the prefix
   and gateway by hand." If your ISP renumbers across subnets, plan for manual steps.
 - **Follow trusts the DHCP ACK, which a shared-L2 neighbour can forge:** on a genuinely
   shared segment an attacker who reads the CARP adverts (to derive the virtual MAC) can
@@ -443,7 +443,7 @@ skip it entirely and pull NTP/DNS/config from the master over SYNC, dropping §6
 *Addresses in this section (`10.1.1.x` node WAN, `10.2.2.x` SYNC, `123.123.123.x` public)
 are examples, substitute your own.*
 
-> **Pre-flight - confirm the ISP serves the virtual MAC (do this *first*).** The whole
+> **Pre-flight: confirm the ISP serves the virtual MAC (do this *first*).** The whole
 > design hinges on the ISP leasing the public address to the CARP virtual MAC
 > (`00:00:5e:00:01:{vhid}`), not only to your interface's burned-in MAC. Some ISPs bind
 > the single lease to the first MAC they see and will **NAK a `REQUEST` from any other

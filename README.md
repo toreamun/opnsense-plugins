@@ -22,7 +22,7 @@ This plugin runs a small daemon that keeps a DHCP lease alive **for the CARP VIP
   <sub><i>The Status page - the VIP holding its lease as CARP <b>master</b>, with gateway reachability confirmed (green check).</i></sub>
 </p>
 
-> **Status - independent plugin, aiming for the official tree.** This is a standalone plugin, not (yet) part of OPNsense. **If enough people find it useful, I intend to propose it for the official OPNsense community plugins** - ⭐ [star the repo](https://github.com/toreamun/opnsense-plugins) if you'd like to see that happen.
+> **Status: independent plugin, aiming for the official tree.** This is a standalone plugin, not (yet) part of OPNsense. **If enough people find it useful, I intend to propose it for the official OPNsense community plugins** - ⭐ [star the repo](https://github.com/toreamun/opnsense-plugins) if you'd like to see that happen.
 
 ## Is this for you?
 
@@ -52,7 +52,7 @@ On the OPNsense box, as **root**:
 
 That's it - the VIP now holds a live lease. The defaults are sensible: it follows a dynamic address, keeps the gateway's ARP fresh, and runs on both nodes for seamless failover.
 
-**Point your traffic at the VIP.** Keeping the lease alive is only half the job - to actually *use* the failover-capable VIP, your NAT and rules must reference **it**, not a single node's own WAN address:
+**Point your traffic at the VIP.** Keeping the lease alive is only half the job: to actually *use* the failover-capable VIP, your NAT and rules must reference **it**, not a single node's own WAN address:
 
 - **Outbound NAT** *(recommended for HA; required for a single-IP WAN)* - set **Firewall ‣ NAT ‣ Outbound** to translate to the **CARP VIP**, so outbound connections source from the VIP and keep working after a failover (a rule left translating to the node's own WAN IP does not fail over).
 - **Dynamic address?** Set **Sync firewall alias** on the keeper and point outbound NAT - and any rule that must follow - at that **alias** instead of a literal IP, so it tracks the address automatically on a follow. See *Following a dynamic address* below.

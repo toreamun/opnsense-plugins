@@ -73,6 +73,13 @@
         <help><![CDATA[Optional DHCP option 12 (hostname). Empty = not sent.]]></help>
     </field>
     <field>
+        <id>keeper.captureBackend</id>
+        <label>Capture backend</label>
+        <type>dropdown</type>
+        <advanced>true</advanced>
+        <help><![CDATA[Experimental. Which packet-capture engine this keeper's daemon uses. <b>Default</b> follows the host-wide <code>carpvipdhcp_backend</code> rc.conf flag if set (<code>sysrc carpvipdhcp_backend=bpf</code>), otherwise <b>scapy</b> (the default engine). <b>bpf</b> runs the dependency-free raw /dev/bpf backend for this keeper only, so a bpf rollout can be staged one VIP at a time. Leave on Default unless you are testing the bpf backend.]]></help>
+    </field>
+    <field>
         <id>keeper.description</id>
         <label>Description</label>
         <type>text</type>

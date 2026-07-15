@@ -155,7 +155,7 @@ def read_keepers(states, names):
             continue
         # keeper.conf field order (keep in lockstep with the template + rc.d readers):
         # 0 request|1 iface|2 chaddr|3 demote|4 vhid|5 follow|6 vendor|7 client-id|
-        # 8 hostname|9 arp-nudge|10 arp-listen-promisc
+        # 8 hostname|9 arp-nudge|10 arp-listen-promisc|11 capture-backend
         request, iface, chaddr, demote = parts[0], parts[1], parts[2], parts[3]
         vhid = parts[4] if len(parts) > 4 else ""
         follow = parts[5] if len(parts) > 5 else "0"

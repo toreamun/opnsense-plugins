@@ -18,7 +18,7 @@ arbitrary, good-looking address (`123.123.123.123`) purely for illustration.
 
 ---
 
-## 1  Goal and problem
+## 1 Goal and problem
 
 **Goal:** seamless firewall failover (hot-warm HA) without depending on the ISP
 handing out more than one IP.
@@ -45,7 +45,7 @@ public IP). That leaves you two short. This document works around that.
 
 ---
 
-## 2  CARP mechanics (from `carp(4)`, FreeBSD + OpenBSD)
+## 2 CARP mechanics (from `carp(4)`, FreeBSD + OpenBSD)
 
 The facts that drive the design:
 
@@ -74,7 +74,7 @@ The facts that drive the design:
 
 ---
 
-## 3  Core idea
+## 3 Core idea
 
 1. **The CARP VIP owns the single public IP**, obtained over DHCP on the **virtual
    CARP MAC** (`00:00:5e:00:01:{vhid}`) via the
@@ -120,7 +120,7 @@ specifically want the election address in the node-IP subnet.
 
 ---
 
-## 4  Topology
+## 4 Topology
 
 ```mermaid
 flowchart TB
@@ -170,7 +170,7 @@ flowchart TB
 
 ---
 
-## 5  IP plan (example addresses)
+## 5 IP plan (example addresses)
 
 | Element | Value | Synced? | Note |
 |---------|-------|---------|------|
@@ -199,14 +199,14 @@ flowchart TB
 
 ---
 
-## 6  The backup's internet: the gateway group
+## 6 The backup's internet: the gateway group
 
 The backup cannot reach `123.123.123.1` (it does not own the VIP), so it routes its
 own traffic (pkg/NTP/DNS/dpinger) through the master over SYNC. **No hook** -
 OPNsense's gateway monitoring (the *dpinger* daemon, configured as the gateway's
 **Monitor IP** under _System ‣ Gateways_) drives the switch by reachability.
 
-### 6.1  One gateway group, two gateways, two interfaces
+### 6.1 One gateway group, two gateways, two interfaces
 
 ```mermaid
 flowchart LR
@@ -228,7 +228,7 @@ flowchart LR
 - `PEER_SYNC` points at the peer's **fixed** SYNC IP (A: `10.2.2.2`,
   B: `10.2.2.1`) - per-node config, avoids a "the VIP is local to me" loop.
 
-### 6.2  Automatic role tracking
+### 6.2 Automatic role tracking
 
 **The node that is MASTER** (owns the VIP):
 
@@ -261,7 +261,7 @@ flowchart LR
 > `10.1.1.x` node IP is in a different subnet so it can never reach the gateway on-link
 > either.
 
-### 6.3  What the master needs to terminate the backup's traffic
+### 6.3 What the master needs to terminate the backup's traffic
 
 | Element | Rule |
 |---------|------|
@@ -271,7 +271,7 @@ flowchart LR
 
 ---
 
-## 7  Failover flow
+## 7 Failover flow
 
 ```mermaid
 sequenceDiagram
@@ -429,7 +429,7 @@ sequenceDiagram
 
 ---
 
-## 9  Reality check
+## 9 Reality check
 
 Both nodes share **one** physical WAN uplink, so backup WAN-gateway monitoring adds
 no real HA value (if the WAN is down, it is down for both). The backup's internet
@@ -460,7 +460,7 @@ Work through these on **node A** first; confirm it holds the lease and reaches t
 internet, then repeat the per-node parts on **node B**. Config-synced items (aliases,
 the keeper) only need doing once.
 
-### 10.1  Define aliases first, they make every later rule simpler
+### 10.1 Define aliases first, they make every later rule simpler
 
 Set these up under _Firewall ‣ Aliases_ before writing any rule. Referring to names
 instead of raw addresses keeps the ruleset readable, and for the VIP it lets the public
@@ -482,7 +482,7 @@ address change without touching a single rule.
 > *service* does not release the alias; the reconcile keys on the keeper's **Enabled**
 > box, so un-tick **Enabled** to hand the alias back.)
 
-### 10.2  Steps
+### 10.2 Steps
 
 1. **WAN-front switch** physically between the ISP hand-off and both nodes' WAN ports.
 2. **WAN interface per node:** static private IP (`10.1.1.1/30` on A, `.2/30` on B).

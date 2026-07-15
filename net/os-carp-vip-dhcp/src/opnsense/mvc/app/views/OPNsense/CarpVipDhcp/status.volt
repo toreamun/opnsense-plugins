@@ -236,5 +236,6 @@
     </div>
     <div class="col-md-12">
         {{ lang._('CARP demotion (this node)') }}: <strong id="carp_demotion">-</strong>
+        &nbsp;&middot;&nbsp; {{ lang._('Plugin version') }}: <strong>{{ pluginVersion }}</strong>
     </div>
 </div>

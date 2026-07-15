@@ -31,6 +31,11 @@ class StatusController extends \OPNsense\Base\IndexController
 {
     public function indexAction()
     {
+        // Installed plugin version, resolved once per page load (not per status
+        // poll), so an operator can confirm an upgrade took and spot HA version
+        // skew by comparing each node's Status page.
+        $version = trim((string)(new \OPNsense\Core\Backend())->configdRun('carpvipdhcp version'));
+        $this->view->pluginVersion = $version !== '' ? $version : gettext('unknown');
         $this->view->pick('OPNsense/CarpVipDhcp/status');
     }
 }

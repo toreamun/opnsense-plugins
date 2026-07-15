@@ -13,6 +13,9 @@ All addresses below are **examples, substitute your own.** The private ranges ar
 [RFC 1918](https://datatracker.ietf.org/doc/html/rfc1918); the public side uses an
 arbitrary, good-looking address (`123.123.123.123`) purely for illustration.
 
+> **In a hurry?** Jump to **§10 Implementation steps** for the click-by-click setup;
+> the sections before it explain *why* it works.
+
 ---
 
 ## 1  Goal and problem

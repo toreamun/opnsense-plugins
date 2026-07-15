@@ -99,6 +99,23 @@
                     <Required>N</Required>
                 </hostname>
 
+                <!--
+                    Experimental: which packet-capture engine this keeper's daemon
+                    uses. "default" follows the host-wide carpvipdhcp_backend rc.conf
+                    flag if set, otherwise scapy. "bpf" runs the dependency-free raw
+                    /dev/bpf backend for this keeper only. Per keeper so a bpf
+                    rollout can be staged one VIP at a time.
+                -->
+                <captureBackend type="OptionField">
+                    <Required>N</Required>
+                    <Default>default</Default>
+                    <OptionValues>
+                        <default>Default (scapy, or host carpvipdhcp_backend)</default>
+                        <scapy>scapy</scapy>
+                        <bpf>bpf (experimental)</bpf>
+                    </OptionValues>
+                </captureBackend>
+
                 <description type="DescriptionField"/>
             </keeper>
         </keepers>

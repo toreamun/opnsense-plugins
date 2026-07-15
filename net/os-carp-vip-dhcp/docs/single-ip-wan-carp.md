@@ -13,8 +13,8 @@ All addresses below are **examples, substitute your own.** The private ranges ar
 [RFC 1918](https://datatracker.ietf.org/doc/html/rfc1918); the public side uses an
 arbitrary, good-looking address (`123.123.123.123`) purely for illustration.
 
-> **In a hurry?** Jump to **§10 Implementation steps** for the click-by-click setup;
-> the sections before it explain *why* it works.
+> **In a hurry?** Jump to **[§10 Implementation steps](#10-implementation-steps-opnsense-gui)**
+> for the click-by-click setup; the sections before it explain *why* it works.
 
 ---
 
@@ -438,7 +438,7 @@ skip it entirely and pull NTP/DNS/config from the master over SYNC, dropping §6
 
 ---
 
-## 10  Implementation steps (OPNsense GUI)
+## 10 Implementation steps (OPNsense GUI)
 
 *Addresses in this section (`10.1.1.x` node WAN, `10.2.2.x` SYNC, `123.123.123.x` public)
 are examples, substitute your own.*
@@ -470,7 +470,7 @@ address change without touching a single rule.
 |-------|------|---------|---------|
 | `wan_carp_vip` | Host | *(plugin-managed, the live public VIP)* | Outbound-NAT target; any rule that must follow the WAN address |
 | `wan_carp_nodes` | Network | the per-node private WAN range (`10.1.1.0/30`) | The no-NAT CARP rule; SYNC/return rules |
-| `internal_nets` | Network | your LAN/VLAN subnets (or the built-in `RFC1918`) | The single "internal to VIP" outbound-NAT rule |
+| `internal_nets` | Network | your LAN/VLAN subnets (or the RFC 1918 ranges) | The single "internal to VIP" outbound-NAT rule |
 
 > **`wan_carp_vip` is created and owned by the plugin:** give the keeper a **Sync firewall alias** name
 > and it ensures a Host alias of that name exists and keeps its content equal to the live
@@ -511,7 +511,7 @@ address change without touching a single rule.
       **Do not NAT**, placed **first**. The node-private IPs are RFC 1918, so the
       catch-all below would otherwise rewrite the source of your CARP advertisements
       (multicast `224.0.0.18`) and break the election.
-   2. **internal to VIP**: source `internal_nets` (or `RFC1918`), destination any,
+   2. **internal to VIP**: source `internal_nets`, destination any,
       translation **`wan_carp_vip`**. One rule replaces per-subnet rules, and pointing
       at the alias makes it follow the lease.
    3. **backup transit** (§6.3): source `wan_carp_nodes` (or the SYNC net) to any,

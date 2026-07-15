@@ -437,27 +437,92 @@ skip it entirely and pull NTP/DNS/config from the master over SYNC, dropping §6
 
 ## 10  Implementation steps (OPNsense GUI)
 
-1. **WAN-front switch** physically between the ISP hand-off and both nodes' WAN
-   ports.
-2. **WAN if per node:** static private IP (`10.1.1.1/30` / `.2/30`).
+> **Pre-flight — confirm the ISP serves the virtual MAC (do this *first*).** The whole
+> design hinges on the ISP leasing the public address to the CARP virtual MAC
+> (`00:00:5e:00:01:{vhid}`), not only to your interface's burned-in MAC. Some ISPs bind
+> the single lease to the first MAC they see and will **NAK a `REQUEST` from any other
+> MAC and stay silent to its `DISCOVER`** — in which case this design cannot work as-is
+> and you need a fixed-MAC-plus-CARP-gated approach instead. Verify with
+> `tcpdump -ni <wan> udp port 67 or udp port 68` while a `DISCOVER` goes out on the
+> virtual chaddr: an `OFFER`/`ACK` addressed to the virtual MAC means you are good; a
+> NAK-then-silence means the line is MAC-bound. Note OPNsense's `dhclient` (OpenBSD
+> variant) has **no `-r`/release** flag, so to free the current lease for a clean test
+> you send a `DHCPRELEASE` another way (e.g. a small Scapy script). See §8 *DHCP
+> behaviour* and §11.
+
+Work through these on **node A** first; confirm it holds the lease and reaches the
+internet, then repeat the per-node parts on **node B**. Config-synced items (aliases,
+the keeper) only need doing once.
+
+### 10.1  Define aliases first — they make every later rule simpler
+
+Set these up under _Firewall → Aliases_ before writing any rule. Referring to names
+instead of raw addresses keeps the ruleset readable, and for the VIP it lets the public
+address change without touching a single rule.
+
+| Alias | Type | Content | Used by |
+|-------|------|---------|---------|
+| `wan_carp_vip` | Host | *(plugin-managed — the live public VIP)* | Outbound-NAT target; any rule that must follow the WAN address |
+| `wan_carp_nodes` | Network | the per-node private WAN range (`10.1.1.0/30`) | The no-NAT CARP rule; SYNC/return rules |
+| `internal_nets` | Network | your LAN/VLAN subnets (or the built-in `RFC1918`) | The single "internal → VIP" outbound-NAT rule |
+
+> **`wan_carp_vip` is created and owned by the plugin:** give the keeper an *Alias name*
+> and it ensures a Host alias of that name exists and keeps its content equal to the live
+> VIP, updated on every lease change. Point outbound NAT (and anything address-dependent)
+> at it and those rules follow the address **with no ruleset reload**. **Do not hand-edit
+> it** — editing the alias out-of-band does not reach the live pf table until a full
+> `filter reload` (a plain `refresh_aliases` leaves the table stale), and the plugin
+> reconciles it back anyway. Let the plugin drive it. (Likewise, disabling the keeper's
+> *service* does not release the alias — the reconcile keys on the keeper's **enabled**
+> flag, so set the keeper `enabled=0` to hand the alias back.)
+
+### 10.2  Steps
+
+1. **WAN-front switch** physically between the ISP hand-off and both nodes' WAN ports.
+2. **WAN interface per node:** static private IP (`10.1.1.1/30` on A, `.2/30` on B).
+   The ISP gateway (`123.123.123.1`) is **not** in this `/30`, so when you create the
+   gateway (step 6) mark it **Far Gateway** — otherwise OPNsense rejects the off-subnet
+   gateway. On-link reachability to `.1` comes from the VIP's public `/24` on the same
+   interface.
 3. **CARP VIP** `123.123.123.123/24`, vhid 9, `pass`, advskew 0/100 →
    _Interfaces → Virtual IPs_.
-4. **Plugin** [os-carp-vip-dhcp](../README.md): a keeper on the VIP, `followIp=1`.
-   Both nodes hold the lease warm, so failover is seamless — but on a shared WAN-front
-   switch both nodes periodically source the virtual MAC (DHCP renewals), which can
-   cause a MAC-table flap; use a switch/topology that tolerates it (or a dedicated
-   point-to-point uplink). (The ARP nudge is master-gated, so it never adds to the flap
-   — only the DHCP renewals do.)
-5. **SYNC if:** `10.2.2.1/30` / `.2/30`; pfsync + XMLRPC config-sync →
+4. **Plugin** [os-carp-vip-dhcp](../README.md): a keeper on the VIP, `followIp=1`, and
+   set its *Alias name* to `wan_carp_vip` (§10.1). Both nodes hold the lease warm, so
+   failover is seamless — but on a shared WAN-front switch both nodes periodically source
+   the virtual MAC (DHCP renewals), which can cause a MAC-table flap; use a
+   switch/topology that tolerates it (or a dedicated point-to-point uplink). (The ARP
+   nudge is master-gated, so it never adds to the flap — only the DHCP renewals do.)
+5. **SYNC interface:** `10.2.2.1/30` / `.2/30`; pfsync + XMLRPC config-sync →
    _System → High Availability_.
-6. **Gateways:** `WAN_ISP` (123.123.123.1, on WAN), `PEER_SYNC` (peer's SYNC IP, on
-   SYNC) → _System → Gateways_.
-7. **Gateway group** `WAN_HA` = `[WAN_ISP tier 1, PEER_SYNC tier 2]`; point the
-   default route / floating policy at the group.
-8. **Outbound NAT** (master role): `10.2.2.0/30` → the WAN VIP.
-9. **Firewall (SYNC):** `SYNC net → any` (tight).
-10. **Verify:** `tcpdump -T carp` (advertisements), a failover test (down the
-    master NIC), dpinger switching tier, and the VIP lease following the master.
+6. **Gateways:** `WAN_ISP` (`123.123.123.1`, on WAN, **Far Gateway** — step 2),
+   `PEER_SYNC` (peer's SYNC IP, on SYNC) → _System → Gateways_.
+7. **Gateway group** `WAN_HA` = `[WAN_ISP tier 1, PEER_SYNC tier 2]`; point the default
+   route / floating policy at the group.
+8. **Outbound NAT** (_Firewall → NAT → Outbound_, mode **Hybrid**). Order matters — put
+   the no-NAT rule **above** the catch-all:
+   1. **no-NAT for CARP** — source `wan_carp_nodes`, destination `224.0.0.18`,
+      **Do not NAT**, placed **first**. The node-private IPs are RFC 1918, so the
+      catch-all below would otherwise rewrite the source of your CARP advertisements
+      (multicast `224.0.0.18`) and break the election.
+   2. **internal → VIP** — source `internal_nets` (or `RFC1918`), destination any,
+      translation **`wan_carp_vip`**. One rule replaces per-subnet rules, and pointing
+      at the alias makes it follow the lease.
+   3. **backup transit** (§6.3) — source `wan_carp_nodes` (or the SYNC net) → any,
+      translation `wan_carp_vip`, so the backup's own traffic NATs out the VIP on the
+      master.
+   > **Why the alias, not "Interface address":** the WAN interface's *primary* address is
+   > the private node IP, so translating to "Interface address" would NAT to `10.1.1.x` —
+   > unroutable. `wan_carp_vip` is the public address. (Cosmetic GUI quirk: a Do-not-NAT
+   > rule still shows "Interface address" in the *Translate* column — that field is
+   > ignored when Do-not-NAT is ticked; it renders as `no nat` in pf.)
+9. **Firewall (SYNC):** allow `SYNC net → any`, kept tight (pkg/NTP/DNS/dpinger).
+10. **Verify:**
+    - `pfctl -sn | grep -E 'no nat|wan_carp'` — the `no nat … to 224.0.0.18` rule sits
+      **above** the catch-all `-> <wan_carp_vip>` rule.
+    - `pfctl -t wan_carp_vip -T show` — the alias table holds the live *public* address
+      (not a stale or private one).
+    - `tcpdump -T carp` on the WAN (advertisements), a failover test (down the master
+      NIC), dpinger switching tier, and the VIP lease following the master.
 
 ---
 

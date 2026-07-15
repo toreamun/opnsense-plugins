@@ -9,6 +9,7 @@ import socket
 import subprocess
 import time
 
+from . import __version__
 from .capture import CAPTURE_BACKENDS
 from .constants import (
     LOGGER_NAME,
@@ -467,8 +468,8 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
 
         # eth-src matters for L2 debugging but only when it differs from the chaddr.
         ethsrc = f" eth-src={self.eth_src}" if self.eth_src != self.chaddr else ""
-        LOG.info("lease-keeper active on %s: chaddr=%s%s request=%s",
-                 self.iface, self.chaddr, ethsrc, self._follow.target or "any")
+        LOG.info("lease-keeper %s active on %s: chaddr=%s%s request=%s",
+                 __version__, self.iface, self.chaddr, ethsrc, self._follow.target or "any")
         time.sleep(SNIFFER_WARMUP)
 
         while not self._stop:
@@ -491,7 +492,7 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         self._capture.stop()
         self._wake_r.close()
         self._wake_w.close()
-        LOG.info("stopped")
+        LOG.info("stopped (lease-keeper %s)", __version__)
         return 0
 
     def claim_once(self):

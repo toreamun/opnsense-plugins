@@ -17,8 +17,10 @@
  * state-preserving. A bare `refresh_aliases` only reloads the last-rendered
  * tables and would leave the pf table stale. The plugin never deletes aliases -
  * they may be referenced elsewhere - so clearing aliasName just leaves a stale
- * alias the operator can remove by hand. It also never touches an alias it does
- * not own (one whose description lacks the plugin marker).
+ * alias the operator can remove by hand. A same-named **Host** alias created by
+ * hand is ADOPTED (stamped with the plugin marker and kept in sync), so an
+ * operator can pre-create the alias and stage NAT/rules that reference it before
+ * the keeper first runs; a non-Host alias of that name is left untouched.
  *
  * Run standalone (configd action `carpvipdhcp sync_aliases`) so it reads the
  * current on-disk config; do NOT call it in the same php process that just did a
@@ -58,15 +60,29 @@ foreach ($mdl->aliases->alias->iterateItems() as $item) {
 $created = false;
 $changed = false;
 $marker = 'os-carp-vip-dhcp';
+$managed_desc = 'Managed by os-carp-vip-dhcp (current CARP VIP address)';
 foreach ($wanted as $name => $ip) {
     if (isset($existing[$name])) {
         $item = $existing[$name];
         if (strpos((string)$item->description, $marker) === false) {
-            fwrite(STDERR, sprintf(
-                "alias '%s' exists but is not managed by %s -- leaving it untouched\n",
-                $name,
-                $marker
-            ));
+            // A same-named alias exists that the plugin did not create. Adopt it
+            // -- stamp the marker and take over its content -- so an operator can
+            // pre-create the alias and stage NAT/rules that reference it before
+            // the keeper first runs. Only a Host alias, though: taking over a
+            // Network/URL/port/etc. alias would change its meaning, so those are
+            // left untouched with a warning.
+            if ((string)$item->type !== 'host') {
+                fwrite(STDERR, sprintf(
+                    "alias '%s' exists as a '%s' alias (not Host) -- leaving it untouched\n",
+                    $name,
+                    (string)$item->type
+                ));
+                continue;
+            }
+            $item->description = $managed_desc;
+            $item->content = $ip;
+            $changed = true;
+            fwrite(STDERR, sprintf("adopted pre-existing Host alias '%s'\n", $name));
             continue;
         }
         if ((string)$item->type !== 'host' || (string)$item->content !== $ip) {
@@ -79,7 +95,7 @@ foreach ($wanted as $name => $ip) {
         $item->name = $name;
         $item->type = 'host';
         $item->content = $ip;
-        $item->description = 'Managed by os-carp-vip-dhcp (current CARP VIP address)';
+        $item->description = $managed_desc;
         $created = true;
     }
 }

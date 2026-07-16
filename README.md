@@ -54,8 +54,8 @@ That's it - the VIP now holds a live lease. The defaults are sensible: it follow
 
 **Point your traffic at the VIP.** Keeping the lease alive is only half the job: to actually *use* the failover-capable VIP, your NAT and rules must reference **it**, not a single node's own WAN address:
 
-- **Outbound NAT** *(recommended for HA; required for a single-IP WAN)*: set **Firewall ‣ NAT ‣ Outbound** to translate to the **CARP VIP**, so outbound connections source from the VIP and keep working after a failover (a rule left translating to the node's own WAN IP does not fail over).
-- **Dynamic address?** Set **Sync firewall alias** on the keeper and point outbound NAT - and any rule that must follow - at that **alias** instead of a literal IP, so it tracks the address automatically on a follow. See *Following a dynamic address* below.
+- **Source NAT** *(recommended for HA; required for a single-IP WAN)*: set **Firewall ‣ NAT ‣ Source NAT** to translate to the **CARP VIP**, so outbound connections source from the VIP and keep working after a failover (a rule left translating to the node's own WAN IP does not fail over). *(OPNsense 26.7 renamed this from **Outbound NAT**; on 26.1 and earlier the menu says Outbound NAT, same behaviour.)*
+- **Dynamic address?** Set **Sync firewall alias** on the keeper and point Source NAT - and any rule that must follow - at that **alias** instead of a literal IP, so it tracks the address automatically on a follow. See *Following a dynamic address* below.
 
 **You'll know it's working when**, on the **Status** page (or the dashboard widget): the keeper shows **bound** to the VIP's address, the node it runs on is CARP **master**, and gateway reachability shows a **green check** (the gateway is answering the ARP nudge). On the backup you'll instead see it **standing by** (or holding its own lease, depending on mode) - that's expected. A persistent problem raises a **dashboard banner**.
 
@@ -105,7 +105,7 @@ This is the **mental model, not a setup checklist** - single-IP needs the privat
 All per-keeper; sensible defaults mean most setups only pick a CARP VIP and enable.
 
 - **Follow a dynamic address** *(default on)*: if the server assigns a different address than the configured VIP, the keeper adopts it and rewrites the CARP VIP to match, so the VIP stays online on a dynamic line. Turn **off** to *enforce* a fixed reservation (a mismatch then alarms).
-- **Sync a firewall alias** *(optional)*: name a Host alias and the plugin keeps it set to the VIP's current address, so outbound NAT/rules pointed at the alias follow a dynamic address. See *Following a dynamic address*.
+- **Sync a firewall alias** *(optional)*: name a Host alias and the plugin keeps it set to the VIP's current address, so Source NAT and rules pointed at the alias follow a dynamic address. See *Following a dynamic address*.
 - **ARP nudge** *(default on)*: keeps the upstream gateway's ARP entry for the VIP fresh and listens for the reply as a reachability signal. See *ARP nudge &amp; reachability*.
 - **CARP failover on lease loss** *(optional)*: demote this node (hand the VIP to the peer) if the keeper stops holding the correct lease.
 - **DHCP identity options** *(advanced)*: set a vendor-class (opt 60), client-id (61) or hostname (12) for servers that only lease to a known value. On a server that keys the lease on the **client-id** (not the chaddr), **both HA nodes must present the *same* client-id** - a divergent one gets them different addresses and breaks the shared VIP. HA config-sync keeps it identical.
@@ -135,7 +135,7 @@ When **Follow dynamic DHCP address** is on (default) and the server assigns a di
 **Make NAT and rules follow** - the plugin rewrites the *VIP address*, not your rules:
 
 1. In the keeper, set **Sync firewall alias** to a name (e.g. `wan_carp_vip`). The plugin creates a Host alias of that name and keeps it equal to the VIP's current address.
-2. Point your **outbound NAT** translation address - and any rule that must follow - at that **alias** instead of a literal IP. On a follow, the plugin updates the alias and reapplies the filter (state-preserving), so rules track the new address.
+2. Point your **Source NAT** translation address - and any rule that must follow - at that **alias** instead of a literal IP. On a follow, the plugin updates the alias and reapplies the filter (state-preserving), so rules track the new address.
 
 
 The alias is created/updated automatically and never deleted (it may be referenced elsewhere).

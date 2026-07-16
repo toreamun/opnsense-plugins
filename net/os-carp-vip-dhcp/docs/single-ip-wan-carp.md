@@ -96,7 +96,7 @@ The facts that drive the design:
 
 The leased public address *is* the CARP VIP's own address (the "direct" model). On a
 follow the plugin rewrites the VIP and re-applies it **add-before-remove**, so the vhid
-never loses its address on that node. Point outbound NAT and any address-dependent rule
+never loses its address on that node. Point Source NAT and any address-dependent rule
 at the plugin-managed **firewall Host alias** rather than a hardcoded IP - the plugin
 updates the alias content live on a follow, so rules track the address without a ruleset
 reload. *(A CARP advertisement's HMAC covers the VIP prefixes, so during a follow the two
@@ -265,7 +265,7 @@ flowchart LR
 
 | Element | Rule |
 |---------|------|
-| Outbound NAT | source `10.2.2.0/30`, translation = **WAN CARP VIP** (123.123.123.123), out the WAN |
+| Source NAT | source `10.2.2.0/30`, translation = **WAN CARP VIP** (123.123.123.123), out the WAN |
 | Firewall (SYNC) | allow `SYNC net -> any` (keep it tight: pkg/NTP/DNS/dpinger) |
 | Return | arrives at the VIP (master), routed back to the backup's SYNC IP (`10.2.2.2`) on-link |
 
@@ -443,6 +443,10 @@ skip it entirely and pull NTP/DNS/config from the master over SYNC, dropping §6
 *Addresses in this section (`10.1.1.x` node WAN, `10.2.2.x` SYNC, `123.123.123.x` public)
 are examples, substitute your own.*
 
+> **NAT terminology:** OPNsense 26.7 renamed *Outbound NAT* to **Source NAT**
+> (_Firewall ‣ NAT ‣ Source NAT_). This guide uses the 26.7 name; on 26.1 and earlier the
+> menu says *Outbound NAT*, with identical behaviour.
+
 > **Pre-flight: confirm the ISP serves the virtual MAC (do this *first*).** The whole
 > design hinges on the ISP leasing the public address to the CARP virtual MAC
 > (`00:00:5e:00:01:{vhid}`), not only to your interface's burned-in MAC. Some ISPs bind
@@ -468,13 +472,13 @@ address change without touching a single rule.
 
 | Alias | Type | Content | Used by |
 |-------|------|---------|---------|
-| `wan_carp_vip` | Host | *(plugin-managed, the live public VIP)* | Outbound-NAT target; any rule that must follow the WAN address |
+| `wan_carp_vip` | Host | *(plugin-managed, the live public VIP)* | Source-NAT target; any rule that must follow the WAN address |
 | `wan_carp_nodes` | Network | the per-node private WAN range (`10.1.1.0/30`) | The no-NAT CARP rule; SYNC/return rules |
-| `internal_nets` | Network | your LAN/VLAN subnets (or the RFC 1918 ranges) | The single "internal to VIP" outbound-NAT rule |
+| `internal_nets` | Network | your LAN/VLAN subnets (or the RFC 1918 ranges) | The single "internal to VIP" source-NAT rule |
 
 > **`wan_carp_vip` is created and owned by the plugin:** give the keeper a **Sync firewall alias** name
 > and it ensures a Host alias of that name exists and keeps its content equal to the live
-> VIP, updated on every lease change. Point outbound NAT (and anything address-dependent)
+> VIP, updated on every lease change. Point Source NAT (and anything address-dependent)
 > at it and those rules follow the address **with no ruleset reload**. **Do not hand-edit
 > it.** Editing the alias out-of-band does not reach the live pf table until a full
 > `filter reload` (a plain `refresh_aliases` leaves the table stale), and the plugin
@@ -505,7 +509,7 @@ address change without touching a single rule.
    `PEER_SYNC` (peer's SYNC IP, on SYNC), under _System ‣ Gateways_.
 7. **Gateway group** `WAN_HA` = `[WAN_ISP tier 1, PEER_SYNC tier 2]`; point the default
    route / floating policy at the group.
-8. **Outbound NAT** (_Firewall ‣ NAT ‣ Outbound_, mode **Hybrid**). Order matters: put
+8. **Source NAT** (_Firewall ‣ NAT ‣ Source NAT_, mode **Hybrid**). Order matters: put
    the no-NAT rule **above** the catch-all:
    1. **no-NAT for CARP**: source `wan_carp_nodes`, destination `224.0.0.18`,
       **Do not NAT**, placed **first**. The node-private IPs are RFC 1918, so the

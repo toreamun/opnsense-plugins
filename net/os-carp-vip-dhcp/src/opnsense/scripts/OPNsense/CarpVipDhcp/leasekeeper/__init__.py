@@ -18,4 +18,4 @@ wires up and runs the Keeper defined here. Modules, leaf-first:
 # PLUGIN_VERSION from this line (so the package version and the daemon's own
 # reported version can never drift). Keep the assignment on one line as
 # __version__ = "X.Y.Z" so the Makefile's sed can read it.
-__version__ = "1.10.2"
+__version__ = "1.10.3"

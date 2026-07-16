@@ -443,9 +443,9 @@ skip it entirely and pull NTP/DNS/config from the master over SYNC, dropping §6
 *Addresses in this section (`10.1.1.x` node WAN, `10.2.2.x` SYNC, `123.123.123.x` public)
 are examples, substitute your own.*
 
-> **Which NAT page:** use **Source NAT** (_Firewall ‣ NAT ‣ Source NAT_) - OPNsense 26.7 made
-> it the only outbound-NAT page. Earlier versions show it alongside a legacy *Outbound* page
-> (and 26.7 migrates those rules); if a version only has *Outbound*, use that - same job.
+> **NAT menu:** the Firewall ‣ NAT menu carries both a **Source NAT** page and a legacy
+> **Outbound** page (both are present on 26.1 and 26.7). Either can host the source-NAT rule
+> this guide needs; the steps below use **Source NAT** (_Firewall ‣ NAT ‣ Source NAT_).
 
 > **Pre-flight: confirm the ISP serves the virtual MAC (do this *first*).** The whole
 > design hinges on the ISP leasing the public address to the CARP virtual MAC

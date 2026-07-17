@@ -134,7 +134,7 @@ When **Follow dynamic DHCP address** is on (default) and the server assigns a di
 
 **Make NAT and rules follow** - the plugin rewrites the *VIP address*, not your rules:
 
-1. In the keeper, set **Sync firewall alias** to a name (e.g. `wan_carp_vip`). The plugin creates a Host alias of that name and keeps it equal to the VIP's current address.
+1. In the keeper, set **Sync firewall alias** to a name (e.g. `wan_carp_vip`). The plugin creates a Host alias of that name (or adopts a Host alias of that name you pre-created) and keeps it equal to the VIP's current address.
 2. Point your **Source NAT** translation address - and any rule that must follow - at that **alias** instead of a literal IP. On a follow, the plugin updates the alias and reapplies the filter (state-preserving), so rules track the new address.
 
 

@@ -445,7 +445,9 @@ are examples, substitute your own.*
 
 > **NAT menu:** the Firewall ‣ NAT menu carries both a **Source NAT** page and a legacy
 > **Outbound** page (both are present on 26.1 and 26.7). Either can host the source-NAT rule
-> this guide needs; the steps below use **Source NAT** (_Firewall ‣ NAT ‣ Source NAT_).
+> this guide needs; the steps below use **Source NAT** (_Firewall ‣ NAT ‣ Source NAT_). See
+> also OPNsense's CARP how-to,
+> [Setup outbound NAT](https://docs.opnsense.org/manual/how-tos/carp.html#setup-outbound-nat).
 
 > **Pre-flight: confirm the ISP serves the virtual MAC (do this *first*).** The whole
 > design hinges on the ISP leasing the public address to the CARP virtual MAC

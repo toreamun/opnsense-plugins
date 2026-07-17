@@ -204,7 +204,10 @@ flowchart TB
 The backup cannot reach `123.123.123.1` (it does not own the VIP), so it routes its
 own traffic (pkg/NTP/DNS/dpinger) through the master over SYNC. **No hook** -
 OPNsense's gateway monitoring (the *dpinger* daemon, configured as the gateway's
-**Monitor IP** under _System ‣ Gateways_) drives the switch by reachability.
+**Monitor IP** under _System ‣ Gateways_) drives the switch by reachability. See also
+OPNsense's CARP how-to,
+[Backup node cannot reach internet](https://docs.opnsense.org/manual/how-tos/carp.html#backup-node-cannot-reach-internet),
+for the general outbound-NAT-to-VIP angle.
 
 ### 6.1 One gateway group, two gateways, two interfaces
 
@@ -415,7 +418,8 @@ sequenceDiagram
   (config-sync makes this automatic).
 - **IPv6 does not fail over:** this is an IPv4-DHCP design. A DHCPv6-PD prefix will not
   float with the VIP, so after an IPv4 failover expect broken/asymmetric IPv6 on the
-  surviving node until it re-acquires. Plan v6 HA separately.
+  surviving node until it re-acquires. Plan v6 HA separately (native IPv6 CARP: OPNsense
+  how-to, [Configuring CARP for IPv6](https://docs.opnsense.org/manual/how-tos/carp.html#configuring-carp-for-ipv6)).
 - **Lab failure modes to watch:** return-path routing for the backup's SYNC-sourced
   traffic, dpinger flapping during role changes, and whether the ISP's DHCP server
   tolerates the virtual MAC.
@@ -495,12 +499,14 @@ address change without touching a single rule.
 
 1. **WAN-front switch** physically between the ISP hand-off and both nodes' WAN ports.
 2. **WAN interface per node:** static private IP (`10.1.1.1/30` on A, `.2/30` on B).
-   The ISP gateway (`123.123.123.1`) is **not** in this `/30`, so when you create the
-   gateway (step 6) mark it **Far Gateway**, otherwise OPNsense rejects the off-subnet
-   gateway. On-link reachability to `.1` comes from the VIP's public `/24` on the same
-   interface.
+   Because this interface is **static** (the public address lives on the VIP, not here),
+   OPNsense does **not** auto-create a gateway the way it does for a DHCP WAN - you add
+   `WAN_ISP` by hand in step 6. The ISP gateway (`123.123.123.1`) is **not** in this
+   `/30`, so mark it **Far Gateway**, otherwise OPNsense rejects the off-subnet gateway.
+   On-link reachability to `.1` comes from the VIP's public `/24` on the same interface.
 3. **CARP VIP** `123.123.123.123/24`, vhid 9, `pass`, advskew 0/100, under
-   _Interfaces ‣ Virtual IPs_.
+   _Interfaces ‣ Virtual IPs_ (OPNsense how-to:
+   [Setup Virtual IPs](https://docs.opnsense.org/manual/how-tos/carp.html#setup-virtual-ips)).
 4. **Plugin** [os-carp-vip-dhcp](../README.md): a keeper on the VIP with **Follow dynamic
    DHCP address** on, and set its **Sync firewall alias** to `wan_carp_vip` (§10.1). Both
    nodes hold the lease warm, so failover is seamless, but on a shared WAN-front switch
@@ -509,7 +515,8 @@ address change without touching a single rule.
    uplink). (The ARP nudge is master-gated, so it never adds to the flap; only the DHCP
    renewals do.)
 5. **SYNC interface:** `10.2.2.1/30` / `.2/30`; pfsync + XMLRPC config-sync, under
-   _System ‣ High Availability_.
+   _System ‣ High Availability_ (OPNsense how-to:
+   [Setup pfSync and HA sync](https://docs.opnsense.org/manual/how-tos/carp.html#setup-pfsync-and-ha-sync-xmlrpc)).
 6. **Gateways:** `WAN_ISP` (`123.123.123.1`, on WAN, **Far Gateway**, see step 2),
    `PEER_SYNC` (peer's SYNC IP, on SYNC), under _System ‣ Gateways_.
 7. **Gateway group** `WAN_HA` = `[WAN_ISP tier 1, PEER_SYNC tier 2]`; point the default

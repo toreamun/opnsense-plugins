@@ -521,18 +521,20 @@ address change without touching a single rule.
    `PEER_SYNC` (peer's SYNC IP, on SYNC), under _System ‣ Gateways_.
 7. **Gateway group** `WAN_HA` = `[WAN_ISP tier 1, PEER_SYNC tier 2]`; point the default
    route / floating policy at the group.
-8. **Source NAT** (_Firewall ‣ NAT ‣ Source NAT_, mode **Hybrid**). Order matters: put
-   the no-NAT rule **above** the catch-all:
+8. **Source NAT** (_Firewall ‣ NAT ‣ Source NAT_, mode **Hybrid**). All three rules sit on
+   the **WAN** interface (the rule's **Interface** field); where they translate to the VIP,
+   set the **Translation / target** address field (it otherwise defaults to *Interface
+   address*) to the alias. Order matters: put the no-NAT rule **above** the catch-all:
    1. **no-NAT for CARP**: source `wan_carp_nodes`, destination `224.0.0.18`,
       **Do not NAT**, placed **first**. The node-private IPs are RFC 1918, so the
       catch-all below would otherwise rewrite the source of your CARP advertisements
       (multicast `224.0.0.18`) and break the election.
-   2. **internal to VIP**: source `internal_nets`, destination any,
-      translation **`wan_carp_vip`**. One rule replaces per-subnet rules, and pointing
-      at the alias makes it follow the lease.
+   2. **internal to VIP**: source `internal_nets`, destination any, **Translation / target**
+      **`wan_carp_vip`**. One rule replaces per-subnet rules, and pointing at the alias makes
+      it follow the lease.
    3. **backup transit** (§6.3): source `wan_carp_nodes` (or the SYNC net) to any,
-      translation `wan_carp_vip`, so the backup's own traffic NATs out the VIP on the
-      master.
+      **Translation / target** `wan_carp_vip`, so the backup's own traffic NATs out the VIP
+      on the master.
    > **Why the alias, not "Interface address":** the WAN interface's *primary* address is
    > the private node IP, so translating to "Interface address" would NAT to `10.1.1.x`,
    > unroutable. `wan_carp_vip` is the public address. (Cosmetic GUI quirk: a Do-not-NAT

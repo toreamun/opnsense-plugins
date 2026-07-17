@@ -475,12 +475,15 @@ address change without touching a single rule.
 | Alias | Type | Content | Used by |
 |-------|------|---------|---------|
 | `wan_carp_vip` | Host | *(plugin-managed, the live public VIP)* | Source-NAT target; any rule that must follow the WAN address |
-| `wan_carp_nodes` | Network | the per-node private WAN range (`10.1.1.0/30`) | The no-NAT CARP rule; SYNC/return rules |
+| `wan_carp_nodes` | Network | the per-node private WAN range (`10.1.1.0/30` in the example) | The no-NAT CARP rule; SYNC/return rules |
 | `internal_nets` | Network | your LAN/VLAN subnets (or the RFC 1918 ranges) | The single "internal to VIP" source-NAT rule |
 
 > **`wan_carp_vip` is created and owned by the plugin:** give the keeper a **Sync firewall alias** name
 > and it ensures a Host alias of that name exists and keeps its content equal to the live
-> VIP, updated on every lease change. Point Source NAT (and anything address-dependent)
+> VIP, updated on every lease change. **You may pre-create the Host alias yourself** (handy if
+> you want to reference it in rules before the keeper runs): on start the plugin **adopts** a
+> matching pre-existing alias - it must be type **Host** - stamps its marker, and drives the
+> content from then on. Point Source NAT (and anything address-dependent)
 > at it and those rules follow the address **with no ruleset reload**. **Do not hand-edit
 > it.** Editing the alias out-of-band does not reach the live pf table until a full
 > `filter reload` (a plain `refresh_aliases` leaves the table stale), and the plugin

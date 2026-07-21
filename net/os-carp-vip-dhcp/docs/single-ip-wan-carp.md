@@ -378,6 +378,14 @@ sequenceDiagram
   with no effect on the live lease. Use a **throwaway** locally-administered MAC, not
   the real virtual MAC, so a lease-binding ISP cannot associate the probe with your
   VIP.)
+- **First cutover from a live DHCP WAN - two one-time traps** (a steady-state failover
+  hits neither). *(1)* Switching the WAN to static and pressing Apply does **not** stop
+  the running `dhclient` - it is `daemon(8)`-supervised, so a plain `kill` is restarted
+  and it re-grabs the old lease; **reboot** into the static config to clear it. *(2)* A
+  MAC-binding ISP may hold the address on the *old* MAC for a few minutes and stay silent
+  to the virtual MAC's `DISCOVER` (**ISP-dependent** - check with the probe above), so
+  release the lease, wait the cooldown out, *then* start the keeper. Failover reuses the
+  *same* virtual MAC, so neither trap recurs.
 - **Follow moves the VIP address only - not the prefix or the gateway:** on an ISP
   renumber the keeper rewrites the CARP VIP to the new address (after checking it is
   sane, in the same routability class, and from the expected server), but it does
@@ -517,6 +525,8 @@ address change without touching a single rule.
 5. **SYNC interface:** `10.2.2.1/30` / `.2/30`; pfsync + XMLRPC config-sync, under
    _System ‣ High Availability_ (OPNsense how-to:
    [Setup pfSync and HA sync](https://docs.opnsense.org/manual/how-tos/carp.html#setup-pfsync-and-ha-sync-xmlrpc)).
+   Include **`carpvipdhcp`** in the synchronized services so the keeper config replicates;
+   the CARP VIPs stay per-node (advskew differs).
 6. **Gateways:** `WAN_ISP` (`123.123.123.1`, on WAN, **Far Gateway**, see step 2),
    `PEER_SYNC` (peer's SYNC IP, on SYNC), under _System ‣ Gateways_.
 7. **Gateway group** `WAN_HA` = `[WAN_ISP tier 1, PEER_SYNC tier 2]`; point the default

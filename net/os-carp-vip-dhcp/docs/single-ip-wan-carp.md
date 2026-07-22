@@ -529,6 +529,23 @@ address change without touching a single rule.
    the CARP VIPs stay per-node (advskew differs).
 6. **Gateways:** `WAN_ISP` (`123.123.123.1`, on WAN, **Far Gateway**, see step 2),
    `PEER_SYNC` (peer's SYNC IP, on SYNC), under _System ‣ Gateways_.
+   > **Gotcha - the leftover DHCP gateway after a DHCP-to-static WAN.** This design turns the
+   > WAN interface from DHCP to static (the public address lives on the VIP, not here). Two
+   > things can then quietly leave the node with **no default route**, even while it is CARP
+   > master and owns the VIP:
+   >
+   > 1. OPNsense does **not** remove the gateway that belonged to the old DHCP interface
+   >    (named `<WANIF>_DHCP`). It can linger, still flagged as the default gateway but now
+   >    with an empty address, so no IPv4 default route installs. Delete it under
+   >    _System ‣ Gateways_ after the cutover.
+   > 2. On OPNsense 26.7 and later, gateways live in an MVC model that the legacy config is
+   >    migrated into **once**; afterwards the model is authoritative. Create `WAN_ISP`
+   >    through the GUI so it lands in the model. A gateway written only into the legacy
+   >    `<gateways>` section afterwards (by hand, or via a restored/templated config) is not
+   >    loaded.
+   >
+   > Symptom: the node owns the VIP as CARP master but has no default route or egress, and
+   > `configctl interface gateways list` does not list `WAN_ISP`.
 7. **Gateway group** `WAN_HA` = `[WAN_ISP tier 1, PEER_SYNC tier 2]`; point the default
    route / floating policy at the group.
 8. **Source NAT** (_Firewall ‣ NAT ‣ Source NAT_, mode **Hybrid**). All three rules sit on

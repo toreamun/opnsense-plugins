@@ -1,0 +1,6 @@
+# os-carp-vip-dhcp is deployed to FreeBSD/OPNsense. Force LF in the working tree
+# so shebang-executed scripts (rc.d, rc.syshook.d, rc.carp_service_status.d, *.sh)
+# are never broken by CRLF introduced on Windows checkouts (core.autocrlf). A CRLF
+# shebang makes the kernel look for the interpreter "/bin/sh\r", so the service
+# fails to start (e.g. rc.d: "env: .../carpvipdhcp: No such file or directory").
+* text=auto eol=lf

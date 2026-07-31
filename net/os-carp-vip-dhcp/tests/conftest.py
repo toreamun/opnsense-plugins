@@ -88,11 +88,11 @@ def lk():
     import time  # pylint: disable=import-outside-toplevel
     from leasekeeper import (  # pylint: disable=import-outside-toplevel
         capture, capture_bpf, capture_scapy, codec, constants, dhcpclient,
-        keeper, policy, util, wire)
+        keeper, policy, route, util, wire)
 
     ns = types.SimpleNamespace()
     for mod in (constants, util, wire, codec, capture, capture_scapy,
-                capture_bpf, dhcpclient, policy, keeper):
+                capture_bpf, dhcpclient, policy, route, keeper):
         for name in dir(mod):
             if not name.startswith("__"):
                 setattr(ns, name, getattr(mod, name))

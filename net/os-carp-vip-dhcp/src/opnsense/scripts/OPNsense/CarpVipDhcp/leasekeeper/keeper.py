@@ -8,6 +8,7 @@ import select
 import socket
 import subprocess
 import time
+from dataclasses import dataclass
 
 from . import __version__
 from .capture import CAPTURE_BACKENDS
@@ -38,6 +39,27 @@ IFCONFIG_STATUS = "status: "                 # any status line present (up or do
 # once per tick and shares it, but None is a valid probe result, so a distinct
 # sentinel means "probe it now".
 _UNSET = object()
+
+
+@dataclass
+class _SignalFlags:
+    """The only shared state a signal handler may write.
+
+    A signal handler (request_stop / trigger_nudge / recheck_carp_role) runs on
+    the MAIN thread, between bytecodes; the single safe thing it may do is flip
+    one of these booleans to True. They are plain booleans on purpose: a set is
+    one bytecode, hence atomic w.r.t. signal delivery (never torn); they are
+    independent of one another (no flag has to be consistent with another); and
+    the maintain loop drains each with check-and-clear + idempotent handling --
+    which is what makes this correct WITHOUT a lock. Do NOT let a handler do
+    more: no I/O, and no mutation of the binding / lease / role or any other
+    shared state -- that reintroduces re-entrancy and consistency bugs. Add a
+    new signal-driven request the same way: a new field here, set by the
+    handler, drained by the loop; never by doing work in the handler.
+    """
+    stop: bool = False           # SIGINT / SIGTERM -> request_stop()
+    nudge: bool = False          # SIGUSR1          -> trigger_nudge()
+    recheck_role: bool = False   # SIGUSR2 (CARP)   -> recheck_carp_role()
 
 
 class Keeper:  # pylint: disable=too-many-instance-attributes
@@ -76,8 +98,11 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         self._nudge = ArpNudge(self._capture, self.chaddr, arp_nudge, self._carp_master_probe)
 
         self._was_master = None        # CARP role at the last nudge check (None = unknown yet)
-        self._nudge_now = False        # operator asked for an immediate nudge (SIGUSR1)
-        self._poll_role_now = False    # a CARP transition fired -> re-check role now (SIGUSR2)
+
+        # The only shared state a signal handler may write (invariant on the type).
+        self._signals = _SignalFlags()
+
+        # Main-loop-only state (set by the loop itself, never by a handler):
         self._renew_asap = False       # renew at the next _hold_lease tick instead of waiting for T1
 
         # DHCP client component: owns the lease state and the protocol sequences;
@@ -86,7 +111,7 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         self._dhcp = DhcpClient(
             self._capture, self.chaddr, self.eth_src,
             _identity_options(vendor_class, client_id, hostname),
-            should_stop=lambda: self._stop,
+            should_stop=lambda: self._signals.stop,
             ensure_sniffer=self._ensure_sniffer,
             on_changed_address=self._on_changed_address)
 
@@ -104,7 +129,6 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         self._link_kick_at = 0.0       # epoch of the last link-return kick (debounce)
         self._link_returned = False    # set by _sleep_interruptible on a carrier return while unbound
 
-        self._stop = False
         # Wake pipe for the maintain-loop sleep: _sleep_interruptible selects on
         # the read end, and _signal_wake() writes one byte to make it return at
         # once instead of waiting out the 1s tick. Woken from two places: the
@@ -339,10 +363,11 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         else:
             self._nudge.maybe_nudge(yiaddr, gateway, force=force, master=master)
 
-    # ---- operator/signal API (signal handlers set a flag only; the loop wakes
-    # via the wake socket -- from the capture thread through _signal_wake, and
-    # from signal delivery through signal.set_wakeup_fd(wake_fileno) wired in
-    # main(), which is async-signal-safe C-level machinery) ----
+    # ---- operator/signal API (signal handlers set a flag only -- see the
+    # _SignalFlags invariant for why that rule is load-bearing; the
+    # loop wakes via the wake socket -- from the capture thread through
+    # _signal_wake, and from signal delivery through signal.set_wakeup_fd(
+    # wake_fileno) wired in main(), which is async-signal-safe C-level machinery) ----
 
     def wake_fileno(self):
         """The wake socket's write-end fd, for signal.set_wakeup_fd() so any
@@ -364,23 +389,23 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
     def request_stop(self):
         """Ask the daemon to exit (SIGINT/SIGTERM). Flag only; set_wakeup_fd
         wakes the loop so it exits at once."""
-        self._stop = True
+        self._signals.stop = True
 
     def trigger_nudge(self):
         """Request an immediate ARP nudge (SIGUSR1 / configd action). Flag only;
         no network I/O in signal context."""
-        self._nudge_now = True
+        self._signals.nudge = True
 
     def recheck_carp_role(self):
         """Re-check the CARP role now (SIGUSR2 from the CARP syshook) instead of
         waiting for the next ~30s poll. Flag only."""
-        self._poll_role_now = True
+        self._signals.recheck_role = True
 
     # ---- main loop / sleeps ----
 
     def _sleep(self, secs):
         slept = 0
-        while slept < secs and not self._stop:
+        while slept < secs and not self._signals.stop:
             time.sleep(1)
             slept += 1
         return slept
@@ -390,16 +415,16 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         operator-requested immediate nudge (SIGUSR1) and a CARP-transition re-check
         (SIGUSR2) so both act within a second instead of at the next heartbeat tick."""
         slept = 0
-        while slept < secs and not self._stop:
-            if self._poll_role_now:
-                self._poll_role_now = False
+        while slept < secs and not self._signals.stop:
+            if self._signals.recheck_role:
+                self._signals.recheck_role = False
                 # A CARP transition just fired (kernel -> devd -> rc.syshook.d/carp
                 # -> SIGUSR2); re-check the role now so a backup->master keeper
                 # nudges + renews immediately instead of at the next ~30s poll.
                 self._poll_carp_role()
 
-            if self._nudge_now:
-                self._nudge_now = False
+            if self._signals.nudge:
+                self._signals.nudge = False
                 # Operator actions are rare and intentional -- always log them,
                 # unlike the periodic nudges (whose freshness the status page
                 # already shows without flooding the log every interval).
@@ -416,7 +441,7 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
             # and let _maintain_step re-DORA immediately (the bound path skips this).
             if self._dhcp.binding.yiaddr is None and slept % LINK_POLL_STEP == 0 and self._check_link_returned():
                 self._link_returned = True
-                return not self._stop
+                return not self._signals.stop
 
             # Event-driven sleep: return at once when the wake socket is written
             # (a fresh observation or an operator signal), otherwise time out
@@ -428,7 +453,7 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
                 except (BlockingIOError, OSError):
                     pass
             slept += 1
-        return not self._stop
+        return not self._signals.stop
 
     def _hold_lease(self, secs):
         """Sleep up to secs while holding a lease, rewriting the heartbeat every
@@ -436,12 +461,12 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         the CARP demotion hook only sees heartbeat freshness). Returns False early
         on stop."""
         remaining = secs
-        while remaining > 0 and not self._stop:
+        while remaining > 0 and not self._signals.stop:
             if self._renew_asap:
                 # Return as if T1 elapsed: the caller renews right away, which
                 # re-teaches upstream DHCP-snooping state after a master change.
                 self._renew_asap = False
-                return not self._stop
+                return not self._signals.stop
 
             chunk = min(HB_REFRESH, remaining)
             if not self._sleep_interruptible(chunk):
@@ -455,14 +480,14 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
             master = self._probe_carp_master()
             self._poll_carp_role(master)   # backup->master? renew early + nudge now
             self._arp_nudge(master=master)
-        return not self._stop
+        return not self._signals.stop
 
     def run(self):
         """The daemon main loop: capture up, then maintain the lease until
         stopped. Never raises; returns the process exit code."""
         # Start the packet capture, retrying forever: a keeper must self-heal, not
         # die, if the interface is briefly unavailable at startup.
-        while not self._stop and not self._capture.start():
+        while not self._signals.stop and not self._capture.start():
             LOG.warning("capture start failed -- retrying in %ds", SNIFFER_RETRY)
             self._sleep(SNIFFER_RETRY)
 
@@ -472,7 +497,7 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
                  __version__, self.iface, self.chaddr, ethsrc, self._follow.target or "any")
         time.sleep(SNIFFER_WARMUP)
 
-        while not self._stop:
+        while not self._signals.stop:
             # The keeper must NEVER die on a bad DHCP state: catch any unexpected
             # error, keep the heartbeat fresh so CARP does not falsely demote us,
             # and retry after a short backoff.
@@ -538,7 +563,7 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
 
         elapsed = t1
         ok = False
-        while elapsed < t2 and not self._stop:
+        while elapsed < t2 and not self._signals.stop:
             # Jitter the REBIND retransmit cadence: both nodes hit T2 together
             # (identical lease timers), so an un-jittered step would broadcast
             # REBIND in lockstep. Overshooting t2 slightly is harmless (the guard

@@ -31,6 +31,13 @@
         <help><![CDATA[Enforce mode only. When set, this node demotes itself (handing the CARP virtual IP to the peer) if this keeper stops holding its DHCP lease. Only meaningful with "Follow dynamic DHCP address" OFF (a following keeper adopts a new address instead of losing its lease, so the two are mutually exclusive). When unset (default), the keeper just keeps the lease alive on both nodes redundantly, without affecting CARP.]]></help>
     </field>
     <field>
+        <id>keeper.defaultRouteMode</id>
+        <label>Own default route by CARP role</label>
+        <type>dropdown</type>
+        <advanced>true</advanced>
+        <help><![CDATA[Default OFF. Make this keeper own the IPv4 default route (0.0.0.0/0) by CARP role: the master node holding this keeper's lease keeps a default via the lease gateway, every other state keeps none, so a node offers a default only while it can actually route one (a failover moves it, a backup withdraws it, instead of black-holing). <b>Off</b>: inert. <b>Observe</b>: log the decision it would make, without touching the routing table (use this first). <b>Enforce</b>: actually install and withdraw the default. Only ONE keeper (the WAN VIP) may enforce. In enforce mode, also tick the WAN gateway's "Mark Gateway as Down" (force_down) so OPNsense does not install a competing default. With os-frr the redistributed kernel default then follows the CARP role automatically; it also works without FRR. See the README.]]></help>
+    </field>
+    <field>
         <id>keeper.arpNudgeInterval</id>
         <label>ARP nudge interval (s)</label>
         <type>text</type>

@@ -64,6 +64,7 @@ from logging.handlers import RotatingFileHandler
 from leasekeeper.capture import CAPTURE_BACKENDS
 from leasekeeper.constants import LOGGER_NAME
 from leasekeeper.keeper import Keeper
+from leasekeeper.route import DefaultRouteMode
 from leasekeeper.util import MAC_RE
 
 LOG = logging.getLogger(LOGGER_NAME)
@@ -148,6 +149,11 @@ def _build_arg_parser():
     ap.add_argument("--capture-backend", choices=sorted(CAPTURE_BACKENDS), default="scapy",
                     help="packet capture/send backend: scapy (default), or bpf -- a raw "
                          "/dev/bpf backend with no packet-library dependency (experimental)")
+    ap.add_argument("--default-route-mode", choices=[m.value for m in DefaultRouteMode],
+                    default=DefaultRouteMode.OFF.value,
+                    help="own the IPv4 default route by CARP role: off (default), observe "
+                         "(log what it would do, no FIB write), or enforce (install/withdraw "
+                         "0/0 via the lease gateway while CARP master holding a lease)")
     ap.add_argument("--once", action="store_true")
     ap.add_argument("--release-on-exit", action="store_true")
     return ap
@@ -200,7 +206,7 @@ def main():
                vhid=a.vhid, follow=a.follow,
                vendor_class=a.vendor_class, client_id=a.client_id, hostname=a.hostname,
                arp_nudge=a.arp_nudge, arp_listen_promisc=a.arp_listen_promisc,
-               capture_backend=a.capture_backend)
+               capture_backend=a.capture_backend, default_route_mode=a.default_route_mode)
 
     if a.arp_listen_promisc:
         LOG.warning("ARP listen: PROMISCUOUS capture enabled on %s -- the daemon now "

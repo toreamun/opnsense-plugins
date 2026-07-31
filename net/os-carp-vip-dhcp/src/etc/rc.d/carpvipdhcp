@@ -7,7 +7,7 @@
 # rc(8) wrapper for the CARP-VIP DHCP lease keepers (lease_keeper.py).
 # Reads /usr/local/etc/carpvipdhcp/keeper.conf (rendered by the configd template):
 # one line per enabled keeper ->
-#   REQUEST_IP|IFACE|CHADDR|DEMOTE_ON_LEASE_LOSS|VHID|FOLLOW_IP|VENDOR_CLASS|CLIENT_ID|HOSTNAME|ARP_NUDGE|ARP_LISTEN_PROMISC.
+#   REQUEST_IP|IFACE|CHADDR|DEMOTE_ON_LEASE_LOSS|VHID|FOLLOW_IP|VENDOR_CLASS|CLIENT_ID|HOSTNAME|ARP_NUDGE|ARP_LISTEN_PROMISC|CAPTURE_BACKEND|DEFAULT_ROUTE_MODE.
 # Starts one supervised daemon per line, keyed by a filesystem-safe request-IP id.
 
 . /etc/rc.subr
@@ -35,7 +35,7 @@ carpvipdhcp_start()
 {
     [ -f "${conf}" ] || { echo "no config"; return 0; }
     count=0
-    while IFS='|' read -r request iface chaddr demote vhid follow vendorclass clientid hostname arpnudge arplistenpromisc capturebackend || [ -n "${request}" ]; do
+    while IFS='|' read -r request iface chaddr demote vhid follow vendorclass clientid hostname arpnudge arplistenpromisc capturebackend defaultroutemode || [ -n "${request}" ]; do
         [ -n "${request}" ] || continue
         case "${request}" in \#*) continue ;; esac
         if [ -z "${iface}" ] || [ -z "${chaddr}" ]; then
@@ -81,6 +81,15 @@ carpvipdhcp_start()
         case "${backend}" in
             ''|scapy|bpf) [ -n "${backend}" ] && set -- "$@" --capture-backend "${backend}" ;;
             *) echo "carpvipdhcp: ignoring unknown capture backend '${backend}' (use scapy or bpf)" >&2 ;;
+        esac
+        # Default-route ownership by CARP role. Pass only observe/enforce; empty
+        # or "off" leaves the daemon default (off, inert). Validate here rather
+        # than pass a typo through: an unknown value fails the daemon's argparse
+        # choice, and daemon(8) -r would turn that exit into a silent crash loop.
+        case "${defaultroutemode}" in
+            ''|off) : ;;
+            observe|enforce) set -- "$@" --default-route-mode "${defaultroutemode}" ;;
+            *) echo "carpvipdhcp: ignoring unknown default-route mode '${defaultroutemode}' (use off, observe or enforce)" >&2 ;;
         esac
         # -f detach; -r supervise/restart on crash; -R 5 restart delay; -P supervisor pidfile.
         /usr/sbin/daemon -f -r -R 5 -P "${pidfile}" -t "${name}-${id}" "${keeper}" "$@"

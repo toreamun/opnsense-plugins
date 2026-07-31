@@ -19,6 +19,7 @@ from .constants import (
     SNIFFER_WARMUP)
 from .dhcpclient import DhcpClient
 from .policy import ArpNudge, FollowPolicy
+from .route import DefaultRouteReconciler
 from .util import _atomic_write, _clock_at, _jittered, _sane_ipv4
 from .wire import _parse_reply
 
@@ -76,6 +77,7 @@ class _Config:
 
     @property
     def master_marker(self):
+        """The ifconfig CARP-master line to grep for this vhid (None if unset)."""
         return CARP_MASTER_FMT.format(vhid=self.vhid) if self.vhid else None
 
 
@@ -100,10 +102,12 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
     operator actions. The lease lives in DhcpClient; the changed-address
     decision and the target address live in FollowPolicy."""
 
-    def __init__(self, iface, chaddr, request_ip=None, eth_src=None, *,  # pylint: disable=too-many-arguments
+    def __init__(self, iface, chaddr, request_ip=None,  # pylint: disable=too-many-arguments,too-many-locals
+                 eth_src=None, *,
                  hbfile=None, release_on_exit=False, vhid=None,
                  follow=False, vendor_class=None, client_id=None, hostname=None,
-                 arp_nudge=0, arp_listen_promisc=False, capture_backend="scapy"):
+                 arp_nudge=0, arp_listen_promisc=False, capture_backend="scapy",
+                 default_route_mode="off"):
         # Fixed identity/config, immutable once set (see _Config).
         self._cfg = _Config(
             iface=iface,
@@ -149,6 +153,16 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         self._follow = FollowPolicy(request_ip, follow, self._cfg.chaddr, self._dhcp,
                                     self._hb_mismatch,
                                     dispatch=self._dispatch_follow_update)
+
+        # Default-route ownership component (opt-in via defaultRouteMode): owns
+        # the IPv4 default route as a function of (CARP role, lease-held, lease
+        # gateway) -- off/observe/enforce, where off and observe never touch the
+        # FIB. Driven from the main loop only, on the CARP-role cadence
+        # (_reconcile_default_route). liveness_probe is left unset for now: the
+        # split-brain install-gate is a deliberate follow-up that needs a
+        # debounced carrier signal (a single transient ifconfig miss must not
+        # flap the default); see docs/default-route-carp-ownership.md.
+        self._defroute = DefaultRouteReconciler(default_route_mode)
 
         self.redora_wait = REDORA_MIN
         # Link-return fast path (only while UNBOUND): a carrier down->up edge
@@ -371,6 +385,25 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
             LOG.info("lost CARP master for vhid %s -- ARP nudges pause on this node", self._cfg.vhid)
         self._was_master = master
 
+    def _reconcile_default_route(self, master=_UNSET):
+        """Drive the IPv4 default route toward its CARP-role-owned desired state
+        (install 0/0 via the lease gateway only while master AND holding a lease;
+        withdraw it otherwise -- see leasekeeper/route.py). Level-triggered and
+        idempotent, so it rides the CARP-role cadence -- the per-tick heartbeat
+        probe (bound) and the acquire loop (unbound), plus the SIGUSR2 CARP edge
+        -- and converges without having to catch every transition. No-op unless a
+        vhid is configured (no CARP role to key on) and the mode is
+        observe/enforce. `master` reuses the tick's probe when the caller has it.
+
+        Passes bound=yiaddr-is-set and gateway=binding.router; reconcile() owns
+        the contract for why bound must not be inferred from the sticky gateway."""
+        if not self._cfg.vhid or not self._defroute.enabled:
+            return
+        if master is _UNSET:
+            master = self._probe_carp_master()
+        b = self._dhcp.binding
+        self._defroute.reconcile(master, b.yiaddr is not None, b.router)
+
     # ---- ARP nudge ----
 
     def _nudge_target(self):
@@ -447,8 +480,12 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
                 self._signals.recheck_role = False
                 # A CARP transition just fired (kernel -> devd -> rc.syshook.d/carp
                 # -> SIGUSR2); re-check the role now so a backup->master keeper
-                # nudges + renews immediately instead of at the next ~30s poll.
-                self._poll_carp_role()
+                # nudges + renews immediately instead of at the next ~30s poll, and
+                # re-own the default route on the same edge (a failover flips which
+                # node installs 0/0). One shared CARP probe feeds both, as the tick does.
+                master = self._probe_carp_master()
+                self._poll_carp_role(master)
+                self._reconcile_default_route(master)
 
             if self._signals.nudge:
                 self._signals.nudge = False
@@ -506,6 +543,7 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
             # nudge below (both would otherwise spawn their own ifconfig).
             master = self._probe_carp_master()
             self._poll_carp_role(master)   # backup->master? renew early + nudge now
+            self._reconcile_default_route(master)   # keep the default route in step with role+lease
             self._arp_nudge(master=master)
         return not self._signals.stop
 
@@ -632,6 +670,9 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         the link-return fast path cuts either wait short."""
         self._ensure_sniffer()  # a dead sniffer would silently fail every DORA
         self._hb()  # active but not holding yet -> publish bound=-
+        # Unbound: a former master that lost its lease must withdraw its default
+        # (want is False while yiaddr is None); the bound-path tick never runs here.
+        self._reconcile_default_route()
 
         # No point broadcasting DISCOVERs on a dead link (native dhclient
         # does not either): wait for the carrier instead of burning DORA

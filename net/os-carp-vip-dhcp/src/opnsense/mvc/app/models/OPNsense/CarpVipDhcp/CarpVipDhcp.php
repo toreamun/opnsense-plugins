@@ -66,6 +66,7 @@ class CarpVipDhcp extends BaseModel
         // of losing its lease, so it must never demote CARP on a change.
         $vipSeen = [];
         $aliasSeen = [];
+        $enforceSeen = false;
         foreach ($this->keepers->keeper->iterateItems() as $keeper) {
             $base = $keeper->__reference;
             $vip = (string)$keeper->carpVip;
@@ -94,6 +95,21 @@ class CarpVipDhcp extends BaseModel
                         . 'following keeper adopts the new address instead of losing its lease.'),
                     $base . '.demoteOnLeaseLoss'
                 ));
+            }
+            // At most one keeper may enforce the default route: there is a single
+            // 0.0.0.0/0, so two enforcing keepers would install/withdraw it against
+            // each other. Checked regardless of enabled (like the vip/alias
+            // invariants above) so the conflict surfaces at edit time, before a
+            // later enable silently creates two FIB-fighters. observe is unlimited.
+            if ((string)$keeper->defaultRouteMode === 'enforce') {
+                if ($enforceSeen) {
+                    $messages->appendMessage(new Message(
+                        gettext('Only one keeper may enforce the default route (they would fight over '
+                            . 'the single default). Set the other keepers to off or observe.'),
+                        $base . '.defaultRouteMode'
+                    ));
+                }
+                $enforceSeen = true;
             }
         }
 

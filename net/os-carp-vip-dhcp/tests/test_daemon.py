@@ -216,14 +216,14 @@ def test_check_link_returned_edge(lk):
     # initial unknown -> up is NOT a trigger (we were already up)
     seq[:] = [True]
     assert k._check_link_returned() is False
-    assert k._link_up is True
+    assert k._link.up is True
     # up -> up: no trigger
     seq[:] = [True]
     assert k._check_link_returned() is False
     # up -> down: recorded, no trigger
     seq[:] = [False]
     assert k._check_link_returned() is False
-    assert k._link_up is False
+    assert k._link.up is False
     # down -> up: TRIGGER
     seq[:] = [True]
     assert k._check_link_returned() is True
@@ -249,7 +249,7 @@ def test_maintain_holds_acquire_without_carrier(lk, caplog):
         k._maintain_step()
         k._maintain_step()
     assert k.acquired == []                  # no DISCOVER burned on a dead link
-    assert k._link_up is False
+    assert k._link.up is False
     # one INFO per down-episode, not per loop pass
     waits = [r for r in caplog.records if "no carrier" in r.getMessage()]
     assert len(waits) == 1
@@ -271,10 +271,10 @@ def test_bound_marks_carrier_up(lk):
     # A completed DORA proves carrier: the last-carrier-state invariant stays
     # honest so the next down-episode always logs its hold line.
     k = _gate_keeper(lk, carrier=True)
-    k._link_up = False                       # stale from an earlier down-episode
+    k._link.up = False                       # stale from an earlier down-episode
     k._dhcp.acquire = lambda rip: True
     k._maintain_step()
-    assert k._link_up is True
+    assert k._link.up is True
 
 
 def test_carrier_wait_resumes_via_link_return(lk, caplog):
@@ -282,7 +282,7 @@ def test_carrier_wait_resumes_via_link_return(lk, caplog):
     k.redora_wait = 40
 
     def sleep_with_return(_secs):
-        k._link_returned = True              # what the fast path sets on the edge
+        k._link.returned = True              # what the fast path sets on the edge
         return True
     k._sleep_interruptible = sleep_with_return
     with caplog.at_level("INFO", logger="lease-keeper"):
@@ -295,9 +295,9 @@ def test_check_link_returned_debounce(lk, monkeypatch):
     k = _link_keeper(lk)
     monkeypatch.setattr(lk.time, "time", lambda: 1000.0)
     k._iface_link_up = lambda: True
-    k._link_up = False   # pretend we saw the link go down
+    k._link.up = False   # pretend we saw the link go down
     assert k._check_link_returned() is True   # first down->up fires (kick_at was 0.0)
-    k._link_up = False   # another down at the same instant
+    k._link.up = False   # another down at the same instant
     assert k._check_link_returned() is False  # debounced (now - kick_at = 0 < LINK_KICK_DEBOUNCE)
 
 

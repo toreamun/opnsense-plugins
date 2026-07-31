@@ -62,6 +62,36 @@ class _SignalFlags:
     recheck_role: bool = False   # SIGUSR2 (CARP)   -> recheck_carp_role()
 
 
+@dataclass(frozen=True)
+class _Config:
+    """The keeper's fixed identity/config, set once from the constructor and
+    never mutated -- so a frozen dataclass. master_marker is derived from vhid
+    (the ifconfig CARP-master line for this vhid), built once here."""
+    iface: str
+    chaddr: str
+    eth_src: str
+    hbfile: "str | None"
+    release_on_exit: bool
+    vhid: "str | None"
+
+    @property
+    def master_marker(self):
+        return CARP_MASTER_FMT.format(vhid=self.vhid) if self.vhid else None
+
+
+@dataclass
+class _LinkState:
+    """WAN-carrier state for the unbound link-return fast path (main-loop only).
+    up: last carrier seen (None = not probed). ifconfig_failed: gate to log an
+    ifconfig probe failure once per episode. kick_at: epoch of the last
+    link-return kick (debounce). returned: set by _sleep_interruptible on a
+    carrier return while unbound."""
+    up: "bool | None" = None
+    ifconfig_failed: bool = False
+    kick_at: float = 0.0
+    returned: bool = False
+
+
 class Keeper:  # pylint: disable=too-many-instance-attributes
     """Orchestration around the components: owns the capture backend (feeding
     DHCP replies to DhcpClient, ARP replies to ArpNudge and peer-ACK
@@ -74,15 +104,14 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
                  hbfile=None, release_on_exit=False, vhid=None,
                  follow=False, vendor_class=None, client_id=None, hostname=None,
                  arp_nudge=0, arp_listen_promisc=False, capture_backend="scapy"):
-        self.iface = iface
-        self.chaddr = chaddr.lower()
-        self.eth_src = (eth_src or chaddr).lower()
-        self.hbfile = hbfile
-        self.release_on_exit = release_on_exit
-        self.vhid = str(vhid) if vhid else None
-        # The CARP-master marker is fixed once the vhid is known; build it here
-        # rather than reformatting it on every probe.
-        self._master_marker = CARP_MASTER_FMT.format(vhid=self.vhid) if self.vhid else None
+        # Fixed identity/config, immutable once set (see _Config).
+        self._cfg = _Config(
+            iface=iface,
+            chaddr=chaddr.lower(),
+            eth_src=(eth_src or chaddr).lower(),
+            hbfile=hbfile,
+            release_on_exit=release_on_exit,
+            vhid=str(vhid) if vhid else None)
 
         # Capture backend component: owns the capture socket/thread and the
         # wire codec on both directions, and hands decoded neutral frames
@@ -95,7 +124,7 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         # ARP nudge component: owns the pacing and reachability state; the
         # keeper supplies the lease binding per nudge (_arp_nudge) and the
         # CARP-role probe (via the _carp_master_probe shim).
-        self._nudge = ArpNudge(self._capture, self.chaddr, arp_nudge, self._carp_master_probe)
+        self._nudge = ArpNudge(self._capture, self._cfg.chaddr, arp_nudge, self._carp_master_probe)
 
         self._was_master = None        # CARP role at the last nudge check (None = unknown yet)
 
@@ -109,7 +138,7 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         # the keeper owns the capture (feeding it xid-matched replies) and the
         # policy hooks.
         self._dhcp = DhcpClient(
-            self._capture, self.chaddr, self.eth_src,
+            self._capture, self._cfg.chaddr, self._cfg.eth_src,
             _identity_options(vendor_class, client_id, hostname),
             should_stop=lambda: self._signals.stop,
             ensure_sniffer=self._ensure_sniffer,
@@ -117,17 +146,15 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
 
         # Follow/enforce policy component: owns the target address and the
         # follow bookkeeping; drives the client via adopt()/release()/expire().
-        self._follow = FollowPolicy(request_ip, follow, self.chaddr, self._dhcp,
+        self._follow = FollowPolicy(request_ip, follow, self._cfg.chaddr, self._dhcp,
                                     self._hb_mismatch,
                                     dispatch=self._dispatch_follow_update)
 
         self.redora_wait = REDORA_MIN
-        # Link-return fast path (only while UNBOUND): a carrier down->up edge resets
-        # the backoff and re-DORAs at once, like dhclient's link-up -> state_reboot.
-        self._link_up = None           # last carrier state seen (None = unknown / not probed)
-        self._ifconfig_failed = False  # ifconfig probe episode gate (log the failure once)
-        self._link_kick_at = 0.0       # epoch of the last link-return kick (debounce)
-        self._link_returned = False    # set by _sleep_interruptible on a carrier return while unbound
+        # Link-return fast path (only while UNBOUND): a carrier down->up edge
+        # resets the backoff and re-DORAs at once, like dhclient's link-up ->
+        # state_reboot. Its carrier state is grouped in _LinkState.
+        self._link = _LinkState()
 
         # Wake pipe for the maintain-loop sleep: _sleep_interruptible selects on
         # the read end, and _signal_wake() writes one byte to make it return at
@@ -202,13 +229,13 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
     # ---- heartbeat / status file ----
 
     def _write_hb(self, content):
-        if not self.hbfile:
+        if not self._cfg.hbfile:
             return
         try:
-            _atomic_write(self.hbfile, content)
+            _atomic_write(self._cfg.hbfile, content)
         except Exception as e:
             # The heartbeat drives CARP gating, so a write failure is worth surfacing.
-            LOG.warning("heartbeat write failed (%s): %s", self.hbfile, e)
+            LOG.warning("heartbeat write failed (%s): %s", self._cfg.hbfile, e)
 
     def _hb(self):
         t1, t2, src = self._dhcp.timing()
@@ -256,16 +283,16 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         episode -- otherwise a wrong --iface or a broken ifconfig looks identical
         to a healthy backup in the log."""
         try:
-            out = subprocess.check_output(["/sbin/ifconfig", self.iface], errors="replace")
+            out = subprocess.check_output(["/sbin/ifconfig", self._cfg.iface], errors="replace")
         except (OSError, subprocess.SubprocessError) as e:
-            if not self._ifconfig_failed:
+            if not self._link.ifconfig_failed:
                 LOG.warning("ifconfig %s probe failed (%s) -- CARP role and carrier "
-                            "state unknown until it recovers", self.iface, e)
-                self._ifconfig_failed = True
+                            "state unknown until it recovers", self._cfg.iface, e)
+                self._link.ifconfig_failed = True
             return None
-        if self._ifconfig_failed:
-            LOG.info("ifconfig %s probe recovered", self.iface)
-            self._ifconfig_failed = False
+        if self._link.ifconfig_failed:
+            LOG.info("ifconfig %s probe recovered", self._cfg.iface)
+            self._link.ifconfig_failed = False
         return out.decode(errors="replace") if isinstance(out, bytes) else out
 
     def _probe_carp_master(self) -> "bool | None":
@@ -273,12 +300,12 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         the probe itself fails; no vhid configured -> True (nothing to gate on).
         Callers apply their own policy on a None probe -- the ARP nudge fails closed
         (no nudge unless a confirmed MASTER); the CARP-transition poll just skips."""
-        if self._master_marker is None:   # no vhid configured -> nothing to gate on
+        if self._cfg.master_marker is None:   # no vhid configured -> nothing to gate on
             return True
         out = self._ifconfig()
         if out is None:
             return None
-        return self._master_marker in out
+        return self._cfg.master_marker in out
 
     def _carp_master_probe(self) -> "bool | None":
         """ArpNudge's is_master hook -> the CARP probe (late-bound through the
@@ -309,13 +336,13 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         up = self._iface_link_up()
         if up is None:
             return False
-        prev = self._link_up
-        self._link_up = up
+        prev = self._link.up
+        self._link.up = up
         if up and prev is False:
             now = time.time()
-            if now - self._link_kick_at < LINK_KICK_DEBOUNCE:
+            if now - self._link.kick_at < LINK_KICK_DEBOUNCE:
                 return False
-            self._link_kick_at = now
+            self._link.kick_at = now
             return True
         return False
 
@@ -327,7 +354,7 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         access node's DHCP-snooping binding, so neither should wait out its
         normal timer. Independent of the ARP nudge setting. `master` lets the
         maintain loop pass the role it already probed this tick."""
-        if not self.vhid:
+        if not self._cfg.vhid:
             return
         if master is _UNSET:
             master = self._probe_carp_master()
@@ -335,13 +362,13 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
             return
         if master and self._was_master is False:
             LOG.info("became CARP master for vhid %s -- immediate ARP nudge and early lease renew",
-                     self.vhid)
+                     self._cfg.vhid)
             self._renew_asap = True
             self._arp_nudge(force=True, master=master)
         elif not master and self._was_master:
             # The symmetric event: without it, "why did the nudges stop?" needs
             # ifconfig instead of the log.
-            LOG.info("lost CARP master for vhid %s -- ARP nudges pause on this node", self.vhid)
+            LOG.info("lost CARP master for vhid %s -- ARP nudges pause on this node", self._cfg.vhid)
         self._was_master = master
 
     # ---- ARP nudge ----
@@ -440,7 +467,7 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
             # seconds; a down->up edge means the WAN just came back, so stop waiting
             # and let _maintain_step re-DORA immediately (the bound path skips this).
             if self._dhcp.binding.yiaddr is None and slept % LINK_POLL_STEP == 0 and self._check_link_returned():
-                self._link_returned = True
+                self._link.returned = True
                 return not self._signals.stop
 
             # Event-driven sleep: return at once when the wake socket is written
@@ -492,9 +519,9 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
             self._sleep(SNIFFER_RETRY)
 
         # eth-src matters for L2 debugging but only when it differs from the chaddr.
-        ethsrc = f" eth-src={self.eth_src}" if self.eth_src != self.chaddr else ""
+        ethsrc = f" eth-src={self._cfg.eth_src}" if self._cfg.eth_src != self._cfg.chaddr else ""
         LOG.info("lease-keeper %s active on %s: chaddr=%s%s request=%s",
-                 __version__, self.iface, self.chaddr, ethsrc, self._follow.target or "any")
+                 __version__, self._cfg.iface, self._cfg.chaddr, ethsrc, self._follow.target or "any")
         time.sleep(SNIFFER_WARMUP)
 
         while not self._signals.stop:
@@ -512,7 +539,7 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
                 self._sleep(LOOP_ERROR_BACKOFF)
 
         # shutdown
-        if self.release_on_exit:
+        if self._cfg.release_on_exit:
             self._dhcp.release()
         self._capture.stop()
         self._wake_r.close()
@@ -528,7 +555,7 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
             return 3
         time.sleep(SNIFFER_WARMUP)
         ok = self._dhcp.dora(self._follow.target)
-        LOG.info("DHCP claim %s -> %s", self.chaddr, self._dhcp.binding.yiaddr if ok else "FAIL")
+        LOG.info("DHCP claim %s -> %s", self._cfg.chaddr, self._dhcp.binding.yiaddr if ok else "FAIL")
         if ok:
             self._dhcp.release()
         self._capture.stop()
@@ -591,9 +618,9 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         return. Returns True (and resets the re-DORA backoff) if the link-return
         fast path fired during the sleep, so the caller re-acquires at once
         instead of waiting out the backoff (matches native dhclient)."""
-        self._link_returned = False
+        self._link.returned = False
         self._sleep_interruptible(secs)
-        if self._link_returned:
+        if self._link.returned:
             LOG.info("WAN link returned while unbound -- re-acquiring now")
             self.redora_wait = REDORA_MIN
             return True
@@ -613,16 +640,16 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         # only a confirmed "no carrier" (False) holds the acquire; an
         # unreadable probe (None) never blocks it.
         if self._iface_link_up() is False:
-            if self._link_up is not False:   # log once per down-episode
+            if self._link.up is not False:   # log once per down-episode
                 LOG.info("no carrier on %s -- waiting for the link before the DHCP acquire",
-                         self.iface)
-            self._link_up = False
+                         self._cfg.iface)
+            self._link.up = False
             self._wait_unbound(REDORA_MIN)
             return
 
         b = self._dhcp.binding
         if self._dhcp.acquire(self._follow.target):
-            self._link_up = True   # a completed DORA proves carrier
+            self._link.up = True   # a completed DORA proves carrier
             LOG.info("DHCP BOUND %s (lease=%ss, expires ~%s, server=%s, gw=%s, mask=%s)",
                      b.yiaddr, b.lease_secs, _clock_at(b.lease_secs),
                      b.server, b.router or "?",

@@ -1091,3 +1091,71 @@ def test_backoff_jitter(lk):
     vals = [lk._jittered(8) for _ in range(200)]
     assert all(6.0 <= v <= 10.0 for v in vals)   # 8 * [0.75, 1.25]
     assert len(set(vals)) > 1
+
+
+# ---- default-route ownership wiring (keeper <-> DefaultRouteReconciler) ----
+
+class _RecordingReconciler:
+    """Stand-in for DefaultRouteReconciler that records reconcile() args, so the
+    keeper-side wiring can be asserted without a real route(8) probe."""
+    def __init__(self, enabled=True):
+        self.enabled = enabled
+        self.calls = []
+
+    def reconcile(self, is_master, bound, gateway):
+        self.calls.append((is_master, bound, gateway))
+
+
+def test_default_route_mode_off_is_inert(lk):
+    # The default keeper is mode=off: the reconciler reports itself disabled and
+    # the keeper never calls it (no CARP probe, no FIB write).
+    k = _keeper(lk, vhid=254)
+    assert k._defroute.enabled is False
+    k._defroute = _RecordingReconciler(enabled=False)
+    k._probe_carp_master = lambda: True
+    k._reconcile_default_route()
+    assert k._defroute.calls == []
+
+
+def test_default_route_forwards_role_bound_gateway(lk):
+    k = _keeper(lk, vhid=254, default_route_mode="enforce")
+    rec = _RecordingReconciler()
+    k._defroute = rec
+    k._dhcp.binding.yiaddr = "100.64.4.7"
+    k._dhcp.binding.router = "100.64.4.1"
+    k._reconcile_default_route(master=True)
+    assert rec.calls == [(True, True, "100.64.4.1")]
+
+
+def test_default_route_bound_keyed_on_yiaddr_not_router(lk):
+    # binding.router is a sticky hint that survives a lease loss; bound must be
+    # keyed on yiaddr, so a lost lease (yiaddr None, router still set) reconciles
+    # as unbound and the reconciler withdraws.
+    k = _keeper(lk, vhid=254, default_route_mode="enforce")
+    rec = _RecordingReconciler()
+    k._defroute = rec
+    k._dhcp.binding.yiaddr = None
+    k._dhcp.binding.router = "100.64.4.1"    # stale last-known gateway
+    k._reconcile_default_route(master=True)
+    assert rec.calls == [(True, False, "100.64.4.1")]
+
+
+def test_default_route_probes_role_when_not_supplied(lk):
+    k = _keeper(lk, vhid=254, default_route_mode="observe")
+    rec = _RecordingReconciler()
+    k._defroute = rec
+    k._probe_carp_master = lambda: False
+    k._dhcp.binding.yiaddr = "100.64.4.7"
+    k._dhcp.binding.router = "100.64.4.1"
+    k._reconcile_default_route()             # no master arg -> probe it
+    assert rec.calls == [(False, True, "100.64.4.1")]
+
+
+def test_default_route_needs_vhid(lk):
+    # No vhid -> no CARP role to key on -> reconcile is a no-op even in enforce.
+    k = _keeper(lk, default_route_mode="enforce")
+    rec = _RecordingReconciler()
+    k._defroute = rec
+    k._probe_carp_master = lambda: True
+    k._reconcile_default_route(master=True)
+    assert rec.calls == []

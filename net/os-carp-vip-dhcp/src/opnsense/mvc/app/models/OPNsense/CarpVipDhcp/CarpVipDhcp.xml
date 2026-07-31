@@ -116,6 +116,26 @@
                     </OptionValues>
                 </captureBackend>
 
+                <!--
+                    Own the IPv4 WAN default route as a function of CARP role and
+                    lease: the CARP-master node that holds this keeper's lease
+                    keeps 0.0.0.0/0 via the lease gateway; every other state has
+                    none, so a node advertises a default only while it can route
+                    one (via os-frr redistribute kernel; works without FRR too).
+                    off (default): inert. observe: log what it would do, no FIB
+                    write. enforce: actually install/withdraw. Only ONE keeper
+                    (the WAN VIP) may enforce. See the README.
+                -->
+                <defaultRouteMode type="OptionField">
+                    <Required>N</Required>
+                    <Default>off</Default>
+                    <OptionValues>
+                        <off>Off (default)</off>
+                        <observe>Observe (log only, no route change)</observe>
+                        <enforce>Enforce (own the default route)</enforce>
+                    </OptionValues>
+                </defaultRouteMode>
+
                 <description type="DescriptionField"/>
             </keeper>
         </keepers>

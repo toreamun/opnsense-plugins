@@ -8,8 +8,8 @@ failure mode is a withdrawn default, never a black-holed one. See
 docs/default-route-carp-ownership.md.
 
 Concurrency: reconcile() must be called only from the keeper's main loop thread;
-the intended caller is Keeper._poll_carp_role (the per-tick poll and the SIGUSR2
-CARP / route_reload edge), wired in a later change. Signal handlers and the capture thread never
+the caller is Keeper._reconcile_default_route (the per-tick poll, the unbound
+acquire arm, and the SIGUSR2 CARP edge). Signal handlers and the capture thread never
 touch the FIB -- they only set flags / hand off observations, exactly as the
 lease path does. So there is no in-process route race; the only shared mutable
 state is the kernel FIB, and cross-process / cross-subsystem contention is
@@ -99,6 +99,7 @@ class DefaultRouteReconciler:
 
     @property
     def enabled(self):
+        """True in observe/enforce (off is inert); see DefaultRouteMode."""
         return self.mode in (DefaultRouteMode.OBSERVE, DefaultRouteMode.ENFORCE)
 
     def reconcile(self, is_master, bound, gateway):
@@ -171,7 +172,7 @@ class DefaultRouteReconciler:
     def _install(self, gateway, replacing=None):
         if self.mode == DefaultRouteMode.OBSERVE:
             LOG.info("[observe] would install default via %s%s", gateway,
-                     "" if replacing is None else " (replacing %s)" % replacing)
+                     "" if replacing is None else f" (replacing {replacing})")
             return
         # Match the base's set-default idiom (delete then add) so a wrong gateway
         # is corrected; the delete is tolerated when there is nothing to remove.
@@ -179,7 +180,7 @@ class DefaultRouteReconciler:
             self._route(RouteCommand.DELETE, _DEFAULT)
         if self._route(RouteCommand.ADD, _DEFAULT, gateway):
             LOG.info("installed default via %s%s", gateway,
-                     "" if replacing is None else " (was %s)" % replacing)
+                     "" if replacing is None else f" (was {replacing})")
 
     def _withdraw(self, current):
         if self.mode == DefaultRouteMode.OBSERVE:
@@ -225,7 +226,7 @@ class DefaultRouteReconciler:
         left for the caller to interpret rather than folded into None here."""
         try:
             return subprocess.run(cmd, capture_output=True, errors="replace",
-                                  timeout=_SUBPROC_TIMEOUT)
+                                  timeout=_SUBPROC_TIMEOUT, check=False)
         except (OSError, subprocess.SubprocessError) as e:
             LOG.warning("route command failed to run (%s): %s", " ".join(cmd), e)
             return None

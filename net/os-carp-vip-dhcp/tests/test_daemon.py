@@ -1095,7 +1095,7 @@ def test_backoff_jitter(lk):
 
 # ---- default-route ownership wiring (keeper <-> DefaultRouteReconciler) ----
 
-class _RecordingReconciler:
+class _RecordingReconciler:  # pylint: disable=too-few-public-methods
     """Stand-in for DefaultRouteReconciler that records reconcile() args, so the
     keeper-side wiring can be asserted without a real route(8) probe."""
     def __init__(self, enabled=True):
@@ -1114,7 +1114,7 @@ def test_default_route_mode_off_is_inert(lk):
     k._defroute = _RecordingReconciler(enabled=False)
     k._probe_carp_master = lambda: True
     k._reconcile_default_route()
-    assert k._defroute.calls == []
+    assert not k._defroute.calls
 
 
 def test_default_route_forwards_role_bound_gateway(lk):
@@ -1158,4 +1158,4 @@ def test_default_route_needs_vhid(lk):
     k._defroute = rec
     k._probe_carp_master = lambda: True
     k._reconcile_default_route(master=True)
-    assert rec.calls == []
+    assert not rec.calls

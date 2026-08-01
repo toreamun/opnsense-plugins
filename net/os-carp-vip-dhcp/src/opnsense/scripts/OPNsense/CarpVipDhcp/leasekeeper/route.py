@@ -81,13 +81,16 @@ class DefaultRouteReconciler:
     All methods run on the keeper's main loop thread only; the class holds no
     lock because nothing else in the keeper mutates routes."""
 
-    def __init__(self, mode=DefaultRouteMode.OFF, *,
+    def __init__(self, mode: "str | DefaultRouteMode" = DefaultRouteMode.OFF, *,
                  unreadable_role_strikes=DEFAULT_UNREADABLE_ROLE_STRIKES,
                  liveness_probe=None):
+        # mode flows in from the model verbatim (keeper.conf -> rc.d -> argparse) as
+        # a plain string; coerce it, and treat any unrecognised value as inert OFF.
         try:
             self.mode = DefaultRouteMode(mode)
         except ValueError:
-            self.mode = DefaultRouteMode.OFF  # unknown mode string -> inert, never guess
+            LOG.warning("unknown default-route mode %r -- treating as off", mode)
+            self.mode = DefaultRouteMode.OFF  # never guess an active mode
         self._strike_limit = unreadable_role_strikes
         # liveness_probe: optional callable() -> bool|None gating the INSTALL
         # side (the split-brain guard). None (no callable) or a None result means

@@ -19,14 +19,14 @@ class FakeRoute:
         self.gw = initial
         self.calls = []
 
-    def run(self, cmd, **kwargs):  # capture_output / errors / timeout -- ignored
+    def run(self, cmd, **_kwargs):  # capture_output / errors / timeout -- ignored
         self.calls.append(list(cmd))
         verb = cmd[2]  # ["/sbin/route","-n",verb,"-inet","default"[,gw]]
         if verb == "get":
             if self.gw is None:
                 return types.SimpleNamespace(returncode=1, stdout="", stderr="not in table")
             return types.SimpleNamespace(
-                returncode=0, stdout="   gateway: %s\n   flags: <UP,GATEWAY>\n" % self.gw, stderr="")
+                returncode=0, stdout=f"   gateway: {self.gw}\n   flags: <UP,GATEWAY>\n", stderr="")
         if verb == "add":
             self.gw = cmd[-1]
             return types.SimpleNamespace(returncode=0, stdout="", stderr="")
@@ -54,7 +54,7 @@ def test_off_never_touches_fib(lk, monkeypatch):
     rec, fake = _rec(lk, monkeypatch, "off")
     rec.reconcile(True, True, GW)
     assert fake.gw is None
-    assert fake.calls == []  # off short-circuits before any route call
+    assert not fake.calls  # off short-circuits before any route call
 
 
 def test_observe_reads_but_does_not_mutate(lk, monkeypatch):

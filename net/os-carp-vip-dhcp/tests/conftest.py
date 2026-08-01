@@ -76,7 +76,7 @@ def _load(filename, modname):
 
 
 @pytest.fixture(scope="session")
-def lk():
+def lk():  # pylint: disable=too-many-locals
     """Facade over the leasekeeper package: every public name from the submodules
     under one namespace, so the tests reach them as lk.* without the daemon
     entry point (../lease_keeper.py) re-exporting its whole API. Also exposes the

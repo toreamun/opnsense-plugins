@@ -5,7 +5,7 @@ role and whether it currently holds a DHCP lease: only the CARP-master node that
 actually holds a lease keeps a default in the FIB; every other state has none. A
 node with no default advertises none (via os-frr redistribute kernel), so the
 failure mode is a withdrawn default, never a black-holed one. See
-docs/default-route-carp-ownership.md.
+docs/single-ip-wan-carp.md.
 
 Concurrency: reconcile() must be called only from the keeper's main loop thread;
 the caller is Keeper._reconcile_default_route (the per-tick poll, the unbound
@@ -23,6 +23,7 @@ import subprocess
 from enum import StrEnum
 
 from .constants import LOGGER_NAME
+from .util import _sane_ipv4
 
 LOG = logging.getLogger(LOGGER_NAME)
 
@@ -33,10 +34,9 @@ LOG = logging.getLogger(LOGGER_NAME)
 
 class DefaultRouteMode(StrEnum):
     """Per-keeper default-route mode (the values the model's defaultRouteMode
-    field will carry). StrEnum (like constants.Phase) so a member both is its
-    config string and compares by value -- the value flows in from the model
-    verbatim. off:
-    inert (default). observe: log what it would do, no FIB write. enforce:
+    field carries). StrEnum (like constants.Phase) so a member both is its config
+    string and compares by value -- the value flows in from the model verbatim.
+    off: inert (default). observe: log what it would do, no FIB write. enforce:
     actually install/withdraw."""
     OFF = "off"
     OBSERVE = "observe"
@@ -53,8 +53,8 @@ class RouteCommand(StrEnum):
     GET = "get"
 
 
-# The IPv4 default. IPv6 is out of scope (docs section 12): no v6 BGP fw<->pve,
-# so no v6 default leak to gate.
+# The IPv4 default. IPv6 is out of scope: no v6 BGP fw<->pve, so no v6 default
+# leak to gate.
 _DEFAULT = "default"
 
 # Consecutive unreadable CARP-role probes tolerated while we still hold a
@@ -84,26 +84,35 @@ class DefaultRouteReconciler:
     def __init__(self, mode: "str | DefaultRouteMode" = DefaultRouteMode.OFF, *,
                  unreadable_role_strikes=DEFAULT_UNREADABLE_ROLE_STRIKES,
                  liveness_probe=None):
-        # mode flows in from the model verbatim (keeper.conf -> rc.d -> argparse) as
-        # a plain string; coerce it, and treat any unrecognised value as inert OFF.
+        # mode flows in from the model verbatim (keeper.conf -> rc.d -> argparse)
+        # as a plain string; coerce it, and treat any unrecognised value as inert
+        # OFF. Set-once: exposed read-only via the `mode` property.
         try:
-            self.mode = DefaultRouteMode(mode)
+            self._mode = DefaultRouteMode(mode)
         except ValueError:
             LOG.warning("unknown default-route mode %r -- treating as off", mode)
-            self.mode = DefaultRouteMode.OFF  # never guess an active mode
+            self._mode = DefaultRouteMode.OFF  # never guess an active mode
+        if unreadable_role_strikes < 1:
+            raise ValueError("unreadable_role_strikes must be >= 1")
         self._strike_limit = unreadable_role_strikes
-        # liveness_probe: optional callable() -> bool|None gating the INSTALL
-        # side (the split-brain guard). None (no callable) or a None result means
-        # "no opinion" and never blocks; only an explicit False blocks. It must
-        # be debounced by the caller -- a single transient miss must not read
-        # False, or a healthy master would flap its default. See docs section 2.
+        # liveness_probe: optional callable() -> bool|None gating the INSTALL side
+        # (the split-brain guard). None (no callable) or a None result means "no
+        # opinion" and never blocks; only an explicit False blocks. It must be
+        # debounced by the caller -- a single transient miss must not read False,
+        # or a healthy master would flap its default (see the README).
         self._liveness_probe = liveness_probe
         self._strikes = 0
+        self._unreadable_warned = False   # rising-edge gate for the fail-closed warning
+
+    @property
+    def mode(self):
+        """The active mode, set once at construction (coerced/validated)."""
+        return self._mode
 
     @property
     def enabled(self):
         """True in observe/enforce (off is inert); see DefaultRouteMode."""
-        return self.mode in (DefaultRouteMode.OBSERVE, DefaultRouteMode.ENFORCE)
+        return self._mode in (DefaultRouteMode.OBSERVE, DefaultRouteMode.ENFORCE)
 
     def reconcile(self, is_master, bound, gateway):
         """Drive the FIB default toward the desired state for the current
@@ -125,8 +134,14 @@ class DefaultRouteReconciler:
             self._on_unknown_role()
             return
         self._strikes = 0
+        self._unreadable_warned = False   # role readable again -> re-arm the warning
 
-        want = is_master and bound and gateway is not None
+        # A sane, non-zero unicast gateway is required to install (rejects a
+        # 0.0.0.0 / malformed option-3 from a rogue or broken DHCP server); an
+        # unusable gateway falls through to the withdraw arm rather than
+        # installing a default that leads nowhere.
+        want = is_master and bound and _sane_ipv4(gateway)
+
         if want and self._liveness_blocks():
             # Master with a lease but liveness is explicitly not confirmed
             # (possible split-brain / dead WAN with a stale lease): do not keep a
@@ -149,15 +164,19 @@ class DefaultRouteReconciler:
         """An unreadable (is_master is None) probe: do not install when unsure,
         but after a bounded number of consecutive unknown probes, withdraw any
         default we still hold so a former master stops advertising once its role
-        can no longer be confirmed."""
+        can no longer be confirmed. The warning fires once per unreadable episode
+        (re-armed when the role reads definite again), not every tick."""
         self._strikes += 1
         if self._strikes < self._strike_limit:
             return
         have = self._fib_default_gateway()
-        if have is not None:
-            LOG.warning("CARP role unreadable for %d checks -- withdrawing default "
+        if have is None:
+            return
+        if not self._unreadable_warned:
+            LOG.warning("CARP role unreadable for %d checks -- dropping the default "
                         "(fail-closed)", self._strikes)
-            self._withdraw(have)
+            self._unreadable_warned = True
+        self._withdraw(have)
 
     def _liveness_blocks(self):
         """True only when the liveness probe is present and returns an explicit
@@ -173,29 +192,47 @@ class DefaultRouteReconciler:
     # ---- FIB operations (idempotent, error-tolerant, main-loop only) ----
 
     def _install(self, gateway, replacing=None):
-        if self.mode == DefaultRouteMode.OBSERVE:
+        if self._mode == DefaultRouteMode.OBSERVE:
             LOG.info("[observe] would install default via %s%s", gateway,
                      "" if replacing is None else f" (replacing {replacing})")
             return
-        # Match the base's set-default idiom (delete then add) so a wrong gateway
-        # is corrected; the delete is tolerated when there is nothing to remove.
+        # Set-default idiom: delete then add, so a wrong gateway is replaced (a
+        # plain `route add default` fails when one is already present). Then
+        # CONFIRM the FIB actually reached the desired state -- reading the result
+        # back is wording-independent, unlike parsing route(8)'s exit/stderr, and
+        # it catches a stuck delete that left the old gateway in place.
         if replacing is not None:
             self._route(RouteCommand.DELETE, _DEFAULT)
-        if self._route(RouteCommand.ADD, _DEFAULT, gateway):
+        self._route(RouteCommand.ADD, _DEFAULT, gateway)
+        have = self._fib_default_gateway()
+        if have == gateway:
             LOG.info("installed default via %s%s", gateway,
                      "" if replacing is None else f" (was {replacing})")
+        else:
+            LOG.error("failed to install default via %s (the FIB default is now %s)",
+                      gateway, have or "absent")
 
     def _withdraw(self, current):
-        if self.mode == DefaultRouteMode.OBSERVE:
+        if self._mode == DefaultRouteMode.OBSERVE:
             LOG.info("[observe] would withdraw default (currently via %s)", current)
             return
-        if self._route(RouteCommand.DELETE, _DEFAULT):
+        self._route(RouteCommand.DELETE, _DEFAULT)
+        # Confirm the FIB, not the exit code: a silently failed delete would leave
+        # a backup advertising a black-hole default -- the one outcome this feature
+        # exists to prevent -- so surface it at ERROR. The level-triggered
+        # reconcile retries the withdraw next tick.
+        if self._fib_default_gateway() is None:
             LOG.info("withdrew default (was via %s)", current)
+        else:
+            LOG.error("failed to withdraw default (still via %s) -- this node keeps "
+                      "advertising it", current)
 
     def _fib_default_gateway(self):
-        """Current IPv4 default gateway, or None when there is no default. A
-        query error (`route get` on an empty table exits non-zero with 'not in
-        table') is treated as 'no default', not as a probe failure."""
+        """Current IPv4 default gateway, or None when there is no default. Any
+        `route get` failure (an empty table exits non-zero) reads as 'no default'
+        -- the common, quiet steady state on a backup -- rather than an error; a
+        genuinely stuck route op is surfaced by the install/withdraw confirm, not
+        by second-guessing this read."""
         res = self._run([_ROUTE, _NUMERIC, RouteCommand.GET, _AF_INET, _DEFAULT])
         if res is None or res.returncode != 0:
             return None
@@ -206,27 +243,22 @@ class DefaultRouteReconciler:
         return None
 
     def _route(self, command, dest, gateway=None):
-        """Issue a `/sbin/route` command; return True on success. A non-zero exit
-        (route already present on add, or absent on delete) is tolerated and
-        logged at debug -- the reconcile is idempotent, so a redundant op is
-        expected, not an error."""
+        """Issue a `/sbin/route` command (best effort). The caller confirms the
+        resulting FIB state, so a non-zero exit -- an idempotent no-op or a real
+        failure alike -- is only debug-logged and left for that confirm to judge,
+        rather than guessed from route(8)'s wording here."""
         cmd = [_ROUTE, _NUMERIC, command, _AF_INET, dest]
         if gateway is not None:
             cmd.append(gateway)
         res = self._run(cmd)
-        if res is None:
-            return False
-        if res.returncode != 0:
-            LOG.debug("route %s %s exit %d (tolerated): %s", command, dest,
-                      res.returncode, (res.stderr or "").strip())
-            return False
-        return True
+        if res is not None and res.returncode != 0:
+            LOG.debug("route %s %s exit %d: %s", command, dest, res.returncode,
+                      (res.stderr or "").strip())
 
     def _run(self, cmd):
         """Run a `/sbin/route` argv, capturing output and bounded by a timeout;
-        return the CompletedProcess, or None if it could not be executed at all.
-        A non-zero exit is a normal, tolerated outcome (idempotent ops), so it is
-        left for the caller to interpret rather than folded into None here."""
+        return the CompletedProcess, or None if it could not be executed at all
+        (logged)."""
         try:
             return subprocess.run(cmd, capture_output=True, errors="replace",
                                   timeout=_SUBPROC_TIMEOUT, check=False)

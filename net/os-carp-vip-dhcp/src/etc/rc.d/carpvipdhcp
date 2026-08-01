@@ -82,8 +82,9 @@ carpvipdhcp_start()
             ''|scapy|bpf) [ -n "${backend}" ] && set -- "$@" --capture-backend "${backend}" ;;
             *) echo "carpvipdhcp: ignoring unknown capture backend '${backend}' (use scapy or bpf)" >&2 ;;
         esac
-        # Default-route ownership by CARP role. Pass only observe/enforce; empty
-        # or "off" leaves the daemon default (off, inert). Validate here rather
+        # Default-route ownership by CARP role (the 13th keeper.conf column). Pass
+        # only observe/enforce; empty or "off" leaves the daemon default (off,
+        # inert). Validate here rather
         # than pass a typo through: an unknown value fails the daemon's argparse
         # choice, and daemon(8) -r would turn that exit into a silent crash loop.
         case "${defaultroutemode}" in

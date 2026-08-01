@@ -793,10 +793,10 @@ def test_hold_returns_early_for_asap_renew(lk):
 
 def test_sigusr1_flag_services_nudge_within_a_second(lk, caplog):
     keeper = _nudge_keeper(lk)
-    keeper._signals.nudge = True   # what the SIGUSR1 handler sets
+    keeper._signals.request_nudge()   # what the SIGUSR1 handler sets
     with caplog.at_level("INFO", logger="lease-keeper"):
         keeper._sleep_interruptible(1)
-    assert keeper._signals.nudge is False
+    assert keeper._signals.take_nudge() is False   # loop already drained it
     assert keeper._nudge.last_nudge > 0
     # Operator-triggered nudges must be visible in the log (the README says so).
     assert any("manual ARP nudge" in r.getMessage() for r in caplog.records)
@@ -812,9 +812,9 @@ def test_sigusr2_flag_rechecks_carp_role_within_a_second(lk):
     keeper._probe_carp_master = probe
     keeper._poll_carp_role()   # first observation: records backup
     assert keeper._renew_asap is False
-    keeper._signals.recheck_role = True          # what the SIGUSR2 handler sets on a CARP event
+    keeper._signals.request_recheck_role()       # what the SIGUSR2 handler sets on a CARP event
     keeper._sleep_interruptible(1)   # services the flag -> re-check -> transition
-    assert keeper._signals.recheck_role is False
+    assert keeper._signals.take_recheck_role() is False   # loop already drained it
     assert keeper._renew_asap is True     # backup->master: renew early
     assert keeper._nudge.last_nudge > 0         # and nudge immediately
 
@@ -1159,3 +1159,51 @@ def test_default_route_needs_vhid(lk):
     k._probe_carp_master = lambda: True
     k._reconcile_default_route(master=True)
     assert not rec.calls
+
+
+# ---- the reconcile is actually driven from all three main-loop call-sites ----
+
+def test_sigusr2_edge_drives_default_route_reconcile(lk):
+    k = _keeper(lk, vhid=254, default_route_mode="enforce")
+    rec = _RecordingReconciler()
+    k._defroute = rec
+    probes = {"n": 0}
+
+    def probe():
+        probes["n"] += 1
+        return True
+    k._probe_carp_master = probe
+    k._dhcp.binding.yiaddr = "100.64.4.7"
+    k._dhcp.binding.router = "100.64.4.1"
+    k._signals.request_recheck_role()          # what the CARP syshook's SIGUSR2 sets
+    k._sleep_interruptible(1)
+    assert rec.calls == [(True, True, "100.64.4.1")]   # reconciled on the failover edge
+    assert probes["n"] == 1                             # one shared probe feeds poll + reconcile
+
+
+def test_hold_lease_tick_drives_default_route_reconcile(lk):
+    k = _keeper(lk, vhid=254, default_route_mode="enforce")
+    rec = _RecordingReconciler()
+    k._defroute = rec
+    k._probe_carp_master = lambda: True
+    k._sleep_interruptible = lambda _s: True   # one chunk, no real sleep
+    k._dhcp.binding.yiaddr = "100.64.4.7"
+    k._dhcp.binding.router = "100.64.4.1"
+    k._hold_lease(1)
+    assert (True, True, "100.64.4.1") in rec.calls
+
+
+def test_acquire_step_reconciles_when_unbound(lk):
+    # A former master that lost its lease withdraws on the unbound arm (bound=False);
+    # the bound-path tick never runs there.
+    k = _keeper(lk, vhid=254, default_route_mode="enforce")
+    rec = _RecordingReconciler()
+    k._defroute = rec
+    k._ensure_sniffer = lambda: None
+    k._probe_carp_master = lambda: True
+    k._iface_link_up = lambda: None            # unreadable carrier -> straight to the acquire
+    k._dhcp.acquire = lambda _rip: False
+    k._sleep_interruptible = lambda _s: True
+    k._dhcp.binding.yiaddr = None              # unbound
+    k._acquire_step()
+    assert rec.calls == [(True, False, k._dhcp.binding.router)]   # bound=False

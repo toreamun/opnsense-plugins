@@ -110,6 +110,7 @@ All per-keeper; sensible defaults mean most setups only pick a CARP VIP and enab
 - **CARP failover on lease loss** *(optional)*: demote this node (hand the VIP to the peer) if the keeper stops holding the correct lease.
 - **DHCP identity options** *(advanced)*: set a vendor-class (opt 60), client-id (61) or hostname (12) for servers that only lease to a known value. On a server that keys the lease on the **client-id** (not the chaddr), **both HA nodes must present the *same* client-id** - a divergent one gets them different addresses and breaks the shared VIP. HA config-sync keeps it identical.
 - **Capture backend** *(advanced, experimental)*: pick the packet-capture engine per keeper: **Default** (follow the host-wide `carpvipdhcp_backend` rc.conf flag if set, else Scapy), **scapy**, or **bpf** (the dependency-free raw `/dev/bpf` backend). Lets a bpf rollout be staged one VIP at a time; leave on Default unless you are testing bpf.
+- **Own the default route by CARP role** *(advanced, default off)*: make one keeper own the IPv4 default route as a function of CARP role and lease - only the master node holding the lease keeps a default (via the lease gateway), every other state has none, so a failover moves the default with the role instead of leaving a backup black-holing traffic. **observe** logs what it would do without touching the routing table; **enforce** installs and withdraws it. Pairs with marking the WAN gateway down (`force_down`) so OPNsense does not install a competing default. See *Owning the default route by CARP role*.
 - **HA config sync** *(optional)*: replicate the keeper config to the peer (System ‣ High Availability ‣ Settings), so you configure once on the master. Safe: the config is node-agnostic.
 - **Self-healing & health banner:** the daemon never exits on a transient fault (it keeps its heartbeat fresh so CARP doesn't falsely demote the node), and a GUI banner warns if any enabled keeper stops holding its lease - closing the silent-failure gap on a redundant spare.
 
@@ -147,6 +148,21 @@ A follow also runs the system's **newwanip hooks** for the VIP's interface, so c
 A **cross-subnet** renumber is handled too: when the ACK moves the gateway, the plugin also updates the VIP prefix and the WAN gateway from the ACK's subnet mask and gateway, and reapplies routing. The one gap left is an ACK that changes the gateway **without** carrying a subnet mask: then only the address moves, and the keeper logs a loud warning to fix the interface prefix and System > Gateways by hand.
 
 **HA note:** firewall aliases are covered by OPNsense HA config sync, so an alias update propagates to the backup too. The CARP VIP itself is intentionally *not* synced (`advskew` differs per node).
+
+</details>
+
+<details>
+<summary><b>Owning the default route by CARP role</b></summary>
+
+On a single-IP CARP WAN, a backup node that still holds (or advertises) a default route can black-hole traffic - it has no live lease of its own, so its default leads nowhere useful. This option makes **one** keeper own the IPv4 default route (`0.0.0.0/0`) as a strict function of CARP role and lease, so the failure mode is a *withdrawn* default (fail-stop), never a black-holed one.
+
+- **The rule:** the CARP **master** that holds this keeper's lease keeps a default via the **lease gateway** (DHCP option 3); every other state - backup, or master without a lease - keeps **none**. It is level-triggered and idempotent (it reconciles on each role/lease change and converges), and a failover moves the default with the role within ~1 s because it reacts to the CARP transition, not a slow poll.
+- **Modes:** **off** *(default)* does nothing. **observe** logs the decision it *would* make without writing the routing table - run this first to watch the behaviour on your own box. **enforce** actually installs and withdraws the default.
+- **With os-frr:** the default lives in the kernel FIB, so `redistribute kernel` makes the advertised default follow the CARP role for free - the backup stops advertising `0/0` instead of advertising a route it cannot honour. It also works **without** FRR (it just keeps the backup route-honest locally); the keeper makes no FRR calls.
+- **Only one keeper may enforce** - there is a single default route, so two enforcing keepers would fight over it (the settings page rejects a second one). Others may still run in **observe**.
+- **Pair with `force_down`:** OPNsense installs its own default from the WAN gateway unconditionally, which would fight the keeper. Mark the WAN gateway down (System ‣ Gateways, **Mark Gateway as Down**) so OPNsense installs no default and the keeper owns it cleanly. On a static single-IP WAN this changes only the default-route decision; gateway monitoring (RTT/loss) still runs. Roll it out gently: **observe** first, then **enforce** with `force_down`.
+
+Part of the [Single-IP WAN failover](net/os-carp-vip-dhcp/docs/single-ip-wan-carp.md) picture.
 
 </details>
 

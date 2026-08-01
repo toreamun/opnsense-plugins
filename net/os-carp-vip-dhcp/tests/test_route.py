@@ -8,6 +8,8 @@ Tests reach into private state by design; comments over per-test docstrings."""
 # pylint: disable=protected-access, missing-function-docstring
 import types
 
+import pytest
+
 GW = "185.41.66.1"
 GW2 = "185.41.66.9"
 
@@ -15,19 +17,27 @@ GW2 = "185.41.66.9"
 class FakeRoute:
     """In-memory stand-in for `/sbin/route`: one default nexthop, verb log."""
 
-    def __init__(self, initial=None):
+    def __init__(self, initial=None, broken=()):
         self.gw = initial
         self.calls = []
+        self.broken = set(broken)  # verbs that fail with a genuine (non-benign) error
 
     def run(self, cmd, **_kwargs):  # capture_output / errors / timeout -- ignored
         self.calls.append(list(cmd))
         verb = cmd[2]  # ["/sbin/route","-n",verb,"-inet","default"[,gw]]
-        if verb == "get":
-            if self.gw is None:
-                return types.SimpleNamespace(returncode=1, stdout="", stderr="not in table")
+        if verb in self.broken:  # a real failure: stuck route / bad socket, not a no-op
             return types.SimpleNamespace(
-                returncode=0, stdout=f"   gateway: {self.gw}\n   flags: <UP,GATEWAY>\n", stderr="")
+                returncode=1, stdout="", stderr="route: writing to routing socket: permission denied")
+        if verb == "get":
+            has = self.gw is not None  # empty table exits non-zero (one return keeps pylint happy)
+            return types.SimpleNamespace(
+                returncode=0 if has else 1,
+                stdout=f"   gateway: {self.gw}\n   flags: <UP,GATEWAY>\n" if has else "",
+                stderr="" if has else "route: not in table")
         if verb == "add":
+            if self.gw is not None:  # FreeBSD: add fails when a default already exists
+                return types.SimpleNamespace(
+                    returncode=1, stdout="", stderr="route: writing to routing socket: File exists")
             self.gw = cmd[-1]
             return types.SimpleNamespace(returncode=0, stdout="", stderr="")
         if verb == "delete":
@@ -42,8 +52,8 @@ class FakeRoute:
         return [c[2] for c in self.calls]
 
 
-def _rec(lk, monkeypatch, mode, initial=None, **kw):
-    fake = FakeRoute(initial)
+def _rec(lk, monkeypatch, mode, initial=None, broken=(), **kw):
+    fake = FakeRoute(initial, broken=broken)
     monkeypatch.setattr(lk.subprocess, "run", fake.run)
     return lk.DefaultRouteReconciler(mode=mode, **kw), fake
 
@@ -179,3 +189,105 @@ def test_empty_table_reads_as_no_default(lk, monkeypatch):
     rec, fake = _rec(lk, monkeypatch, "enforce")
     assert rec._fib_default_gateway() is None  # returncode 1 -> None, not a raise
     assert fake.verbs == ["get"]
+
+
+def test_get_without_gateway_line_reads_absent(lk, monkeypatch):
+    # route get succeeds (rc 0) for an interface-scoped default with no gateway
+    # field (e.g. a point-to-point/PPP default) -- parses as "no default".
+    monkeypatch.setattr(lk.subprocess, "run", lambda *a, **k: types.SimpleNamespace(
+        returncode=0, stdout="   interface: pppoe0\n   flags: <UP>\n", stderr=""))
+    rec = lk.DefaultRouteReconciler(mode="enforce")
+    assert rec._fib_default_gateway() is None
+
+
+def test_get_failure_reads_absent_quietly(lk, monkeypatch, caplog):
+    # a failed / empty-table `route get` is the quiet steady state on a backup:
+    # read as "no default" with NO warning -- route(8) wording varies by
+    # platform, so a stuck op is caught by the install/withdraw confirm instead.
+    monkeypatch.setattr(lk.subprocess, "run", lambda *a, **k: types.SimpleNamespace(
+        returncode=1, stdout="", stderr="route: not in table"))
+    rec = lk.DefaultRouteReconciler(mode="enforce")
+    with caplog.at_level("WARNING", logger="lease-keeper"):
+        assert rec._fib_default_gateway() is None
+    assert not [r for r in caplog.records if r.levelname in ("WARNING", "ERROR")]
+
+
+def test_run_swallows_subprocess_exception(lk, monkeypatch):
+    def boom(*_a, **_k):
+        raise OSError("route binary missing")
+    monkeypatch.setattr(lk.subprocess, "run", boom)
+    rec = lk.DefaultRouteReconciler(mode="enforce")
+    assert rec._fib_default_gateway() is None
+    rec.reconcile(True, True, GW)  # must not raise out of the maintain loop
+
+
+# ---- unknown / invalid construction ----
+
+def test_unknown_mode_coerces_to_off_and_warns(lk, monkeypatch, caplog):
+    with caplog.at_level("WARNING", logger="lease-keeper"):
+        rec, fake = _rec(lk, monkeypatch, "bogus")
+    assert rec.mode is lk.DefaultRouteMode.OFF and rec.enabled is False
+    assert any("unknown default-route mode" in r.getMessage() for r in caplog.records)
+    rec.reconcile(True, True, GW)
+    assert not fake.calls  # off is inert: never even reads the FIB
+
+
+def test_valid_mode_maps_through_verbatim(lk, monkeypatch):
+    rec, _ = _rec(lk, monkeypatch, "enforce")
+    assert rec.mode is lk.DefaultRouteMode.ENFORCE and rec.enabled is True
+
+
+def test_mode_is_read_only(lk, monkeypatch):
+    rec, _ = _rec(lk, monkeypatch, "observe")
+    with pytest.raises(AttributeError):
+        rec.mode = lk.DefaultRouteMode.ENFORCE  # set-once, no setter
+
+
+def test_strike_limit_must_be_positive(lk):
+    with pytest.raises(ValueError):
+        lk.DefaultRouteReconciler(mode="enforce", unreadable_role_strikes=0)
+
+
+# ---- a bogus / rogue option-3 gateway is never installed ----
+
+def test_bogus_gateway_is_not_installed(lk, monkeypatch):
+    rec, fake = _rec(lk, monkeypatch, "enforce")
+    rec.reconcile(True, True, "0.0.0.0")  # rogue / malformed option 3
+    assert fake.gw is None and "add" not in fake.verbs
+
+
+def test_bogus_gateway_withdraws_existing(lk, monkeypatch):
+    # master+bound but an unusable gateway must not KEEP a default it can't honour.
+    rec, fake = _rec(lk, monkeypatch, "enforce", initial=GW)
+    rec.reconcile(True, True, "0.0.0.0")
+    assert fake.gw is None and "delete" in fake.verbs
+
+
+def test_bound_without_gateway_withdraws(lk, monkeypatch):
+    # a lease with no router option (gateway None) cannot back a default -> withdraw,
+    # and _sane_ipv4(None) must be handled, not raise.
+    rec, fake = _rec(lk, monkeypatch, "enforce", initial=GW)
+    rec.reconcile(True, True, None)
+    assert fake.gw is None and "delete" in fake.verbs
+
+
+# ---- a genuine route-command failure is surfaced, not buried as a no-op ----
+
+def test_failed_withdraw_is_logged_and_default_stays(lk, monkeypatch, caplog):
+    rec, fake = _rec(lk, monkeypatch, "enforce", initial=GW, broken={"delete"})
+    with caplog.at_level("ERROR", logger="lease-keeper"):
+        rec.reconcile(False, False, None)  # backup -> should withdraw, but delete is stuck
+    assert fake.gw == GW  # the default is still in the FIB (the fail-stop breach we must SEE)
+    assert any("failed to withdraw default" in r.getMessage() for r in caplog.records)
+    assert not any("withdrew default" in r.getMessage() for r in caplog.records)
+
+
+def test_stuck_delete_on_replace_keeps_old_and_errors(lk, monkeypatch, caplog):
+    # the delete of the old default is stuck, so the add of the new one fails
+    # "already in table" and the FIB keeps the OLD gateway -- the confirm catches
+    # what a non-zero exit alone could not tell from a benign no-op.
+    rec, fake = _rec(lk, monkeypatch, "enforce", initial=GW, broken={"delete"})
+    with caplog.at_level("ERROR", logger="lease-keeper"):
+        rec.reconcile(True, True, GW2)  # replace GW -> GW2
+    assert fake.gw == GW  # old gateway kept, not silently overwritten
+    assert any("failed to install default via " + GW2 in r.getMessage() for r in caplog.records)

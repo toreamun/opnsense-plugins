@@ -25,7 +25,7 @@ LOG = logging.getLogger(LOGGER_NAME)
 
 
 @dataclass
-class Lease:
+class Lease:  # pylint: disable=too-many-instance-attributes
     """The held DHCP binding: address, granting server, timing, and the
     routing facts (options 3/1) the Parameter Request List asks for. During
     a DORA it briefly holds the unconfirmed OFFER candidate; otherwise it is
@@ -39,6 +39,11 @@ class Lease:
     t2_server: int | None = None   # server-provided rebinding time (DHCP opt 59)
     router: str | None = None      # default gateway (DHCP opt 3, fallback: server)
     mask_bits: int | None = None   # subnet prefix length from opt 1
+    # The opt-3 gateway of the CURRENT lease, for the route reconciler: unlike the
+    # sticky `router` above (kept as a nudge/logging hint), this is None when the
+    # lease in hand did not itself supply a router, so a new lease that omits it is
+    # never routed via the previous lease's (possibly wrong-subnet) gateway.
+    lease_router: str | None = None
 
 
 class DhcpClient:  # pylint: disable=too-many-instance-attributes
@@ -114,17 +119,26 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
                 return rx
         return None
 
-    def _absorb_reply(self, rx, default_lease):
+    def _absorb_reply(self, rx, default_lease, fresh_bind=False):
         """Adopt lease timing, gateway (opt 3) and subnet mask (opt 1) from an ACK
         -- the one place that knows which DhcpReply fields carry lease state.
         gateway + mask are what the Parameter Request List asks for; keep them for
         logging + the cross-subnet follow decision. The lease time is floored at
         MIN_LEASE so a server (or a spoofed ACK) offering a 1-second lease cannot
-        drive the renew loop into a tight broadcast/CPU spin."""
+        drive the renew loop into a tight broadcast/CPU spin. fresh_bind: this ACK
+        is a new binding (a DORA/adopt), not a renew of the held lease."""
         self.binding.lease_secs = max(rx.lease or default_lease, MIN_LEASE)
         self.binding.t1_server, self.binding.t2_server = rx.t1, rx.t2
         self.binding.router = rx.router or self.binding.router
         self.binding.mask_bits = _mask_to_bits(rx.subnet_mask) or self.binding.mask_bits
+        # lease_router tracks the CURRENT lease's own gateway (see the field). A
+        # fresh bind takes it verbatim from this ACK (None if the ACK omits opt 3,
+        # so no default is installed via a stale gateway); a renew of the same
+        # address keeps the current lease's gateway unless the ACK refreshes it.
+        if fresh_bind:
+            self.binding.lease_router = rx.router
+        else:
+            self.binding.lease_router = rx.router or self.binding.lease_router
 
     def adopt(self, rx):
         """Bind to the address in rx: the ACK that completes a DORA, or a
@@ -134,7 +148,7 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
         the ACK's server-id, keeping the previous one when the ACK has none."""
         self.binding.yiaddr = rx.yiaddr
         self.binding.server = rx.server_id or self.binding.server
-        self._absorb_reply(rx, DEFAULT_LEASE)
+        self._absorb_reply(rx, DEFAULT_LEASE, fresh_bind=True)
 
     def expire(self):
         """Forget the held binding WITHOUT a RELEASE (on-time lease expiry, or a
@@ -168,7 +182,15 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
         the offer until the ACK lands). Returns True once BOUND, False on
         failure/NAK."""
         self.xid = _new_xid()
-        return self._discover(request_ip) and self._request_offer(request_ip)
+        if self._discover(request_ip) and self._request_offer(request_ip):
+            return True
+        # A failed DORA (NAK / timeout after an OFFER) must not leave the
+        # unconfirmed offered address in binding.yiaddr: _discover parks it there
+        # so _request_offer can REQUEST it, but _maintain_step reads a set yiaddr
+        # as "bound" and would then renew -- and the route reconciler install a
+        # default for -- a lease we never actually got. Clear it so we re-acquire.
+        self.binding.yiaddr = None
+        return False
 
     def _discover(self, request_ip):
         """SELECTING: broadcast DISCOVER until a server OFFERs; record the

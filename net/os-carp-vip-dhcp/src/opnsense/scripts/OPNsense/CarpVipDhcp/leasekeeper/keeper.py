@@ -79,6 +79,13 @@ class _SignalFlags:
         self._recheck_role = True
 
     # -- main-loop side --
+    # take_*() reads-then-clears and is NOT masked against signal delivery: a
+    # signal landing between the read and the store can be erased by the store,
+    # dropping that one edge. This needs no lock or signal masking because each
+    # edge has a periodic fallback -- a dropped CARP re-check (SIGUSR2) is caught
+    # by the next per-tick role poll, and the periodic ARP nudge keeps reachability
+    # fresh regardless of a dropped manual nudge (SIGUSR1) -- so a lost edge costs
+    # at most one poll interval of latency, never a missed state change.
     @property
     def stopping(self):
         """Terminal stop flag; polled (never cleared) by every loop/sleep guard."""
@@ -421,20 +428,24 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         """Drive the IPv4 default route toward its CARP-role-owned desired state
         (install 0/0 via the lease gateway only while master AND holding a lease;
         withdraw it otherwise -- see leasekeeper/route.py). Level-triggered and
-        idempotent, so it rides the CARP-role cadence -- the per-tick heartbeat
-        probe (bound) and the acquire loop (unbound), plus the SIGUSR2 CARP edge
-        -- and converges without having to catch every transition. No-op unless a
+        idempotent, so it can ride every point that changes the inputs -- the
+        per-tick heartbeat probe (bound), the acquire arm (unbound and just after
+        a successful acquire), the SIGUSR2 CARP edge, and a fail-stop non-master
+        withdraw at startup and on shutdown -- converging without having to catch
+        every transition. No-op unless a
         vhid is configured (no CARP role to key on) and the mode is
         observe/enforce. `master` reuses the tick's probe when the caller has it.
 
-        Passes bound=yiaddr-is-set and gateway=binding.router; reconcile() owns
-        the contract for why bound must not be inferred from the sticky gateway."""
+        Passes bound=yiaddr-is-set and gateway=binding.lease_router (the CURRENT
+        lease's own opt-3 gateway, not the sticky binding.router hint), so a new
+        lease that omits option 3 never installs a default via a stale gateway;
+        reconcile() owns the contract for why bound must not be inferred from it."""
         if not self._cfg.vhid or not self._defroute.enabled:
             return
         if master is _UNSET:
             master = self._probe_carp_master()
         b = self._dhcp.binding
-        self._defroute.reconcile(master, b.yiaddr is not None, b.router)
+        self._defroute.reconcile(master, b.yiaddr is not None, b.lease_router)
 
     # ---- ARP nudge ----
 
@@ -580,6 +591,11 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
     def run(self):
         """The daemon main loop: capture up, then maintain the lease until
         stopped. Never raises; returns the process exit code."""
+        # Fail-stop on startup, before the capture-retry loop below can block: a
+        # predecessor that crashed (no graceful withdraw) may have left a default
+        # in the FIB. We hold no lease yet, so reconcile as non-master to withdraw
+        # any such stale default even if capture never (re)opens.
+        self._reconcile_default_route(master=False)
         # Start the packet capture, retrying forever: a keeper must self-heal, not
         # die, if the interface is briefly unavailable at startup.
         while not self._signals.stopping and not self._capture.start():
@@ -606,7 +622,11 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
                     pass
                 self._sleep(LOOP_ERROR_BACKOFF)
 
-        # shutdown
+        # shutdown: relinquish an owned default so a stopped, disabled or
+        # mode-changed (enforce -> off) enforcing keeper does not leave 0/0 in the
+        # FIB, still redistributed by FRR, with nothing managing it. Reconcile as
+        # non-master -> withdraw; observe logs a would-withdraw and off is a no-op.
+        self._reconcile_default_route(master=False)
         if self._cfg.release_on_exit:
             self._dhcp.release()
         self._capture.stop()
@@ -728,6 +748,11 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
             self._hb()
             self._arp_nudge(force=True)
             self.redora_wait = REDORA_MIN
+            # Own the default now the lease is in hand: the pre-acquire reconcile
+            # saw bound=False, and _hold_lease's first tick is a full HB_REFRESH
+            # away -- without this a freshly-acquired master would sit with no
+            # default for up to that interval (fail-stop, but a needless gap).
+            self._reconcile_default_route()
         else:
             LOG.warning("DHCP acquire (DISCOVER/REQUEST) failed -- retrying in %ds", self.redora_wait)
             if not self._wait_unbound(_jittered(self.redora_wait)):

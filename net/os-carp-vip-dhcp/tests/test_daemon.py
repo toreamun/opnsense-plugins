@@ -1122,20 +1122,20 @@ def test_default_route_forwards_role_bound_gateway(lk):
     rec = _RecordingReconciler()
     k._defroute = rec
     k._dhcp.binding.yiaddr = "100.64.4.7"
-    k._dhcp.binding.router = "100.64.4.1"
+    k._dhcp.binding.lease_router = "100.64.4.1"
     k._reconcile_default_route(master=True)
     assert rec.calls == [(True, True, "100.64.4.1")]
 
 
 def test_default_route_bound_keyed_on_yiaddr_not_router(lk):
-    # binding.router is a sticky hint that survives a lease loss; bound must be
-    # keyed on yiaddr, so a lost lease (yiaddr None, router still set) reconciles
-    # as unbound and the reconciler withdraws.
+    # lease_router lingers after a lease loss (expire() clears only yiaddr); bound
+    # must be keyed on yiaddr, so a lost lease (yiaddr None, gateway still set)
+    # reconciles as unbound and the reconciler withdraws.
     k = _keeper(lk, vhid=254, default_route_mode="enforce")
     rec = _RecordingReconciler()
     k._defroute = rec
     k._dhcp.binding.yiaddr = None
-    k._dhcp.binding.router = "100.64.4.1"    # stale last-known gateway
+    k._dhcp.binding.lease_router = "100.64.4.1"    # lingering gateway from the lost lease
     k._reconcile_default_route(master=True)
     assert rec.calls == [(True, False, "100.64.4.1")]
 
@@ -1146,7 +1146,7 @@ def test_default_route_probes_role_when_not_supplied(lk):
     k._defroute = rec
     k._probe_carp_master = lambda: False
     k._dhcp.binding.yiaddr = "100.64.4.7"
-    k._dhcp.binding.router = "100.64.4.1"
+    k._dhcp.binding.lease_router = "100.64.4.1"
     k._reconcile_default_route()             # no master arg -> probe it
     assert rec.calls == [(False, True, "100.64.4.1")]
 
@@ -1161,7 +1161,8 @@ def test_default_route_needs_vhid(lk):
     assert not rec.calls
 
 
-# ---- the reconcile is actually driven from all three main-loop call-sites ----
+# ---- the reconcile is driven from every call-site (startup, bound tick, unbound
+# acquire arm, SIGUSR2 edge, post-acquire, and shutdown) ----
 
 def test_sigusr2_edge_drives_default_route_reconcile(lk):
     k = _keeper(lk, vhid=254, default_route_mode="enforce")
@@ -1174,7 +1175,7 @@ def test_sigusr2_edge_drives_default_route_reconcile(lk):
         return True
     k._probe_carp_master = probe
     k._dhcp.binding.yiaddr = "100.64.4.7"
-    k._dhcp.binding.router = "100.64.4.1"
+    k._dhcp.binding.lease_router = "100.64.4.1"
     k._signals.request_recheck_role()          # what the CARP syshook's SIGUSR2 sets
     k._sleep_interruptible(1)
     assert rec.calls == [(True, True, "100.64.4.1")]   # reconciled on the failover edge
@@ -1188,7 +1189,7 @@ def test_hold_lease_tick_drives_default_route_reconcile(lk):
     k._probe_carp_master = lambda: True
     k._sleep_interruptible = lambda _s: True   # one chunk, no real sleep
     k._dhcp.binding.yiaddr = "100.64.4.7"
-    k._dhcp.binding.router = "100.64.4.1"
+    k._dhcp.binding.lease_router = "100.64.4.1"
     k._hold_lease(1)
     assert (True, True, "100.64.4.1") in rec.calls
 
@@ -1206,4 +1207,90 @@ def test_acquire_step_reconciles_when_unbound(lk):
     k._sleep_interruptible = lambda _s: True
     k._dhcp.binding.yiaddr = None              # unbound
     k._acquire_step()
-    assert rec.calls == [(True, False, k._dhcp.binding.router)]   # bound=False
+    assert rec.calls == [(True, False, k._dhcp.binding.lease_router)]   # bound=False
+
+
+def test_acquire_success_reconciles_immediately(lk):
+    # A fresh acquire owns the default at once, not after the first HB_REFRESH tick.
+    k = _keeper(lk, vhid=254, default_route_mode="enforce")
+    rec = _RecordingReconciler()
+    k._defroute = rec
+    k._ensure_sniffer = lambda: None
+    k._probe_carp_master = lambda: True
+    k._iface_link_up = lambda: True
+    k._dhcp.binding.yiaddr = None
+    k._dhcp.binding.lease_router = "100.64.4.1"
+
+    def fake_acquire(_rip):
+        k._dhcp.binding.yiaddr = "100.64.4.7"   # the acquire binds
+        return True
+    k._dhcp.acquire = fake_acquire
+    k._acquire_step()
+    # pre-acquire reconcile saw unbound; the post-acquire one installs
+    assert rec.calls == [(True, False, "100.64.4.1"), (True, True, "100.64.4.1")]
+
+
+def test_shutdown_withdraws_owned_default(lk, monkeypatch):
+    # Stopping an enforcing keeper relinquishes its default so it is not left in
+    # the FIB (and redistributed by FRR) with nothing managing it.
+    monkeypatch.setattr(lk.time, "sleep", lambda *_a, **_k: None)
+    k = _keeper(lk, vhid=254, default_route_mode="enforce")
+    rec = _RecordingReconciler()
+    k._defroute = rec
+    k._capture.start = lambda: True
+    k._capture.stop = lambda: None
+    k._signals.request_stop()          # exit at once -> straight to the shutdown path
+    assert k.run() == 0
+    assert (False, False, None) in rec.calls   # reconcile as non-master -> withdraw
+
+
+def test_startup_withdraws_stale_default_before_capture(lk, monkeypatch):
+    # A crashed predecessor's default is withdrawn at startup even if capture
+    # cannot (re)open -- the reconcile runs before the capture-retry loop.
+    monkeypatch.setattr(lk.time, "sleep", lambda *_a, **_k: None)
+    k = _keeper(lk, vhid=254, default_route_mode="enforce")
+    rec = _RecordingReconciler()
+    k._defroute = rec
+
+    def failing_start():
+        k._signals.request_stop()   # stop after the first failed attempt
+        return False                # capture never opens
+    k._capture.start = failing_start
+    k._capture.stop = lambda: None
+    assert k.run() == 0
+    assert rec.calls[0] == (False, False, None)   # the startup reconcile ran first
+
+
+def test_lease_router_reset_on_fresh_bind_without_option3(lk):
+    # A new lease that omits option 3 must not inherit the previous lease's gateway
+    # (the route reconciler installs from lease_router; a stale value would route
+    # the new lease via the old, possibly wrong-subnet, gateway).
+    c = _client(lk)
+    c.adopt(lk.DhcpReply(lk.ACK, "100.64.4.7", "100.64.4.1", 1800, None, None, "100.64.4.1"))
+    assert c.binding.lease_router == "100.64.4.1"
+    c.adopt(lk.DhcpReply(lk.ACK, "100.64.5.7", "100.64.5.1", 1800, None, None, None))  # new addr, no opt 3
+    assert c.binding.lease_router is None      # reset -> reconciler withdraws, does not install stale
+    assert c.binding.router == "100.64.4.1"    # the sticky nudge/log hint is untouched
+
+
+def test_lease_router_kept_across_option3_less_renew(lk):
+    # A RENEW of the SAME lease that omits option 3 keeps the current gateway.
+    c = _client(lk)
+    c.adopt(lk.DhcpReply(lk.ACK, "100.64.4.7", "100.64.4.1", 1800, None, None, "100.64.4.1"))
+    c._absorb_reply(lk.DhcpReply(lk.ACK, "100.64.4.7", "100.64.4.1", 1800, None, None, None), 1800)
+    assert c.binding.lease_router == "100.64.4.1"
+
+
+def test_failed_dora_clears_unconfirmed_offer(lk):
+    # A NAK after the OFFER must not leave the offered address in yiaddr: the
+    # maintain loop reads a set yiaddr as bound and would then renew -- and the
+    # route reconciler install a default for -- a lease that was never confirmed.
+    c = _client(lk)
+    c._ensure_sniffer = lambda: None
+    replies = iter([
+        lk.DhcpReply(lk.OFFER, "100.64.4.7", "100.64.4.1", 1800, None, None, "100.64.4.1"),  # OFFER
+        lk.DhcpReply(lk.NAK, None, "100.64.4.1", None, None, None, None),                     # REQUEST -> NAK
+    ])
+    c._wait_for_dhcp_reply = lambda want, timeout: next(replies, None)
+    assert c.dora("100.64.4.7") is False
+    assert c.binding.yiaddr is None   # cleared -> re-acquire, never a phantom bound

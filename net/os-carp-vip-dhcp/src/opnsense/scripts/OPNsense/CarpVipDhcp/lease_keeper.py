@@ -186,78 +186,84 @@ def main():
     a = _build_arg_parser().parse_args()
     _setup_logging(a.logfile)
 
-    # Fail-stop FIRST, before any early exit below: a crashed predecessor (whose
-    # backend is now missing, or that was restarted with a bad arg) may have left a
-    # default in the FIB, still redistributed by FRR. Withdraw it as non-master
-    # here -- pure route(8), no capture backend -- since the backend preflight and
-    # the arg checks can each return before Keeper.run() would otherwise do it.
-    # Skipped for --once (a wiring test, not a supervised service restart), and
-    # when there is no CARP vhid (nothing owns a default route by role).
-    if not a.once and a.vhid:
-        DefaultRouteReconciler.withdraw_if_enabled(a.default_route_mode)
-
-    # Fail fast (with a logged reason) if the selected backend cannot run on
-    # this host -- checked uniformly through the registry so a future backend
-    # with an optional dependency is covered without a special case here.
-    reason = CAPTURE_BACKENDS[a.capture_backend].unavailable_reason()
-    if reason is not None:
-        LOG.critical("capture backend %r cannot run: %s -- the lease keeper cannot start",
-                     a.capture_backend, reason)
-        return 3
-    LOG.info("capture backend: %s", a.capture_backend)
-
-    for label, mac in (("chaddr", a.chaddr), ("eth-src", a.eth_src)):
-        if mac and not MAC_RE.match(mac):
-            LOG.error("invalid %s MAC address: %r", label, mac)
-            return 2
-
-    k = Keeper(a.iface, a.chaddr, a.request, a.eth_src,
-               hbfile=a.hbfile, release_on_exit=a.release_on_exit or a.once,
-               vhid=a.vhid, follow=a.follow,
-               vendor_class=a.vendor_class, client_id=a.client_id, hostname=a.hostname,
-               arp_nudge=a.arp_nudge, arp_listen_promisc=a.arp_listen_promisc,
-               capture_backend=a.capture_backend, default_route_mode=a.default_route_mode)
-
-    if a.arp_listen_promisc:
-        LOG.warning("ARP listen: PROMISCUOUS capture enabled on %s -- the daemon now "
-                    "sees all traffic on the segment (opt-in fallback for NICs that "
-                    "drop the gateway's unicast ARP reply otherwise)", a.iface)
-
-    def _sig(*_):
-        # Flag only -- no logging or other non-async-signal-safe work in the
-        # handler (like the SIGUSR1/2 handlers below). set_wakeup_fd wakes the
-        # loop at once; run() logs "stopped" when it exits.
-        k.request_stop()
-    signal.signal(signal.SIGINT, _sig)
-    signal.signal(signal.SIGTERM, _sig)
-
-    def _sig_arp_nudge(*_):
-        # Operator-requested immediate ARP nudge (configd action / kill -USR1).
-        k.trigger_nudge()
-    signal.signal(signal.SIGUSR1, _sig_arp_nudge)  # type: ignore[attr-defined]  # pylint: disable=no-member
-
-    def _sig_carp(*_):
-        # CARP transition (rc.syshook.d/carp/50-carpvipdhcp sends SIGUSR2).
-        k.recheck_carp_role()
-    signal.signal(signal.SIGUSR2, _sig_carp)  # type: ignore[attr-defined]  # pylint: disable=no-member
-
-    if a.once:
-        return k.claim_once()
-
-    # Wake the maintain-loop sleep the instant a signal is delivered: Python's
-    # C-level signal machinery writes the signal number to this fd, which is
-    # async-signal-safe and needs no work in the handler (the _sig* handlers
-    # above only set a flag). The loop selects on the read end and drains it.
-    signal.set_wakeup_fd(k.wake_fileno())
-
-    pf = acquire_pidfile(a.pidfile)
+    # Single-instance guard BEFORE any FIB mutation: the startup fail-stop withdraw
+    # below deletes a default, so a duplicate start (pidfile held by the live owner)
+    # must exit HERE -- already running -- rather than clobber the owner's default
+    # and only then discover it is the duplicate. Held across the withdraw and the
+    # backend/arg checks; the finally releases it on every exit. --once is a wiring
+    # test: no guard and no FIB mutation, so it takes neither (pf stays None).
+    pf = None if a.once else acquire_pidfile(a.pidfile)
     try:
-        return k.run()
+        # Fail-stop: a crashed predecessor (whose backend is now missing, or that
+        # was restarted with a bad arg) may have left a default in the FIB, still
+        # redistributed by FRR. Withdraw it as non-master here -- pure route(8), no
+        # capture backend -- BEFORE the backend preflight and the arg checks, each
+        # of which can return before Keeper.run() would otherwise do it. Skipped for
+        # --once, and when no CARP vhid owns a default route by role.
+        if not a.once and a.vhid:
+            DefaultRouteReconciler.withdraw_if_enabled(a.default_route_mode)
+
+        # Fail fast (with a logged reason) if the selected backend cannot run on
+        # this host -- checked uniformly through the registry so a future backend
+        # with an optional dependency is covered without a special case here.
+        reason = CAPTURE_BACKENDS[a.capture_backend].unavailable_reason()
+        if reason is not None:
+            LOG.critical("capture backend %r cannot run: %s -- the lease keeper cannot start",
+                         a.capture_backend, reason)
+            return 3
+        LOG.info("capture backend: %s", a.capture_backend)
+
+        for label, mac in (("chaddr", a.chaddr), ("eth-src", a.eth_src)):
+            if mac and not MAC_RE.match(mac):
+                LOG.error("invalid %s MAC address: %r", label, mac)
+                return 2
+
+        k = Keeper(a.iface, a.chaddr, a.request, a.eth_src,
+                   hbfile=a.hbfile, release_on_exit=a.release_on_exit or a.once,
+                   vhid=a.vhid, follow=a.follow,
+                   vendor_class=a.vendor_class, client_id=a.client_id, hostname=a.hostname,
+                   arp_nudge=a.arp_nudge, arp_listen_promisc=a.arp_listen_promisc,
+                   capture_backend=a.capture_backend, default_route_mode=a.default_route_mode)
+
+        if a.arp_listen_promisc:
+            LOG.warning("ARP listen: PROMISCUOUS capture enabled on %s -- the daemon now "
+                        "sees all traffic on the segment (opt-in fallback for NICs that "
+                        "drop the gateway's unicast ARP reply otherwise)", a.iface)
+
+        def _sig(*_):
+            # Flag only -- no logging or other non-async-signal-safe work in the
+            # handler (like the SIGUSR1/2 handlers below). set_wakeup_fd wakes the
+            # loop at once; run() logs "stopped" when it exits.
+            k.request_stop()
+        signal.signal(signal.SIGINT, _sig)
+        signal.signal(signal.SIGTERM, _sig)
+
+        def _sig_arp_nudge(*_):
+            # Operator-requested immediate ARP nudge (configd action / kill -USR1).
+            k.trigger_nudge()
+        signal.signal(signal.SIGUSR1, _sig_arp_nudge)  # type: ignore[attr-defined]  # pylint: disable=no-member
+
+        def _sig_carp(*_):
+            # CARP transition (rc.syshook.d/carp/50-carpvipdhcp sends SIGUSR2).
+            k.recheck_carp_role()
+        signal.signal(signal.SIGUSR2, _sig_carp)  # type: ignore[attr-defined]  # pylint: disable=no-member
+
+        if a.once:
+            return k.claim_once()
+
+        # Wake the maintain-loop sleep the instant a signal is delivered: Python's
+        # C-level signal machinery writes the signal number to this fd, which is
+        # async-signal-safe and needs no work in the handler (the _sig* handlers
+        # above only set a flag). The loop selects on the read end and drains it.
+        signal.set_wakeup_fd(k.wake_fileno())
+        try:
+            return k.run()
+        finally:
+            # Stop the C-level signal machinery from writing to the wake socket
+            # before run() closes it; otherwise a signal in the shutdown window
+            # writes to a closed fd (harmless, but noisy on stderr).
+            signal.set_wakeup_fd(-1)
     finally:
-        # Stop the C-level signal machinery from writing to the wake socket
-        # before run() closes it; otherwise a signal in the shutdown window
-        # writes to a closed fd (harmless, but noisy on stderr).
-        signal.set_wakeup_fd(-1)
         if pf and os.path.exists(pf):
             try:
                 os.unlink(pf)

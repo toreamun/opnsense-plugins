@@ -1,5 +1,6 @@
-"""Pure, stateless helpers: MAC/IP/mask conversions, address classification,
-filesystem-safe tokens, jitter, atomic writes and clock formatting.
+"""Pure helpers: MAC/IP/mask conversions, address classification, filesystem-safe
+tokens, jitter, atomic writes and clock formatting -- plus one small stateful
+utility, _RateLimit, for throttling noisy log lines.
 
 No project dependencies (stdlib only), so anything can import from here.
 """
@@ -10,6 +11,44 @@ import re
 import time
 
 MAC_RE = re.compile(r"^([0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}$")
+
+
+class _RateLimit:
+    """Monotonic-time throttle for noisy, possibly attacker-driven log lines.
+    ready() returns (ok, suppressed): ok is True at most once per `interval`
+    seconds, and suppressed is how many calls were dropped since the previous ok
+    -- so a malformed-packet or spoof storm collapses to one line per interval
+    that also reports how much it hid, instead of churning the log. Single-thread
+    use only (the call sites are the capture/main threads that already own their
+    logging); it holds no lock."""
+
+    def __init__(self, interval):
+        self._interval = interval
+        self._deadline = 0.0   # monotonic; 0 => the first call is always allowed
+        self._suppressed = 0
+
+    def ready(self):
+        """(ok, suppressed): ok True at most once per interval; suppressed is 0
+        while inside a window and, on the ok call, the count hidden since the
+        previous ok."""
+        now = time.monotonic()
+        if now >= self._deadline:
+            dropped, self._suppressed = self._suppressed, 0
+            self._deadline = now + self._interval
+            return True, dropped
+        self._suppressed += 1
+        return False, 0
+
+    def emit(self, log_fn, fmt, *args):
+        """Log `fmt % args` through log_fn at most once per interval, appending a
+        "(+N more suppressed)" note when calls were dropped since the last emit --
+        so the throttle and the suppressed-count wording live in one place instead
+        of at each call site."""
+        ok, dropped = self.ready()
+        if ok:
+            suffix = f" (+{dropped} more suppressed)" if dropped else ""
+            log_fn(fmt + "%s", *args, suffix)
+
 
 _CGNAT = ipaddress.ip_network("100.64.0.0/10")
 

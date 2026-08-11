@@ -122,8 +122,11 @@ def _parse_reply(frame) -> DhcpReply:
     gi = frame.giaddr   # relay agent; 0.0.0.0 = directly attached
     if gi in (None, "0.0.0.0", 0):
         gi = None
+    yi = frame.yiaddr   # 0.0.0.0 (a NAK, or a broken/rogue reply) = no address,
+    if yi in (None, "0.0.0.0", 0):  # normalized to None like giaddr so "bound"
+        yi = None                   # (truthy yiaddr) can never latch onto 0.0.0.0
     return DhcpReply(
-        mtype=opts.get(DhcpOptName.MESSAGE_TYPE), yiaddr=frame.yiaddr,
+        mtype=opts.get(DhcpOptName.MESSAGE_TYPE), yiaddr=yi,
         server_id=opts.get(DhcpOptName.SERVER_ID), lease=opts.get(DhcpOptName.LEASE_TIME),
         t1=opts.get(DhcpOptName.RENEWAL_TIME), t2=opts.get(DhcpOptName.REBINDING_TIME),
         router=opts.get(DhcpOptName.ROUTER), message=opts.get(DhcpOptName.MESSAGE),

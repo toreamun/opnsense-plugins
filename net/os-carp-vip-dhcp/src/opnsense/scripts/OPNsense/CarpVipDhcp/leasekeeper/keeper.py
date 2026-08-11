@@ -688,6 +688,14 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
                 break
             elapsed += step
             self._hb()   # still holding the lease until T2 -- keep the heartbeat fresh
+            # REBIND can span the whole T1..T2 window; keep the CARP-role
+            # bookkeeping and the default route reconciled here too, exactly as
+            # _hold_lease does per tick. Otherwise a failover during this degraded
+            # path relies solely on the SIGUSR2 edge, with no periodic fallback
+            # for a missed one until REBIND exits.
+            master = self._probe_carp_master()
+            self._poll_carp_role(master)
+            self._reconcile_default_route(master)
             if self._dhcp.renew(rebind=True):
                 ok = True
                 break

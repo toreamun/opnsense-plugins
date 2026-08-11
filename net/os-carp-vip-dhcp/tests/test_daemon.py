@@ -1294,3 +1294,81 @@ def test_failed_dora_clears_unconfirmed_offer(lk):
     c._wait_for_dhcp_reply = lambda want, timeout: next(replies, None)
     assert c.dora("100.64.4.7") is False
     assert c.binding.yiaddr is None   # cleared -> re-acquire, never a phantom bound
+
+
+def test_failed_dora_after_offer_timeout_clears_yiaddr(lk, monkeypatch):
+    # The timeout branch (OFFER received, then no ACK at all) reaches the same
+    # unconfirmed-offer clear as the NAK branch via a different control path, so
+    # a REQUEST that simply times out cannot leave a phantom bound yiaddr either.
+    monkeypatch.setattr(lk.time, "sleep", lambda *_a, **_k: None)
+    c = _client(lk)
+    c._ensure_sniffer = lambda: None
+    calls = {"n": 0}
+
+    def reply(_want, _timeout):
+        calls["n"] += 1
+        # the first wait is the DISCOVER's OFFER; every REQUEST wait after it times out
+        if calls["n"] == 1:
+            return lk.DhcpReply(lk.OFFER, "100.64.4.7", "100.64.4.1", 1800, None, None, "100.64.4.1")
+        return None
+    c._wait_for_dhcp_reply = reply
+    assert c.dora("100.64.4.7") is False
+    assert c.binding.yiaddr is None
+
+
+def test_renew_keeps_lease_router_when_ack_omits_option3(lk):
+    # renew() must absorb with fresh_bind=False, so a RENEW of the SAME lease whose
+    # ACK omits option 3 keeps the current gateway. A regression to fresh_bind=True
+    # would clear lease_router mid-lease -> reconcile sees gateway None -> withdraws
+    # the default under a still-healthy master. Drives renew(), not _absorb_reply.
+    c = _client(lk)
+    c.adopt(lk.DhcpReply(lk.ACK, "100.64.4.7", "100.64.4.1", 1800, None, None, "100.64.4.1"))
+    assert c.binding.lease_router == "100.64.4.1"
+    c._ensure_sniffer = lambda: None
+    c._wait_for_dhcp_reply = lambda _want, _timeout: lk.DhcpReply(
+        lk.ACK, "100.64.4.7", "100.64.4.1", 1800, None, None, None)   # same lease, no opt 3
+    assert c.renew() is True
+    assert c.binding.lease_router == "100.64.4.1"
+
+
+def test_parse_reply_normalizes_zero_yiaddr_to_none(lk):
+    # A 0.0.0.0 yiaddr (a NAK, or a broken/rogue reply) decodes to None like giaddr,
+    # so a truthy "0.0.0.0" can never be read as a held lease ("bound").
+    frame = _dhcp_frame(lk, 0x1234, [("message-type", lk.NAK), "end"], yiaddr="0.0.0.0")
+    assert lk._parse_reply(frame).yiaddr is None
+
+
+def test_rebind_loop_drives_default_route_reconcile(lk):
+    # The REBIND loop (T1..T2, after a failed RENEW) reconciles the default per
+    # iteration too -- the periodic fallback _hold_lease has -- so a failover during
+    # that degraded window converges even if its SIGUSR2 edge is missed.
+    k = _keeper(lk, vhid=254, default_route_mode="enforce")
+    rec = _RecordingReconciler()
+    k._defroute = rec
+    k._probe_carp_master = lambda: True
+    k._hb = lambda: None
+    k._arp_nudge = lambda *_a, **_k: None
+    k._hold_lease = lambda _s: True             # skip the T1 wait (its own reconcile too)
+    k._sleep_interruptible = lambda _s: True     # one REBIND step, no real sleep
+    k._dhcp.timing = lambda: (0, 100, "test")
+    k._dhcp.binding.yiaddr = "100.64.4.7"
+    k._dhcp.binding.lease_router = "100.64.4.1"
+    k._dhcp.renew = lambda rebind=False: bool(rebind)  # RENEW fails; first REBIND attempt succeeds
+    k._maintain_step()
+    assert (True, True, "100.64.4.1") in rec.calls   # reconciled inside the REBIND loop
+
+
+def test_startup_and_shutdown_drive_a_real_route_withdraw(lk, monkeypatch):
+    # End to end through the REAL DefaultRouteReconciler (not the recording stub):
+    # a stale default in the FIB is actually deleted via route(8), exercising the
+    # mode plumbing (default_route_mode -> constructed reconciler) and the withdraw.
+    from test_route import FakeRoute, GW as RGW  # noqa: E402  # pylint: disable=import-outside-toplevel
+    monkeypatch.setattr(lk.time, "sleep", lambda *_a, **_k: None)
+    fake = FakeRoute(initial=RGW)
+    monkeypatch.setattr(lk.subprocess, "run", fake.run)
+    k = _keeper(lk, vhid=254, default_route_mode="enforce")
+    k._capture.start = lambda: True
+    k._capture.stop = lambda: None
+    k._signals.request_stop()          # exit at once -> startup + shutdown non-master withdraw
+    assert k.run() == 0
+    assert "delete" in fake.verbs and fake.gw is None

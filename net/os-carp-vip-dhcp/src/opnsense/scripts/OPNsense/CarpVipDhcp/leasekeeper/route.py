@@ -185,8 +185,8 @@ class DefaultRouteReconciler:
         if have is None:
             return
         if not self._unreadable_warned:
-            LOG.warning("CARP role unreadable for %d checks -- dropping the default "
-                        "(fail-closed)", self._strikes)
+            LOG.warning("CARP role unreadable for %d checks -- failing closed on "
+                        "the default", self._strikes)
             self._unreadable_warned = True
         self._withdraw(have)
 

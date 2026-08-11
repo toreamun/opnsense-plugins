@@ -12,15 +12,17 @@ import pytest
 
 GW = "185.41.66.1"
 GW2 = "185.41.66.9"
+CGNAT_GW = "100.64.4.1"   # the production case: a 100.64/10 single-IP CGNAT WAN
 
 
 class FakeRoute:
     """In-memory stand-in for `/sbin/route`: one default nexthop, verb log."""
 
-    def __init__(self, initial=None, broken=()):
+    def __init__(self, initial=None, broken=(), lying=()):
         self.gw = initial
         self.calls = []
         self.broken = set(broken)  # verbs that fail with a genuine (non-benign) error
+        self.lying = set(lying)    # verbs that exit 0 but do NOT mutate the FIB
 
     def run(self, cmd, **_kwargs):  # capture_output / errors / timeout -- ignored
         self.calls.append(list(cmd))
@@ -38,7 +40,8 @@ class FakeRoute:
             if self.gw is not None:  # FreeBSD: add fails when a default already exists
                 return types.SimpleNamespace(
                     returncode=1, stdout="", stderr="route: writing to routing socket: File exists")
-            self.gw = cmd[-1]
+            if verb not in self.lying:  # a lying add exits 0 but leaves the FIB unchanged
+                self.gw = cmd[-1]
             return types.SimpleNamespace(returncode=0, stdout="", stderr="")
         if verb == "delete":
             existed = self.gw is not None
@@ -52,8 +55,9 @@ class FakeRoute:
         return [c[2] for c in self.calls]
 
 
-def _rec(lk, monkeypatch, mode, initial=None, broken=(), **kw):
-    fake = FakeRoute(initial, broken=broken)
+def _rec(lk, monkeypatch, mode, initial=None, *,  # pylint: disable=too-many-arguments
+         broken=(), lying=(), **kw):
+    fake = FakeRoute(initial, broken=broken, lying=lying)
     monkeypatch.setattr(lk.subprocess, "run", fake.run)
     return lk.DefaultRouteReconciler(mode=mode, **kw), fake
 
@@ -92,6 +96,36 @@ def test_enforce_idempotent_no_change_when_correct(lk, monkeypatch):
     rec.reconcile(True, True, GW)
     assert fake.gw == GW
     assert fake.verbs == ["get"]  # compare-then-act: no add/delete, no churn
+
+
+def test_install_reads_the_fib_back_to_confirm(lk, monkeypatch, caplog):
+    # the success path must CONFIRM the FIB (a second get after the add), not
+    # trust the add's exit code -- the read-back is what test_lying_add relies on.
+    rec, fake = _rec(lk, monkeypatch, "enforce")
+    with caplog.at_level("INFO", logger="lease-keeper"):
+        rec.reconcile(True, True, GW)
+    assert fake.verbs == ["get", "add", "get"]  # top read, install, confirm read-back
+    assert any(r.getMessage() == f"installed default via {GW}" for r in caplog.records)
+
+
+def test_lying_add_success_is_caught_by_confirm(lk, monkeypatch, caplog):
+    # route(8) exits 0 but the FIB did not actually take the default (a "lying"
+    # success): the confirm read-back, not the exit code, catches it. An
+    # implementation that trusted the add's returncode would falsely log success.
+    rec, fake = _rec(lk, monkeypatch, "enforce", lying={"add"})
+    with caplog.at_level("INFO", logger="lease-keeper"):
+        rec.reconcile(True, True, GW)
+    assert fake.gw is None  # never actually installed despite the rc 0
+    assert any(f"failed to install default via {GW}" in r.getMessage() for r in caplog.records)
+    assert not any(r.getMessage().startswith("installed default via") for r in caplog.records)
+
+
+def test_enforce_installs_cgnat_gateway(lk, monkeypatch):
+    # the plugin exists for a CGNAT single-IP WAN; a 100.64/10 gateway is the
+    # production case, so exercise the install through one end to end.
+    rec, fake = _rec(lk, monkeypatch, "enforce")
+    rec.reconcile(True, True, CGNAT_GW)
+    assert fake.gw == CGNAT_GW and "add" in fake.verbs
 
 
 def test_enforce_corrects_wrong_nexthop(lk, monkeypatch):
@@ -152,6 +186,21 @@ def test_definite_role_resets_strikes(lk, monkeypatch):
     rec.reconcile(True, True, GW)     # definite read resets the counter
     rec.reconcile(None, True, GW)     # strike 1 again, not 4
     assert fake.gw == GW              # still held, not withdrawn
+
+
+def test_unreadable_role_warns_once_per_episode_and_rearms(lk, monkeypatch, caplog):
+    # the fail-closed warning fires once per unreadable EPISODE (not per tick, and
+    # not once ever): a definite read re-arms it so a later episode warns again.
+    rec, fake = _rec(lk, monkeypatch, "enforce", initial=GW, unreadable_role_strikes=2)
+    with caplog.at_level("WARNING", logger="lease-keeper"):
+        for _ in range(5):            # first episode, well past the strike limit
+            rec.reconcile(None, True, GW)
+        assert len([r for r in caplog.records if "failing closed" in r.getMessage()]) == 1
+        rec.reconcile(True, True, GW)  # definite: resets strikes, re-arms, reinstalls
+        assert fake.gw == GW
+        for _ in range(5):            # second episode -> a second, distinct warning
+            rec.reconcile(None, True, GW)
+    assert len([r for r in caplog.records if "failing closed" in r.getMessage()]) == 2
 
 
 # ---- liveness gate (split-brain guard) ----
@@ -291,3 +340,15 @@ def test_stuck_delete_on_replace_keeps_old_and_errors(lk, monkeypatch, caplog):
         rec.reconcile(True, True, GW2)  # replace GW -> GW2
     assert fake.gw == GW  # old gateway kept, not silently overwritten
     assert any("failed to install default via " + GW2 in r.getMessage() for r in caplog.records)
+
+
+def test_fresh_install_add_failure_is_logged_absent(lk, monkeypatch, caplog):
+    # first install (no prior default) and the add itself fails: the replacing=None
+    # arm skips the delete, the add fails, and the confirm reads the FIB as absent
+    # -> a surfaced ERROR naming the empty FIB, not a silent claim of success.
+    rec, fake = _rec(lk, monkeypatch, "enforce", broken={"add"})
+    with caplog.at_level("ERROR", logger="lease-keeper"):
+        rec.reconcile(True, True, GW)
+    assert fake.gw is None
+    assert any(f"failed to install default via {GW}" in r.getMessage()
+               and "absent" in r.getMessage() for r in caplog.records)

@@ -1244,21 +1244,27 @@ def test_shutdown_withdraws_owned_default(lk, monkeypatch):
     assert (False, False, None) in rec.calls   # reconcile as non-master -> withdraw
 
 
-def test_startup_withdraws_stale_default_before_capture(lk, monkeypatch):
-    # A crashed predecessor's default is withdrawn at startup even if capture
-    # cannot (re)open -- the reconcile runs before the capture-retry loop.
-    monkeypatch.setattr(lk.time, "sleep", lambda *_a, **_k: None)
-    k = _keeper(lk, vhid=254, default_route_mode="enforce")
-    rec = _RecordingReconciler()
-    k._defroute = rec
+def test_fail_stop_withdraw_default_removes_stale_default(lk, monkeypatch):
+    # The startup fail-stop path is a standalone staticmethod (no Keeper, no capture
+    # backend) so main() runs it BEFORE the backend preflight / arg checks -- any of
+    # which can exit before Keeper.run(). A crashed enforcing predecessor's default
+    # is withdrawn here even when the backend can no longer load.
+    from test_route import FakeRoute, GW as RGW  # noqa: E402  # pylint: disable=import-outside-toplevel
+    fake = FakeRoute(initial=RGW)
+    monkeypatch.setattr(lk.subprocess, "run", fake.run)
+    lk.Keeper.fail_stop_withdraw_default("enforce", vhid=254)
+    assert "delete" in fake.verbs and fake.gw is None
 
-    def failing_start():
-        k._signals.request_stop()   # stop after the first failed attempt
-        return False                # capture never opens
-    k._capture.start = failing_start
-    k._capture.stop = lambda: None
-    assert k.run() == 0
-    assert rec.calls[0] == (False, False, None)   # the startup reconcile ran first
+
+def test_fail_stop_withdraw_default_inert_when_off_or_no_vhid(lk, monkeypatch):
+    # Gated exactly like _reconcile_default_route: off mode and no-vhid never touch
+    # the FIB (off is inert; no vhid means no CARP role to own a default by).
+    from test_route import FakeRoute, GW as RGW  # noqa: E402  # pylint: disable=import-outside-toplevel
+    fake = FakeRoute(initial=RGW)
+    monkeypatch.setattr(lk.subprocess, "run", fake.run)
+    lk.Keeper.fail_stop_withdraw_default("off", vhid=254)       # off -> inert
+    lk.Keeper.fail_stop_withdraw_default("enforce", vhid=None)   # no vhid -> inert
+    assert fake.gw == RGW and not fake.calls
 
 
 def test_lease_router_reset_on_fresh_bind_without_option3(lk):
@@ -1447,10 +1453,11 @@ def test_renew_success_reconciles_changed_gateway_immediately(lk):
     assert (True, True, "100.64.4.9") in rec.calls   # reconciled with the NEW gateway at once
 
 
-def test_startup_and_shutdown_drive_a_real_route_withdraw(lk, monkeypatch):
+def test_shutdown_drives_a_real_route_withdraw(lk, monkeypatch):
     # End to end through the REAL DefaultRouteReconciler (not the recording stub):
-    # a stale default in the FIB is actually deleted via route(8), exercising the
+    # on shutdown an owned default is actually deleted via route(8), exercising the
     # mode plumbing (default_route_mode -> constructed reconciler) and the withdraw.
+    # (The startup counterpart is Keeper.fail_stop_withdraw_default, tested above.)
     from test_route import FakeRoute, GW as RGW  # noqa: E402  # pylint: disable=import-outside-toplevel
     monkeypatch.setattr(lk.time, "sleep", lambda *_a, **_k: None)
     fake = FakeRoute(initial=RGW)
@@ -1458,6 +1465,6 @@ def test_startup_and_shutdown_drive_a_real_route_withdraw(lk, monkeypatch):
     k = _keeper(lk, vhid=254, default_route_mode="enforce")
     k._capture.start = lambda: True
     k._capture.stop = lambda: None
-    k._signals.request_stop()          # exit at once -> startup + shutdown non-master withdraw
+    k._signals.request_stop()          # exit at once -> the shutdown non-master withdraw
     assert k.run() == 0
     assert "delete" in fake.verbs and fake.gw is None

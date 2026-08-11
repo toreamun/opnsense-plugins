@@ -452,6 +452,22 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         b = self._dhcp.binding
         self._defroute.reconcile(master, b.yiaddr is not None, b.lease_router)
 
+    @staticmethod
+    def fail_stop_withdraw_default(default_route_mode, vhid):
+        """Withdraw a default a crashed predecessor may have left in the FIB, as a
+        non-master (we hold no lease at startup). This is pure route(8) with no
+        capture backend, so main() runs it BEFORE the backend preflight and the arg
+        checks -- each of which can return early, and Keeper.run() (which would
+        otherwise do this) then never executes, leaving a stale 0/0 installed and
+        redistributed while the supervisor keeps restarting. No-op unless a vhid is
+        configured and the mode is observe/enforce (the same gate, and the same
+        non-master withdraw, as _reconcile_default_route)."""
+        if not vhid:
+            return
+        reconciler = DefaultRouteReconciler(default_route_mode)
+        if reconciler.enabled:
+            reconciler.reconcile(is_master=False, bound=False, gateway=None)
+
     # ---- ARP nudge ----
 
     def _nudge_target(self):
@@ -595,12 +611,12 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
 
     def run(self):
         """The daemon main loop: capture up, then maintain the lease until
-        stopped. Never raises; returns the process exit code."""
-        # Fail-stop on startup, before the capture-retry loop below can block: a
-        # predecessor that crashed (no graceful withdraw) may have left a default
-        # in the FIB. We hold no lease yet, so reconcile as non-master to withdraw
-        # any such stale default even if capture never (re)opens.
-        self._reconcile_default_route(master=False)
+        stopped. Never raises; returns the process exit code.
+
+        The startup fail-stop withdraw (a crashed predecessor's stale default) runs
+        in main() via Keeper.fail_stop_withdraw_default BEFORE the backend preflight,
+        so it happens even when a backend/arg early-exit means run() is never
+        reached; the shutdown withdraw below is the graceful counterpart."""
         # Start the packet capture, retrying forever: a keeper must self-heal, not
         # die, if the interface is briefly unavailable at startup.
         while not self._signals.stopping and not self._capture.start():

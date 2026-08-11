@@ -1688,6 +1688,24 @@ def test_log_initial_carp_role_skips_without_vhid(lk, caplog):
     assert not any("initial CARP role" in r.getMessage() for r in caplog.records)
 
 
+def test_initial_unknown_carp_role_is_resolved_on_first_poll(lk, caplog):
+    # a transient ifconfig failure at startup gives "unknown"; it must not seed
+    # _was_master, so the first definite poll announces the role instead of the log
+    # staying stuck at "unknown".
+    k = _keeper(lk, vhid=254)
+    k._probe_carp_master = lambda: None
+    with caplog.at_level("INFO", logger="lease-keeper"):
+        k._log_initial_carp_role()
+    assert k._was_master is None
+    assert any("initial CARP role for vhid 254: unknown" in r.getMessage() for r in caplog.records)
+    caplog.clear()
+    with caplog.at_level("INFO", logger="lease-keeper"):
+        k._poll_carp_role(master=True)          # role becomes definite -> announced, no failover action
+    assert k._was_master is True
+    assert any("CARP role for vhid 254: MASTER" in r.getMessage() for r in caplog.records)
+    assert not k._renew_asap                     # initial determination, not a promotion
+
+
 def test_lease_changes_reports_lease_and_timer_deltas(lk):
     k = _keeper(lk)
     b = k._dhcp.binding

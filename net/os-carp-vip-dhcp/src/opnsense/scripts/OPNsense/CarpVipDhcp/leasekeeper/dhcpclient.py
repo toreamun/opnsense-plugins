@@ -115,7 +115,7 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
                 txt = _msg_text(rx.message)
                 reason = f" -- {txt}" if txt else ""
                 LOG.warning("DHCPNAK in %s for %s (server %s, xid 0x%08x%s)%s",
-                            phase, for_addr or "the requested address",
+                            phase, for_addr or "an unspecified address",
                             rx.server_id or "unknown", self.xid,
                             f" via relay {rx.giaddr}" if rx.giaddr else "", reason)
                 return rx

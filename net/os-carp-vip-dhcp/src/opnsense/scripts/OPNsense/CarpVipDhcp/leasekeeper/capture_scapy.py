@@ -10,7 +10,8 @@ from typing import Any
 from .constants import (
     LOGGER_NAME,
     ArpOp, DHCP_CLIENT_PORT, DHCP_SERVER_PORT, ETHER_BROADCAST, ETHER_ZERO,
-    THREAD_JOIN_TIMEOUT)
+    PARSE_ERROR_LOG_INTERVAL, THREAD_JOIN_TIMEOUT)
+from .util import _RateLimit
 from .wire import ArpFrame, BootpFrame, SNIFFER_FILTER, _deliver
 
 LOG = logging.getLogger(LOGGER_NAME)
@@ -53,6 +54,9 @@ class ScapyCapture:
         self._on_bootp = on_bootp
         self._on_arp = on_arp
         self._sniffer = None
+        # Throttle the untrusted-input parse-error line: a malformed/spoof storm
+        # must not churn the log (DEBUG still hits disk regardless of the view).
+        self._parse_errs = _RateLimit(PARSE_ERROR_LOG_INTERVAL)
 
     @staticmethod
     def unavailable_reason() -> "str | None":
@@ -78,7 +82,7 @@ class ScapyCapture:
             self._sniffer.start()
             return True
         except Exception as e:
-            LOG.error("DHCP-reply sniffer start failed: %s", e)
+            LOG.error("DHCP-reply sniffer start failed on %s: %s", self.iface, e)
             return False
 
     def stop(self):
@@ -122,7 +126,7 @@ class ScapyCapture:
                 arp = p[ARP]
                 frame, handler = ArpFrame(arp.op, arp.psrc, arp.pdst), self._on_arp
         except Exception as e:
-            LOG.debug("sniffed packet parse error: %s", e)
+            self._parse_errs.emit(LOG.debug, "sniffed packet parse error: %s", e)
             return
         _deliver(handler, frame)
 

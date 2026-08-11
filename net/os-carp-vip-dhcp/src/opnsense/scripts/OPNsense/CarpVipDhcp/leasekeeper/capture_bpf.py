@@ -13,13 +13,15 @@ from typing import Any
 
 from .constants import (
     LOGGER_NAME,
-    DHCP_CLIENT_PORT, DHCP_SERVER_PORT, ETHER_BROADCAST, THREAD_JOIN_TIMEOUT)
+    DHCP_CLIENT_PORT, DHCP_SERVER_PORT, ETHER_BROADCAST, PARSE_ERROR_LOG_INTERVAL,
+    THREAD_JOIN_TIMEOUT)
 from .codec import (BIOCGBLEN, BIOCGDLT, BIOCIMMEDIATE, BIOCPROMISC, BIOCSETF,
                     BIOCSETIF, BIOCSHDRCMPLT, DLT_EN10MB, ETHER_HDR_LEN,
                     ETHER_MIN_FRAME, ETHERTYPE_ARP, ETHERTYPE_IPV4, ETHERTYPE_OFF,
                     _BPF_FILTER, _bpf_frames, _decode_arp, _decode_ipv4_bootp,
                     _encode_arp_request, _encode_bootp_request, _encode_ether,
                     _encode_ipv4_udp)
+from .util import _RateLimit
 from .wire import _deliver
 
 LOG = logging.getLogger(LOGGER_NAME)
@@ -66,6 +68,9 @@ class BpfCapture:  # pylint: disable=too-many-instance-attributes
         self._thread = None            # the current reader thread
         self._stop_event = None        # set to ask the current reader to exit
         self._wake_writer = None       # write end of this generation's wake pipe
+        # Throttle the untrusted-input parse-error line: a malformed/spoof storm
+        # must not churn the log (DEBUG still hits disk regardless of the view).
+        self._parse_errs = _RateLimit(PARSE_ERROR_LOG_INTERVAL)
 
     @staticmethod
     def unavailable_reason() -> "str | None":
@@ -90,7 +95,7 @@ class BpfCapture:  # pylint: disable=too-many-instance-attributes
         except OSError as e:
             os.close(wake_reader)
             os.close(wake_writer)
-            LOG.error("bpf capture start failed on %s: %s", self.iface, e)
+            LOG.error("bpf open /dev/bpf failed (iface %s): %s", self.iface, e)
             return False
         try:
             self._configure(fd)
@@ -98,7 +103,7 @@ class BpfCapture:  # pylint: disable=too-many-instance-attributes
             os.close(fd)
             os.close(wake_reader)
             os.close(wake_writer)
-            LOG.error("bpf capture start failed on %s: %s", self.iface, e)
+            LOG.error("bpf configure failed on %s: %s", self.iface, e)
             return False
         stop_event = threading.Event()
         # The reader owns fd and wake_reader and closes them when it exits.
@@ -174,8 +179,8 @@ class BpfCapture:  # pylint: disable=too-many-instance-attributes
         if thread is not None and thread.is_alive():
             thread.join(timeout=THREAD_JOIN_TIMEOUT)
             if thread.is_alive():
-                LOG.warning("bpf reader did not exit within 2s -- leaving it to "
-                            "finish; its fd is not reused")
+                LOG.warning("bpf reader did not exit within %ss -- leaving it to "
+                            "finish; its fd is not reused", THREAD_JOIN_TIMEOUT)
 
     def alive(self):
         """True while the descriptor is open and the reader thread runs."""
@@ -198,7 +203,7 @@ class BpfCapture:  # pylint: disable=too-many-instance-attributes
                     data = os.read(fd, self._buflen)
                 except (OSError, ValueError):
                     if not stop_event.is_set():
-                        LOG.warning("bpf read failed -- capture thread exiting")
+                        LOG.warning("bpf read failed on %s -- capture thread exiting", self.iface)
                     return
                 for frame in _bpf_frames(data):
                     self._dispatch(frame)
@@ -223,7 +228,7 @@ class BpfCapture:  # pylint: disable=too-many-instance-attributes
                 elif ethertype == ETHERTYPE_IPV4:
                     decoded, handler = _decode_ipv4_bootp(frame[ETHER_HDR_LEN:]), self._on_bootp
         except Exception as e:
-            LOG.debug("bpf frame parse error: %s", e)
+            self._parse_errs.emit(LOG.debug, "bpf frame parse error: %s", e)
             return
         _deliver(handler, decoded)
 

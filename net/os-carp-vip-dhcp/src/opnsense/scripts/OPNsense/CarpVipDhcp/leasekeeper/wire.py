@@ -157,5 +157,9 @@ def _deliver(handler, frame):
         return
     try:
         handler(frame)
-    except Exception as e:  # pylint: disable=broad-exception-caught
-        LOG.debug("frame handler error: %s", e)
+    except Exception:  # pylint: disable=broad-exception-caught
+        # A handler bug, not malformed input (parse errors never reach here): make
+        # it visible at the default log view, with a traceback to fix it, rather
+        # than hiding it at DEBUG. We still swallow it so one bad frame cannot kill
+        # the capture thread.
+        LOG.warning("frame handler error -- dropping this frame", exc_info=True)

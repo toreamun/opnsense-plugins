@@ -107,11 +107,13 @@ def acquire_pidfile(path):
                               "owner) -- exiting", path, old)
                     sys.exit(4)
                 else:
-                    LOG.error("already running (pid %d) -- exiting", old)
+                    LOG.error("already running (pid %d, %s) -- exiting", old, path)
                     sys.exit(4)
             # Stale (dead pid or unreadable content): remove it and retry the create.
             try:
                 os.unlink(path)
+                LOG.info("replaced stale pidfile %s (dead pid %s)",
+                         path, old if old is not None else "unreadable")
             except OSError as e:
                 # If the stale file cannot be removed (e.g. a permission problem
                 # that will not self-heal), exit instead of spinning the
@@ -119,7 +121,7 @@ def acquire_pidfile(path):
                 LOG.error("cannot remove stale pidfile %s: %s -- exiting", path, e)
                 sys.exit(5)
         except OSError as e:
-            LOG.error("cannot write pidfile %s: %s", path, e)
+            LOG.critical("cannot write pidfile %s: %s -- exiting", path, e)
             sys.exit(5)
 
 
@@ -215,7 +217,7 @@ def main():
 
         for label, mac in (("chaddr", a.chaddr), ("eth-src", a.eth_src)):
             if mac and not MAC_RE.match(mac):
-                LOG.error("invalid %s MAC address: %r", label, mac)
+                LOG.critical("invalid %s MAC address %r -- the lease keeper cannot start", label, mac)
                 return 2
 
         k = Keeper(a.iface, a.chaddr, a.request, a.eth_src,

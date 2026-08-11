@@ -1358,6 +1358,29 @@ def test_rebind_loop_drives_default_route_reconcile(lk):
     assert (True, True, "100.64.4.1") in rec.calls   # reconciled inside the REBIND loop
 
 
+def test_renew_success_reconciles_changed_gateway_immediately(lk):
+    # A same-address renew that carries a new option-3 gateway must hit the FIB at
+    # once, not at the next per-tick poll: otherwise the default keeps routing via
+    # the old gateway for up to HB_REFRESH after the lease already changed.
+    k = _keeper(lk, vhid=254, default_route_mode="enforce")
+    rec = _RecordingReconciler()
+    k._defroute = rec
+    k._probe_carp_master = lambda: True
+    k._hb = lambda: None
+    k._arp_nudge = lambda *_a, **_k: None
+    k._hold_lease = lambda _s: True             # skip the T1 wait (its own reconcile too)
+    k._dhcp.timing = lambda: (0, 100, "test")
+    k._dhcp.binding.yiaddr = "100.64.4.7"
+    k._dhcp.binding.lease_router = "100.64.4.1"
+
+    def fake_renew(_rebind=False):
+        k._dhcp.binding.lease_router = "100.64.4.9"   # the renewal carries a new gateway
+        return True
+    k._dhcp.renew = fake_renew
+    k._maintain_step()
+    assert (True, True, "100.64.4.9") in rec.calls   # reconciled with the NEW gateway at once
+
+
 def test_startup_and_shutdown_drive_a_real_route_withdraw(lk, monkeypatch):
     # End to end through the REAL DefaultRouteReconciler (not the recording stub):
     # a stale default in the FIB is actually deleted via route(8), exercising the

@@ -668,6 +668,13 @@ only because the VIP, its on-link path to the gateway, is suppressed in backup s
 has the right default route installed, and the moment CARP brings the VIP up on it, that
 route starts working - **no routing reconfiguration on role change.**
 
+> **`defaultRouteMode`:** the design above is the baseline (`off`, the default), where
+> OPNsense installs the default on both nodes and it never moves. If you instead set a
+> keeper's `defaultRouteMode` to `enforce`, that keeper owns the default per CARP role
+> (install as master, withdraw otherwise), which requires the WAN gateway's **Mark
+> Gateway as Down** (`force_down`) so OPNsense does not also manage it. See the README's
+> default-route ownership section. In `off` this section applies unchanged.
+
 ```mermaid
 flowchart LR
     subgraph BK["Backup state"]

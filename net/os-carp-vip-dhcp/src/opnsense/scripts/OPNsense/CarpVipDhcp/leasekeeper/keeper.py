@@ -672,7 +672,12 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
             LOG.info("DHCP RENEW ok %s (lease=%ss, expires ~%s)",
                      b.yiaddr, b.lease_secs, _clock_at(b.lease_secs))
             self._hb()
-            self._arp_nudge(force=True)
+            # A renewed lease can carry a new option-3 gateway; reconcile now (one
+            # shared CARP probe, as _hold_lease does) so the FIB tracks it at once
+            # instead of only at the next per-tick poll.
+            master = self._probe_carp_master()
+            self._reconcile_default_route(master)
+            self._arp_nudge(force=True, master=master)
             return
         LOG.warning("DHCP RENEW failed at T1 -- trying REBIND until T2")
 
@@ -703,7 +708,11 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
             LOG.info("DHCP REBIND ok %s (lease=%ss, expires ~%s)",
                      b.yiaddr, b.lease_secs, _clock_at(b.lease_secs))
             self._hb()
-            self._arp_nudge(force=True)
+            # As with RENEW above: a rebound lease can carry a new gateway, so
+            # reconcile immediately rather than waiting for the next poll.
+            master = self._probe_carp_master()
+            self._reconcile_default_route(master)
+            self._arp_nudge(force=True, master=master)
             return
 
         LOG.error("DHCP lease expired -- re-acquiring (back to DISCOVER)")

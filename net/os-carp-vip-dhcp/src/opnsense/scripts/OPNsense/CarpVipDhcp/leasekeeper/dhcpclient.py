@@ -329,7 +329,12 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
                 return False
             rx = self._wait_for_dhcp_reply(ACK, RENEW_TIMEOUT)
             if rx and rx.mtype == NAK:
-                return False   # NAK -> re-DORA
+                # DHCPNAK: the server revoked the lease. RFC 2131 4.4.5 says go back
+                # to INIT (re-DISCOVER), not keep REBINDing an address it refused, so
+                # forget the binding here; the caller withdraws any owned default and
+                # re-acquires. expire() keeps the server/router hints for the re-DORA.
+                self.expire()
+                return False
             if rx:
                 got = rx.yiaddr
                 if got and got != self.binding.yiaddr:

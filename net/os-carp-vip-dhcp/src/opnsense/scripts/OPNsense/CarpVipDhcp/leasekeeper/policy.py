@@ -10,8 +10,9 @@ from dataclasses import dataclass, field
 from .constants import (
     LOGGER_NAME,
     ARP_NUDGE_MIN, ArpOp, FOLLOW_RETRY_DEADLINE, MIN_FOLLOW_INTERVAL,
-    Phase)
-from .util import _atomic_write, _fs_safe, _mask_to_bits, _same_ip_class, _sane_ipv4
+    NUDGE_FAIL_LOG_INTERVAL, Phase)
+from .util import (
+    _RateLimit, _atomic_write, _fs_safe, _mask_to_bits, _same_ip_class, _sane_ipv4)
 
 LOG = logging.getLogger(LOGGER_NAME)
 
@@ -47,6 +48,9 @@ class ArpNudge:  # pylint: disable=too-many-instance-attributes
         self.last_reply = 0.0          # epoch of the gateway's last ARP reply (0 = none)
         self._gw = None                # last nudge target we logged (log again on change)
         self._warned = False           # warned once about a missing nudge target
+        # Throttle a failing send so a persistent fault stays periodically visible
+        # (with a suppressed count) instead of spamming or latching fully silent.
+        self._nudge_fail_log = _RateLimit(NUDGE_FAIL_LOG_INTERVAL)
 
     def maybe_nudge(self, yiaddr, gateway, force=False, master=_UNSET):
         """Refresh the gateway's ARP entry for yiaddr by broadcasting an ARP
@@ -96,7 +100,9 @@ class ArpNudge:  # pylint: disable=too-many-instance-attributes
             else:
                 LOG.debug("ARP nudge sent: who-has %s tell %s", gateway, yiaddr)
         except Exception as e:
-            LOG.warning("ARP nudge failed (target %s): %s", gateway, e)
+            # A persistently failing send stays periodically visible (throttled with
+            # a suppressed count), not spammed every interval nor latched silent.
+            self._nudge_fail_log.emit(LOG.warning, "ARP nudge failed (target %s): %s", gateway, e)
 
     def on_arp_reply(self, frame, yiaddr, gateway):
         """Stamp last_reply when the gateway answers our nudge -- a reachability
@@ -170,9 +176,10 @@ class FollowPolicy:  # pylint: disable=too-many-instance-attributes
         except (OSError, ValueError) as e:
             # A present-but-corrupt/unreadable state file returns 0.0, which
             # disarms the MIN_FOLLOW_INTERVAL spoof-storm throttle on the next
-            # changed-address ACK; log it so the corrupt case is not silent.
-            LOG.debug("follow-throttle state %s unreadable (%s) -- treating as never followed",
-                      self._state_file, e)
+            # changed-address ACK -- a security-relevant fail-open, so warn (it is
+            # rare: only a corrupt state file, only on a changed-address ACK).
+            LOG.warning("follow-throttle state %s unreadable (%s) -- treating as never "
+                        "followed (throttle disarmed until the next follow)", self._state_file, e)
             return 0.0
 
     def _record_follow(self):

@@ -94,12 +94,13 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
             chaddr=self.chraw, xid=self.xid, ciaddr=ciaddr, flags=BROADCAST_FLAG,
             options=_dhcp_options(mtype, extra, self._id_opts)))
 
-    def _wait_for_dhcp_reply(self, want, timeout) -> DhcpReply | None:
+    def _wait_for_dhcp_reply(self, want, timeout, phase, for_addr=None) -> DhcpReply | None:
         """Wait up to timeout for a reply of message-type `want`. Returns the
         DhcpReply on a match OR on a DHCPNAK (the caller checks rx.mtype == NAK
         to tell them apart -- a NAK ends the attempt, a match proceeds), or None
         on timeout. Returning the snapshot avoids re-reading self._rx (set by the
-        sniffer thread) after the wait."""
+        sniffer thread) after the wait. phase / for_addr give the NAK log the
+        operator's actual context (which exchange, which address was refused)."""
         end = time.time() + timeout
         while time.time() < end and not self._should_stop():
             self._ev.clear()
@@ -113,7 +114,8 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
                 # it is the operator's main clue for a rejected renew.
                 txt = _msg_text(rx.message)
                 reason = f" -- {txt}" if txt else ""
-                LOG.warning("DHCPNAK received (server %s, xid 0x%08x%s)%s",
+                LOG.warning("DHCPNAK in %s for %s (server %s, xid 0x%08x%s)%s",
+                            phase, for_addr or "the requested address",
                             rx.server_id or "unknown", self.xid,
                             f" via relay {rx.giaddr}" if rx.giaddr else "", reason)
                 return rx
@@ -204,17 +206,20 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
             try:
                 self._send_dhcp("discover", extra)
             except Exception as e:
-                LOG.error("DHCP DISCOVER send failed: %s", e)
+                LOG.warning("DHCP DISCOVER send failed (attempt %d, xid 0x%08x): %s",
+                            attempt, self.xid, e)
                 time.sleep(SEND_RETRY_DELAY)
                 continue
-            rx = self._wait_for_dhcp_reply(OFFER, REPLY_TIMEOUT)
+            rx = self._wait_for_dhcp_reply(OFFER, REPLY_TIMEOUT, Phase.DORA, request_ip)
             if rx and rx.mtype == NAK:
                 return False
             if rx:
                 self.binding.yiaddr, self.binding.server = rx.yiaddr, rx.server_id
                 return True
-            # xid included so the exchange can be matched against a packet capture.
-            LOG.info("no DHCP OFFER (attempt %d, xid 0x%08x)", attempt, self.xid)
+            # DEBUG (not INFO): a single missed OFFER is routine; the acquire's
+            # overall failure is summarised once by the run loop. xid included so
+            # the exchange can be matched against a packet capture.
+            LOG.debug("no DHCP OFFER (attempt %d, xid 0x%08x)", attempt, self.xid)
             time.sleep(min(_jittered(2 ** attempt), ATTEMPT_BACKOFF_CAP))
         return False
 
@@ -233,10 +238,11 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
                     [(DhcpOptName.SERVER_ID, self.binding.server), (DhcpOptName.REQUESTED_ADDR, self.binding.yiaddr)],
                 )
             except Exception as e:
-                LOG.error("DHCP REQUEST send failed: %s", e)
+                LOG.warning("DHCP REQUEST send failed (attempt %d, xid 0x%08x): %s",
+                            attempt, self.xid, e)
                 time.sleep(SEND_RETRY_DELAY)
                 continue
-            rx = self._wait_for_dhcp_reply(ACK, REPLY_TIMEOUT)
+            rx = self._wait_for_dhcp_reply(ACK, REPLY_TIMEOUT, Phase.DORA, self.binding.yiaddr)
             if rx and rx.mtype == NAK:
                 return False   # NAK -> back to INIT; the run loop re-acquires (DISCOVER)
             if rx:
@@ -245,8 +251,8 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
                     return self._on_changed(got, rx, Phase.DORA, True)
                 self.adopt(rx)
                 return True
-            LOG.info("no DHCP ACK from %s for %s (attempt %d, xid 0x%08x)",
-                     self.binding.server, self.binding.yiaddr, attempt, self.xid)
+            LOG.debug("no DHCP ACK from %s for %s (attempt %d, xid 0x%08x)",
+                      self.binding.server, self.binding.yiaddr, attempt, self.xid)
             time.sleep(min(_jittered(2 ** attempt), ATTEMPT_BACKOFF_CAP))
         return False
 
@@ -278,10 +284,11 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
             try:
                 self._send_dhcp("request", extra)
             except Exception as e:
-                LOG.error("DHCP INIT-REBOOT send failed: %s", e)
+                LOG.warning("DHCP INIT-REBOOT send failed (attempt %d, xid 0x%08x): %s",
+                            attempt, self.xid, e)
                 time.sleep(SEND_RETRY_DELAY)
                 continue
-            rx = self._wait_for_dhcp_reply(ACK, REPLY_TIMEOUT)
+            rx = self._wait_for_dhcp_reply(ACK, REPLY_TIMEOUT, Phase.REBOOT, request_ip)
             if rx and rx.mtype == NAK:
                 return False   # server refused our known address -> full DISCOVER
             if rx:
@@ -292,8 +299,8 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
                 if not self.binding.yiaddr:
                     self.binding.yiaddr = request_ip   # ACK without yiaddr: we asked for it
                 return True
-            LOG.info("no DHCP ACK to INIT-REBOOT for %s (attempt %d, xid 0x%08x)",
-                     request_ip, attempt, self.xid)
+            LOG.debug("no DHCP ACK to INIT-REBOOT for %s (attempt %d, xid 0x%08x)",
+                      request_ip, attempt, self.xid)
             if attempt < REBOOT_ATTEMPTS:   # no backoff after the last try -- fall to DORA at once
                 time.sleep(min(_jittered(2 ** attempt), ATTEMPT_BACKOFF_CAP))
         return False
@@ -315,8 +322,9 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
         yiaddr = self.binding.yiaddr
         if not yiaddr:
             return False   # nothing bound -> nothing to renew
+        phase = Phase.REBIND if rebind else Phase.RENEW
 
-        for _ in range(RENEW_ATTEMPTS):
+        for attempt in range(1, RENEW_ATTEMPTS + 1):
             if self._should_stop():
                 return False
             self._ensure_sniffer()
@@ -325,9 +333,10 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
                 # RENEW/REBIND carry no extra options -- ciaddr identifies the lease.
                 self._send_dhcp("request", [], ciaddr=yiaddr)
             except Exception as e:
-                LOG.error("DHCP %s send failed: %s", Phase.REBIND if rebind else Phase.RENEW, e)
+                LOG.warning("DHCP %s send failed (xid 0x%08x, ciaddr %s): %s",
+                            phase, self.xid, yiaddr, e)
                 return False
-            rx = self._wait_for_dhcp_reply(ACK, RENEW_TIMEOUT)
+            rx = self._wait_for_dhcp_reply(ACK, RENEW_TIMEOUT, phase, yiaddr)
             if rx and rx.mtype == NAK:
                 # DHCPNAK: the server revoked the lease. RFC 2131 4.4.5 says go back
                 # to INIT (re-DISCOVER), not keep REBINDing an address it refused, so
@@ -341,10 +350,13 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
                     # Some dynamic servers change the address at renewal (ACK with a
                     # new yiaddr) instead of NAKing. Route it through the same
                     # follow / enforce decision (and hardening) as the initial DORA.
-                    phase = Phase.REBIND if rebind else Phase.RENEW
                     return self._on_changed(got, rx, phase, False)
                 self._absorb_reply(rx, self.binding.lease_secs)
                 return True
+            # DEBUG: a single missed renew ACK is routine; the run loop escalates
+            # RENEW -> REBIND -> expiry and logs those outcomes.
+            LOG.debug("no DHCP ACK to %s of %s (attempt %d, xid 0x%08x)",
+                      phase, yiaddr, attempt, self.xid)
         return False
 
     def release(self, yiaddr=None, server=None):
@@ -362,9 +374,10 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
                 eth_src=self.eth_src, ip_src=yiaddr, ip_dst=server or IPV4_BROADCAST,
                 chaddr=self.chraw, xid=self.xid, ciaddr=yiaddr, flags=0,
                 options=[(DhcpOptName.MESSAGE_TYPE, "release"), (DhcpOptName.SERVER_ID, server), "end"]))
-            LOG.info("DHCP RELEASE of lease %s sent (server %s)", yiaddr, server or "broadcast")
+            LOG.info("DHCP RELEASE of %s sent (server %s)", yiaddr, server or "broadcast")
         except Exception as e:
-            LOG.error("RELEASE failed: %s", e)
+            LOG.warning("DHCP RELEASE of %s failed (server %s): %s",
+                        yiaddr, server or "broadcast", e)
 
     def timing(self):
         """Effective renew (T1) / rebind (T2) seconds and where they came from.

@@ -183,6 +183,24 @@ def test_unreadable_role_withdraws_after_strike_limit(lk, monkeypatch):
     assert "delete" in fake.verbs
 
 
+def test_unreadable_role_but_unbound_withdraws_immediately(lk, monkeypatch):
+    # Role unreadable AND no lease held: nothing to be master of, so withdraw at
+    # once instead of holding the default through the strike tolerance (which is
+    # reserved for a bound node that might still legitimately be master).
+    rec, fake = _rec(lk, monkeypatch, "enforce", initial=GW, unreadable_role_strikes=3)
+    rec.reconcile(None, False, None)   # probe failed, but we hold no lease
+    assert fake.gw is None             # withdrawn on the first call, not after 3 strikes
+    assert "delete" in fake.verbs
+
+
+def test_unreadable_role_with_unusable_gateway_withdraws_immediately(lk, monkeypatch):
+    # Same: an unusable (0.0.0.0) gateway is not a lease to be master of, so an
+    # unreadable role does not earn the strike tolerance -- withdraw now.
+    rec, fake = _rec(lk, monkeypatch, "enforce", initial=GW, unreadable_role_strikes=3)
+    rec.reconcile(None, True, "0.0.0.0")
+    assert fake.gw is None and "delete" in fake.verbs
+
+
 def test_definite_role_resets_strikes(lk, monkeypatch):
     rec, fake = _rec(lk, monkeypatch, "enforce", initial=GW, unreadable_role_strikes=3)
     rec.reconcile(None, True, GW)

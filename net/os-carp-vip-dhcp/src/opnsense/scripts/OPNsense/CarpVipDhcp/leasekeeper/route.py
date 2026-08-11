@@ -59,6 +59,12 @@ class RouteCommand(StrEnum):
 # leak to gate.
 _DEFAULT = "default"
 
+# Sentinel for "no desired state recorded yet". The first reconcile then reads as
+# a change, so the entry state (owning / no default / would-install / ...) is
+# logged once at INFO -- the mode-entry heartbeat -- and every unchanged repeat
+# after it drops to DEBUG, keeping steady state out of the default INFO view.
+_UNSET = object()
+
 # Consecutive unreadable CARP-role probes tolerated while we still hold a
 # default before we withdraw it. An unreadable probe (ifconfig failed) is
 # fail-safe on the INSTALL side (do nothing) but must fail *closed* on the
@@ -105,6 +111,9 @@ class DefaultRouteReconciler:
         self._liveness_probe = liveness_probe
         self._strikes = 0
         self._unreadable_warned = False   # rising-edge gate for the fail-closed warning
+        # Last (want, gateway) we logged, so a steady desired state is confirmed
+        # once at INFO then repeats at DEBUG (see _at / _UNSET).
+        self._last_desired = _UNSET
 
     @property
     def mode(self):
@@ -179,18 +188,31 @@ class DefaultRouteReconciler:
 
         want = (is_master is True) and holds_lease
 
-        if want and self._liveness_blocks():
+        blocked = want and self._liveness_blocks()
+        if blocked:
             # Master with a lease but liveness is explicitly not confirmed
             # (possible split-brain / dead WAN with a stale lease): do not keep a
-            # default we may be unable to honour. Fall through to the withdraw arm.
+            # default we may be unable to honour. Fall through to the withdraw arm,
+            # tagged so the log says why (not a plain CARP role loss).
             want = False
 
         have = self._fib_default_gateway()
+
+        # Confirm the desired state once per change at INFO, then quietly at DEBUG:
+        # a steady master ("owning default via X") or backup ("no default held")
+        # states its ownership at the default log view without per-tick spam, and
+        # observe's would-install/would-withdraw stops repeating every tick.
+        desired = (want, gateway if want else None)
+        changed = desired != self._last_desired
+        self._last_desired = desired
+
         if want:
             if have == gateway:
-                return  # already correct -- silent, no route change, no churn
-            self._install(gateway, replacing=have)
+                self._confirm_owned(changed, gateway)  # already correct -- no route change
+            else:
+                self._install(changed, gateway, replacing=have)
         else:
+            reason = self._no_default_reason(blocked, is_master, holds_lease)
             # A route-get failure (for any reason) also reads as None here, so we
             # skip the withdraw. Treating an unreadable table as "absent" is a
             # deliberate trade-off: an empty table -- the common quiet state on a
@@ -202,8 +224,44 @@ class DefaultRouteReconciler:
             # succeeds the withdraw runs and confirms the FIB. A bounded delay
             # beats a per-tick false alarm.
             if have is None:
-                return  # already absent (or unreadable -- see above)
-            self._withdraw(have)
+                self._confirm_no_default(changed, reason)  # already absent
+            else:
+                self._withdraw(changed, have, reason)
+
+    @staticmethod
+    def _at(changed):
+        """Pick the log level for a desired-state confirmation: INFO the first
+        time a state is entered (changed), DEBUG on every unchanged repeat."""
+        return LOG.info if changed else LOG.debug
+
+    @staticmethod
+    def _no_default_reason(blocked, is_master, holds_lease):
+        """Why the desired state is 'no default' -- the informative half of the
+        backup/no-lease/liveness heartbeat and of a withdraw."""
+        if blocked:
+            return "liveness not confirmed (possible split-brain / dead WAN)"
+        if not holds_lease:
+            return "no usable lease"
+        if is_master is not True:
+            return "CARP backup"
+        return "not owned"
+
+    def _confirm_owned(self, changed, gateway):
+        """Steady-state master heartbeat: the FIB default already matches the lease
+        gateway, so there is nothing to install -- state ownership positively
+        instead of returning silently."""
+        if self._mode == DefaultRouteMode.OBSERVE:
+            self._at(changed)("[observe] default already via %s -- would own", gateway)
+        else:
+            self._at(changed)("owning default via %s", gateway)
+
+    def _confirm_no_default(self, changed, reason):
+        """Steady-state no-default heartbeat: there is correctly no default to
+        hold (backup / no lease / liveness-gated)."""
+        if self._mode == DefaultRouteMode.OBSERVE:
+            self._at(changed)("[observe] no default held (%s) -- as wanted", reason)
+        else:
+            self._at(changed)("no default held (%s)", reason)
 
     # ---- role-unknown handling ----
 
@@ -219,11 +277,12 @@ class DefaultRouteReconciler:
         have = self._fib_default_gateway()
         if have is None:
             return
-        if not self._unreadable_warned:
+        first_time = not self._unreadable_warned
+        if first_time:
             LOG.warning("CARP role unreadable for %d checks -- failing closed on "
                         "the default", self._strikes)
             self._unreadable_warned = True
-        self._withdraw(have)
+        self._withdraw(first_time, have, "CARP role unreadable")
 
     def _liveness_blocks(self):
         """True only when the liveness probe is present and returns an explicit
@@ -238,10 +297,10 @@ class DefaultRouteReconciler:
 
     # ---- FIB operations (idempotent, error-tolerant, main-loop only) ----
 
-    def _install(self, gateway, replacing=None):
+    def _install(self, changed, gateway, replacing=None):
         if self._mode == DefaultRouteMode.OBSERVE:
-            LOG.info("[observe] would install default via %s%s", gateway,
-                     "" if replacing is None else f" (replacing {replacing})")
+            self._at(changed)("[observe] would install default via %s%s", gateway,
+                              "" if replacing is None else f" (replacing {replacing})")
             return
         # Replace atomically with `route change`, not delete-then-add. A bench
         # check on FreeBSD 14.3 confirmed both halves: `route change` to an on-link
@@ -264,9 +323,10 @@ class DefaultRouteReconciler:
             LOG.error("failed to install default via %s (the FIB default is now %s)",
                       gateway, have or "absent")
 
-    def _withdraw(self, current):
+    def _withdraw(self, changed, current, reason):
         if self._mode == DefaultRouteMode.OBSERVE:
-            LOG.info("[observe] would withdraw default (currently via %s)", current)
+            self._at(changed)("[observe] would withdraw default (currently via %s) -- %s",
+                              current, reason)
             return
         self._route(RouteCommand.DELETE, _DEFAULT)
         # Confirm the FIB, not the exit code: a silently failed delete would leave
@@ -274,7 +334,7 @@ class DefaultRouteReconciler:
         # exists to prevent -- so surface it at ERROR. The level-triggered
         # reconcile retries the withdraw next tick.
         if self._fib_default_gateway() is None:
-            LOG.info("withdrew default (was via %s)", current)
+            LOG.info("withdrew default (was via %s) -- %s", current, reason)
         else:
             LOG.error("failed to withdraw default (still via %s) -- this node keeps "
                       "advertising it", current)

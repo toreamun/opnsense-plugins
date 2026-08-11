@@ -1258,6 +1258,29 @@ def test_withdraw_if_enabled_off_is_inert(lk, monkeypatch):
     assert fake.gw == RGW and not fake.calls
 
 
+def test_duplicate_start_guards_before_any_withdraw(lk, monkeypatch):
+    # Regression: the startup fail-stop withdraw must run AFTER the single-instance
+    # guard, so a duplicate start (pidfile held by the live owner) exits "already
+    # running" WITHOUT deleting the owner's live default. Assert the guard fires and
+    # no withdraw happens before it.
+    import lease_keeper  # noqa: E402  # pylint: disable=import-outside-toplevel
+    calls = []
+
+    def fake_guard(_path):
+        calls.append("guard")
+        raise SystemExit(4)   # another live instance holds the pidfile
+    monkeypatch.setattr(lease_keeper, "_setup_logging", lambda _logfile: None)
+    monkeypatch.setattr(lease_keeper, "acquire_pidfile", fake_guard)
+    monkeypatch.setattr(lk.DefaultRouteReconciler, "withdraw_if_enabled",
+                        lambda _mode: calls.append("withdraw"))
+    monkeypatch.setattr("sys.argv", [
+        "lease_keeper", "--iface", "eth0", "--chaddr", CHADDR_STR, "--request",
+        "100.64.4.7", "--vhid", "254", "--default-route-mode", "enforce"])
+    with pytest.raises(SystemExit):
+        lease_keeper.main()
+    assert calls == ["guard"]   # guarded first; the live default was never touched
+
+
 def test_lease_router_reset_on_fresh_bind_without_option3(lk):
     # A new lease that omits option 3 must not inherit the previous lease's gateway
     # (the route reconciler installs from lease_router; a stale value would route

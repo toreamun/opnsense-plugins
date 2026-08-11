@@ -8,8 +8,9 @@ failure mode is a withdrawn default, never a black-holed one. See
 docs/single-ip-wan-carp.md.
 
 Concurrency: reconcile() must be called only from the keeper's main loop thread;
-the caller is Keeper._reconcile_default_route (the per-tick poll, the unbound
-acquire arm, and the SIGUSR2 CARP edge). Signal handlers and the capture thread never
+the caller is Keeper._reconcile_default_route -- the per-tick poll, the acquire
+arm (unbound and just after a successful acquire) and the SIGUSR2 CARP edge, plus
+a fail-stop non-master withdraw at startup and on shutdown. Signal handlers and the capture thread never
 touch the FIB -- they only set flags / hand off observations, exactly as the
 lease path does. So there is no in-process route race; the only shared mutable
 state is the kernel FIB, and cross-process / cross-subsystem contention is
@@ -121,9 +122,10 @@ class DefaultRouteReconciler:
         is_master: True / False, or None when the CARP probe itself failed.
         bound:     True iff a lease is currently held (binding.yiaddr set). This
                    is the lease-held signal; do NOT infer it from `gateway`,
-                   which is a sticky last-known hint that survives a lease loss.
-        gateway:   the lease gateway (binding.router), used as the route's
-                   gateway and only when bound.
+                   which can linger non-None after a lease loss (expire() clears
+                   only yiaddr).
+        gateway:   the current lease's own gateway (binding.lease_router), used
+                   as the route's gateway and only when bound.
         """
         if not self.enabled:
             return
@@ -154,8 +156,18 @@ class DefaultRouteReconciler:
                 return  # already correct -- silent, no route change, no churn
             self._install(gateway, replacing=have)
         else:
+            # A route-get failure (for any reason) also reads as None here, so we
+            # skip the withdraw. Treating an unreadable table as "absent" is a
+            # deliberate trade-off: an empty table -- the common quiet state on a
+            # backup -- is the overwhelming case, route(8)'s empty-table wording
+            # varies by platform/version, and warning on every empty read would be
+            # noise. The genuine stuck case (a default present while route get
+            # fails) is rare (get and delete share one routing socket) and
+            # self-corrects: the reconcile re-reads every tick, and once the read
+            # succeeds the withdraw runs and confirms the FIB. A bounded delay
+            # beats a per-tick false alarm.
             if have is None:
-                return  # already absent -- silent
+                return  # already absent (or unreadable -- see above)
             self._withdraw(have)
 
     # ---- role-unknown handling ----

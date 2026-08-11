@@ -14,13 +14,13 @@ from . import __version__
 from .capture import CAPTURE_BACKENDS
 from .constants import (
     LOGGER_NAME,
-    ACK, BootpOp, DhcpOptName, HB_REFRESH, LINK_KICK_DEBOUNCE, LINK_POLL_STEP,
-    LOOP_ERROR_BACKOFF, Phase, REBIND_POLL_STEP, REDORA_MAX, REDORA_MIN,
+    ACK, BootpOp, DhcpOptName, HB_REFRESH, LEASE_PULSE_INTERVAL, LINK_KICK_DEBOUNCE,
+    LINK_POLL_STEP, LOOP_ERROR_BACKOFF, Phase, REBIND_POLL_STEP, REDORA_MAX, REDORA_MIN,
     SNIFFER_RETRY, SNIFFER_WARMUP)
 from .dhcpclient import DhcpClient
 from .policy import ArpNudge, FollowPolicy
 from .route import DefaultRouteReconciler
-from .util import _atomic_write, _clock_at, _jittered, _sane_ipv4
+from .util import _RateLimit, _atomic_write, _clock_at, _jittered, _sane_ipv4
 from .wire import _parse_reply
 
 LOG = logging.getLogger(LOGGER_NAME)
@@ -206,6 +206,7 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
 
         # Main-loop-only state (set by the loop itself, never by a handler):
         self._renew_asap = False       # renew at the next _hold_lease tick instead of waiting for T1
+        self._pulse = _RateLimit(LEASE_PULSE_INTERVAL)   # throttles the "lease healthy" INFO
 
         # DHCP client component: owns the lease state and the protocol sequences;
         # the keeper owns the capture (feeding it xid-matched replies) and the
@@ -254,13 +255,17 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
     # ---- capture (resilient) ----
     def _ensure_sniffer(self):
         if not self._capture.alive():
-            LOG.warning("DHCP-reply capture down -- (re)starting")
+            LOG.warning("DHCP-reply capture down on %s -- (re)starting", self._cfg.iface)
             if not self._capture.start():
                 # The backend already logged why at ERROR; make the persistent
                 # case explicit so the preceding "(re)starting" is not read as
                 # success -- until the capture recovers, every exchange times out.
                 LOG.error("DHCP-reply capture restart failed -- exchanges will "
                           "time out until it recovers")
+            else:
+                # Positive trace so a flap-and-recover is not silent (only failures
+                # were logged before, so a recovery left no evidence).
+                LOG.info("DHCP-reply capture restarted on %s", self._cfg.iface)
             time.sleep(1)
 
     def _on_arp_reply(self, frame):
@@ -449,6 +454,17 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
             LOG.info("lost CARP master for vhid %s -- ARP nudges pause on this node", self._cfg.vhid)
         self._was_master = master
 
+    def _log_initial_carp_role(self):
+        """Announce the CARP role once at startup and seed _was_master, so the
+        role is in the log immediately instead of only on the next transition (a
+        keeper that starts master and stays master would otherwise never state it)."""
+        if not self._cfg.vhid:
+            return
+        master = self._probe_carp_master()
+        role = "unknown" if master is None else ("MASTER" if master else "BACKUP")
+        LOG.info("initial CARP role for vhid %s: %s", self._cfg.vhid, role)
+        self._was_master = master
+
     def _reconcile_default_route(self, master=_UNSET):
         """Drive the IPv4 default route toward its CARP-role-owned desired state
         (install 0/0 via the lease gateway only while master AND holding a lease;
@@ -484,14 +500,43 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         self._reconcile_default_route(master)
         return master
 
-    def _on_lease_extended(self, phase):
-        """A RENEW or REBIND (the Phase) landed a fresh lease: refresh the heartbeat
-        and force an ARP nudge. The default route is reconciled by the loop-head
-        reconcile on the next _maintain_step entry (a renewed lease can carry a new
-        option-3 gateway), so it is not repeated here."""
+    def _lease_facts(self):
+        """The lease facts a renew might change (captured before renewing, for the
+        changed-vs-steady RENEW log): lease length, opt-3 gateway, server T1/T2."""
         b = self._dhcp.binding
-        LOG.info("DHCP %s ok %s (lease=%ss, expires ~%s)", phase, b.yiaddr, b.lease_secs,
-                 _clock_at(b.lease_secs))
+        return (b.lease_secs, b.lease_router, b.t1_server, b.t2_server)
+
+    def _lease_changes(self, prior):
+        """A short 'what changed' summary of the current binding against `prior`,
+        or '' when nothing an operator cares about moved (the routine steady renew)."""
+        old_secs, old_gw, old_t1, old_t2 = prior
+        b = self._dhcp.binding
+        parts = []
+        if b.lease_secs != old_secs:
+            parts.append(f"lease {old_secs}s->{b.lease_secs}s")
+        if b.lease_router != old_gw:
+            parts.append(f"gw {old_gw or 'none'}->{b.lease_router or 'none'}")
+        if (b.t1_server, b.t2_server) != (old_t1, old_t2):
+            parts.append("renew timers changed")
+        return ", ".join(parts)
+
+    def _on_lease_extended(self, phase, prior):
+        """A RENEW or REBIND (the Phase) landed a fresh lease: refresh the heartbeat
+        and force an ARP nudge. A steady RENEW that changed nothing logs at DEBUG so
+        a short lease does not fill the log between events; a RENEW that changed the
+        lease length / gateway / timers -- and every REBIND (recovery from a failed
+        renew is notable) -- logs at INFO stating what changed. The default route is
+        reconciled by the loop-head reconcile on the next _maintain_step entry (a
+        renewed lease can carry a new option-3 gateway), so it is not repeated here."""
+        b = self._dhcp.binding
+        changes = self._lease_changes(prior)
+        if phase == Phase.RENEW and not changes:
+            LOG.debug("DHCP RENEW ok %s (lease=%ss, expires ~%s)", b.yiaddr, b.lease_secs,
+                      _clock_at(b.lease_secs))
+        else:
+            suffix = f" [{changes}]" if changes else ""
+            LOG.info("DHCP %s ok %s (lease=%ss, expires ~%s)%s", phase, b.yiaddr, b.lease_secs,
+                     _clock_at(b.lease_secs), suffix)
         self._hb()
         self._arp_nudge(force=True)
 
@@ -632,12 +677,25 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
             remaining -= chunk
 
             self._hb()
+            self._maybe_pulse()       # ~1/h "lease healthy" so a quiet keeper shows life
             self._follow.watchdog()   # re-drive a follow whose apply stalled
             # One CARP-role probe per tick, shared by the role poll, the route
             # reconcile (both via _role_tick) and the nudge below.
             master = self._role_tick()
             self._arp_nudge(master=master)
         return not self._signals.stopping
+
+    def _maybe_pulse(self):
+        """A throttled (~1/h) 'lease healthy' INFO. A keeper holding a steady lease
+        logs nothing at INFO between renews (routine renews are DEBUG), so this
+        periodic line shows it is alive without per-tick spam. Not master-gated: a
+        backup holds the same lease and is just as 'healthy'."""
+        b = self._dhcp.binding
+        if not b.yiaddr:
+            return
+        ok, _ = self._pulse.ready()
+        if ok:
+            LOG.info("lease healthy: %s on %s (lease %ss)", b.yiaddr, self._cfg.iface, b.lease_secs)
 
     def run(self):
         """The daemon main loop: capture up, then maintain the lease until
@@ -656,9 +714,11 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
 
         # eth-src matters for L2 debugging but only when it differs from the chaddr.
         ethsrc = f", eth-src {self._cfg.eth_src}" if self._cfg.eth_src != self._cfg.chaddr else ""
-        LOG.info("lease-keeper %s up on %s via %s backend: CARP MAC %s%s, requesting %s",
-                 __version__, self._cfg.iface, self._cfg.capture_backend, self._cfg.chaddr,
-                 ethsrc, self._follow.target or "any")
+        LOG.info("lease-keeper %s up on %s (vhid %s, default-route %s) via %s backend: "
+                 "CARP MAC %s%s, requesting %s",
+                 __version__, self._cfg.iface, self._cfg.vhid or "none", self._defroute.mode,
+                 self._cfg.capture_backend, self._cfg.chaddr, ethsrc, self._follow.target or "any")
+        self._log_initial_carp_role()
         time.sleep(SNIFFER_WARMUP)
 
         while not self._signals.stopping:
@@ -734,8 +794,9 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
                   b.lease_secs, t1, _clock_at(t1), t2, _clock_at(t2), src)
         if not self._hold_lease(t1):
             return
+        prior = self._lease_facts()   # snapshot to report what a renew changed
         if self._dhcp.renew():
-            self._on_lease_extended(Phase.RENEW)
+            self._on_lease_extended(Phase.RENEW, prior)
             return
         if not b.yiaddr:            # renew() drew a NAK and forgot the binding
             self._on_lease_revoked(Phase.RENEW)
@@ -767,7 +828,7 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
                 self._on_lease_revoked(Phase.REBIND)
                 return
         if ok:
-            self._on_lease_extended(Phase.REBIND)
+            self._on_lease_extended(Phase.REBIND, prior)
             return
 
         LOG.error("DHCP lease expired -- re-acquiring (back to %s)", Phase.DORA)

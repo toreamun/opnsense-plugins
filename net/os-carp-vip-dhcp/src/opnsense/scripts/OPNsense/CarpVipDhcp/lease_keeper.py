@@ -64,7 +64,7 @@ from logging.handlers import RotatingFileHandler
 from leasekeeper.capture import CAPTURE_BACKENDS
 from leasekeeper.constants import LOGGER_NAME
 from leasekeeper.keeper import Keeper
-from leasekeeper.route import DefaultRouteMode
+from leasekeeper.route import DefaultRouteMode, DefaultRouteReconciler
 from leasekeeper.util import MAC_RE
 
 LOG = logging.getLogger(LOGGER_NAME)
@@ -191,9 +191,10 @@ def main():
     # default in the FIB, still redistributed by FRR. Withdraw it as non-master
     # here -- pure route(8), no capture backend -- since the backend preflight and
     # the arg checks can each return before Keeper.run() would otherwise do it.
-    # Skipped for --once (a wiring test, not a supervised service restart).
-    if not a.once:
-        Keeper.fail_stop_withdraw_default(a.default_route_mode, a.vhid)
+    # Skipped for --once (a wiring test, not a supervised service restart), and
+    # when there is no CARP vhid (nothing owns a default route by role).
+    if not a.once and a.vhid:
+        DefaultRouteReconciler.withdraw_if_enabled(a.default_route_mode)
 
     # Fail fast (with a logged reason) if the selected backend cannot run on
     # this host -- checked uniformly through the registry so a future backend

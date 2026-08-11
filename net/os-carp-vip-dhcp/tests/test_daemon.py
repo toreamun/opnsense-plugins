@@ -1194,41 +1194,33 @@ def test_hold_lease_tick_drives_default_route_reconcile(lk):
     assert (True, True, "100.64.4.1") in rec.calls
 
 
-def test_acquire_step_reconciles_when_unbound(lk):
-    # A former master that lost its lease withdraws on the unbound arm (bound=False);
-    # the bound-path tick never runs there.
+def test_maintain_step_head_withdraws_when_unbound(lk):
+    # The loop head withdraws any owned default whenever unbound (the role is
+    # irrelevant, so master=False, no probe) before the acquire arm runs.
     k = _keeper(lk, vhid=254, default_route_mode="enforce")
     rec = _RecordingReconciler()
     k._defroute = rec
-    k._ensure_sniffer = lambda: None
-    k._probe_carp_master = lambda: True
-    k._iface_link_up = lambda: None            # unreadable carrier -> straight to the acquire
-    k._dhcp.acquire = lambda _rip: False
-    k._sleep_interruptible = lambda _s: True
+    k._acquire_step = lambda: None             # isolate the head reconcile
     k._dhcp.binding.yiaddr = None              # unbound
-    k._acquire_step()
-    # unbound -> withdraw regardless of role, so the arm passes master=False (no probe)
-    assert rec.calls == [(False, False, k._dhcp.binding.lease_router)]   # bound=False
+    k._dhcp.binding.lease_router = "100.64.4.1"
+    k._maintain_step()
+    assert rec.calls == [(False, False, "100.64.4.1")]   # withdraw at the head, no probe
 
 
-def test_acquire_success_reconciles_immediately(lk):
-    # A fresh acquire owns the default at once, not after the first HB_REFRESH tick.
+def test_maintain_step_head_installs_when_bound(lk):
+    # Once bound, the loop head installs the default by role. A fresh acquire's
+    # immediacy comes from run() re-entering _maintain_step at once after the bind,
+    # so no separate per-acquire reconcile is needed.
     k = _keeper(lk, vhid=254, default_route_mode="enforce")
     rec = _RecordingReconciler()
     k._defroute = rec
-    k._ensure_sniffer = lambda: None
     k._probe_carp_master = lambda: True
-    k._iface_link_up = lambda: True
-    k._dhcp.binding.yiaddr = None
+    k._dhcp.timing = lambda: (0, 100, "test")
+    k._hold_lease = lambda _s: False           # stop right after the head reconcile
+    k._dhcp.binding.yiaddr = "100.64.4.7"      # bound (as if the acquire just completed)
     k._dhcp.binding.lease_router = "100.64.4.1"
-
-    def fake_acquire(_rip):
-        k._dhcp.binding.yiaddr = "100.64.4.7"   # the acquire binds
-        return True
-    k._dhcp.acquire = fake_acquire
-    k._acquire_step()
-    # pre-acquire reconcile saw unbound (master=False, no probe); the post-acquire one installs
-    assert rec.calls == [(False, False, "100.64.4.1"), (True, True, "100.64.4.1")]
+    k._maintain_step()
+    assert rec.calls == [(True, True, "100.64.4.1")]   # installed by role at the head
 
 
 def test_shutdown_withdraws_owned_default(lk, monkeypatch):
@@ -1245,26 +1237,24 @@ def test_shutdown_withdraws_owned_default(lk, monkeypatch):
     assert (False, False, None) in rec.calls   # reconcile as non-master -> withdraw
 
 
-def test_fail_stop_withdraw_default_removes_stale_default(lk, monkeypatch):
-    # The startup fail-stop path is a standalone staticmethod (no Keeper, no capture
-    # backend) so main() runs it BEFORE the backend preflight / arg checks -- any of
-    # which can exit before Keeper.run(). A crashed enforcing predecessor's default
-    # is withdrawn here even when the backend can no longer load.
+def test_withdraw_if_enabled_removes_stale_default(lk, monkeypatch):
+    # The startup fail-stop lives on the reconciler (no Keeper, no capture backend),
+    # so main() runs it BEFORE the backend preflight / arg checks -- any of which can
+    # exit before Keeper.run(). A crashed enforcing predecessor's default is
+    # withdrawn here even when the backend can no longer load.
     from test_route import FakeRoute, GW as RGW  # noqa: E402  # pylint: disable=import-outside-toplevel
     fake = FakeRoute(initial=RGW)
     monkeypatch.setattr(lk.subprocess, "run", fake.run)
-    lk.Keeper.fail_stop_withdraw_default("enforce", vhid=254)
+    lk.DefaultRouteReconciler.withdraw_if_enabled("enforce")
     assert "delete" in fake.verbs and fake.gw is None
 
 
-def test_fail_stop_withdraw_default_inert_when_off_or_no_vhid(lk, monkeypatch):
-    # Gated exactly like _reconcile_default_route: off mode and no-vhid never touch
-    # the FIB (off is inert; no vhid means no CARP role to own a default by).
+def test_withdraw_if_enabled_off_is_inert(lk, monkeypatch):
+    # off mode never touches the FIB (the vhid gate is main()'s, not the entry point's).
     from test_route import FakeRoute, GW as RGW  # noqa: E402  # pylint: disable=import-outside-toplevel
     fake = FakeRoute(initial=RGW)
     monkeypatch.setattr(lk.subprocess, "run", fake.run)
-    lk.Keeper.fail_stop_withdraw_default("off", vhid=254)       # off -> inert
-    lk.Keeper.fail_stop_withdraw_default("enforce", vhid=None)   # no vhid -> inert
+    lk.DefaultRouteReconciler.withdraw_if_enabled("off")
     assert fake.gw == RGW and not fake.calls
 
 
@@ -1379,9 +1369,10 @@ def test_renew_nak_forgets_binding(lk):
     assert c.binding.server == "100.64.4.1"  # hint kept
 
 
-def test_renew_nak_withdraws_default_and_reacquires(lk):
-    # A DHCPNAK at T1 withdraws the default at once (bound=False) and drops to the
-    # unbound arm -- it must NOT enter the REBIND loop still advertising the default.
+def test_renew_nak_leaves_binding_for_head_to_withdraw(lk):
+    # A DHCPNAK at T1 forgets the binding and must NOT enter the REBIND loop still
+    # advertising the default; the next _maintain_step is then unbound and its loop
+    # head withdraws.
     k = _keeper(lk, vhid=254, default_route_mode="enforce")
     rec = _RecordingReconciler()
     k._defroute = rec
@@ -1389,6 +1380,7 @@ def test_renew_nak_withdraws_default_and_reacquires(lk):
     k._hb = lambda: None
     k._arp_nudge = lambda *_a, **_k: None
     k._hold_lease = lambda _s: True
+    k._acquire_step = lambda: None              # isolate the head on the unbound re-entry
     k._dhcp.timing = lambda: (0, 100, "test")
     k._dhcp.binding.yiaddr = "100.64.4.7"
     k._dhcp.binding.lease_router = "100.64.4.1"
@@ -1401,14 +1393,17 @@ def test_renew_nak_withdraws_default_and_reacquires(lk):
         k._dhcp.expire()   # a NAK forgets the binding
         return False
     k._dhcp.renew = fake_renew
-    k._maintain_step()
-    assert (True, False, "100.64.4.1") in rec.calls   # withdrew (bound=False)
-    assert rebinds["n"] == 0                            # never entered the REBIND loop
+    k._maintain_step()                          # bound: head installs, then RENEW NAK
+    assert k._dhcp.binding.yiaddr is None        # NAK cleared it
+    assert rebinds["n"] == 0                      # never entered the REBIND loop
+    k._maintain_step()                          # unbound: head withdraws
+    assert (False, False, "100.64.4.1") in rec.calls
 
 
-def test_rebind_nak_withdraws_default_and_reacquires(lk):
-    # A NAK during the REBIND window is likewise a revoke: withdraw and re-acquire
-    # instead of spinning REBIND to T2 with the default still installed.
+def test_rebind_nak_leaves_binding_for_head_to_withdraw(lk):
+    # A NAK during the REBIND window likewise forgets the binding; the next
+    # _maintain_step is unbound and its loop head withdraws, rather than spinning
+    # REBIND to T2 with the default still installed.
     k = _keeper(lk, vhid=254, default_route_mode="enforce")
     rec = _RecordingReconciler()
     k._defroute = rec
@@ -1417,6 +1412,7 @@ def test_rebind_nak_withdraws_default_and_reacquires(lk):
     k._arp_nudge = lambda *_a, **_k: None
     k._hold_lease = lambda _s: True
     k._sleep_interruptible = lambda _s: True
+    k._acquire_step = lambda: None              # isolate the head on the unbound re-entry
     k._dhcp.timing = lambda: (0, 100, "test")
     k._dhcp.binding.yiaddr = "100.64.4.7"
     k._dhcp.binding.lease_router = "100.64.4.1"
@@ -1427,21 +1423,23 @@ def test_rebind_nak_withdraws_default_and_reacquires(lk):
         k._dhcp.expire()       # the first REBIND attempt gets a NAK
         return False
     k._dhcp.renew = fake_renew
-    k._maintain_step()
-    assert (True, False, "100.64.4.1") in rec.calls   # withdrew after the REBIND NAK
+    k._maintain_step()                          # bound -> REBIND -> NAK forgets the binding
+    assert k._dhcp.binding.yiaddr is None
+    k._maintain_step()                          # unbound: head withdraws
+    assert (False, False, "100.64.4.1") in rec.calls
 
 
-def test_renew_success_reconciles_changed_gateway_immediately(lk):
-    # A same-address renew that carries a new option-3 gateway must hit the FIB at
-    # once, not at the next per-tick poll: otherwise the default keeps routing via
-    # the old gateway for up to HB_REFRESH after the lease already changed.
+def test_renew_changed_gateway_reconciled_by_next_head(lk):
+    # A renew that carries a new option-3 gateway is picked up by the loop-head
+    # reconcile on the next _maintain_step entry (run() re-enters at once), so a
+    # gateway change hits the FIB promptly, not only at the next per-tick poll.
     k = _keeper(lk, vhid=254, default_route_mode="enforce")
     rec = _RecordingReconciler()
     k._defroute = rec
     k._probe_carp_master = lambda: True
     k._hb = lambda: None
     k._arp_nudge = lambda *_a, **_k: None
-    k._hold_lease = lambda _s: True             # skip the T1 wait (its own reconcile too)
+    k._hold_lease = lambda _s: True
     k._dhcp.timing = lambda: (0, 100, "test")
     k._dhcp.binding.yiaddr = "100.64.4.7"
     k._dhcp.binding.lease_router = "100.64.4.1"
@@ -1450,15 +1448,16 @@ def test_renew_success_reconciles_changed_gateway_immediately(lk):
         k._dhcp.binding.lease_router = "100.64.4.9"   # the renewal carries a new gateway
         return True
     k._dhcp.renew = fake_renew
-    k._maintain_step()
-    assert (True, True, "100.64.4.9") in rec.calls   # reconciled with the NEW gateway at once
+    k._maintain_step()   # head reconciles the OLD gw; renew then changes it to NEW
+    k._maintain_step()   # head reconciles the NEW gw
+    assert (True, True, "100.64.4.9") in rec.calls
 
 
 def test_shutdown_drives_a_real_route_withdraw(lk, monkeypatch):
     # End to end through the REAL DefaultRouteReconciler (not the recording stub):
     # on shutdown an owned default is actually deleted via route(8), exercising the
     # mode plumbing (default_route_mode -> constructed reconciler) and the withdraw.
-    # (The startup counterpart is Keeper.fail_stop_withdraw_default, tested above.)
+    # (The startup counterpart is DefaultRouteReconciler.withdraw_if_enabled, tested above.)
     from test_route import FakeRoute, GW as RGW  # noqa: E402  # pylint: disable=import-outside-toplevel
     monkeypatch.setattr(lk.time, "sleep", lambda *_a, **_k: None)
     fake = FakeRoute(initial=RGW)

@@ -10,6 +10,8 @@ import types
 
 import pytest
 
+from leasekeeper.route import RouteCommand
+
 GW = "185.41.66.1"
 GW2 = "185.41.66.9"
 CGNAT_GW = "100.64.4.1"   # the production case: a 100.64/10 single-IP CGNAT WAN
@@ -32,22 +34,22 @@ class FakeRoute:
         rc, out, err = 0, "", ""
         if verb in self.broken:  # a real failure: stuck route / bad socket, not a no-op
             rc, err = 1, "route: writing to routing socket: permission denied"
-        elif verb == "get":
+        elif verb == RouteCommand.GET:
             has = self.gw is not None  # empty table exits non-zero
             rc = 0 if has else 1
             out = f"   gateway: {self.gw}\n   flags: <UP,GATEWAY>\n" if has else ""
             err = "" if has else "route: not in table"
-        elif verb == "add":
+        elif verb == RouteCommand.ADD:
             if self.gw is not None:  # FreeBSD: add fails when a default already exists
                 rc, err = 1, "route: writing to routing socket: File exists"
             elif verb not in self.lying:  # a lying add exits 0 but leaves the FIB unchanged
                 self.gw = cmd[-1]
-        elif verb == "change":
+        elif verb == RouteCommand.CHANGE:
             if self.gw is None:  # FreeBSD: change fails when no route exists to change
                 rc, err = 1, "route: change net default: not in table"
             else:
-                self.gw = cmd[-1]  # an on-link gateway swaps in place; off-link is broken={"change"}
-        elif verb == "delete":
+                self.gw = cmd[-1]  # on-link swaps in place; off-link is broken={RouteCommand.CHANGE}
+        elif verb == RouteCommand.DELETE:
             existed = self.gw is not None
             self.gw = None
             rc, err = (0, "") if existed else (1, "not in table")
@@ -74,15 +76,20 @@ def test_off_never_touches_fib(lk, monkeypatch):
     assert not fake.calls  # off short-circuits before any route call
 
 
-def test_observe_reads_but_does_not_mutate(lk, monkeypatch):
+def test_observe_would_install_does_not_mutate(lk, monkeypatch):
+    # observe master+bound: logs a would-install but never writes the FIB.
     rec, fake = _rec(lk, monkeypatch, "observe")
-    rec.reconcile(True, True, GW)          # would-install
-    assert fake.gw is None                 # no mutation
-    assert "add" not in fake.verbs and "delete" not in fake.verbs
-    rec2, fake2 = _rec(lk, monkeypatch, "observe", initial=GW)
-    rec2.reconcile(False, False, None)     # would-withdraw
-    assert fake2.gw == GW
-    assert "delete" not in fake2.verbs
+    rec.reconcile(True, True, GW)
+    assert fake.gw is None
+    assert RouteCommand.ADD not in fake.verbs and RouteCommand.DELETE not in fake.verbs
+
+
+def test_observe_would_withdraw_does_not_mutate(lk, monkeypatch):
+    # observe backup with an existing default: logs a would-withdraw but leaves it.
+    rec, fake = _rec(lk, monkeypatch, "observe", initial=GW)
+    rec.reconcile(False, False, None)
+    assert fake.gw == GW
+    assert RouteCommand.DELETE not in fake.verbs
 
 
 # ---- enforce: install / withdraw / correct / idempotent ----
@@ -91,14 +98,14 @@ def test_enforce_master_installs(lk, monkeypatch):
     rec, fake = _rec(lk, monkeypatch, "enforce")
     rec.reconcile(True, True, GW)
     assert fake.gw == GW
-    assert "add" in fake.verbs
+    assert RouteCommand.ADD in fake.verbs
 
 
 def test_enforce_idempotent_no_change_when_correct(lk, monkeypatch):
     rec, fake = _rec(lk, monkeypatch, "enforce", initial=GW)
     rec.reconcile(True, True, GW)
     assert fake.gw == GW
-    assert fake.verbs == ["get"]  # compare-then-act: no add/delete, no churn
+    assert fake.verbs == [RouteCommand.GET]  # compare-then-act: no add/delete, no churn
 
 
 def test_install_reads_the_fib_back_to_confirm(lk, monkeypatch, caplog):
@@ -107,7 +114,7 @@ def test_install_reads_the_fib_back_to_confirm(lk, monkeypatch, caplog):
     rec, fake = _rec(lk, monkeypatch, "enforce")
     with caplog.at_level("INFO", logger="lease-keeper"):
         rec.reconcile(True, True, GW)
-    assert fake.verbs == ["get", "add", "get"]  # top read, install, confirm read-back
+    assert fake.verbs == [RouteCommand.GET, RouteCommand.ADD, RouteCommand.GET]  # top read, install, confirm read-back
     assert any(r.getMessage() == f"installed default via {GW}" for r in caplog.records)
 
 
@@ -115,7 +122,7 @@ def test_lying_add_success_is_caught_by_confirm(lk, monkeypatch, caplog):
     # route(8) exits 0 but the FIB did not actually take the default (a "lying"
     # success): the confirm read-back, not the exit code, catches it. An
     # implementation that trusted the add's returncode would falsely log success.
-    rec, fake = _rec(lk, monkeypatch, "enforce", lying={"add"})
+    rec, fake = _rec(lk, monkeypatch, "enforce", lying={RouteCommand.ADD})
     with caplog.at_level("INFO", logger="lease-keeper"):
         rec.reconcile(True, True, GW)
     assert fake.gw is None  # never actually installed despite the rc 0
@@ -128,7 +135,7 @@ def test_enforce_installs_cgnat_gateway(lk, monkeypatch):
     # production case, so exercise the install through one end to end.
     rec, fake = _rec(lk, monkeypatch, "enforce")
     rec.reconcile(True, True, CGNAT_GW)
-    assert fake.gw == CGNAT_GW and "add" in fake.verbs
+    assert fake.gw == CGNAT_GW and RouteCommand.ADD in fake.verbs
 
 
 def test_enforce_corrects_wrong_nexthop(lk, monkeypatch):
@@ -136,21 +143,21 @@ def test_enforce_corrects_wrong_nexthop(lk, monkeypatch):
     rec.reconcile(True, True, GW)
     assert fake.gw == GW
     # atomic replace via `route change`: no delete-then-add, so no no-default gap
-    assert fake.verbs == ["get", "change", "get"]
+    assert fake.verbs == [RouteCommand.GET, RouteCommand.CHANGE, RouteCommand.GET]
 
 
 def test_enforce_backup_withdraws(lk, monkeypatch):
     rec, fake = _rec(lk, monkeypatch, "enforce", initial=GW)
     rec.reconcile(False, False, None)
     assert fake.gw is None
-    assert "delete" in fake.verbs
+    assert RouteCommand.DELETE in fake.verbs
 
 
 def test_enforce_backup_absent_is_noop(lk, monkeypatch):
     rec, fake = _rec(lk, monkeypatch, "enforce")
     rec.reconcile(False, False, None)
     assert fake.gw is None
-    assert fake.verbs == ["get"]  # nothing to withdraw
+    assert fake.verbs == [RouteCommand.GET]  # nothing to withdraw
 
 
 def test_master_without_lease_withdraws_despite_sticky_gateway(lk, monkeypatch):
@@ -159,7 +166,7 @@ def test_master_without_lease_withdraws_despite_sticky_gateway(lk, monkeypatch):
     rec, fake = _rec(lk, monkeypatch, "enforce", initial=GW)
     rec.reconcile(True, False, GW)
     assert fake.gw is None
-    assert "delete" in fake.verbs
+    assert RouteCommand.DELETE in fake.verbs
 
 
 # ---- unreadable role: fail-safe install, fail-closed withdraw ----
@@ -169,7 +176,7 @@ def test_unreadable_role_never_installs(lk, monkeypatch):
     for _ in range(10):
         rec.reconcile(None, True, GW)
     assert fake.gw is None
-    assert "add" not in fake.verbs
+    assert RouteCommand.ADD not in fake.verbs
 
 
 def test_unreadable_role_withdraws_after_strike_limit(lk, monkeypatch):
@@ -177,10 +184,10 @@ def test_unreadable_role_withdraws_after_strike_limit(lk, monkeypatch):
     rec.reconcile(None, True, GW)
     rec.reconcile(None, True, GW)
     assert fake.gw == GW              # held for the first strike_limit-1 checks
-    assert "delete" not in fake.verbs
+    assert RouteCommand.DELETE not in fake.verbs
     rec.reconcile(None, True, GW)     # third strike -> fail closed
     assert fake.gw is None
-    assert "delete" in fake.verbs
+    assert RouteCommand.DELETE in fake.verbs
 
 
 def test_unreadable_role_but_unbound_withdraws_immediately(lk, monkeypatch):
@@ -190,7 +197,7 @@ def test_unreadable_role_but_unbound_withdraws_immediately(lk, monkeypatch):
     rec, fake = _rec(lk, monkeypatch, "enforce", initial=GW, unreadable_role_strikes=3)
     rec.reconcile(None, False, None)   # probe failed, but we hold no lease
     assert fake.gw is None             # withdrawn on the first call, not after 3 strikes
-    assert "delete" in fake.verbs
+    assert RouteCommand.DELETE in fake.verbs
 
 
 def test_unreadable_role_with_unusable_gateway_withdraws_immediately(lk, monkeypatch):
@@ -198,7 +205,7 @@ def test_unreadable_role_with_unusable_gateway_withdraws_immediately(lk, monkeyp
     # unreadable role does not earn the strike tolerance -- withdraw now.
     rec, fake = _rec(lk, monkeypatch, "enforce", initial=GW, unreadable_role_strikes=3)
     rec.reconcile(None, True, "0.0.0.0")
-    assert fake.gw is None and "delete" in fake.verbs
+    assert fake.gw is None and RouteCommand.DELETE in fake.verbs
 
 
 def test_definite_role_resets_strikes(lk, monkeypatch):
@@ -231,7 +238,7 @@ def test_liveness_false_blocks_install(lk, monkeypatch):
     rec, fake = _rec(lk, monkeypatch, "enforce", liveness_probe=lambda: False)
     rec.reconcile(True, True, GW)
     assert fake.gw is None
-    assert "add" not in fake.verbs
+    assert RouteCommand.ADD not in fake.verbs
 
 
 def test_liveness_false_withdraws_existing(lk, monkeypatch):
@@ -259,7 +266,7 @@ def test_liveness_exception_does_not_block(lk, monkeypatch):
 def test_empty_table_reads_as_no_default(lk, monkeypatch):
     rec, fake = _rec(lk, monkeypatch, "enforce")
     assert rec._fib_default_gateway() is None  # returncode 1 -> None, not a raise
-    assert fake.verbs == ["get"]
+    assert fake.verbs == [RouteCommand.GET]
 
 
 def test_get_without_gateway_line_reads_absent(lk, monkeypatch):
@@ -324,14 +331,14 @@ def test_strike_limit_must_be_positive(lk):
 def test_bogus_gateway_is_not_installed(lk, monkeypatch):
     rec, fake = _rec(lk, monkeypatch, "enforce")
     rec.reconcile(True, True, "0.0.0.0")  # rogue / malformed option 3
-    assert fake.gw is None and "add" not in fake.verbs
+    assert fake.gw is None and RouteCommand.ADD not in fake.verbs
 
 
 def test_bogus_gateway_withdraws_existing(lk, monkeypatch):
     # master+bound but an unusable gateway must not KEEP a default it can't honour.
     rec, fake = _rec(lk, monkeypatch, "enforce", initial=GW)
     rec.reconcile(True, True, "0.0.0.0")
-    assert fake.gw is None and "delete" in fake.verbs
+    assert fake.gw is None and RouteCommand.DELETE in fake.verbs
 
 
 def test_bound_without_gateway_withdraws(lk, monkeypatch):
@@ -339,13 +346,13 @@ def test_bound_without_gateway_withdraws(lk, monkeypatch):
     # and _sane_ipv4(None) must be handled, not raise.
     rec, fake = _rec(lk, monkeypatch, "enforce", initial=GW)
     rec.reconcile(True, True, None)
-    assert fake.gw is None and "delete" in fake.verbs
+    assert fake.gw is None and RouteCommand.DELETE in fake.verbs
 
 
 # ---- a genuine route-command failure is surfaced, not buried as a no-op ----
 
 def test_failed_withdraw_is_logged_and_default_stays(lk, monkeypatch, caplog):
-    rec, fake = _rec(lk, monkeypatch, "enforce", initial=GW, broken={"delete"})
+    rec, fake = _rec(lk, monkeypatch, "enforce", initial=GW, broken={RouteCommand.DELETE})
     with caplog.at_level("ERROR", logger="lease-keeper"):
         rec.reconcile(False, False, None)  # backup -> should withdraw, but delete is stuck
     assert fake.gw == GW  # the default is still in the FIB (the fail-stop breach we must SEE)
@@ -358,11 +365,11 @@ def test_rejected_change_on_replace_keeps_old_and_errors(lk, monkeypatch, caplog
     # the new gateway is not on-link, e.g. a cross-subnet lease whose interface has
     # not moved yet): the FIB keeps the OLD default -- never torn down or
     # black-holed -- and the confirm read-back surfaces that the new one is not in.
-    rec, fake = _rec(lk, monkeypatch, "enforce", initial=GW, broken={"change"})
+    rec, fake = _rec(lk, monkeypatch, "enforce", initial=GW, broken={RouteCommand.CHANGE})
     with caplog.at_level("ERROR", logger="lease-keeper"):
         rec.reconcile(True, True, GW2)  # replace GW -> GW2, but the change is rejected
     assert fake.gw == GW  # old gateway kept intact, not withdrawn
-    assert "delete" not in fake.verbs  # the working default is never removed on a failed replace
+    assert RouteCommand.DELETE not in fake.verbs  # the working default is never removed on a failed replace
     assert any("failed to install default via " + GW2 in r.getMessage() for r in caplog.records)
 
 
@@ -370,7 +377,7 @@ def test_fresh_install_add_failure_is_logged_absent(lk, monkeypatch, caplog):
     # first install (no prior default) and the add itself fails: the replacing=None
     # arm skips the delete, the add fails, and the confirm reads the FIB as absent
     # -> a surfaced ERROR naming the empty FIB, not a silent claim of success.
-    rec, fake = _rec(lk, monkeypatch, "enforce", broken={"add"})
+    rec, fake = _rec(lk, monkeypatch, "enforce", broken={RouteCommand.ADD})
     with caplog.at_level("ERROR", logger="lease-keeper"):
         rec.reconcile(True, True, GW)
     assert fake.gw is None

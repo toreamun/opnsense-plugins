@@ -186,6 +186,15 @@ def main():
     a = _build_arg_parser().parse_args()
     _setup_logging(a.logfile)
 
+    # Fail-stop FIRST, before any early exit below: a crashed predecessor (whose
+    # backend is now missing, or that was restarted with a bad arg) may have left a
+    # default in the FIB, still redistributed by FRR. Withdraw it as non-master
+    # here -- pure route(8), no capture backend -- since the backend preflight and
+    # the arg checks can each return before Keeper.run() would otherwise do it.
+    # Skipped for --once (a wiring test, not a supervised service restart).
+    if not a.once:
+        Keeper.fail_stop_withdraw_default(a.default_route_mode, a.vhid)
+
     # Fail fast (with a logged reason) if the selected backend cannot run on
     # this host -- checked uniformly through the registry so a future backend
     # with an optional dependency is covered without a special case here.

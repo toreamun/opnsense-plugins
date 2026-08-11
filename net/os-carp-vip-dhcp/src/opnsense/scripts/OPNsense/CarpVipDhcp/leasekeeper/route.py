@@ -131,19 +131,26 @@ class DefaultRouteReconciler:
         if not self.enabled:
             return
 
-        # Guard the unreadable-role case first, before any FIB read: fail-safe on
-        # install, fail-closed (bounded) on withdraw.
-        if is_master is None:
+        # A live binding plus a sane, non-zero unicast gateway is a usable lease
+        # (rejects a 0.0.0.0 / malformed option-3 from a rogue or broken DHCP
+        # server, and a gateway that lingers after a lease loss -- expire() clears
+        # only yiaddr). Role-independent: without a usable lease there is nothing to
+        # be master OF, so the default must go regardless of the CARP role.
+        holds_lease = bound and _sane_ipv4(gateway)
+
+        # Role unreadable AND a lease is held: we might still legitimately be
+        # master, so tolerate a bounded number of unreadable probes (fail-safe on
+        # install, fail-closed on withdraw) rather than flapping the default on a
+        # transient ifconfig failure. Every other state -- role readable, or no
+        # usable lease -- is decided normally below, so an unreadable role on an
+        # unbound node withdraws at once instead of holding for the strike limit.
+        if is_master is None and holds_lease:
             self._on_unknown_role()
             return
         self._strikes = 0
-        self._unreadable_warned = False   # role readable again -> re-arm the warning
+        self._unreadable_warned = False   # not in an unreadable-while-bound episode -> re-arm
 
-        # A sane, non-zero unicast gateway is required to install (rejects a
-        # 0.0.0.0 / malformed option-3 from a rogue or broken DHCP server); an
-        # unusable gateway falls through to the withdraw arm rather than
-        # installing a default that leads nowhere.
-        want = is_master and bound and _sane_ipv4(gateway)
+        want = (is_master is True) and holds_lease
 
         if want and self._liveness_blocks():
             # Master with a lease but liveness is explicitly not confirmed

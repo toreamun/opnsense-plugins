@@ -443,7 +443,13 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
             master = self._probe_carp_master()
         if master is None:
             return
-        if master and self._was_master is False:
+        if self._was_master is None:
+            # First definite role after an unknown initial probe (a transient
+            # ifconfig failure at startup): announce it so the log does not stay
+            # stuck at "unknown", but take no failover action -- this is the initial
+            # determination, not a promotion or demotion.
+            LOG.info("CARP role for vhid %s: %s", self._cfg.vhid, "MASTER" if master else "BACKUP")
+        elif master and self._was_master is False:
             LOG.info("became CARP master for vhid %s -- immediate ARP nudge and early lease renew",
                      self._cfg.vhid)
             self._renew_asap = True
@@ -455,15 +461,19 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         self._was_master = master
 
     def _log_initial_carp_role(self):
-        """Announce the CARP role once at startup and seed _was_master, so the
-        role is in the log immediately instead of only on the next transition (a
-        keeper that starts master and stays master would otherwise never state it)."""
+        """Announce the CARP role once at startup and seed _was_master, so the role
+        is in the log immediately instead of only on the next transition (a keeper
+        that starts master and stays master would otherwise never state it). Seed
+        only a DEFINITE result: an unknown (a transient startup ifconfig failure) is
+        left unseeded so _poll_carp_role announces the first definite role rather
+        than the log staying stuck at 'unknown'."""
         if not self._cfg.vhid:
             return
         master = self._probe_carp_master()
         role = "unknown" if master is None else ("MASTER" if master else "BACKUP")
         LOG.info("initial CARP role for vhid %s: %s", self._cfg.vhid, role)
-        self._was_master = master
+        if master is not None:
+            self._was_master = master
 
     def _reconcile_default_route(self, master=_UNSET):
         """Drive the IPv4 default route toward its CARP-role-owned desired state

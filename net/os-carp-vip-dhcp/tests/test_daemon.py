@@ -1358,6 +1358,72 @@ def test_rebind_loop_drives_default_route_reconcile(lk):
     assert (True, True, "100.64.4.1") in rec.calls   # reconciled inside the REBIND loop
 
 
+def test_renew_nak_forgets_binding(lk):
+    # A DHCPNAK on renew revokes the lease (RFC 2131 4.4.5 -> INIT): the binding is
+    # forgotten so the caller withdraws the default and re-acquires, rather than
+    # REBINDing an address the server refused. Hints stay for the re-DORA (expire()).
+    c = _client(lk)
+    c.adopt(lk.DhcpReply(lk.ACK, "100.64.4.7", "100.64.4.1", 1800, None, None, "100.64.4.1"))
+    c._ensure_sniffer = lambda: None
+    c._wait_for_dhcp_reply = lambda _want, _timeout: lk.DhcpReply(
+        lk.NAK, None, "100.64.4.1", None, None, None, None)
+    assert c.renew() is False
+    assert c.binding.yiaddr is None          # forgotten -> reconcile withdraws, next step re-acquires
+    assert c.binding.server == "100.64.4.1"  # hint kept
+
+
+def test_renew_nak_withdraws_default_and_reacquires(lk):
+    # A DHCPNAK at T1 withdraws the default at once (bound=False) and drops to the
+    # unbound arm -- it must NOT enter the REBIND loop still advertising the default.
+    k = _keeper(lk, vhid=254, default_route_mode="enforce")
+    rec = _RecordingReconciler()
+    k._defroute = rec
+    k._probe_carp_master = lambda: True
+    k._hb = lambda: None
+    k._arp_nudge = lambda *_a, **_k: None
+    k._hold_lease = lambda _s: True
+    k._dhcp.timing = lambda: (0, 100, "test")
+    k._dhcp.binding.yiaddr = "100.64.4.7"
+    k._dhcp.binding.lease_router = "100.64.4.1"
+    rebinds = {"n": 0}
+
+    def fake_renew(rebind=False):
+        if rebind:
+            rebinds["n"] += 1
+            return False
+        k._dhcp.expire()   # a NAK forgets the binding
+        return False
+    k._dhcp.renew = fake_renew
+    k._maintain_step()
+    assert (True, False, "100.64.4.1") in rec.calls   # withdrew (bound=False)
+    assert rebinds["n"] == 0                            # never entered the REBIND loop
+
+
+def test_rebind_nak_withdraws_default_and_reacquires(lk):
+    # A NAK during the REBIND window is likewise a revoke: withdraw and re-acquire
+    # instead of spinning REBIND to T2 with the default still installed.
+    k = _keeper(lk, vhid=254, default_route_mode="enforce")
+    rec = _RecordingReconciler()
+    k._defroute = rec
+    k._probe_carp_master = lambda: True
+    k._hb = lambda: None
+    k._arp_nudge = lambda *_a, **_k: None
+    k._hold_lease = lambda _s: True
+    k._sleep_interruptible = lambda _s: True
+    k._dhcp.timing = lambda: (0, 100, "test")
+    k._dhcp.binding.yiaddr = "100.64.4.7"
+    k._dhcp.binding.lease_router = "100.64.4.1"
+
+    def fake_renew(rebind=False):
+        if not rebind:
+            return False       # RENEW at T1 times out -> enter the REBIND loop
+        k._dhcp.expire()       # the first REBIND attempt gets a NAK
+        return False
+    k._dhcp.renew = fake_renew
+    k._maintain_step()
+    assert (True, False, "100.64.4.1") in rec.calls   # withdrew after the REBIND NAK
+
+
 def test_renew_success_reconciles_changed_gateway_immediately(lk):
     # A same-address renew that carries a new option-3 gateway must hit the FIB at
     # once, not at the next per-tick poll: otherwise the default keeps routing via

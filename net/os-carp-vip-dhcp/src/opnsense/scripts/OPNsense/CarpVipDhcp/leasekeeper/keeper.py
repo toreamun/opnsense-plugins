@@ -86,6 +86,11 @@ class _SignalFlags:
     # by the next per-tick role poll, and the periodic ARP nudge keeps reachability
     # fresh regardless of a dropped manual nudge (SIGUSR1) -- so a lost edge costs
     # at most one poll interval of latency, never a missed state change.
+    # The one stretch where that interval is longer than a tick is inside a
+    # blocking DhcpClient.renew()/reboot() reply wait, which services only the stop
+    # callback: a CARP edge that lands there is reconciled when the call returns
+    # (the renew/rebind-success arms and the REBIND loop all reconcile), so failover
+    # convergence is delayed by at most one renew/rebind attempt there, not lost.
     @property
     def stopping(self):
         """Terminal stop flag; polled (never cleared) by every loop/sleep guard."""
@@ -679,6 +684,13 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
             self._reconcile_default_route(master)
             self._arp_nudge(force=True, master=master)
             return
+        if not b.yiaddr:
+            # renew() got a DHCPNAK and forgot the binding (lease revoked): withdraw
+            # any default we owned at once and drop to the unbound arm to re-acquire,
+            # rather than REBINDing an address the server just refused.
+            LOG.warning("DHCP RENEW got NAK -- lease revoked, re-acquiring")
+            self._reconcile_default_route()
+            return
         LOG.warning("DHCP RENEW failed at T1 -- trying REBIND until T2")
 
         elapsed = t1
@@ -704,6 +716,12 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
             if self._dhcp.renew(rebind=True):
                 ok = True
                 break
+            if not b.yiaddr:
+                # A NAK during REBIND likewise revoked the lease: withdraw and
+                # re-acquire instead of spinning REBIND until T2 with the default up.
+                LOG.warning("DHCP REBIND got NAK -- lease revoked, re-acquiring")
+                self._reconcile_default_route()
+                return
         if ok:
             LOG.info("DHCP REBIND ok %s (lease=%ss, expires ~%s)",
                      b.yiaddr, b.lease_secs, _clock_at(b.lease_secs))

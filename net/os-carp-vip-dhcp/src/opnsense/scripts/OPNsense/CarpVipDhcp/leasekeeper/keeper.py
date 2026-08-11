@@ -42,6 +42,35 @@ IFCONFIG_STATUS = "status: "                 # any status line present (up or do
 _UNSET = object()
 
 
+def _ifconfig_text(iface):
+    """Raw `ifconfig <iface>` text, or None if it could not run (no logging -- each
+    caller adds its own error policy)."""
+    try:
+        out = subprocess.check_output(["/sbin/ifconfig", iface], errors="replace")
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return out.decode(errors="replace") if isinstance(out, bytes) else out
+
+
+def _carp_master(ifconfig_text, vhid):
+    """CARP-master decision from ifconfig text: True/False for the vhid, None when
+    the text is missing (probe failed), True when no vhid (nothing to gate on)."""
+    if not vhid:
+        return True
+    if ifconfig_text is None:
+        return None
+    return CARP_MASTER_FMT.format(vhid=vhid) in ifconfig_text
+
+
+def carp_master(iface, vhid):
+    """CARP-master role for `vhid` on `iface` (True/False, None on probe failure).
+    Standalone -- no Keeper -- so the daemon entry point can gate its startup
+    fail-stop default withdraw on the role before the Keeper / capture backend
+    exist; the Keeper's per-tick probe (_probe_carp_master) shares CARP_MASTER_FMT
+    through _carp_master."""
+    return _carp_master(_ifconfig_text(iface), vhid)
+
+
 @dataclass
 class _SignalFlags:
     """The only shared state a signal handler may write, behind a tiny protocol
@@ -110,19 +139,13 @@ class _SignalFlags:
 @dataclass(frozen=True)
 class _Config:
     """The keeper's fixed identity/config, set once from the constructor and
-    never mutated -- so a frozen dataclass. master_marker is derived from vhid
-    (the ifconfig CARP-master line for this vhid)."""
+    never mutated -- so a frozen dataclass."""
     iface: str
     chaddr: str
     eth_src: str
     hbfile: "str | None"
     release_on_exit: bool
     vhid: "str | None"
-
-    @property
-    def master_marker(self):
-        """The ifconfig CARP-master line to grep for this vhid (None if unset)."""
-        return CARP_MASTER_FMT.format(vhid=self.vhid) if self.vhid else None
 
 
 @dataclass
@@ -340,30 +363,25 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         nudge fails closed, the transition poll skips), so warn once per failure
         episode -- otherwise a wrong --iface or a broken ifconfig looks identical
         to a healthy backup in the log."""
-        try:
-            out = subprocess.check_output(["/sbin/ifconfig", self._cfg.iface], errors="replace")
-        except (OSError, subprocess.SubprocessError) as e:
+        out = _ifconfig_text(self._cfg.iface)
+        if out is None:
             if not self._link.ifconfig_failed:
-                LOG.warning("ifconfig %s probe failed (%s) -- CARP role and carrier "
-                            "state unknown until it recovers", self._cfg.iface, e)
+                LOG.warning("ifconfig %s probe failed -- CARP role and carrier "
+                            "state unknown until it recovers", self._cfg.iface)
                 self._link.ifconfig_failed = True
             return None
         if self._link.ifconfig_failed:
             LOG.info("ifconfig %s probe recovered", self._cfg.iface)
             self._link.ifconfig_failed = False
-        return out.decode(errors="replace") if isinstance(out, bytes) else out
+        return out
 
     def _probe_carp_master(self) -> "bool | None":
         """Raw CARP-role probe for our vhid: True/False from ifconfig, None when
         the probe itself fails; no vhid configured -> True (nothing to gate on).
         Callers apply their own policy on a None probe -- the ARP nudge fails closed
-        (no nudge unless a confirmed MASTER); the CARP-transition poll just skips."""
-        if self._cfg.master_marker is None:   # no vhid configured -> nothing to gate on
-            return True
-        out = self._ifconfig()
-        if out is None:
-            return None
-        return self._cfg.master_marker in out
+        (no nudge unless a confirmed MASTER); the CARP-transition poll just skips.
+        Uses the warn-once _ifconfig(), unlike the standalone carp_master()."""
+        return _carp_master(self._ifconfig(), self._cfg.vhid)
 
     def _carp_master_probe(self) -> "bool | None":
         """ArpNudge's is_master hook -> the CARP probe (late-bound through the
@@ -624,10 +642,10 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         stopped. Never raises; returns the process exit code.
 
         The startup fail-stop withdraw (a crashed predecessor's stale default) runs
-        in main() via DefaultRouteReconciler.withdraw_if_enabled (gated on a vhid)
-        BEFORE the backend preflight, so it happens even when a backend/arg
+        in main() before the backend preflight, so it happens even when a backend/arg
         early-exit means run() is never reached; the shutdown withdraw below is the
-        graceful counterpart."""
+        graceful counterpart. Both go through withdraw_unless_master (kept on a
+        master, so a keeper restart does not flap 0/0)."""
         # Start the packet capture, retrying forever: a keeper must self-heal, not
         # die, if the interface is briefly unavailable at startup.
         while not self._signals.stopping and not self._capture.start():
@@ -654,11 +672,10 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
                     pass
                 self._sleep(LOOP_ERROR_BACKOFF)
 
-        # shutdown: relinquish an owned default so a stopped, disabled or
-        # mode-changed (enforce -> off) enforcing keeper does not leave 0/0 in the
-        # FIB, still redistributed by FRR, with nothing managing it. Reconcile as
-        # non-master -> withdraw; observe logs a would-withdraw and off is a no-op.
-        self._reconcile_default_route(master=False)
+        # shutdown: relinquish an owned default unless we are the CARP master, so a
+        # keeper restart on a master does not flap 0/0 (the rationale and the accepted
+        # trade-off live in withdraw_unless_master).
+        self._defroute.withdraw_unless_master(self._probe_carp_master)
         if self._cfg.release_on_exit:
             self._dhcp.release()
         self._capture.stop()

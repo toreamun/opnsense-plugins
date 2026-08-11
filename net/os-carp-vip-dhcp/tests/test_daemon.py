@@ -1223,39 +1223,103 @@ def test_maintain_step_head_installs_when_bound(lk):
     assert rec.calls == [(True, True, "100.64.4.1")]   # installed by role at the head
 
 
-def test_shutdown_withdraws_owned_default(lk, monkeypatch):
-    # Stopping an enforcing keeper relinquishes its default so it is not left in
-    # the FIB (and redistributed by FRR) with nothing managing it.
+def _run_to_shutdown(lk, monkeypatch, *, master, initial):
+    # Run a stopped enforcing keeper straight to its shutdown path (real reconciler
+    # over a FakeRoute) with the CARP role stubbed; return the FakeRoute so the caller
+    # asserts whether the shutdown withdrew the default.
+    from test_route import FakeRoute  # noqa: E402  # pylint: disable=import-outside-toplevel
     monkeypatch.setattr(lk.time, "sleep", lambda *_a, **_k: None)
-    k = _keeper(lk, vhid=254, default_route_mode="enforce")
-    rec = _RecordingReconciler()
-    k._defroute = rec
+    fake = FakeRoute(initial=initial)
+    monkeypatch.setattr(lk.subprocess, "run", fake.run)
+    k = _keeper(lk, vhid=254, default_route_mode="enforce")   # a real DefaultRouteReconciler
+    k._probe_carp_master = lambda: master
     k._capture.start = lambda: True
     k._capture.stop = lambda: None
     k._signals.request_stop()          # exit at once -> straight to the shutdown path
     assert k.run() == 0
-    assert (False, False, None) in rec.calls   # reconcile as non-master -> withdraw
+    return fake
 
 
-def test_withdraw_if_enabled_removes_stale_default(lk, monkeypatch):
-    # The startup fail-stop lives on the reconciler (no Keeper, no capture backend),
-    # so main() runs it BEFORE the backend preflight / arg checks -- any of which can
-    # exit before Keeper.run(). A crashed enforcing predecessor's default is
-    # withdrawn here even when the backend can no longer load.
-    from test_route import FakeRoute, GW as RGW  # noqa: E402  # pylint: disable=import-outside-toplevel
-    fake = FakeRoute(initial=RGW)
-    monkeypatch.setattr(lk.subprocess, "run", fake.run)
-    lk.DefaultRouteReconciler.withdraw_if_enabled("enforce")
+def test_shutdown_withdraws_default_when_not_master(lk, monkeypatch):
+    from test_route import GW as RGW  # noqa: E402  # pylint: disable=import-outside-toplevel
+    # Stopping a NON-master keeper relinquishes its default so it is not left in the
+    # FIB (and redistributed by FRR) with nothing managing it.
+    fake = _run_to_shutdown(lk, monkeypatch, master=False, initial=RGW)
     assert "delete" in fake.verbs and fake.gw is None
 
 
-def test_withdraw_if_enabled_off_is_inert(lk, monkeypatch):
-    # off mode never touches the FIB (the vhid gate is main()'s, not the entry point's).
+def test_shutdown_keeps_default_when_master(lk, monkeypatch):
+    from test_route import GW as RGW  # noqa: E402  # pylint: disable=import-outside-toplevel
+    # A master keeps its default across a keeper restart (config change / upgrade):
+    # shutdown must NOT withdraw, else redistribute-kernel flaps 0/0 and the WAN blips
+    # until the restarted keeper re-adopts the lease.
+    fake = _run_to_shutdown(lk, monkeypatch, master=True, initial=RGW)
+    assert fake.gw == RGW and "delete" not in fake.verbs
+
+
+def test_withdraw_unless_master_withdraws_when_not_master(lk, monkeypatch):
+    # The fail-stop lives on the reconciler (no Keeper, no capture backend), so main()
+    # runs it BEFORE the backend preflight / arg checks -- any of which can exit before
+    # Keeper.run(). A crashed non-master predecessor's default is withdrawn here even
+    # when the backend can no longer load.
     from test_route import FakeRoute, GW as RGW  # noqa: E402  # pylint: disable=import-outside-toplevel
     fake = FakeRoute(initial=RGW)
     monkeypatch.setattr(lk.subprocess, "run", fake.run)
-    lk.DefaultRouteReconciler.withdraw_if_enabled("off")
-    assert fake.gw == RGW and not fake.calls
+    lk.DefaultRouteReconciler("enforce").withdraw_unless_master(lambda: False)
+    assert "delete" in fake.verbs and fake.gw is None
+
+
+def test_withdraw_unless_master_skips_when_master(lk, monkeypatch):
+    # A CARP master owns the default and re-adopts it in the maintain loop, so the
+    # fail-stop must NOT withdraw -- otherwise a keeper restart tears the master's
+    # default down before it is re-installed.
+    from test_route import FakeRoute, GW as RGW  # noqa: E402  # pylint: disable=import-outside-toplevel
+    fake = FakeRoute(initial=RGW)
+    monkeypatch.setattr(lk.subprocess, "run", fake.run)
+    lk.DefaultRouteReconciler("enforce").withdraw_unless_master(lambda: True)
+    assert fake.gw == RGW and not fake.calls   # kept, no route(8) call at all
+
+
+def test_withdraw_unless_master_off_is_inert_without_probing(lk, monkeypatch):
+    # off never touches the FIB AND never even spawns the CARP probe (the reconciler
+    # short-circuits on `enabled` before calling `probe`).
+    from test_route import FakeRoute, GW as RGW  # noqa: E402  # pylint: disable=import-outside-toplevel
+    fake = FakeRoute(initial=RGW)
+    monkeypatch.setattr(lk.subprocess, "run", fake.run)
+    probed = []
+    lk.DefaultRouteReconciler("off").withdraw_unless_master(lambda: probed.append(1))
+    assert fake.gw == RGW and not fake.calls and not probed
+
+
+def test_carp_master_decision_from_ifconfig_text(lk):
+    # The pure decision: MASTER for the vhid -> True, BACKUP/absent -> False, missing
+    # text (probe failed) -> None, no vhid -> True (nothing to gate on).
+    m = "\tcarp: MASTER vhid 199 advbase 1 advskew 0\n"
+    b = "\tcarp: BACKUP vhid 199 advbase 1 advskew 100\n"
+    assert lk._carp_master(m, "199") is True
+    assert lk._carp_master(b, "199") is False
+    assert lk._carp_master("", "199") is False        # no carp line at all
+    assert lk._carp_master(None, "199") is None        # ifconfig probe failed
+    assert lk._carp_master(m, None) is True            # no vhid -> nothing to gate on
+
+
+def test_carp_master_vhid_is_word_bounded(lk):
+    # The trailing space in CARP_MASTER_FMT stops vhid 199 matching 19 or 1990.
+    assert lk._carp_master("carp: MASTER vhid 19 advbase 1\n", "199") is False
+    assert lk._carp_master("carp: MASTER vhid 1990 advbase 1\n", "199") is False
+
+
+def test_carp_master_standalone_probes_via_ifconfig(lk, monkeypatch):
+    # carp_master(iface, vhid) runs ifconfig itself (no Keeper) and applies the same
+    # decision; a probe failure reads as None.
+    monkeypatch.setattr(lk.subprocess, "check_output",
+                        lambda *_a, **_k: b"\tcarp: MASTER vhid 199 advbase 1 advskew 0\n")
+    assert lk.carp_master("lagg1", "199") is True
+
+    def boom(*_a, **_k):
+        raise OSError("no ifconfig")
+    monkeypatch.setattr(lk.subprocess, "check_output", boom)
+    assert lk.carp_master("lagg1", "199") is None
 
 
 def test_duplicate_start_guards_before_any_withdraw(lk, monkeypatch):
@@ -1271,8 +1335,8 @@ def test_duplicate_start_guards_before_any_withdraw(lk, monkeypatch):
         raise SystemExit(4)   # another live instance holds the pidfile
     monkeypatch.setattr(lease_keeper, "_setup_logging", lambda _logfile: None)
     monkeypatch.setattr(lease_keeper, "acquire_pidfile", fake_guard)
-    monkeypatch.setattr(lk.DefaultRouteReconciler, "withdraw_if_enabled",
-                        lambda _mode: calls.append("withdraw"))
+    monkeypatch.setattr(lk.DefaultRouteReconciler, "withdraw_unless_master",
+                        lambda _self, _probe: calls.append("withdraw"))
     monkeypatch.setattr("sys.argv", [
         "lease_keeper", "--iface", "eth0", "--chaddr", CHADDR_STR, "--request",
         "100.64.4.7", "--vhid", "254", "--default-route-mode", "enforce"])
@@ -1474,20 +1538,3 @@ def test_renew_changed_gateway_reconciled_by_next_head(lk):
     k._maintain_step()   # head reconciles the OLD gw; renew then changes it to NEW
     k._maintain_step()   # head reconciles the NEW gw
     assert (True, True, "100.64.4.9") in rec.calls
-
-
-def test_shutdown_drives_a_real_route_withdraw(lk, monkeypatch):
-    # End to end through the REAL DefaultRouteReconciler (not the recording stub):
-    # on shutdown an owned default is actually deleted via route(8), exercising the
-    # mode plumbing (default_route_mode -> constructed reconciler) and the withdraw.
-    # (The startup counterpart is DefaultRouteReconciler.withdraw_if_enabled, tested above.)
-    from test_route import FakeRoute, GW as RGW  # noqa: E402  # pylint: disable=import-outside-toplevel
-    monkeypatch.setattr(lk.time, "sleep", lambda *_a, **_k: None)
-    fake = FakeRoute(initial=RGW)
-    monkeypatch.setattr(lk.subprocess, "run", fake.run)
-    k = _keeper(lk, vhid=254, default_route_mode="enforce")
-    k._capture.start = lambda: True
-    k._capture.stop = lambda: None
-    k._signals.request_stop()          # exit at once -> the shutdown non-master withdraw
-    assert k.run() == 0
-    assert "delete" in fake.verbs and fake.gw is None

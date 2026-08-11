@@ -15,8 +15,8 @@ from .capture import CAPTURE_BACKENDS
 from .constants import (
     LOGGER_NAME,
     ACK, BootpOp, DhcpOptName, HB_REFRESH, LINK_KICK_DEBOUNCE, LINK_POLL_STEP,
-    LOOP_ERROR_BACKOFF, REBIND_POLL_STEP, REDORA_MAX, REDORA_MIN, SNIFFER_RETRY,
-    SNIFFER_WARMUP)
+    LOOP_ERROR_BACKOFF, Phase, REBIND_POLL_STEP, REDORA_MAX, REDORA_MIN,
+    SNIFFER_RETRY, SNIFFER_WARMUP)
 from .dhcpclient import DhcpClient
 from .policy import ArpNudge, FollowPolicy
 from .route import DefaultRouteReconciler
@@ -452,6 +452,39 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         b = self._dhcp.binding
         self._defroute.reconcile(master, b.yiaddr is not None, b.lease_router)
 
+    def _role_tick(self, master=_UNSET):
+        """One shared CARP-role probe driving both the role poll and the
+        default-route reconcile, so a heartbeat tick, the SIGUSR2 edge and the
+        REBIND loop never spawn two ifconfigs or let the poll and the reconcile
+        drift apart. Returns the probed role for any further per-tick use (the ARP
+        nudge). Pass an already-probed role to skip the ifconfig."""
+        if master is _UNSET:
+            master = self._probe_carp_master()
+        self._poll_carp_role(master)
+        self._reconcile_default_route(master)
+        return master
+
+    def _on_lease_extended(self, phase):
+        """A RENEW or REBIND (the Phase) landed a fresh lease: refresh the
+        heartbeat, then off one shared CARP probe reconcile the default route (a
+        renewed lease can carry a new option-3 gateway, so track it at once instead
+        of at the next tick) and force an ARP nudge."""
+        b = self._dhcp.binding
+        LOG.info("DHCP %s ok %s (lease=%ss, expires ~%s)", phase, b.yiaddr, b.lease_secs,
+                 _clock_at(b.lease_secs))
+        self._hb()
+        master = self._probe_carp_master()
+        self._reconcile_default_route(master)
+        self._arp_nudge(force=True, master=master)
+
+    def _on_lease_revoked(self, phase):
+        """A RENEW or REBIND (the Phase) drew a DHCPNAK: renew() has already
+        forgotten the binding (RFC 2131 4.4.5 -> INIT, not keep REBINDing a refused
+        address), so withdraw any default we owned at once; the next step
+        re-acquires."""
+        LOG.warning("DHCP %s got NAK -- lease revoked, re-acquiring", phase)
+        self._reconcile_default_route()
+
     @staticmethod
     def fail_stop_withdraw_default(default_route_mode, vhid):
         """Withdraw a default a crashed predecessor may have left in the FIB, as a
@@ -546,9 +579,7 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
                 # nudges + renews immediately instead of at the next ~30s poll, and
                 # re-own the default route on the same edge (a failover flips which
                 # node installs 0/0). One shared CARP probe feeds both, as the tick does.
-                master = self._probe_carp_master()
-                self._poll_carp_role(master)
-                self._reconcile_default_route(master)
+                self._role_tick()
 
             if self._signals.take_nudge():
                 # Operator actions are rare and intentional -- always log them,
@@ -601,11 +632,9 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
 
             self._hb()
             self._follow.watchdog()   # re-drive a follow whose apply stalled
-            # One CARP-role probe per tick, shared by the role poll and the
-            # nudge below (both would otherwise spawn their own ifconfig).
-            master = self._probe_carp_master()
-            self._poll_carp_role(master)   # backup->master? renew early + nudge now
-            self._reconcile_default_route(master)   # keep the default route in step with role+lease
+            # One CARP-role probe per tick, shared by the role poll, the route
+            # reconcile (both via _role_tick) and the nudge below.
+            master = self._role_tick()
             self._arp_nudge(master=master)
         return not self._signals.stopping
 
@@ -690,24 +719,12 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         if not self._hold_lease(t1):
             return
         if self._dhcp.renew():
-            LOG.info("DHCP RENEW ok %s (lease=%ss, expires ~%s)",
-                     b.yiaddr, b.lease_secs, _clock_at(b.lease_secs))
-            self._hb()
-            # A renewed lease can carry a new option-3 gateway; reconcile now (one
-            # shared CARP probe, as _hold_lease does) so the FIB tracks it at once
-            # instead of only at the next per-tick poll.
-            master = self._probe_carp_master()
-            self._reconcile_default_route(master)
-            self._arp_nudge(force=True, master=master)
+            self._on_lease_extended(Phase.RENEW)
             return
-        if not b.yiaddr:
-            # renew() got a DHCPNAK and forgot the binding (lease revoked): withdraw
-            # any default we owned at once and drop to the unbound arm to re-acquire,
-            # rather than REBINDing an address the server just refused.
-            LOG.warning("DHCP RENEW got NAK -- lease revoked, re-acquiring")
-            self._reconcile_default_route()
+        if not b.yiaddr:            # renew() drew a NAK and forgot the binding
+            self._on_lease_revoked(Phase.RENEW)
             return
-        LOG.warning("DHCP RENEW failed at T1 -- trying REBIND until T2")
+        LOG.warning("DHCP %s failed at T1 -- trying %s until T2", Phase.RENEW, Phase.REBIND)
 
         elapsed = t1
         ok = False
@@ -726,27 +743,15 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
             # _hold_lease does per tick. Otherwise a failover during this degraded
             # path relies solely on the SIGUSR2 edge, with no periodic fallback
             # for a missed one until REBIND exits.
-            master = self._probe_carp_master()
-            self._poll_carp_role(master)
-            self._reconcile_default_route(master)
+            self._role_tick()
             if self._dhcp.renew(rebind=True):
                 ok = True
                 break
-            if not b.yiaddr:
-                # A NAK during REBIND likewise revoked the lease: withdraw and
-                # re-acquire instead of spinning REBIND until T2 with the default up.
-                LOG.warning("DHCP REBIND got NAK -- lease revoked, re-acquiring")
-                self._reconcile_default_route()
+            if not b.yiaddr:            # a NAK during REBIND likewise revoked the lease
+                self._on_lease_revoked(Phase.REBIND)
                 return
         if ok:
-            LOG.info("DHCP REBIND ok %s (lease=%ss, expires ~%s)",
-                     b.yiaddr, b.lease_secs, _clock_at(b.lease_secs))
-            self._hb()
-            # As with RENEW above: a rebound lease can carry a new gateway, so
-            # reconcile immediately rather than waiting for the next poll.
-            master = self._probe_carp_master()
-            self._reconcile_default_route(master)
-            self._arp_nudge(force=True, master=master)
+            self._on_lease_extended(Phase.REBIND)
             return
 
         LOG.error("DHCP lease expired -- re-acquiring (back to DISCOVER)")
@@ -772,8 +777,9 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         self._ensure_sniffer()  # a dead sniffer would silently fail every DORA
         self._hb()  # active but not holding yet -> publish bound=-
         # Unbound: a former master that lost its lease must withdraw its default
-        # (want is False while yiaddr is None); the bound-path tick never runs here.
-        self._reconcile_default_route()
+        # (want is False while yiaddr is None). The role is irrelevant when unbound
+        # -- every value withdraws -- so pass master=False and skip the ifconfig.
+        self._reconcile_default_route(master=False)
 
         # No point broadcasting DISCOVERs on a dead link (native dhclient
         # does not either): wait for the carrier instead of burning DORA
@@ -797,13 +803,15 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
                      b.server, b.router or "?",
                      f"/{b.mask_bits}" if b.mask_bits else "none")
             self._hb()
-            self._arp_nudge(force=True)
             self.redora_wait = REDORA_MIN
             # Own the default now the lease is in hand: the pre-acquire reconcile
             # saw bound=False, and _hold_lease's first tick is a full HB_REFRESH
             # away -- without this a freshly-acquired master would sit with no
-            # default for up to that interval (fail-stop, but a needless gap).
-            self._reconcile_default_route()
+            # default for up to that interval (fail-stop, but a needless gap). One
+            # shared CARP probe feeds both the nudge and the reconcile.
+            master = self._probe_carp_master()
+            self._arp_nudge(force=True, master=master)
+            self._reconcile_default_route(master)
         else:
             LOG.warning("DHCP acquire (DISCOVER/REQUEST) failed -- retrying in %ds", self.redora_wait)
             if not self._wait_unbound(_jittered(self.redora_wait)):

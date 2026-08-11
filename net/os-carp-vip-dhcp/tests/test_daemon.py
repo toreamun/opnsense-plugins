@@ -1207,7 +1207,8 @@ def test_acquire_step_reconciles_when_unbound(lk):
     k._sleep_interruptible = lambda _s: True
     k._dhcp.binding.yiaddr = None              # unbound
     k._acquire_step()
-    assert rec.calls == [(True, False, k._dhcp.binding.lease_router)]   # bound=False
+    # unbound -> withdraw regardless of role, so the arm passes master=False (no probe)
+    assert rec.calls == [(False, False, k._dhcp.binding.lease_router)]   # bound=False
 
 
 def test_acquire_success_reconciles_immediately(lk):
@@ -1226,8 +1227,8 @@ def test_acquire_success_reconciles_immediately(lk):
         return True
     k._dhcp.acquire = fake_acquire
     k._acquire_step()
-    # pre-acquire reconcile saw unbound; the post-acquire one installs
-    assert rec.calls == [(True, False, "100.64.4.1"), (True, True, "100.64.4.1")]
+    # pre-acquire reconcile saw unbound (master=False, no probe); the post-acquire one installs
+    assert rec.calls == [(False, False, "100.64.4.1"), (True, True, "100.64.4.1")]
 
 
 def test_shutdown_withdraws_owned_default(lk, monkeypatch):

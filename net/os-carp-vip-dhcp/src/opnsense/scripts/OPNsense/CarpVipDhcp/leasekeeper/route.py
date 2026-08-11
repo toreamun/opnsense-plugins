@@ -132,10 +132,10 @@ class DefaultRouteReconciler:
             return
 
         # A live binding plus a sane, non-zero unicast gateway is a usable lease
-        # (rejects a 0.0.0.0 / malformed option-3 from a rogue or broken DHCP
-        # server, and a gateway that lingers after a lease loss -- expire() clears
-        # only yiaddr). Role-independent: without a usable lease there is nothing to
-        # be master OF, so the default must go regardless of the CARP role.
+        # (the guard rejects a 0.0.0.0 / malformed option-3, and a stale gateway
+        # lingering past a lease loss -- see the bound/gateway contract above).
+        # Role-independent: without a usable lease there is nothing to be master OF,
+        # so the default must go regardless of the CARP role.
         holds_lease = bound and _sane_ipv4(gateway)
 
         # Role unreadable AND a lease is held: we might still legitimately be

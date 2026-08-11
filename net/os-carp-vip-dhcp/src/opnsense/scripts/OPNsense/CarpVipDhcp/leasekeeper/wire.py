@@ -108,6 +108,12 @@ def _fmt_reply(rx) -> str:
             f"gw={rx.router or '-'} mask={rx.subnet_mask or '-'}{msg}")
 
 
+def _zero_ip_to_none(addr):
+    """A BOOTP address field of 0.0.0.0 (or unset) means 'no address'; map it to
+    None so it is falsy, not the truthy string "0.0.0.0"."""
+    return None if addr in (None, "0.0.0.0", 0) else addr
+
+
 def _parse_reply(frame) -> DhcpReply:
     """Snapshot only the handful of DHCP options the keeper acts on from a
     BootpFrame into a DhcpReply; the rest of the reply's option data --
@@ -119,12 +125,12 @@ def _parse_reply(frame) -> DhcpReply:
     # rather than dict(frame.options) so a multi-value option that decodes to a
     # 3+-tuple is still read by its first value (o[1]) instead of raising.
     opts = {o[0]: o[1] for o in frame.options if isinstance(o, tuple)}
-    gi = frame.giaddr   # relay agent; 0.0.0.0 = directly attached
-    if gi in (None, "0.0.0.0", 0):
-        gi = None
-    yi = frame.yiaddr   # 0.0.0.0 (a NAK, or a broken/rogue reply) = no address,
-    if yi in (None, "0.0.0.0", 0):  # normalized to None like giaddr so "bound"
-        yi = None                   # (truthy yiaddr) can never latch onto 0.0.0.0
+    # An unset BOOTP address is 0.0.0.0 on the wire; normalize both to None so a
+    # relay-less reply (giaddr) and a "no address" reply (yiaddr on a NAK, or a
+    # broken/rogue reply) read as absent rather than as a truthy "0.0.0.0" -- in
+    # particular so the yiaddr-derived "bound" signal can never latch onto 0.0.0.0.
+    gi = _zero_ip_to_none(frame.giaddr)   # relay agent; absent = directly attached
+    yi = _zero_ip_to_none(frame.yiaddr)
     return DhcpReply(
         mtype=opts.get(DhcpOptName.MESSAGE_TYPE), yiaddr=yi,
         server_id=opts.get(DhcpOptName.SERVER_ID), lease=opts.get(DhcpOptName.LEASE_TIME),

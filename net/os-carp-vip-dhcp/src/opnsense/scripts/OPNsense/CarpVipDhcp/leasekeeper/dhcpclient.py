@@ -172,7 +172,7 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
             if request_ip:
                 if self.reboot(request_ip):
                     return True
-                LOG.info("INIT-REBOOT did not bind %s -- falling back to DISCOVER", request_ip)
+                LOG.info("INIT-REBOOT did not bind %s -- falling back to %s", request_ip, Phase.DORA)
 
         return self.dora(request_ip)
 

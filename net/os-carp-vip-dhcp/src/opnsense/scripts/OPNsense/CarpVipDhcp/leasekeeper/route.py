@@ -116,6 +116,19 @@ class DefaultRouteReconciler:
         """True in observe/enforce (off is inert); see DefaultRouteMode."""
         return self._mode in (DefaultRouteMode.OBSERVE, DefaultRouteMode.ENFORCE)
 
+    @classmethod
+    def withdraw_if_enabled(cls, mode):
+        """Construct a reconciler for `mode` and drive it to the withdrawn state (no
+        lease, non-master), dropping a default a crashed predecessor left in the FIB.
+        Pure route(8) with no capture backend, so the daemon entry point runs it as a
+        startup fail-stop BEFORE the Keeper / capture backend exist and ahead of any
+        arg/backend early-exit that would skip Keeper.run(). off is a no-op; observe
+        logs a would-withdraw without touching the FIB; enforce actually withdraws.
+        The caller gates on having a CARP vhid (nothing owns a default without one)."""
+        reconciler = cls(mode)
+        if reconciler.enabled:
+            reconciler.reconcile(is_master=False, bound=False, gateway=None)
+
     def reconcile(self, is_master, bound, gateway):
         """Drive the FIB default toward the desired state for the current
         (is_master, bound, gateway). Call from the main loop thread only.

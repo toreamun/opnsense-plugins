@@ -25,30 +25,33 @@ class FakeRoute:
         self.lying = set(lying)    # verbs that exit 0 but do NOT mutate the FIB
 
     def run(self, cmd, **_kwargs):  # capture_output / errors / timeout -- ignored
+        # One return (accumulate rc/out/err) to keep the verb branches readable
+        # without tripping too-many-return-statements.
         self.calls.append(list(cmd))
         verb = cmd[2]  # ["/sbin/route","-n",verb,"-inet","default"[,gw]]
+        rc, out, err = 0, "", ""
         if verb in self.broken:  # a real failure: stuck route / bad socket, not a no-op
-            return types.SimpleNamespace(
-                returncode=1, stdout="", stderr="route: writing to routing socket: permission denied")
-        if verb == "get":
-            has = self.gw is not None  # empty table exits non-zero (one return keeps pylint happy)
-            return types.SimpleNamespace(
-                returncode=0 if has else 1,
-                stdout=f"   gateway: {self.gw}\n   flags: <UP,GATEWAY>\n" if has else "",
-                stderr="" if has else "route: not in table")
-        if verb == "add":
+            rc, err = 1, "route: writing to routing socket: permission denied"
+        elif verb == "get":
+            has = self.gw is not None  # empty table exits non-zero
+            rc = 0 if has else 1
+            out = f"   gateway: {self.gw}\n   flags: <UP,GATEWAY>\n" if has else ""
+            err = "" if has else "route: not in table"
+        elif verb == "add":
             if self.gw is not None:  # FreeBSD: add fails when a default already exists
-                return types.SimpleNamespace(
-                    returncode=1, stdout="", stderr="route: writing to routing socket: File exists")
-            if verb not in self.lying:  # a lying add exits 0 but leaves the FIB unchanged
+                rc, err = 1, "route: writing to routing socket: File exists"
+            elif verb not in self.lying:  # a lying add exits 0 but leaves the FIB unchanged
                 self.gw = cmd[-1]
-            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
-        if verb == "delete":
+        elif verb == "change":
+            if self.gw is None:  # FreeBSD: change fails when no route exists to change
+                rc, err = 1, "route: change net default: not in table"
+            else:
+                self.gw = cmd[-1]  # an on-link gateway swaps in place; off-link is broken={"change"}
+        elif verb == "delete":
             existed = self.gw is not None
             self.gw = None
-            return types.SimpleNamespace(
-                returncode=0 if existed else 1, stdout="", stderr="" if existed else "not in table")
-        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+            rc, err = (0, "") if existed else (1, "not in table")
+        return types.SimpleNamespace(returncode=rc, stdout=out, stderr=err)
 
     @property
     def verbs(self):
@@ -132,7 +135,8 @@ def test_enforce_corrects_wrong_nexthop(lk, monkeypatch):
     rec, fake = _rec(lk, monkeypatch, "enforce", initial=GW2)
     rec.reconcile(True, True, GW)
     assert fake.gw == GW
-    assert "delete" in fake.verbs and "add" in fake.verbs
+    # atomic replace via `route change`: no delete-then-add, so no no-default gap
+    assert fake.verbs == ["get", "change", "get"]
 
 
 def test_enforce_backup_withdraws(lk, monkeypatch):
@@ -331,14 +335,16 @@ def test_failed_withdraw_is_logged_and_default_stays(lk, monkeypatch, caplog):
     assert not any("withdrew default" in r.getMessage() for r in caplog.records)
 
 
-def test_stuck_delete_on_replace_keeps_old_and_errors(lk, monkeypatch, caplog):
-    # the delete of the old default is stuck, so the add of the new one fails
-    # "already in table" and the FIB keeps the OLD gateway -- the confirm catches
-    # what a non-zero exit alone could not tell from a benign no-op.
-    rec, fake = _rec(lk, monkeypatch, "enforce", initial=GW, broken={"delete"})
+def test_rejected_change_on_replace_keeps_old_and_errors(lk, monkeypatch, caplog):
+    # the atomic `route change` is rejected (bench-confirmed on FreeBSD 14.3 when
+    # the new gateway is not on-link, e.g. a cross-subnet lease whose interface has
+    # not moved yet): the FIB keeps the OLD default -- never torn down or
+    # black-holed -- and the confirm read-back surfaces that the new one is not in.
+    rec, fake = _rec(lk, monkeypatch, "enforce", initial=GW, broken={"change"})
     with caplog.at_level("ERROR", logger="lease-keeper"):
-        rec.reconcile(True, True, GW2)  # replace GW -> GW2
-    assert fake.gw == GW  # old gateway kept, not silently overwritten
+        rec.reconcile(True, True, GW2)  # replace GW -> GW2, but the change is rejected
+    assert fake.gw == GW  # old gateway kept intact, not withdrawn
+    assert "delete" not in fake.verbs  # the working default is never removed on a failed replace
     assert any("failed to install default via " + GW2 in r.getMessage() for r in caplog.records)
 
 

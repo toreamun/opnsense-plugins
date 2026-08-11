@@ -116,18 +116,32 @@ class DefaultRouteReconciler:
         """True in observe/enforce (off is inert); see DefaultRouteMode."""
         return self._mode in (DefaultRouteMode.OBSERVE, DefaultRouteMode.ENFORCE)
 
-    @classmethod
-    def withdraw_if_enabled(cls, mode):
-        """Construct a reconciler for `mode` and drive it to the withdrawn state (no
-        lease, non-master), dropping a default a crashed predecessor left in the FIB.
-        Pure route(8) with no capture backend, so the daemon entry point runs it as a
-        startup fail-stop BEFORE the Keeper / capture backend exist and ahead of any
-        arg/backend early-exit that would skip Keeper.run(). off is a no-op; observe
-        logs a would-withdraw without touching the FIB; enforce actually withdraws.
-        The caller gates on having a CARP vhid (nothing owns a default without one)."""
-        reconciler = cls(mode)
-        if reconciler.enabled:
-            reconciler.reconcile(is_master=False, bound=False, gateway=None)
+    def withdraw_unless_master(self, probe):
+        """Drop an owned default UNLESS this node is the CARP master. `probe` is a
+        callable() -> bool|None returning the CARP-master role; it runs only once the
+        mode would act, so off never spawns it. A confirmed master KEEPS its default
+        (a keeper restart -- a config change or an upgrade -- must not tear it down
+        and flap 0/0; the maintain loop re-adopts it). A backup or an unreadable role
+        (False / None) withdraws, fail-closed, so a stale default is never left for
+        FRR to keep advertising with nothing managing it.
+
+        Run at the two process boundaries: main()'s startup fail-stop (on a throwaway
+        reconciler, before the Keeper / capture backend exist and ahead of any
+        arg/backend early-exit that would skip Keeper.run()) and Keeper.run()'s
+        graceful shutdown. off is a no-op; observe logs a would-withdraw without
+        touching the FIB; enforce actually withdraws. The caller gates on a CARP vhid.
+
+        Trade-off: a GENUINE permanent stop (an operator disabling the plugin) on a
+        node that is still CARP master keeps the default in the FIB with nothing
+        managing it after -- the state this withdraw otherwise prevents. That window
+        is narrow (the node is still master, so the default is at least
+        static-correct) and telling it apart from a restart would need a fragile
+        stop-vs-restart signal, so it is accepted."""
+        if not self.enabled:
+            return
+        if probe() is True:
+            return
+        self.reconcile(is_master=False, bound=False, gateway=None)
 
     def reconcile(self, is_master, bound, gateway):
         """Drive the FIB default toward the desired state for the current

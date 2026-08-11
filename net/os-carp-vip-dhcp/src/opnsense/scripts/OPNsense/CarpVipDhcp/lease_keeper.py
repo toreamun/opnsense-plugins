@@ -63,7 +63,7 @@ from logging.handlers import RotatingFileHandler
 
 from leasekeeper.capture import CAPTURE_BACKENDS
 from leasekeeper.constants import LOGGER_NAME
-from leasekeeper.keeper import Keeper
+from leasekeeper.keeper import Keeper, carp_master
 from leasekeeper.route import DefaultRouteMode, DefaultRouteReconciler
 from leasekeeper.util import MAC_RE
 
@@ -194,14 +194,15 @@ def main():
     # test: no guard and no FIB mutation, so it takes neither (pf stays None).
     pf = None if a.once else acquire_pidfile(a.pidfile)
     try:
-        # Fail-stop: a crashed predecessor (whose backend is now missing, or that
-        # was restarted with a bad arg) may have left a default in the FIB, still
-        # redistributed by FRR. Withdraw it as non-master here -- pure route(8), no
-        # capture backend -- BEFORE the backend preflight and the arg checks, each
-        # of which can return before Keeper.run() would otherwise do it. Skipped for
-        # --once, and when no CARP vhid owns a default route by role.
+        # Fail-stop: a crashed predecessor (backend now missing, or a bad arg) may
+        # have left a default in the FIB, still redistributed by FRR. Drop it here --
+        # pure route(8), no capture backend -- BEFORE the backend preflight and the
+        # arg checks, each of which can return before Keeper.run() would. The gate
+        # (a master keeps its default, a backup withdraws; probe only when the mode
+        # acts) lives in withdraw_unless_master. Skipped for --once and no vhid.
         if not a.once and a.vhid:
-            DefaultRouteReconciler.withdraw_if_enabled(a.default_route_mode)
+            DefaultRouteReconciler(a.default_route_mode).withdraw_unless_master(
+                lambda: carp_master(a.iface, a.vhid))
 
         # Fail fast (with a logged reason) if the selected backend cannot run on
         # this host -- checked uniformly through the registry so a future backend

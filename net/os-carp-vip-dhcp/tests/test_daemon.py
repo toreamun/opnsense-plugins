@@ -80,7 +80,7 @@ def test_dhcpreply_giaddr_defaults_none(lk):
 
 def test_reboot_request_shape_and_bind(lk):
     c = _client(lk)
-    c._wait_for_dhcp_reply = lambda want, timeout: lk.DhcpReply(
+    c._wait_for_dhcp_reply = lambda want, timeout, *a: lk.DhcpReply(
         lk.ACK, "100.64.4.7", "100.64.4.1", 1800, None, None, None)
     assert c.reboot("100.64.4.7") is True
     assert c.binding.yiaddr == "100.64.4.7" and c.binding.server == "100.64.4.1"
@@ -92,7 +92,7 @@ def test_reboot_request_shape_and_bind(lk):
 
 def test_reboot_nak_falls_through(lk):
     c = _client(lk)
-    c._wait_for_dhcp_reply = lambda want, timeout: lk.DhcpReply(
+    c._wait_for_dhcp_reply = lambda want, timeout, *a: lk.DhcpReply(
         lk.NAK, None, None, None, None, None, None)
     assert c.reboot("100.64.4.7") is False
     assert c.binding.yiaddr is None
@@ -351,13 +351,13 @@ def test_on_dhcp_reply_captures_option56_message(lk):
 @pytest.mark.parametrize("message, expect", [
     ("lease not available", "lease not available"),   # option-56 text surfaced
     (b"bad chaddr", "bad chaddr"),   # a bytes reason is decoded
-    (None, "DHCPNAK received"),   # no reason -> the NAK is still logged
+    (None, "DHCPNAK in"),   # no reason -> the NAK is still logged (with phase/address context)
 ])
 def test_dhcpnak_logs_reason(lk, caplog, message, expect):
     keeper = _keeper(lk)
     keeper._dhcp._rx = lk.DhcpReply(lk.NAK, None, "100.64.4.1", None, None, None, None, message)
     with caplog.at_level("WARNING", logger="lease-keeper"):
-        assert keeper._dhcp._wait_for_dhcp_reply(lk.ACK, 0.2).mtype == lk.NAK
+        assert keeper._dhcp._wait_for_dhcp_reply(lk.ACK, 0.2, "DORA").mtype == lk.NAK
     assert any(expect in r.getMessage() for r in caplog.records)
 
 
@@ -1069,7 +1069,7 @@ def test_renew_omits_server_id_and_requested_addr(lk):
     # requested_addr, and ciaddr MUST be the client's address.
     c = _client(lk)
     c.binding.server, c.binding.yiaddr, c.binding.lease_secs = "100.64.4.1", "100.64.4.7", 1800
-    c._wait_for_dhcp_reply = lambda want, timeout: lk.DhcpReply(
+    c._wait_for_dhcp_reply = lambda want, timeout, *a: lk.DhcpReply(
         lk.ACK, c.binding.yiaddr, c.binding.server, 1800, None, None, None)
     assert c.renew() is True   # RENEW (T1)
     assert c.renew(rebind=True) is True  # REBIND (T2)
@@ -1392,7 +1392,7 @@ def test_failed_dora_clears_unconfirmed_offer(lk):
         lk.DhcpReply(lk.OFFER, "100.64.4.7", "100.64.4.1", 1800, None, None, "100.64.4.1"),  # OFFER
         lk.DhcpReply(lk.NAK, None, "100.64.4.1", None, None, None, None),                     # REQUEST -> NAK
     ])
-    c._wait_for_dhcp_reply = lambda want, timeout: next(replies, None)
+    c._wait_for_dhcp_reply = lambda want, timeout, *a: next(replies, None)
     assert c.dora("100.64.4.7") is False
     assert c.binding.yiaddr is None   # cleared -> re-acquire, never a phantom bound
 
@@ -1406,7 +1406,7 @@ def test_failed_dora_after_offer_timeout_clears_yiaddr(lk, monkeypatch):
     c._ensure_sniffer = lambda: None
     calls = {"n": 0}
 
-    def reply(_want, _timeout):
+    def reply(_want, _timeout, *_a):
         calls["n"] += 1
         # the first wait is the DISCOVER's OFFER; every REQUEST wait after it times out
         if calls["n"] == 1:
@@ -1426,7 +1426,7 @@ def test_renew_keeps_lease_router_when_ack_omits_option3(lk):
     c.adopt(lk.DhcpReply(lk.ACK, "100.64.4.7", "100.64.4.1", 1800, None, None, "100.64.4.1"))
     assert c.binding.lease_router == "100.64.4.1"
     c._ensure_sniffer = lambda: None
-    c._wait_for_dhcp_reply = lambda _want, _timeout: lk.DhcpReply(
+    c._wait_for_dhcp_reply = lambda _want, _timeout, *a: lk.DhcpReply(
         lk.ACK, "100.64.4.7", "100.64.4.1", 1800, None, None, None)   # same lease, no opt 3
     assert c.renew() is True
     assert c.binding.lease_router == "100.64.4.1"
@@ -1466,7 +1466,7 @@ def test_renew_nak_forgets_binding(lk):
     c = _client(lk)
     c.adopt(lk.DhcpReply(lk.ACK, "100.64.4.7", "100.64.4.1", 1800, None, None, "100.64.4.1"))
     c._ensure_sniffer = lambda: None
-    c._wait_for_dhcp_reply = lambda _want, _timeout: lk.DhcpReply(
+    c._wait_for_dhcp_reply = lambda _want, _timeout, *a: lk.DhcpReply(
         lk.NAK, None, "100.64.4.1", None, None, None, None)
     assert c.renew() is False
     assert c.binding.yiaddr is None          # forgotten -> reconcile withdraws, next step re-acquires
@@ -1555,3 +1555,144 @@ def test_renew_changed_gateway_reconciled_by_next_head(lk):
     k._maintain_step()   # head reconciles the OLD gw; renew then changes it to NEW
     k._maintain_step()   # head reconciles the NEW gw
     assert (True, True, "100.64.4.9") in rec.calls
+
+
+# ---- logging: rate limiter, renew gating, nudge liveness, lease pulse ----
+
+def test_rate_limit_throttles_and_reports_suppressed(lk, monkeypatch):
+    now = {"t": 1000.0}
+    monkeypatch.setattr(lk.time, "monotonic", lambda: now["t"])
+    rl = lk._RateLimit(10)
+    assert rl.ready() == (True, 0)     # first call always allowed
+    assert rl.ready() == (False, 0)    # inside the window -> suppressed
+    assert rl.ready() == (False, 0)
+    now["t"] = 1011.0                  # past the interval
+    assert rl.ready() == (True, 2)     # allowed again, reporting the two it hid
+
+
+def test_renew_unchanged_is_debug_changed_is_info_with_delta(lk, caplog):
+    # a steady renew (nothing changed) drops to DEBUG so a short lease does not fill
+    # the log; a renew that moves the gateway logs at INFO stating what changed.
+    k = _keeper(lk)
+    k._hb = lambda: None
+    k._arp_nudge = lambda *_a, **_k: None
+    b = k._dhcp.binding
+    b.yiaddr, b.lease_secs, b.lease_router = "100.64.4.7", 300, "100.64.4.1"
+    b.t1_server = b.t2_server = None
+    prior = k._lease_facts()
+    with caplog.at_level("DEBUG", logger="lease-keeper"):
+        k._on_lease_extended(lk.Phase.RENEW, prior)     # unchanged -> DEBUG
+        b.lease_router = "100.64.4.9"                   # the renewal carries a new gateway
+        k._on_lease_extended(lk.Phase.RENEW, prior)     # changed -> INFO
+    renew_lines = [r for r in caplog.records if "RENEW ok" in r.getMessage()]
+    assert [r.levelname for r in renew_lines] == ["DEBUG", "INFO"]
+    assert any("gw 100.64.4.1->100.64.4.9" in r.getMessage() for r in renew_lines)
+
+
+def test_rebind_always_logs_info(lk, caplog):
+    # a REBIND is recovery from a failed renew -- notable even if nothing changed.
+    k = _keeper(lk)
+    k._hb = lambda: None
+    k._arp_nudge = lambda *_a, **_k: None
+    b = k._dhcp.binding
+    b.yiaddr, b.lease_secs, b.lease_router = "100.64.4.7", 300, "100.64.4.1"
+    prior = k._lease_facts()
+    with caplog.at_level("DEBUG", logger="lease-keeper"):
+        k._on_lease_extended(lk.Phase.REBIND, prior)
+    rebind = [r for r in caplog.records if "REBIND ok" in r.getMessage()]
+    assert [r.levelname for r in rebind] == ["INFO"]
+
+
+def _nudge(lk, send):
+    capture = types.SimpleNamespace(send_arp_request=send)
+    return lk.ArpNudge(capture, CHADDR_STR, lk.ARP_NUDGE_MIN, lambda: True)
+
+
+def test_nudge_send_failure_warns_are_throttled(lk, monkeypatch, caplog):
+    # a persistently failing send warns at most once per NUDGE_FAIL_LOG_INTERVAL
+    # (not per tick, not latched-silent-forever), and re-fires once the window
+    # passes so the fault stays visible.
+    def boom(*_a):
+        raise OSError("send failed")
+    now = {"t": 9000.0}
+    monkeypatch.setattr(lk.time, "monotonic", lambda: now["t"])
+    n = _nudge(lk, boom)
+    with caplog.at_level("WARNING", logger="lease-keeper"):
+        n.maybe_nudge("100.64.4.7", "100.64.4.1")         # first failure -> WARNING
+        n.last_nudge = 0.0
+        n.maybe_nudge("100.64.4.7", "100.64.4.1")         # within the window -> throttled
+        assert len([r for r in caplog.records if "ARP nudge failed" in r.getMessage()]) == 1
+        now["t"] += lk.NUDGE_FAIL_LOG_INTERVAL + 1
+        n.last_nudge = 0.0
+        n.maybe_nudge("100.64.4.7", "100.64.4.1")         # window passed -> warns again
+    assert len([r for r in caplog.records if "ARP nudge failed" in r.getMessage()]) == 2
+
+
+def test_lease_healthy_pulse_is_throttled(lk, monkeypatch, caplog):
+    k = _keeper(lk)
+    k._dhcp.binding.yiaddr = "100.64.4.7"
+    k._dhcp.binding.lease_secs = 300
+    now = {"t": 5000.0}
+    monkeypatch.setattr(lk.time, "monotonic", lambda: now["t"])
+    with caplog.at_level("INFO", logger="lease-keeper"):
+        k._maybe_pulse()                              # first -> emits
+        k._maybe_pulse()                              # within the hour -> suppressed
+        now["t"] += lk.LEASE_PULSE_INTERVAL + 1
+        k._maybe_pulse()                              # past the interval -> emits again
+    assert len([r for r in caplog.records if "lease healthy" in r.getMessage()]) == 2
+
+
+def test_lease_healthy_pulse_silent_when_unbound(lk, monkeypatch, caplog):
+    k = _keeper(lk)
+    k._dhcp.binding.yiaddr = None
+    monkeypatch.setattr(lk.time, "monotonic", lambda: 5000.0)
+    with caplog.at_level("INFO", logger="lease-keeper"):
+        k._maybe_pulse()
+    assert not [r for r in caplog.records if "lease healthy" in r.getMessage()]
+
+
+def test_parse_error_storm_collapses_to_one_debug_line(lk, monkeypatch, caplog):
+    # a storm of malformed frames must collapse to one throttled DEBUG line that
+    # reports how many it hid, not one line per frame (log-churn / spoof-storm guard).
+    def boom(*_a):
+        raise ValueError("boom")
+    monkeypatch.setattr("leasekeeper.capture_bpf._decode_arp", boom)
+    now = {"t": 100.0}
+    monkeypatch.setattr(lk.time, "monotonic", lambda: now["t"])
+    cap = lk.BpfCapture("eth0", False, lambda f: None, lambda f: None)
+    frame = b"\x00" * 12 + b"\x08\x06" + b"\x00" * 30   # ARP ethertype, long enough to dispatch
+    with caplog.at_level("DEBUG", logger="lease-keeper"):
+        for _ in range(5):
+            cap._dispatch(frame)
+        assert len([r for r in caplog.records if "bpf frame parse error" in r.getMessage()]) == 1
+        now["t"] += lk.PARSE_ERROR_LOG_INTERVAL + 1
+        cap._dispatch(frame)
+    lines = [r for r in caplog.records if "bpf frame parse error" in r.getMessage()]
+    assert len(lines) == 2
+    assert "more suppressed" in lines[1].getMessage()   # the suffix reports the hidden count
+
+
+def test_log_initial_carp_role_announces_and_seeds(lk, caplog):
+    k = _keeper(lk, vhid=254)
+    k._probe_carp_master = lambda: True
+    with caplog.at_level("INFO", logger="lease-keeper"):
+        k._log_initial_carp_role()
+    assert k._was_master is True    # seeded so the first poll does not log a spurious transition
+    assert any("initial CARP role for vhid 254: MASTER" in r.getMessage() for r in caplog.records)
+
+
+def test_log_initial_carp_role_skips_without_vhid(lk, caplog):
+    k = _keeper(lk)   # no vhid
+    with caplog.at_level("INFO", logger="lease-keeper"):
+        k._log_initial_carp_role()
+    assert not any("initial CARP role" in r.getMessage() for r in caplog.records)
+
+
+def test_lease_changes_reports_lease_and_timer_deltas(lk):
+    k = _keeper(lk)
+    b = k._dhcp.binding
+    b.lease_secs, b.lease_router, b.t1_server, b.t2_server = 300, "100.64.4.1", None, None
+    prior = k._lease_facts()
+    b.lease_secs, b.t1_server = 600, 250    # lease length and a server timer both move
+    changes = k._lease_changes(prior)
+    assert "lease 300s->600s" in changes and "renew timers changed" in changes

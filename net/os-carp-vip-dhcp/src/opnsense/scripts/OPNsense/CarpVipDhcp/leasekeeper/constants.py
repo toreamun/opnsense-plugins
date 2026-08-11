@@ -129,6 +129,12 @@ SNIFFER_RETRY = 5          # wait before retrying a failed packet-sniffer start
 SNIFFER_WARMUP = 0.5       # let the capture thread attach before the first send
 LOOP_ERROR_BACKOFF = 10    # wait after an unexpected main-loop error before retrying
 
+# Logging rate limits (seconds).
+# Min gap between WAN-untrusted parse-error DEBUG lines, so a malformed/spoof
+# storm cannot churn the log rotation.
+PARSE_ERROR_LOG_INTERVAL = 10
+LEASE_PULSE_INTERVAL = 3600    # emit a throttled "lease healthy" INFO pulse at most this often while bound
+
 # Follow (VIP-rewrite) throttle + apply-retry.
 MIN_FOLLOW_INTERVAL = 60   # min seconds between follow (VIP rewrite) events -- damps flap/spoof storms
 FOLLOW_RETRY_DEADLINE = 120  # re-drive follow_update if we are not restarted within this after firing
@@ -149,6 +155,7 @@ DHCP_SERVER_PORT = 67
 DHCP_CLIENT_PORT = 68
 
 ARP_NUDGE_MIN = 30         # floor for --arp-nudge so a typo cannot flood the segment
+NUDGE_FAIL_LOG_INTERVAL = 300   # min seconds between "ARP nudge failed" warnings on a persistent send failure
 
 
 class Phase(StrEnum):

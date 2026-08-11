@@ -50,6 +50,7 @@ class RouteCommand(StrEnum):
     as its bare value (a plain Enum would render 'RouteCommand.ADD' and need
     .value)."""
     ADD = "add"
+    CHANGE = "change"
     DELETE = "delete"
     GET = "get"
 
@@ -208,14 +209,19 @@ class DefaultRouteReconciler:
             LOG.info("[observe] would install default via %s%s", gateway,
                      "" if replacing is None else f" (replacing {replacing})")
             return
-        # Set-default idiom: delete then add, so a wrong gateway is replaced (a
-        # plain `route add default` fails when one is already present). Then
-        # CONFIRM the FIB actually reached the desired state -- reading the result
-        # back is wording-independent, unlike parsing route(8)'s exit/stderr, and
-        # it catches a stuck delete that left the old gateway in place.
-        if replacing is not None:
-            self._route(RouteCommand.DELETE, _DEFAULT)
-        self._route(RouteCommand.ADD, _DEFAULT, gateway)
+        # Replace atomically with `route change`, not delete-then-add. A bench
+        # check on FreeBSD 14.3 confirmed both halves: `route change` to an on-link
+        # gateway swaps in place (no momentary no-default gap for FRR
+        # redistribute-kernel to flap on), and to an off-link gateway it fails
+        # ("Invalid argument") and leaves the old default intact -- so a still-usable
+        # default is never torn down for one we cannot install (e.g. a cross-subnet
+        # lease whose new gateway is not on-link until the interface moves). A first
+        # install (no prior default) uses `add`: `change` requires the route to
+        # exist. Then CONFIRM the FIB reached the desired state -- reading the result
+        # back is wording-independent, unlike parsing route(8)'s exit/stderr, and a
+        # rejected change simply reads back as the old gateway (surfaced below).
+        verb = RouteCommand.ADD if replacing is None else RouteCommand.CHANGE
+        self._route(verb, _DEFAULT, gateway)
         have = self._fib_default_gateway()
         if have == gateway:
             LOG.info("installed default via %s%s", gateway,

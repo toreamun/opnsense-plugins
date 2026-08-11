@@ -383,3 +383,79 @@ def test_fresh_install_add_failure_is_logged_absent(lk, monkeypatch, caplog):
     assert fake.gw is None
     assert any(f"failed to install default via {GW}" in r.getMessage()
                and "absent" in r.getMessage() for r in caplog.records)
+
+
+# ---- desired-state confirmation: INFO on entry/change, DEBUG on unchanged repeat ----
+
+def _levels_for(caplog, needle):
+    return [r.levelname for r in caplog.records if needle in r.getMessage()]
+
+
+def test_enforce_owning_heartbeat_info_then_debug(lk, monkeypatch, caplog):
+    # a steady, already-correct master states ownership positively (not silence),
+    # once at INFO then repeating at DEBUG so a stable lease does not spam INFO.
+    rec, _ = _rec(lk, monkeypatch, "enforce", initial=GW)
+    with caplog.at_level("DEBUG", logger="lease-keeper"):
+        rec.reconcile(True, True, GW)   # already correct -> entry
+        rec.reconcile(True, True, GW)   # unchanged repeat
+    assert _levels_for(caplog, f"owning default via {GW}") == ["INFO", "DEBUG"]
+
+
+def test_enforce_no_default_heartbeat_names_reason(lk, monkeypatch, caplog):
+    # a backup that holds the (shared-vMAC) lease but is not master confirms it has
+    # correctly no default, with the reason, at INFO on entry then DEBUG.
+    rec, _ = _rec(lk, monkeypatch, "enforce")
+    with caplog.at_level("DEBUG", logger="lease-keeper"):
+        rec.reconcile(False, True, GW)
+        rec.reconcile(False, True, GW)
+    msgs = [r for r in caplog.records if "no default held (CARP backup)" in r.getMessage()]
+    assert [r.levelname for r in msgs] == ["INFO", "DEBUG"]
+
+
+def test_observe_would_install_info_then_debug(lk, monkeypatch, caplog):
+    # observe never writes the FIB, so the would-install condition persists every
+    # tick; log it once at INFO then DEBUG instead of repeating at INFO forever.
+    rec, _ = _rec(lk, monkeypatch, "observe")
+    with caplog.at_level("DEBUG", logger="lease-keeper"):
+        rec.reconcile(True, True, GW)
+        rec.reconcile(True, True, GW)
+    assert _levels_for(caplog, "would install default") == ["INFO", "DEBUG"]
+
+
+def test_observe_would_withdraw_info_then_debug(lk, monkeypatch, caplog):
+    rec, _ = _rec(lk, monkeypatch, "observe", initial=GW)
+    with caplog.at_level("DEBUG", logger="lease-keeper"):
+        rec.reconcile(False, False, None)
+        rec.reconcile(False, False, None)
+    assert _levels_for(caplog, "would withdraw default") == ["INFO", "DEBUG"]
+
+
+def test_liveness_withdraw_names_the_reason(lk, monkeypatch, caplog):
+    # a withdraw forced by the liveness gate says so, so the operator does not
+    # misread it as a plain CARP role loss.
+    rec, _ = _rec(lk, monkeypatch, "enforce", initial=GW, liveness_probe=lambda: False)
+    with caplog.at_level("INFO", logger="lease-keeper"):
+        rec.reconcile(True, True, GW)
+    assert any("withdrew default" in r.getMessage() and "liveness not confirmed" in r.getMessage()
+               for r in caplog.records)
+
+
+def test_no_default_reason_no_usable_lease(lk, monkeypatch, caplog):
+    # master but holding no lease: the no-default heartbeat names "no usable lease"
+    # (not "CARP backup"), so the operator sees WHY there is no default.
+    rec, _ = _rec(lk, monkeypatch, "enforce")
+    with caplog.at_level("INFO", logger="lease-keeper"):
+        rec.reconcile(True, False, None)
+    assert any("no default held (no usable lease)" in r.getMessage() for r in caplog.records)
+
+
+def test_gateway_change_relogs_ownership_at_info(lk, monkeypatch, caplog):
+    # the desired state is keyed on (want, gateway): a follow to a new gateway is a
+    # change, so ownership is stated again at INFO, not silenced as unchanged.
+    rec, _ = _rec(lk, monkeypatch, "enforce", initial=GW)
+    with caplog.at_level("DEBUG", logger="lease-keeper"):
+        rec.reconcile(True, True, GW)     # own via GW (INFO)
+        rec.reconcile(True, True, GW2)    # gateway changed -> install GW2 (INFO)
+    assert _levels_for(caplog, f"owning default via {GW}") == ["INFO"]
+    assert any(r.levelname == "INFO" and f"installed default via {GW2}" in r.getMessage()
+               for r in caplog.records)

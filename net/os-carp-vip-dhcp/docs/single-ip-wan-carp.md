@@ -803,8 +803,10 @@ trying to own the single `0.0.0.0/0` would fight over it.
 `enforce` raises a choice about the OPNsense WAN gateway object, because OPNsense has its
 own default-route logic (`getDefaultGW`) that installs `0.0.0.0/0` via the first usable
 gateway. The keeper does **not** use that gateway object: it takes the default's next hop
-from the DHCP lease itself (option 3, falling back to the server-id). So the object only
-matters to OPNsense's own routing and to gateway monitoring. Two ways to run it:
+from the lease's own gateway (DHCP option 3) alone. If a lease carries no usable option-3
+gateway, `enforce` installs no default at all (the fail-stop state above) rather than
+substituting another address. So the object only matters to OPNsense's own routing and to
+gateway monitoring. Two ways to run it:
 
 - **Keep the gateway and mark it down (`force_down`).** The recommended pairing.
   `getDefaultGW` skips a `force_down` gateway unconditionally, so OPNsense installs no

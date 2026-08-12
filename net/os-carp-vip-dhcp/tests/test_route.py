@@ -385,49 +385,69 @@ def test_fresh_install_add_failure_is_logged_absent(lk, monkeypatch, caplog):
                and "absent" in r.getMessage() for r in caplog.records)
 
 
-# ---- desired-state confirmation: INFO on entry/change, DEBUG on unchanged repeat ----
+# ---- desired-state confirmation: INFO on entry/change, then a throttled DEBUG
+# heartbeat. The per-tick repeat within the heartbeat window is suppressed (see
+# test_reconcile_heartbeat_throttle_cycle) so a quiet node does not churn the log. ----
 
 def _levels_for(caplog, needle):
     return [r.levelname for r in caplog.records if needle in r.getMessage()]
 
 
-def test_enforce_owning_heartbeat_info_then_debug(lk, monkeypatch, caplog):
-    # a steady, already-correct master states ownership positively (not silence),
-    # once at INFO then repeating at DEBUG so a stable lease does not spam INFO.
+def test_enforce_owning_heartbeat_states_at_info(lk, monkeypatch, caplog):
+    # a steady, already-correct master states ownership positively (not silence) at
+    # INFO on entry; the immediate per-tick repeat is throttled away.
     rec, _ = _rec(lk, monkeypatch, "enforce", initial=GW)
     with caplog.at_level("DEBUG", logger="lease-keeper"):
         rec.reconcile(True, True, GW)   # already correct -> entry
-        rec.reconcile(True, True, GW)   # unchanged repeat
-    assert _levels_for(caplog, f"owning default via {GW}") == ["INFO", "DEBUG"]
+        rec.reconcile(True, True, GW)   # unchanged repeat -> throttled
+    assert _levels_for(caplog, f"owning default via {GW}") == ["INFO"]
 
 
 def test_enforce_no_default_heartbeat_names_reason(lk, monkeypatch, caplog):
     # a backup that holds the (shared-vMAC) lease but is not master confirms it has
-    # correctly no default, with the reason, at INFO on entry then DEBUG.
+    # correctly no default, with the reason, at INFO on entry (the repeat throttled).
     rec, _ = _rec(lk, monkeypatch, "enforce")
     with caplog.at_level("DEBUG", logger="lease-keeper"):
         rec.reconcile(False, True, GW)
         rec.reconcile(False, True, GW)
     msgs = [r for r in caplog.records if "no default held (CARP backup)" in r.getMessage()]
-    assert [r.levelname for r in msgs] == ["INFO", "DEBUG"]
+    assert [r.levelname for r in msgs] == ["INFO"]
 
 
-def test_observe_would_install_info_then_debug(lk, monkeypatch, caplog):
+def test_observe_would_install_states_at_info(lk, monkeypatch, caplog):
     # observe never writes the FIB, so the would-install condition persists every
-    # tick; log it once at INFO then DEBUG instead of repeating at INFO forever.
+    # tick; log it once at INFO instead of forever (the repeat throttled).
     rec, _ = _rec(lk, monkeypatch, "observe")
     with caplog.at_level("DEBUG", logger="lease-keeper"):
         rec.reconcile(True, True, GW)
         rec.reconcile(True, True, GW)
-    assert _levels_for(caplog, "would install default") == ["INFO", "DEBUG"]
+    assert _levels_for(caplog, "would install default") == ["INFO"]
 
 
-def test_observe_would_withdraw_info_then_debug(lk, monkeypatch, caplog):
+def test_observe_would_withdraw_states_at_info(lk, monkeypatch, caplog):
     rec, _ = _rec(lk, monkeypatch, "observe", initial=GW)
     with caplog.at_level("DEBUG", logger="lease-keeper"):
         rec.reconcile(False, False, None)
         rec.reconcile(False, False, None)
-    assert _levels_for(caplog, "would withdraw default") == ["INFO", "DEBUG"]
+    assert _levels_for(caplog, "would withdraw default") == ["INFO"]
+
+
+def test_reconcile_heartbeat_throttle_cycle(lk, monkeypatch, caplog):
+    # the steady-state decision logs INFO once on entry, suppresses the per-tick
+    # repeat within the heartbeat window, emits a single DEBUG once the window
+    # elapses, and returns to INFO (re-arming the throttle) the moment the decision
+    # actually changes -- so a quiet node cannot fill the log with a per-tick line.
+    rec, _ = _rec(lk, monkeypatch, "observe")
+    with caplog.at_level("DEBUG", logger="lease-keeper"):
+        rec.reconcile(True, True, GW)        # would-install entry -> INFO
+        rec.reconcile(True, True, GW)        # within the window -> suppressed
+        assert _levels_for(caplog, "would install default") == ["INFO"]
+        rec._heartbeat._deadline = 0         # the heartbeat window has elapsed
+        rec.reconcile(True, True, GW)        # -> a single DEBUG heartbeat
+        assert _levels_for(caplog, "would install default") == ["INFO", "DEBUG"]
+        rec.reconcile(False, False, None)    # the decision changes -> INFO, re-arm
+        rec.reconcile(False, False, None)    # immediate repeat -> suppressed again
+    assert _levels_for(caplog, "no default held") == ["INFO"]
 
 
 def test_liveness_withdraw_names_the_reason(lk, monkeypatch, caplog):

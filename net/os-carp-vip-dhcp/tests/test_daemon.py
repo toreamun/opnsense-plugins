@@ -1706,11 +1706,37 @@ def test_initial_unknown_carp_role_is_resolved_on_first_poll(lk, caplog):
     assert not k._renew_asap                     # initial determination, not a promotion
 
 
-def test_lease_changes_reports_lease_and_timer_deltas(lk):
+def test_lease_changes_reports_gateway_and_timers_not_lease(lk):
+    # a gateway or server-timer change is reported (and promotes the renew to INFO);
+    # a lease-length change is deliberately not, so server option-51 jitter stays quiet.
     k = _keeper(lk)
     b = k._dhcp.binding
     b.lease_secs, b.lease_router, b.t1_server, b.t2_server = 300, "100.64.4.1", None, None
     prior = k._lease_facts()
-    b.lease_secs, b.t1_server = 600, 250    # lease length and a server timer both move
+    b.lease_secs, b.lease_router, b.t1_server = 600, "100.64.4.9", 250   # all three move
     changes = k._lease_changes(prior)
-    assert "lease 300s->600s" in changes and "renew timers changed" in changes
+    assert "gw 100.64.4.1->100.64.4.9" in changes and "renew timers changed" in changes
+    assert "lease" not in changes    # the lease-length change is intentionally not reported
+
+
+def test_renew_lease_length_change_stays_debug(lk, caplog):
+    # the lease length is deliberately not compared (servers jitter option 51 by a
+    # second or two each renew; a live ISP oscillated 295<->296), so a renew that
+    # changes only the lease length stays at DEBUG with no "[lease ...]" delta --
+    # neither the 1s wobble nor even a large change promotes it to INFO.
+    k = _keeper(lk)
+    k._hb = lambda: None
+    k._arp_nudge = lambda *_a, **_k: None
+    b = k._dhcp.binding
+    b.yiaddr, b.lease_router, b.t1_server, b.t2_server = "100.64.4.7", "100.64.4.1", None, None
+    b.lease_secs = 296
+    prior = k._lease_facts()
+    b.lease_secs = 295                                   # a 1-second wobble
+    assert k._lease_changes(prior) == ""
+    b.lease_secs = 600                                   # even a large lease change
+    assert k._lease_changes(prior) == ""                 # is still not a "change"
+    with caplog.at_level("DEBUG", logger="lease-keeper"):
+        k._on_lease_extended(lk.Phase.RENEW, prior)
+    renew = [r for r in caplog.records if "RENEW ok" in r.getMessage()]
+    assert [r.levelname for r in renew] == ["DEBUG"]
+    assert "->" not in renew[0].getMessage()             # no spurious [lease ...] delta

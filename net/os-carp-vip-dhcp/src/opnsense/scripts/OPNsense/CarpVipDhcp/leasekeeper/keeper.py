@@ -511,19 +511,23 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         return master
 
     def _lease_facts(self):
-        """The lease facts a renew might change (captured before renewing, for the
-        changed-vs-steady RENEW log): lease length, opt-3 gateway, server T1/T2."""
+        """The lease facts a renew might meaningfully change (captured before
+        renewing, for the changed-vs-steady RENEW log): the opt-3 gateway and the
+        server T1/T2. The lease length is deliberately excluded -- many servers
+        jitter option 51 by a second or two each renew, which is not an operationally
+        meaningful change and would otherwise force every renew to INFO."""
         b = self._dhcp.binding
-        return (b.lease_secs, b.lease_router, b.t1_server, b.t2_server)
+        return (b.lease_router, b.t1_server, b.t2_server)
 
     def _lease_changes(self, prior):
-        """A short 'what changed' summary of the current binding against `prior`,
-        or '' when nothing an operator cares about moved (the routine steady renew)."""
-        old_secs, old_gw, old_t1, old_t2 = prior
+        """A short 'what changed' summary of the current binding against `prior`, or
+        '' when nothing an operator cares about moved (the routine steady renew).
+        Keyed on the gateway (routing) and the server-provided T1/T2, not the jittery
+        lease length; see _lease_facts. The current lease length is still shown in
+        the renew line itself, just not treated as a change."""
+        old_gw, old_t1, old_t2 = prior
         b = self._dhcp.binding
         parts = []
-        if b.lease_secs != old_secs:
-            parts.append(f"lease {old_secs}s->{b.lease_secs}s")
         if b.lease_router != old_gw:
             parts.append(f"gw {old_gw or 'none'}->{b.lease_router or 'none'}")
         if (b.t1_server, b.t2_server) != (old_t1, old_t2):
@@ -534,8 +538,8 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         """A RENEW or REBIND (the Phase) landed a fresh lease: refresh the heartbeat
         and force an ARP nudge. A steady RENEW that changed nothing logs at DEBUG so
         a short lease does not fill the log between events; a RENEW that changed the
-        lease length / gateway / timers -- and every REBIND (recovery from a failed
-        renew is notable) -- logs at INFO stating what changed. The default route is
+        gateway or renew timers -- and every REBIND (recovery from a failed renew is
+        notable) -- logs at INFO stating what changed. The default route is
         reconciled by the loop-head reconcile on the next _maintain_step entry (a
         renewed lease can carry a new option-3 gateway), so it is not repeated here."""
         b = self._dhcp.binding

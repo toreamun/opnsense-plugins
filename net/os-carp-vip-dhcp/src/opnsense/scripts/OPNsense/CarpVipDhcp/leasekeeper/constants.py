@@ -134,6 +134,12 @@ LOOP_ERROR_BACKOFF = 10    # wait after an unexpected main-loop error before ret
 # storm cannot churn the log rotation.
 PARSE_ERROR_LOG_INTERVAL = 10
 LEASE_PULSE_INTERVAL = 3600    # emit a throttled "lease healthy" INFO pulse at most this often while bound
+# Steady-state default-route decision (owning / no-default) is DEBUG-logged at most
+# this often while unchanged. Any actual change logs immediately at INFO; this only
+# throttles the per-tick "still the same" heartbeat so it does not dominate the log
+# file (which is written at DEBUG regardless of the GUI view level) and churn the
+# rotation, flushing real events out of the retained backups.
+RECONCILE_HEARTBEAT_INTERVAL = 300
 
 # Follow (VIP-rewrite) throttle + apply-retry.
 MIN_FOLLOW_INTERVAL = 60   # min seconds between follow (VIP rewrite) events -- damps flap/spoof storms

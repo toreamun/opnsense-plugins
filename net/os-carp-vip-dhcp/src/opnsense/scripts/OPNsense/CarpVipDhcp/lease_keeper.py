@@ -212,7 +212,6 @@ def main():
             LOG.critical("capture backend %r cannot run: %s -- the lease keeper cannot start",
                          a.capture_backend, reason)
             return 3
-        LOG.info("capture backend: %s", a.capture_backend)
 
         for label, mac in (("chaddr", a.chaddr), ("eth-src", a.eth_src)):
             if mac and not MAC_RE.match(mac):

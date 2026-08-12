@@ -1194,17 +1194,34 @@ def test_hold_lease_tick_drives_default_route_reconcile(lk):
     assert (True, True, "100.64.4.1") in rec.calls
 
 
-def test_maintain_step_head_withdraws_when_unbound(lk):
-    # The loop head withdraws any owned default whenever unbound (the role is
-    # irrelevant, so master=False, no probe) before the acquire arm runs.
+def test_unbound_withdraws_when_acquire_does_not_bind(lk):
+    # Unbound and the (re)acquire did not bind (a lost lease, or a dead WAN: mode-D):
+    # withdraw, so a node that cannot route stops advertising 0/0. Role-independent.
     k = _keeper(lk, vhid=254, default_route_mode="enforce")
     rec = _RecordingReconciler()
     k._defroute = rec
-    k._acquire_step = lambda: None             # isolate the head reconcile
+    k._acquire_step = lambda: None             # the acquire does not bind
     k._dhcp.binding.yiaddr = None              # unbound
     k._dhcp.binding.lease_router = "100.64.4.1"
     k._maintain_step()
-    assert rec.calls == [(False, False, "100.64.4.1")]   # withdraw at the head, no probe
+    assert rec.calls == [(False, False, "100.64.4.1")]   # withdrew after the failed acquire
+
+
+def test_unbound_keeps_default_when_acquire_binds(lk):
+    # A keeper restart re-adopts its still-valid lease in the acquire (INIT-REBOOT),
+    # so the unbound branch must NOT withdraw first -- the inherited default stays, no
+    # 0/0 flap. This is the whole point: acquire-then-withdraw-only-if-still-unbound.
+    k = _keeper(lk, vhid=254, default_route_mode="enforce")
+    rec = _RecordingReconciler()
+    k._defroute = rec
+
+    def fake_acquire():
+        k._dhcp.binding.yiaddr = "100.64.4.7"   # the acquire re-adopts the lease
+    k._acquire_step = fake_acquire
+    k._dhcp.binding.yiaddr = None
+    k._dhcp.binding.lease_router = "100.64.4.1"
+    k._maintain_step()
+    assert not rec.calls                         # no withdraw: the re-acquire kept it
 
 
 def test_maintain_step_head_installs_when_bound(lk):

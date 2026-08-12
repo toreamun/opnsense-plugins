@@ -146,6 +146,7 @@ class _Config:
     hbfile: "str | None"
     release_on_exit: bool
     vhid: "str | None"
+    capture_backend: str
 
 
 @dataclass
@@ -182,7 +183,8 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
             eth_src=(eth_src or chaddr).lower(),
             hbfile=hbfile,
             release_on_exit=release_on_exit,
-            vhid=str(vhid) if vhid else None)
+            vhid=str(vhid) if vhid else None,
+            capture_backend=capture_backend)
 
         # Capture backend component: owns the capture socket/thread and the
         # wire codec on both directions, and hands decoded neutral frames
@@ -653,9 +655,10 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
             self._sleep(SNIFFER_RETRY)
 
         # eth-src matters for L2 debugging but only when it differs from the chaddr.
-        ethsrc = f" eth-src={self._cfg.eth_src}" if self._cfg.eth_src != self._cfg.chaddr else ""
-        LOG.info("lease-keeper %s active on %s: chaddr=%s%s request=%s",
-                 __version__, self._cfg.iface, self._cfg.chaddr, ethsrc, self._follow.target or "any")
+        ethsrc = f", eth-src {self._cfg.eth_src}" if self._cfg.eth_src != self._cfg.chaddr else ""
+        LOG.info("lease-keeper %s up on %s via %s backend: CARP MAC %s%s, requesting %s",
+                 __version__, self._cfg.iface, self._cfg.capture_backend, self._cfg.chaddr,
+                 ethsrc, self._follow.target or "any")
         time.sleep(SNIFFER_WARMUP)
 
         while not self._signals.stopping:
@@ -704,11 +707,15 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         retried, so a transient fault can never terminate the keeper."""
         b = self._dhcp.binding
         if not b.yiaddr:
-            # Unbound: withdraw any default we still own (the role is irrelevant when
-            # unbound -- every value withdraws -- so master=False, no ifconfig), then
-            # try to (re)acquire.
-            self._reconcile_default_route(master=False)
+            # Unbound: (re)acquire FIRST, then withdraw only if that did not bind. A
+            # keeper restart re-adopts its still-valid lease here (INIT-REBOOT, a few
+            # ms), so a master keeps its inherited default -- no 0/0 flap -- instead of
+            # tearing it down and reinstalling. Only when the acquire cannot bind (a
+            # lost lease, or a dead WAN: mode-D) do we withdraw, so a node that cannot
+            # route stops advertising 0/0. Role-independent, no ifconfig probe.
             self._acquire_step()
+            if not b.yiaddr:
+                self._reconcile_default_route(master=False)
             return
         # Bound: own the default by CARP role, here at the loop head. _maintain_step
         # is re-entered after every transition (a just-acquired lease, a renew that

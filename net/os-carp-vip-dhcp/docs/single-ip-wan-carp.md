@@ -9,7 +9,7 @@ nodes: the classic "single-IP" obstacle to CARP on the WAN side.
 > (failover machinery) and a real CGNAT WAN (the DHCP-lease-on-a-virtual-MAC part). One
 > correction came out of that run: giving the backup its own internet via an **automatic
 > gateway-group tier flip is failover-unsafe**, and is replaced by a fixed default route
-> plus an optional on-demand path ([section 8](#s8)). [section 9](#s9) has the piece-by-piece status.
+> plus an optional on-demand path ([section 8](#s8)). [section 10](#s10) has the piece-by-piece status.
 
 All addresses below are **examples, substitute your own.** The per-node WAN IPs are
 **link-local** (`169.254.0.0/16`); the other private ranges (SYNC, internal) are
@@ -247,7 +247,7 @@ sequenceDiagram
 >
 > **Lab-validated, and exercised on real ISPs.** The failover itself has run on real
 > WANs: the VIP followed the master on a CGNAT WAN, and on a live single-IP WAN a real
-> CARP failover promoted the backup, which served immediately ([section 9](#s9)). The
+> CARP failover promoted the backup, which served immediately ([section 10](#s10)). The
 > connection-level details here are the lab findings - a client's TCP connection carried
 > data both **before and after** a mid-connection cable-pull (`pfsync` had synced the
 > state; outbound NAT to the VIP keeps it portable across nodes, so the promoted node
@@ -291,7 +291,7 @@ are examples, substitute your own.*
 >   NAK-then-silence = MAC-bound. A `DISCOVER` takes no lease, so it leaves the live line
 >   untouched. (OPNsense's `dhclient` has **no `-r`/release** flag; for a maximally clean
 >   test free the current lease with a `DHCPRELEASE` sent another way.) See [section 7](#s7)
->   *DHCP behaviour* and [section 9](#s9).
+>   *DHCP behaviour* and [section 10](#s10).
 
 <a id="s6-1"></a>
 
@@ -671,9 +671,9 @@ route starts working - **no routing reconfiguration on role change.**
 > **`defaultRouteMode`:** the design above is the baseline (`off`, the default), where
 > OPNsense installs the default on both nodes and it never moves. If you instead set a
 > keeper's `defaultRouteMode` to `enforce`, that keeper owns the default per CARP role
-> (install as master, withdraw otherwise), which requires the WAN gateway's **Mark
-> Gateway as Down** (`force_down`) so OPNsense does not also manage it. See the README's
-> default-route ownership section. In `off` this section applies unchanged.
+> (install as master, withdraw otherwise), for which you either mark the WAN gateway
+> down (`force_down`) or remove it, so OPNsense does not also manage the default. See
+> [section 9](#s9). In `off` this section applies unchanged.
 
 ```mermaid
 flowchart LR
@@ -765,7 +765,87 @@ SYNC-sourced traffic out the VIP:
 
 <a id="s9"></a>
 
-## 9 What is validated vs. still open
+## 9 Default-route ownership by CARP role (`defaultRouteMode`)
+
+The baseline above pins the default to `WAN_ISP` on both nodes and never moves it
+([section 8](#s8)): failover is seamless because the promoted node already holds the
+route and only its on-link path (the VIP) changes. That is the default
+(`defaultRouteMode = off`), and everything above applies unchanged.
+
+`enforce` is an opt-in alternative for when you want exactly one node to hold a default
+at a time. The keeper then owns the IPv4 default route (`0.0.0.0/0`) as a function of its
+CARP role and whether it holds a lease: **only the CARP master that actually holds a
+lease keeps a default in the FIB; every other state has none.** The failure mode is
+therefore a *withdrawn* default, never a black-holed one, a node that cannot route stops
+presenting a default rather than presenting one that does not work.
+
+This is pure FreeBSD `route`, with no dynamic-routing dependency. It is useful on its own
+(it keeps the FIB honest per role), and it composes with a dynamic router if you happen
+to run one: a node that has withdrawn its default automatically stops advertising one
+(for example via FRR `redistribute kernel`), so the withdrawal propagates with no extra
+wiring. FRR is not required by the plugin.
+
+### The three modes
+
+- **`off`** (default): inert. The keeper never touches the FIB, and the baseline design
+  above holds.
+- **`observe`**: a dry run. The keeper logs the install or withdraw it *would* perform,
+  but never writes the FIB. Use it to confirm the decisions look right before switching
+  to `enforce`.
+- **`enforce`**: the keeper installs the default when master (with an atomic `route
+  change`, then reads the FIB back to confirm) and withdraws it otherwise.
+
+Only one keeper may run `enforce` (a model validation enforces this): two keepers both
+trying to own the single `0.0.0.0/0` would fight over it.
+
+### The gateway, and `force_down`
+
+`enforce` raises a choice about the OPNsense WAN gateway object, because OPNsense has its
+own default-route logic (`getDefaultGW`) that installs `0.0.0.0/0` via the first usable
+gateway. The keeper does **not** use that gateway object: it takes the default's next hop
+from the DHCP lease itself (option 3, falling back to the server-id). So the object only
+matters to OPNsense's own routing and to gateway monitoring. Two ways to run it:
+
+- **Keep the gateway and mark it down (`force_down`).** The recommended pairing.
+  `getDefaultGW` skips a `force_down` gateway unconditionally, so OPNsense installs no
+  default and the keeper owns it cleanly, while `dpinger` keeps monitoring the WAN path
+  (RTT, loss, status, alerts). The cost is cosmetic: the gateway reads as down even
+  though it is fine. Without `force_down`, `enforce` still converges (the keeper
+  re-withdraws on its next reconcile), but each OPNsense routing reconfigure reasserts
+  the default on a backup for up to one reconcile interval, a short window in which a
+  redistributing router would advertise it. `force_down` removes that window.
+- **Remove the gateway entirely.** With no WAN gateway defined, OPNsense installs no
+  default at all, the keeper owns it, and no `force_down` is needed. Simpler, but you
+  lose `dpinger`'s WAN monitoring, and with it the reachability signal a future liveness
+  gate would want.
+
+### Rolling it out on a live HA pair
+
+Order matters, and the FIB-touching steps should be done on a node while it is the
+**backup**, or at the console, never on the node currently carrying traffic:
+
+1. `force_down` the WAN gateway (if you are keeping it) on both nodes. The existing
+   default stays; nothing moves yet.
+2. Set `defaultRouteMode = enforce` on the WAN keeper on both nodes. The master keeps its
+   default (a confirmed no-op); a backup withdraws.
+3. If you redistribute the default into a dynamic router, migrate the master's
+   origination from an unconditional advertisement to a FIB-following one (for example
+   FRR `default-originate` to `redistribute kernel`) **last**: doing it earlier can make
+   an upstream peer prefer the backup during the change.
+
+### Still open
+
+- A **liveness gate** for the "link up, ISP dead" case, where the master holds a stale
+  lease over a dead upstream and keeps a default that black-holes. `enforce` today keys
+  only on CARP role and lease-held, not on upstream reachability; the gate is a separate
+  follow-up.
+- A **faster reaction** to an OPNsense default reassert, to close the short window above
+  without depending on `force_down`, if that independence is wanted.
+
+
+<a id="s10"></a>
+
+## 10 What is validated vs. still open
 
 Three environments were used: an isolated two-node **Proxmox lab** for the failover
 machinery, a **real CGNAT WAN** for the DHCP part, and a **live single-IP DHCP WAN** for
@@ -783,6 +863,7 @@ the integrated field run.
 | A client's TCP connection survives a master failover (`pfsync` + NAT to VIP) | **Lab-validated** - bytes flowed on the same connection before *and* after a mid-connection cable-pull. Note the physical+VM caveat: WAN-device-anchored states do not sync, LAN-anchored ones do ([section 7](#s7)) |
 | The switch relearns the VIP's MAC on failover | **Lab-validated** - the bridge relearns from the new master's gratuitous ARP; no special switch config, extra bridge, or NIC driver needed |
 | Default pinned to `WAN_ISP`, giving seamless failover with no routing switch | **Field-validated** - the promoted node routed straight out the VIP the moment it took the VIP; no gateway switching involved ([section 8](#s8)) |
+| Default-route ownership by CARP role (`defaultRouteMode = enforce`), fail-stop | **Field-validated on a live single-IP pair** - both nodes made fail-stop (`force_down` + `enforce` + FIB-following origination), and a controlled failover moved the default in ~20-50 ms with the WAN up throughout ([section 9](#s9)) |
 | ~~Automatic gateway-group tier flip for the backup's default route~~ | **Rejected - failover-unsafe ([section 8.1](#s8-1)).** Switching lags the CARP event, so a promoted backup blackholes until dpinger catches up (field-observed). Default stays pinned to `WAN_ISP`; give the backup internet on-demand ([section 8.2](#s8-2)) instead |
 | Outbound NAT on an interface group across a physical/VM pair's divergent WAN keys | **Field-validated failure + fix** - a group bound to only one node's key left the backup's outbound NAT silently dead once promoted; setting the group members to *both* keys (`opt3,wan`) fixed it, and `ifconfig -g WAN` then lists the real device on both ([section 7](#s7)) |
 | `pfsync` state sync across a physical (`igc`) + VM (`vtnet`) pair | **Field-observed working** - the backup held ~60% of the master's state count; states on identically-named LAN/VLAN interfaces sync, WAN-device-anchored states do not ([section 7](#s7)). A mid-connection failover on this exact pair has not been separately retested |

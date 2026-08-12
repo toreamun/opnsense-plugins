@@ -23,10 +23,16 @@ import logging
 import subprocess
 from enum import StrEnum
 
-from .constants import LOGGER_NAME
-from .util import _sane_ipv4
+from .constants import LOGGER_NAME, RECONCILE_HEARTBEAT_INTERVAL
+from .util import _RateLimit, _sane_ipv4
 
 LOG = logging.getLogger(LOGGER_NAME)
+
+
+def _drop(*_args, **_kwargs):
+    """A log-callable that discards its call: what _at returns for a throttled
+    steady-state repeat, so a suppressed heartbeat is a no-op with the same
+    call shape as LOG.debug/LOG.info."""
 
 # Daemon log-and-continue posture: broad catch-alls are deliberate (see the
 # package docstring / module docstrings).
@@ -114,6 +120,10 @@ class DefaultRouteReconciler:
         # Last (want, gateway) we logged, so a steady desired state is confirmed
         # once at INFO then repeats at DEBUG (see _at / _UNSET).
         self._last_desired = _UNSET
+        # Throttle for the unchanged steady-state DEBUG heartbeat, so a quiet
+        # backup/master does not log its (identical) decision every tick and churn
+        # the log rotation. A change re-arms it (see _at).
+        self._heartbeat = _RateLimit(RECONCILE_HEARTBEAT_INTERVAL)
 
     @property
     def mode(self):
@@ -228,11 +238,19 @@ class DefaultRouteReconciler:
             else:
                 self._withdraw(changed, have, reason)
 
-    @staticmethod
-    def _at(changed):
-        """Pick the log level for a desired-state confirmation: INFO the first
-        time a state is entered (changed), DEBUG on every unchanged repeat."""
-        return LOG.info if changed else LOG.debug
+    def _at(self, changed):
+        """Pick the log callable for a desired-state confirmation. A state change
+        logs at INFO the first time the state is entered, and re-arms the heartbeat
+        so the identical DEBUG repeat does not fire on the very next tick. An
+        unchanged repeat logs at DEBUG at most once per RECONCILE_HEARTBEAT_INTERVAL
+        (proof the reconciler is alive and its decision); the ticks in between are
+        dropped, so a steady node does not fill the log file with a per-tick
+        heartbeat and churn the rotation."""
+        if changed:
+            self._heartbeat.reset()
+            return LOG.info
+        ok, _ = self._heartbeat.ready()
+        return LOG.debug if ok else _drop
 
     @staticmethod
     def _no_default_reason(blocked, is_master, holds_lease):

@@ -49,6 +49,13 @@ class _RateLimit:
             suffix = f" (+{dropped} more suppressed)" if dropped else ""
             log_fn(fmt + "%s", *args, suffix)
 
+    def reset(self):
+        """Start a fresh window: the next ready() waits a full interval again. Used
+        when another line has just conveyed the same state (an immediate INFO on a
+        change), so the throttled periodic repeat should not fire right after it."""
+        self._deadline = time.monotonic() + self._interval
+        self._suppressed = 0
+
 
 _CGNAT = ipaddress.ip_network("100.64.0.0/10")
 

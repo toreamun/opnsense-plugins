@@ -12,10 +12,6 @@
 # added or removed without shifting a positional column.
 # Starts one supervised daemon per line, keyed by a filesystem-safe request-IP id.
 
-# The keeper-field variables (request, iface, chaddr, ...) are assigned by the
-# sourced keeperconf.sh parser, whose absolute install path the linter cannot
-# follow; suppress the resulting "unassigned" warnings (file-wide).
-# shellcheck disable=SC2154
 . /etc/rc.subr
 
 name="carpvipdhcp"
@@ -41,6 +37,10 @@ _id()
     printf '%s' "$1" | tr -c 'A-Za-z0-9' '_'
 }
 
+# The keeper-field variables used below are assigned by the sourced keeperconf.sh
+# parser (carpvipdhcp_parse_line); the linter cannot follow its absolute install
+# path, so scope-disable the "unassigned" warning to this function only.
+# shellcheck disable=SC2154
 carpvipdhcp_start()
 {
     [ -f "${conf}" ] || { echo "no config"; return 0; }

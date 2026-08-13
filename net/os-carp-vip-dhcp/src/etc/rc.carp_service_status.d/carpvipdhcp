@@ -11,10 +11,6 @@
 # per keeper, pipe-separated KEY=VALUE fields in no fixed order; we dispatch by
 # key name and use only request= and demote= here.
 
-# request/demote are assigned by the sourced keeperconf.sh parser, whose absolute
-# install path the linter cannot follow; suppress the resulting "unassigned"
-# warnings (file-wide).
-# shellcheck disable=SC2154
 CONF="/usr/local/etc/carpvipdhcp/keeper.conf"
 RUN_DIR="/var/run"
 # The daemon refreshes the heartbeat every ~30s while holding a lease; the
@@ -35,6 +31,10 @@ _id()
 }
 
 now=$(date +%s)
+# request/demote below are assigned by the sourced keeperconf.sh parser; the
+# linter cannot follow its absolute install path, so scope-disable the
+# "unassigned" warning to this loop only.
+# shellcheck disable=SC2154
 while IFS= read -r line || [ -n "${line}" ]; do
     case "${line}" in ''|\#*) continue ;; esac
     carpvipdhcp_parse_line "${line}"

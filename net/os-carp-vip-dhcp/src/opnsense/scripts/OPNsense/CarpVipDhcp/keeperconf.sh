@@ -25,28 +25,31 @@ carpvipdhcp_parse_line()
     clientid='' hostname='' arpnudge='' arplistenpromisc='' defaultroutemode=''
     backupegress='' backupegressform='' backupegressgw='' backupegressiface=''
     backupegressprefixes=''
-    _rec="$1"
-    while [ -n "${_rec}" ]; do
-        _field="${_rec%%|*}"
-        case "${_rec}" in *"|"*) _rec="${_rec#*|}" ;; *) _rec='' ;; esac
-        case "${_field}" in
-            request=*) request="${_field#*=}" ;;
-            iface=*) iface="${_field#*=}" ;;
-            chaddr=*) chaddr="${_field#*=}" ;;
-            demote=*) demote="${_field#*=}" ;;
-            vhid=*) vhid="${_field#*=}" ;;
-            follow=*) follow="${_field#*=}" ;;
-            vendorclass=*) vendorclass="${_field#*=}" ;;
-            clientid=*) clientid="${_field#*=}" ;;
-            hostname=*) hostname="${_field#*=}" ;;
-            arpnudge=*) arpnudge="${_field#*=}" ;;
-            arplistenpromisc=*) arplistenpromisc="${_field#*=}" ;;
-            defaultroutemode=*) defaultroutemode="${_field#*=}" ;;
-            backupegress=*) backupegress="${_field#*=}" ;;
-            backupegressform=*) backupegressform="${_field#*=}" ;;
-            backupegressgateway=*) backupegressgw="${_field#*=}" ;;
-            backupegressinterface=*) backupegressiface="${_field#*=}" ;;
-            backupegressprefixes=*) backupegressprefixes="${_field#*=}" ;;
+    # Namespaced scratch temporaries (POSIX sh has no `local`), unset at the end so
+    # sourcing this parser does not leak them into the caller's environment.
+    _kc_rec="$1"
+    while [ -n "${_kc_rec}" ]; do
+        _kc_field="${_kc_rec%%|*}"
+        case "${_kc_rec}" in *"|"*) _kc_rec="${_kc_rec#*|}" ;; *) _kc_rec='' ;; esac
+        case "${_kc_field}" in
+            request=*) request="${_kc_field#*=}" ;;
+            iface=*) iface="${_kc_field#*=}" ;;
+            chaddr=*) chaddr="${_kc_field#*=}" ;;
+            demote=*) demote="${_kc_field#*=}" ;;
+            vhid=*) vhid="${_kc_field#*=}" ;;
+            follow=*) follow="${_kc_field#*=}" ;;
+            vendorclass=*) vendorclass="${_kc_field#*=}" ;;
+            clientid=*) clientid="${_kc_field#*=}" ;;
+            hostname=*) hostname="${_kc_field#*=}" ;;
+            arpnudge=*) arpnudge="${_kc_field#*=}" ;;
+            arplistenpromisc=*) arplistenpromisc="${_kc_field#*=}" ;;
+            defaultroutemode=*) defaultroutemode="${_kc_field#*=}" ;;
+            backupegress=*) backupegress="${_kc_field#*=}" ;;
+            backupegressform=*) backupegressform="${_kc_field#*=}" ;;
+            backupegressgateway=*) backupegressgw="${_kc_field#*=}" ;;
+            backupegressinterface=*) backupegressiface="${_kc_field#*=}" ;;
+            backupegressprefixes=*) backupegressprefixes="${_kc_field#*=}" ;;
         esac
     done
+    unset _kc_rec _kc_field
 }

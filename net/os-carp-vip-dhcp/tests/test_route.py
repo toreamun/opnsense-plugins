@@ -375,6 +375,26 @@ def test_mode_is_read_only(lk, monkeypatch):
         rec.mode = lk.DefaultRouteMode.ENFORCE  # set-once, no setter
 
 
+def test_default_route_mode_coerce(lk, caplog):
+    # Valid values (string or member) pass through; anything else is inert OFF + a warning,
+    # so a hand-edited config never activates a mode nor crash-loops the daemon.
+    assert lk.DefaultRouteMode.coerce("enforce") is lk.DefaultRouteMode.ENFORCE
+    assert lk.DefaultRouteMode.coerce(lk.DefaultRouteMode.OBSERVE) is lk.DefaultRouteMode.OBSERVE
+    with caplog.at_level("WARNING", logger="lease-keeper"):
+        assert lk.DefaultRouteMode.coerce("bogus") is lk.DefaultRouteMode.OFF
+    assert any("unknown default-route mode" in r.getMessage() for r in caplog.records)
+
+
+def test_backup_egress_form_coerce(lk, caplog):
+    # Same contract for the egress form: unrecognised -> leak-safe SPLIT + a warning
+    # (previously a bad value raised and crash-looped the supervised daemon).
+    assert lk.BackupEgressForm.coerce("prefixes") is lk.BackupEgressForm.PREFIXES
+    assert lk.BackupEgressForm.coerce(lk.BackupEgressForm.SPLIT) is lk.BackupEgressForm.SPLIT
+    with caplog.at_level("WARNING", logger="lease-keeper"):
+        assert lk.BackupEgressForm.coerce("bogus") is lk.BackupEgressForm.SPLIT
+    assert any("unknown backup-egress form" in r.getMessage() for r in caplog.records)
+
+
 def test_strike_limit_must_be_positive(lk):
     with pytest.raises(ValueError):
         lk.DefaultRouteReconciler(mode="enforce", unreadable_role_strikes=0)

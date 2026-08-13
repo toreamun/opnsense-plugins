@@ -1,10 +1,9 @@
-"""Backend-neutral wire layer: the frame types both capture backends decode
+"""Backend-neutral wire layer: the frame types the capture backend decodes
 into, plus the reply parse/format/build helpers and the static capture filter.
 
 These carry no client state; the stateful protocol sequences live in
 dhcpclient. The option (name, value) vocabulary used here is the keeper's own
-and is deliberately scapy-compatible (ScapyCapture relays outbound option lists
-to scapy verbatim).
+internal vocabulary (codec maps it to the numeric DHCP option codes on the wire).
 """
 import logging
 import re
@@ -36,12 +35,11 @@ class DhcpReply(NamedTuple):
 
 
 class BootpFrame(NamedTuple):
-    """A received BOOTP/DHCP frame in backend-neutral shape: both capture
-    backends (scapy packet / raw bytes) decode to this before the keeper sees
-    it. `chaddr` is raw bytes; `options` is a list of (name, value) tuples in
-    the keeper's own option vocabulary (the names in codec's
-    _OPT_ENCODERS/_OPT_DECODERS), which _parse_reply reads regardless of
-    backend."""
+    """A received BOOTP/DHCP frame in backend-neutral shape: the capture
+    backend decodes raw bytes to this before the keeper sees it. `chaddr` is
+    raw bytes; `options` is a list of (name, value) tuples in the keeper's own
+    option vocabulary (the names in codec's _OPT_ENCODERS/_OPT_DECODERS), which
+    _parse_reply reads regardless of backend."""
     op: int
     xid: int
     yiaddr: str
@@ -62,8 +60,8 @@ class DhcpSend(NamedTuple):
     """One outbound DHCP client message in backend-neutral shape: the fields
     that go on the wire (Ethernet source, IP src/dst, the BOOTP
     chaddr/xid/ciaddr/flags, and the option list). DhcpClient builds it; the
-    backend either encodes it (bpf) or relays it to scapy. The send-side
-    counterpart to the received BootpFrame."""
+    capture backend encodes it to raw bytes. The send-side counterpart to the
+    received BootpFrame."""
     eth_src: str
     ip_src: str
     ip_dst: str
@@ -150,9 +148,9 @@ def _dhcp_options(mtype, extra, id_opts):
 def _deliver(handler, frame):
     """Run a keeper frame callback under its own guard: a failure in there is
     a handler bug, not a parse error, and must neither kill the capture
-    thread nor be mislabelled as malformed input. Shared by both capture
-    backends (it lives here, the lowest layer both import, not in the capture
-    registry, to keep the backend imports acyclic)."""
+    thread nor be mislabelled as malformed input. Lives in this low wire layer
+    (which the capture backend imports) rather than in capture.py, so the
+    backend's imports stay acyclic (and a second backend could reuse it)."""
     if frame is None:
         return
     try:

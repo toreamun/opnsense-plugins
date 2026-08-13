@@ -51,6 +51,17 @@ class DefaultRouteMode(StrEnum):
     OBSERVE = "observe"
     ENFORCE = "enforce"
 
+    @classmethod
+    def coerce(cls, value):
+        """The mode for a config string, falling back to OFF (inert) with a warning
+        for any unrecognised value -- so a hand-edited config never activates an
+        unintended mode nor crash-loops the supervised daemon."""
+        try:
+            return cls(value)
+        except ValueError:
+            LOG.warning("unknown default-route mode %r -- treating as off", value)
+            return cls.OFF
+
 
 class BackupEgressForm(StrEnum):
     """The route form the backup installs for its own egress (docs/backup-egress.md).
@@ -61,6 +72,17 @@ class BackupEgressForm(StrEnum):
     run under observe/enforce, and enforce owns 0/0, so it could never install.)"""
     SPLIT = "split"
     PREFIXES = "prefixes"
+
+    @classmethod
+    def coerce(cls, value):
+        """The form for a config string, falling back to SPLIT (leak-safe) with a
+        warning for any unrecognised value -- so a hand-edited config never
+        crash-loops the supervised daemon."""
+        try:
+            return cls(value)
+        except ValueError:
+            LOG.warning("unknown backup-egress form %r -- treating as split", value)
+            return cls.SPLIT
 
 
 class _BackupState(StrEnum):
@@ -151,13 +173,9 @@ class DefaultRouteReconciler:
                  unreadable_role_strikes=DEFAULT_UNREADABLE_ROLE_STRIKES,
                  liveness_probe=None, backup_egress: "BackupEgressConfig | None" = None):
         # mode flows in from the model verbatim (keeper.conf -> rc.d -> argparse)
-        # as a plain string; coerce it, and treat any unrecognised value as inert
-        # OFF. Set-once: exposed read-only via the `mode` property.
-        try:
-            self._mode = DefaultRouteMode(mode)
-        except ValueError:
-            LOG.warning("unknown default-route mode %r -- treating as off", mode)
-            self._mode = DefaultRouteMode.OFF  # never guess an active mode
+        # as a plain string; coerce it, treating any unrecognised value as inert
+        # OFF (never guess an active mode). Set-once: exposed read-only via `mode`.
+        self._mode = DefaultRouteMode.coerce(mode)
         if unreadable_role_strikes < 1:
             raise ValueError("unreadable_role_strikes must be >= 1")
         self._strike_limit = unreadable_role_strikes

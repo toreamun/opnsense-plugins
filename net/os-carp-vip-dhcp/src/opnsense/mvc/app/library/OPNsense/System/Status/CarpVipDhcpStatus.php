@@ -109,10 +109,22 @@ class CarpVipDhcpStatus extends AbstractStatus
         }
         foreach ($lines as $line) {
             $line = trim($line);
-            if ($line === '' || $line[0] === '#' || strpos($line, '|') === false) {
+            if ($line === '' || $line[0] === '#') {
                 continue;
             }
-            $out[] = explode('|', $line)[0];
+            // keeper.conf is one keeper per line, pipe-separated key=value fields
+            // in no fixed order; pull the request= field by name (see the template
+            // and keeperconf.py). A line with no request (or an empty one) is
+            // skipped, matching keeper_records and the rc.d reader.
+            foreach (explode('|', $line) as $field) {
+                if (strncmp($field, 'request=', 8) === 0) {
+                    $request = substr($field, 8);
+                    if ($request !== '') {
+                        $out[] = $request;
+                    }
+                    break;
+                }
+            }
         }
         return $out;
     }

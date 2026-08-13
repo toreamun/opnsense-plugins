@@ -6,8 +6,10 @@
 #
 # rc(8) wrapper for the CARP-VIP DHCP lease keepers (lease_keeper.py).
 # Reads /usr/local/etc/carpvipdhcp/keeper.conf (rendered by the configd template):
-# one line per enabled keeper ->
-#   REQUEST_IP|IFACE|CHADDR|DEMOTE_ON_LEASE_LOSS|VHID|FOLLOW_IP|VENDOR_CLASS|CLIENT_ID|HOSTNAME|ARP_NUDGE|ARP_LISTEN_PROMISC|CAPTURE_BACKEND|DEFAULT_ROUTE_MODE.
+# one line per enabled keeper, each a pipe-separated list of KEY=VALUE fields
+# (request=, iface=, chaddr=, ...) in no fixed order. We dispatch by key name, so
+# an unknown key is ignored and a missing key keeps its default -- fields can be
+# added or removed without shifting a positional column.
 # Starts one supervised daemon per line, keyed by a filesystem-safe request-IP id.
 
 . /etc/rc.subr
@@ -35,10 +37,44 @@ carpvipdhcp_start()
 {
     [ -f "${conf}" ] || { echo "no config"; return 0; }
     count=0
-    while IFS='|' read -r request iface chaddr demote vhid follow vendorclass clientid hostname arpnudge arplistenpromisc capturebackend defaultroutemode backupegress backupegressform backupegressgw backupegressiface backupegressprefixes || [ -n "${request}" ]; do
-        [ -n "${request}" ] || continue
-        case "${request}" in \#*) continue ;; esac
-        if [ -z "${iface}" ] || [ -z "${chaddr}" ]; then
+    while IFS= read -r line || [ -n "${line}" ]; do
+        case "${line}" in ''|\#*) continue ;; esac
+        # Parse the record's KEY=VALUE fields (pipe-separated, any order). Peel one
+        # field off the front at a time with parameter expansion -- no IFS/glob
+        # side effects -- and dispatch by key, so an unknown key is ignored and a
+        # missing key keeps the reset-below default.
+        request='' iface='' chaddr='' vhid='' follow='' vendorclass=''
+        clientid='' hostname='' arpnudge='' arplistenpromisc='' defaultroutemode=''
+        backupegress='' backupegressform='' backupegressgw='' backupegressiface=''
+        backupegressprefixes=''
+        rec="${line}"
+        while [ -n "${rec}" ]; do
+            field="${rec%%|*}"
+            case "${rec}" in *"|"*) rec="${rec#*|}" ;; *) rec='' ;; esac
+            case "${field}" in
+                request=*) request="${field#*=}" ;;
+                iface=*) iface="${field#*=}" ;;
+                chaddr=*) chaddr="${field#*=}" ;;
+                vhid=*) vhid="${field#*=}" ;;
+                follow=*) follow="${field#*=}" ;;
+                vendorclass=*) vendorclass="${field#*=}" ;;
+                clientid=*) clientid="${field#*=}" ;;
+                hostname=*) hostname="${field#*=}" ;;
+                arpnudge=*) arpnudge="${field#*=}" ;;
+                arplistenpromisc=*) arplistenpromisc="${field#*=}" ;;
+                defaultroutemode=*) defaultroutemode="${field#*=}" ;;
+                backupegress=*) backupegress="${field#*=}" ;;
+                backupegressform=*) backupegressform="${field#*=}" ;;
+                backupegressgateway=*) backupegressgw="${field#*=}" ;;
+                backupegressinterface=*) backupegressiface="${field#*=}" ;;
+                backupegressprefixes=*) backupegressprefixes="${field#*=}" ;;
+            esac
+        done
+        if [ -z "${request}" ] || [ -z "${iface}" ] || [ -z "${chaddr}" ]; then
+            # A non-comment line that yields no request/iface/chaddr is unexpected
+            # (the template only renders resolvable keepers). Say so rather than
+            # skip silently, so a rendering bug is not hidden behind "Started 0".
+            echo "carpvipdhcp: skipping unparseable keeper.conf line" >&2
             continue
         fi
         id=$(_id "${request}")
@@ -67,46 +103,17 @@ carpvipdhcp_start()
         [ -n "${arpnudge}" ] && set -- "$@" --arp-nudge "${arpnudge}"
         # Promiscuous ARP capture is an opt-in fallback (default off).
         [ "${arplistenpromisc}" = "1" ] && set -- "$@" --arp-listen-promisc
-        # Capture backend. The per-keeper GUI field (the 12th keeper.conf column)
-        # wins; when it is empty or "default" the host-wide carpvipdhcp_backend
-        # rc.conf flag applies (sysrc carpvipdhcp_backend=bpf); otherwise the
-        # daemon default (scapy) is left in place. Validate here rather than pass
-        # a typo through: an unknown value would make the daemon exit 2 on the
-        # argparse choice, and daemon(8) -r would turn that into a silent 5s crash
-        # loop. Warn and fall back to the default instead.
-        backend="${capturebackend}"
-        case "${backend}" in
-            ''|default) backend="${carpvipdhcp_backend}" ;;
-        esac
-        case "${backend}" in
-            ''|scapy|bpf) [ -n "${backend}" ] && set -- "$@" --capture-backend "${backend}" ;;
-            *) echo "carpvipdhcp: ignoring unknown capture backend '${backend}' (use scapy or bpf)" >&2 ;;
-        esac
-        # Default-route ownership by CARP role (the 13th keeper.conf column). Pass
-        # only observe/enforce; empty or "off" leaves the daemon default (off,
-        # inert). Validate here rather
-        # than pass a typo through: an unknown value fails the daemon's argparse
-        # choice, and daemon(8) -r would turn that exit into a silent crash loop.
-        case "${defaultroutemode}" in
-            ''|off) : ;;
-            observe|enforce) set -- "$@" --default-route-mode "${defaultroutemode}" ;;
-            *) echo "carpvipdhcp: ignoring unknown default-route mode '${defaultroutemode}' (use off, observe or enforce)" >&2 ;;
-        esac
-        # Backup egress (keeper.conf columns 14-18): while CARP backup, route this
-        # node's own internet traffic to the master. Only acts under observe/enforce
-        # (the daemon gates on that); a blank gateway/interface/prefixes field passes
-        # nothing, and --backup-egress-form is only sent for "prefixes" (split relies on
-        # the daemon default).
+        # Default-route ownership by CARP role. Passed through verbatim; the daemon
+        # coerces an empty or unrecognised value to the inert "off" default (it no
+        # longer rejects on an argparse choice, so a typo can't crash-loop it).
+        [ -n "${defaultroutemode}" ] && set -- "$@" --default-route-mode "${defaultroutemode}"
+        # Backup egress: while CARP backup, route this node's own internet traffic to
+        # the master. Only acts under observe/enforce (the daemon gates on that); a
+        # blank gateway/interface/prefixes field passes nothing. The form is passed
+        # through verbatim (the daemon coerces an unrecognised value to "split").
         if [ "${backupegress}" = "1" ]; then
             set -- "$@" --backup-egress
-            # Validate the form here (like default-route-mode above): passing an unknown
-            # legacy value straight to the daemon's argparse choices would exit-loop the
-            # supervised daemon every few seconds instead of falling back to split.
-            case "${backupegressform}" in
-                ''|split) : ;;
-                prefixes) set -- "$@" --backup-egress-form prefixes ;;
-                *) echo "carpvipdhcp: ignoring unknown backup-egress form '${backupegressform}' (use split or prefixes)" >&2 ;;
-            esac
+            [ -n "${backupegressform}" ] && set -- "$@" --backup-egress-form "${backupegressform}"
             [ -n "${backupegressgw}" ] && set -- "$@" --backup-egress-gateway "${backupegressgw}"
             [ -n "${backupegressiface}" ] && set -- "$@" --backup-egress-interface "${backupegressiface}"
             [ -n "${backupegressprefixes}" ] && set -- "$@" --backup-egress-prefixes "${backupegressprefixes}"
@@ -231,7 +238,6 @@ carpvipdhcp_status()
 
 load_rc_config "${name}"
 : "${carpvipdhcp_enable:=YES}"
-: "${carpvipdhcp_backend:=}"
 # Optional 2nd arg = a single keeper id to act on (start/stop/restart just that
 # one, e.g. the Services overview per-row buttons and follow_update's re-bounce).
 # Empty = act on all keepers, exactly as before -- this is what boot (syshook)

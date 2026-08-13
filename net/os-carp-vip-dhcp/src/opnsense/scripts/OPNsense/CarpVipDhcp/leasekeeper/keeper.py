@@ -11,7 +11,8 @@ import time
 from dataclasses import dataclass
 
 from . import __version__
-from .capture import CAPTURE_BACKENDS
+from .capture import Capture
+from .capture_bpf import BpfCapture
 from .constants import (
     LOGGER_NAME,
     ACK, BootpOp, DhcpOptName, HB_REFRESH, LEASE_PULSE_INTERVAL, LINK_KICK_DEBOUNCE,
@@ -146,7 +147,6 @@ class _Config:
     hbfile: "str | None"
     release_on_exit: bool
     vhid: "str | None"
-    capture_backend: str
 
 
 @dataclass
@@ -174,7 +174,7 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
                  eth_src=None, *,
                  hbfile=None, release_on_exit=False, vhid=None,
                  follow=False, vendor_class=None, client_id=None, hostname=None,
-                 arp_nudge=0, arp_listen_promisc=False, capture_backend="scapy",
+                 arp_nudge=0, arp_listen_promisc=False,
                  default_route_mode="off", backup_egress=None):
         # Fixed identity/config, immutable once set (see _Config).
         self._cfg = _Config(
@@ -183,8 +183,7 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
             eth_src=(eth_src or chaddr).lower(),
             hbfile=hbfile,
             release_on_exit=release_on_exit,
-            vhid=str(vhid) if vhid else None,
-            capture_backend=capture_backend)
+            vhid=str(vhid) if vhid else None)
 
         # Capture backend component: owns the capture socket/thread and the
         # wire codec on both directions, and hands decoded neutral frames
@@ -199,7 +198,7 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         if arp_listen_promisc and not effective_promisc:
             LOG.info("ARP listen promiscuous is set but the ARP nudge is disabled (interval "
                      "0) -- ignoring it; promiscuous capture only serves the nudge reply")
-        self._capture = CAPTURE_BACKENDS[capture_backend](
+        self._capture: Capture = BpfCapture(
             iface, effective_promisc, self._on_dhcp_reply, self._on_arp_reply)
 
         # ARP nudge component: owns the pacing and reachability state; the
@@ -742,10 +741,10 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
 
         # eth-src matters for L2 debugging but only when it differs from the chaddr.
         ethsrc = f", eth-src {self._cfg.eth_src}" if self._cfg.eth_src != self._cfg.chaddr else ""
-        LOG.info("lease-keeper %s up on %s (vhid %s, default-route %s) via %s backend: "
+        LOG.info("lease-keeper %s up on %s (vhid %s, default-route %s): "
                  "CARP MAC %s%s, requesting %s",
                  __version__, self._cfg.iface, self._cfg.vhid or "none", self._defroute.mode,
-                 self._cfg.capture_backend, self._cfg.chaddr, ethsrc, self._follow.target or "any")
+                 self._cfg.chaddr, ethsrc, self._follow.target or "any")
         self._log_initial_carp_role()
         time.sleep(SNIFFER_WARMUP)
 

@@ -175,7 +175,7 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
                  hbfile=None, release_on_exit=False, vhid=None,
                  follow=False, vendor_class=None, client_id=None, hostname=None,
                  arp_nudge=0, arp_listen_promisc=False, capture_backend="scapy",
-                 default_route_mode="off"):
+                 default_route_mode="off", backup_egress=None):
         # Fixed identity/config, immutable once set (see _Config).
         self._cfg = _Config(
             iface=iface,
@@ -232,7 +232,7 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         # split-brain install-gate is a deliberate follow-up that needs a
         # debounced carrier signal (a single transient ifconfig miss must not
         # flap the default); see docs/single-ip-wan-carp.md.
-        self._defroute = DefaultRouteReconciler(default_route_mode)
+        self._defroute = DefaultRouteReconciler(default_route_mode, backup_egress=backup_egress)
 
         self.redora_wait = REDORA_MIN
         # Link-return fast path (only while UNBOUND): a carrier down->up edge
@@ -475,7 +475,7 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         if master is not None:
             self._was_master = master
 
-    def _reconcile_default_route(self, master=_UNSET):
+    def _reconcile_default_route(self, master=_UNSET, *, probe_for_backup=False):
         """Drive the IPv4 default route toward its CARP-role-owned desired state
         (install 0/0 via the lease gateway only while master AND holding a lease;
         withdraw it otherwise -- see leasekeeper/route.py). Level-triggered and
@@ -497,6 +497,12 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
             master = self._probe_carp_master()
         b = self._dhcp.binding
         self._defroute.reconcile(master, b.yiaddr is not None, b.lease_router)
+        # Backup egress needs the REAL CARP role: the unbound path drives the 0/0
+        # withdraw with a fictional master=False (role-independent for 0/0), which would
+        # wrongly install a backup route on a master-without-lease. probe_for_backup
+        # re-probes there so that edge is decided on the true role.
+        backup_master = self._probe_carp_master() if probe_for_backup else master
+        self._defroute.reconcile_backup_egress(backup_master)
 
     def _role_tick(self, master=_UNSET):
         """One shared CARP-role probe driving both the role poll and the
@@ -787,9 +793,22 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
             # tearing it down and reinstalling. Only when the acquire cannot bind (a
             # lost lease, or a dead WAN: mode-D) do we withdraw, so a node that cannot
             # route stops advertising 0/0. Role-independent, no ifconfig probe.
+            #
+            # Before that (possibly long: DORA + backoff) acquire, settle backup egress on
+            # the REAL CARP role: a routed backup promoted to master while unbound must shed
+            # its /1 before it blocks, or that /1 loops the new master's egress for the whole
+            # acquire; a still-backup keeps its route. The 0/0 deliberately stays after the
+            # acquire (the no-flap restart path above). A promotion that lands mid-acquire is
+            # caught by the post-acquire reconcile on the next iteration.
+            if self._defroute.backup_egress_enabled:
+                self._defroute.reconcile_backup_egress(self._probe_carp_master())
             self._acquire_step()
             if not b.yiaddr:
-                self._reconcile_default_route(master=False)
+                # master=False is the fictional role for the role-independent 0/0
+                # withdraw; backup egress needs the true role (a master-without-lease
+                # must not get a backup route), so probe when the feature is enabled.
+                self._reconcile_default_route(
+                    master=False, probe_for_backup=self._defroute.backup_egress_enabled)
             return
         # Bound: own the default by CARP role, here at the loop head. _maintain_step
         # is re-entered after every transition (a just-acquired lease, a renew that

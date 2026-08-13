@@ -19,8 +19,10 @@ OPNsense does not also manage the default). Every route operation is idempotent
 and error-tolerant, so a redundant add/delete -- or a burst of coalesced signals
 collapsed onto one boolean flag -- converges quietly rather than raising.
 """
+import ipaddress
 import logging
 import subprocess
+from dataclasses import dataclass
 from enum import StrEnum
 
 from .constants import LOGGER_NAME, RECONCILE_HEARTBEAT_INTERVAL
@@ -48,6 +50,41 @@ class DefaultRouteMode(StrEnum):
     OFF = "off"
     OBSERVE = "observe"
     ENFORCE = "enforce"
+
+
+class BackupEgressForm(StrEnum):
+    """The route form the backup installs for its own egress (docs/backup-egress.md).
+    split: 0.0.0.0/1 + 128.0.0.0/1 -- full internet, but not the default, so it never
+    redistributes as a default nor collides with enforce (the recommended default, and
+    the fail-safe fallback for an unrecognised value). prefixes: a curated list of
+    specific destinations. (A plain 0.0.0.0/0 is deliberately not offered: it can only
+    run under observe/enforce, and enforce owns 0/0, so it could never install.)"""
+    SPLIT = "split"
+    PREFIXES = "prefixes"
+
+
+class _BackupState(StrEnum):
+    """The backup-egress desired state for a tick: present (install the set via the
+    gateway), absent (this node is master -- remove any managed route), or unresolved
+    (the gateway could not be worked out -- leave the FIB alone). Recorded per tick so
+    a change re-arms the heartbeat, like the 0/0 decision's _last_desired."""
+    PRESENT = "present"
+    ABSENT = "absent"
+    UNRESOLVED = "unresolved"
+
+
+@dataclass(frozen=True)
+class BackupEgressConfig:
+    """Config for the optional backup-egress feature: while a node is the CARP backup
+    (no WAN default) route its own internet traffic to the master. Flows in from the
+    model via argparse. Disabled by default; the reconciler is a no-op unless enabled.
+    gateway: a stable next hop (a CARP VIP or a fallback-WAN gateway); when blank the
+    peer is derived from `interface` (the other host of a point-to-point /30 or /31)."""
+    enabled: bool = False
+    form: BackupEgressForm = BackupEgressForm.SPLIT
+    gateway: "str | None" = None
+    interface: "str | None" = None
+    prefixes: "tuple[str, ...]" = ()
 
 
 class RouteCommand(StrEnum):
@@ -80,10 +117,21 @@ _UNSET = object()
 DEFAULT_UNREADABLE_ROLE_STRIKES = 3
 
 _ROUTE = "/sbin/route"
+_NETSTAT = "/usr/bin/netstat"
+_IFCONFIG = "/sbin/ifconfig"
 _NUMERIC = "-n"              # numeric output, no name resolution
 _AF_INET = "-inet"          # IPv4 address family modifier; the v6 twin: -inet6
 _GATEWAY_FIELD = "gateway:"  # the field label parsed from `route get` output
 _SUBPROC_TIMEOUT = 5
+
+# The /1-split: two half-internet routes that together cover 0.0.0.0/0 but are each
+# more specific than it (so they win over any default) and are not the default (so
+# redistribute kernel's exact-0/0 route-map never picks them up, and enforce, which
+# only manages 0/0, ignores them). See docs/backup-egress.md.
+_SPLIT_PREFIXES = ("0.0.0.0/1", "128.0.0.0/1")
+_DEFAULT_NET = ipaddress.ip_network("0.0.0.0/0")
+# Point-to-point prefix lengths a backup-egress peer can be derived from unambiguously.
+_PTP_PREFIXLENS = (30, 31)
 
 
 class DefaultRouteReconciler:
@@ -95,9 +143,13 @@ class DefaultRouteReconciler:
     All methods run on the keeper's main loop thread only; the class holds no
     lock because nothing else in the keeper mutates routes."""
 
+    # The 0/0 decision and the optional backup-egress decision each carry their own
+    # last-state + heartbeat, so the attribute count is intentional.
+    # pylint: disable=too-many-instance-attributes
+
     def __init__(self, mode: "str | DefaultRouteMode" = DefaultRouteMode.OFF, *,
                  unreadable_role_strikes=DEFAULT_UNREADABLE_ROLE_STRIKES,
-                 liveness_probe=None):
+                 liveness_probe=None, backup_egress: "BackupEgressConfig | None" = None):
         # mode flows in from the model verbatim (keeper.conf -> rc.d -> argparse)
         # as a plain string; coerce it, and treat any unrecognised value as inert
         # OFF. Set-once: exposed read-only via the `mode` property.
@@ -124,6 +176,16 @@ class DefaultRouteReconciler:
         # backup/master does not log its (identical) decision every tick and churn
         # the log rotation. A change re-arms it (see _at).
         self._heartbeat = _RateLimit(RECONCILE_HEARTBEAT_INTERVAL)
+        # Optional backup-egress (docs/backup-egress.md), with its own last-state and
+        # heartbeat so its logging does not interfere with the 0/0 decision's.
+        self._backup = backup_egress or BackupEgressConfig()
+        self._last_backup_desired = _UNSET
+        self._backup_heartbeat = _RateLimit(RECONCILE_HEARTBEAT_INTERVAL)
+        self._valid_prefixes = None            # cached validated prefixes (warn-once via the cache)
+        self._backup_unresolved_warned = False  # rising-edge gate for gateway-resolution warnings
+        self._fib_unreadable_warned = False    # rising-edge gate for the netstat-unreadable warning
+        self._backup_installed_gw = None       # the gateway last installed this session (ownership)
+        self._backup_collision_warned = False  # rising-edge gate for foreign-route collision warnings
 
     @property
     def mode(self):
@@ -134,6 +196,13 @@ class DefaultRouteReconciler:
     def enabled(self):
         """True in observe/enforce (off is inert); see DefaultRouteMode."""
         return self._mode in (DefaultRouteMode.OBSERVE, DefaultRouteMode.ENFORCE)
+
+    @property
+    def backup_egress_enabled(self):
+        """True when the backup-egress feature is active (mode observe/enforce AND the
+        feature enabled). Lets the caller decide whether the unbound path must probe the
+        real CARP role for backup egress (the 0/0 withdraw there uses a fictional role)."""
+        return self.enabled and self._backup.enabled
 
     def withdraw_unless_master(self, probe):
         """Drop an owned default UNLESS this node is the CARP master. `probe` is a
@@ -157,10 +226,37 @@ class DefaultRouteReconciler:
         static-correct) and telling it apart from a restart would need a fragile
         stop-vs-restart signal, so it is accepted."""
         if not self.enabled:
-            return
+            return    # off is fully inert: no FIB read/write, no probe.
+        # Clean the backup-egress set at the boundary so a stopped keeper leaves no route a
+        # later master would loop through. Only routes this feature actually manages are
+        # touched (withdraw_backup_egress no-ops when the feature is disabled): the /1-split
+        # is also the classic full-tunnel-VPN pair, so a keeper that never installed it must
+        # not delete a /1 it does not own.
+        self.withdraw_backup_egress()
         if probe() is True:
             return
         self.reconcile(is_master=False, bound=False, gateway=None)
+
+    def withdraw_backup_egress(self):
+        """Remove the backup-egress routes (the /1-split plus any configured prefixes) at a
+        process boundary, so a stopped keeper leaves none that a later master would loop
+        through. A no-op unless the feature is enabled: the /1-split (0.0.0.0/1 +
+        128.0.0.0/1) is also the classic full-tunnel-VPN split, so a keeper that never
+        managed backup egress must not delete a /1 it does not own -- routes are cleaned by
+        ownership, not by matching a shape. observe logs, enforce deletes. Unlike the
+        reconcile loop there is no next tick to retry, so an unconfirmable removal is
+        surfaced loudly here rather than left to a silent re-check.
+
+        Accepted limit: a /1 left by a crashed predecessor whose feature (or mode) is then
+        disabled before restart is not cleaned, because it can no longer be told apart from
+        an unrelated VPN /1. That narrow crash-then-disable case needs manual cleanup (or
+        the deferred persisted-ownership follow-up); see docs/backup-egress.md."""
+        if not self.backup_egress_enabled:
+            return
+        self._backup_remove(self._backup_removal_set(), changed=True, reason="keeper stopping")
+        if self._mode == DefaultRouteMode.ENFORCE and self._fib_routes() is None:
+            LOG.warning("backup egress: could not confirm removal at shutdown (routing table "
+                        "unreadable) -- a leftover /1 would loop egress if this node is master")
 
     def reconcile(self, is_master, bound, gateway):
         """Drive the FIB default toward the desired state for the current
@@ -238,18 +334,20 @@ class DefaultRouteReconciler:
             else:
                 self._withdraw(changed, have, reason)
 
-    def _at(self, changed):
+    def _at(self, changed, heartbeat=None):
         """Pick the log callable for a desired-state confirmation. A state change
         logs at INFO the first time the state is entered, and re-arms the heartbeat
         so the identical DEBUG repeat does not fire on the very next tick. An
         unchanged repeat logs at DEBUG at most once per RECONCILE_HEARTBEAT_INTERVAL
         (proof the reconciler is alive and its decision); the ticks in between are
         dropped, so a steady node does not fill the log file with a per-tick
-        heartbeat and churn the rotation."""
+        heartbeat and churn the rotation. `heartbeat` defaults to the 0/0 decision's;
+        the backup-egress decision passes its own so the two do not interfere."""
+        hb = heartbeat if heartbeat is not None else self._heartbeat
         if changed:
-            self._heartbeat.reset()
+            hb.reset()
             return LOG.info
-        ok, _ = self._heartbeat.ready()
+        ok, _ = hb.ready()
         return LOG.debug if ok else _drop
 
     @staticmethod
@@ -280,6 +378,318 @@ class DefaultRouteReconciler:
             self._at(changed)("[observe] no default held (%s) -- as wanted", reason)
         else:
             self._at(changed)("no default held (%s)", reason)
+
+    # ---- backup egress (optional; docs/backup-egress.md) ----
+
+    def reconcile_backup_egress(self, is_master):
+        """Keep the backup-egress route set present while this node is the CARP
+        backup and absent while it is master (the inverse of the 0/0 it manages).
+        Call from the same tick as reconcile(), after it. A no-op unless the feature
+        is enabled and the mode is observe/enforce (off is inert). is_master None (an
+        unreadable role) touches nothing, like the 0/0 side."""
+        if not self.enabled or not self._backup.enabled or is_master is None:
+            return
+        if is_master:
+            self._backup_unresolved_warned = False   # re-arm so a returning backup re-warns once
+            desired = (_BackupState.ABSENT, None)
+        else:
+            gateway = self._resolve_backup_gateway()
+            desired = ((_BackupState.PRESENT, gateway) if gateway
+                       else (_BackupState.UNRESOLVED, None))
+        changed = desired != self._last_backup_desired
+        self._last_backup_desired = desired
+        state, gateway = desired
+        if state is _BackupState.PRESENT:
+            self._backup_install(self._backup_route_set(), gateway, changed)
+        elif state is _BackupState.ABSENT:
+            # Remove the UNION of every form's prefixes, not just the current one, so a
+            # form change that orphaned an old set (e.g. split -> prefixes) is cleaned
+            # up here too -- a leftover /1 on the master would loop all egress.
+            self._backup_remove(self._backup_removal_set(), changed)
+        # UNRESOLVED: the gateway could not be worked out (warned, rising-edge); leave
+        # the FIB as-is rather than tearing down a possibly-good route.
+
+    # ---- backup-egress route sets (cached: form/prefixes/mode are set-once) ----
+
+    def _backup_route_set(self):
+        """The prefixes to install for the configured form. SPLIT (and any unrecognised
+        form) is the leak-safe /1-split; PREFIXES is the validated configured list."""
+        if self._backup.form == BackupEgressForm.PREFIXES:
+            return self._backup_prefixes()
+        return _SPLIT_PREFIXES
+
+    def _backup_removal_set(self):
+        """The /1-split plus the CURRENT configured prefixes -- the set removed on the
+        master. This covers a form change (split <-> prefixes; the /1-split is always
+        included) but NOT a prefixes-LIST change across an ungraceful exit: a prefix
+        dropped from the config while a crashed predecessor still had it installed is not
+        known here and would orphan (a black-hole for that one prefix, not egress-wide).
+        A graceful restart removes the old set at shutdown; only crash-then-list-change
+        leaves it. Persisting the managed set is deferred (see docs/backup-egress.md)."""
+        return tuple(dict.fromkeys(_SPLIT_PREFIXES + self._backup_prefixes()))
+
+    def _backup_prefixes(self):
+        """The validated configured prefixes, cached so the drop warnings (invalid
+        prefix, 0.0.0.0/0 under enforce, empty prefixes list) each fire once."""
+        if self._valid_prefixes is None:
+            valid = []
+            for prefix in self._backup.prefixes:
+                try:
+                    net = ipaddress.ip_network(prefix, strict=False)
+                except ValueError:
+                    LOG.warning("backup egress: ignoring invalid prefix %r", prefix)
+                    continue
+                if net.version != 4:   # the FIB ops are IPv4-only (netstat/route -inet)
+                    LOG.warning("backup egress: ignoring non-IPv4 prefix %r (IPv4 only)", prefix)
+                    continue
+                if self._mode == DefaultRouteMode.ENFORCE and net == _DEFAULT_NET:
+                    LOG.warning("backup egress: 0.0.0.0/0 is owned by enforce and cannot be "
+                                "a backup-egress route -- ignoring it (use the /1-split)")
+                    continue
+                valid.append(prefix)
+            if self._backup.form == BackupEgressForm.PREFIXES and not valid:
+                LOG.warning("backup egress: form is 'prefixes' but no valid prefixes are set")
+            self._valid_prefixes = tuple(valid)
+        return self._valid_prefixes
+
+    # ---- gateway resolution ----
+
+    def _resolve_backup_gateway(self):
+        """The next hop for the backup-egress route: the configured stable gateway (a
+        CARP VIP or a fallback-WAN gateway), or, when blank, the derived point-to-point
+        peer of the configured interface. None (warned, rising-edge) when it cannot be
+        worked out; a successful resolve re-arms the warning."""
+        gateway = self._backup_gateway()
+        self._backup_unresolved_warned = gateway is None
+        return gateway
+
+    def _backup_gateway(self):
+        cfg = self._backup
+        if cfg.gateway:
+            own = self._gateway_is_own(cfg.gateway)   # True / False / None (could not check)
+            if own is None:
+                self._warn_unresolved("backup egress: could not verify gateway %s (route get "
+                                      "failed) -- deferring rather than routing via a maybe-own "
+                                      "address", cfg.gateway)
+                return None
+            if own:
+                self._warn_unresolved("backup egress: gateway %s is this node's own address "
+                                      "(config-sync trap) -- not routing via self", cfg.gateway)
+                return None
+            return cfg.gateway
+        if not cfg.interface:
+            self._warn_unresolved("backup egress: no gateway set and no interface to derive "
+                                  "one from")
+            return None
+        return self._derive_peer(cfg.interface)
+
+    def _warn_unresolved(self, fmt, *args):
+        """Log a gateway-resolution failure at most once per unresolved episode: a node
+        can sit as backup for a long time, so the message must not churn the log."""
+        if not self._backup_unresolved_warned:
+            LOG.warning(fmt, *args)
+
+    def _gateway_is_own(self, gateway):
+        """Tri-state: True if `gateway` is this node's own address (FreeBSD routes a local
+        address via lo0), False if it is not, None if the check could not run (route get
+        failed). Catches the config-sync trap of an explicit peer unicast that is correct
+        on the peer but equals this node's own IP. A CARP VIP this node is backup for is
+        not active locally, so it resolves via the real interface, not lo0 -- the
+        recommended VIP gateway is not caught. Never cached: a transient route-get failure
+        must not permanently disable the guard, so the caller defers on None and re-checks."""
+        res = self._run([_ROUTE, _NUMERIC, RouteCommand.GET, _AF_INET, gateway])
+        if res is None or res.returncode != 0:
+            return None   # could not determine -> caller defers rather than routing blind
+        for line in res.stdout.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("interface:"):
+                return stripped.split(":", 1)[1].strip() == "lo0"
+        return False
+
+    def _derive_peer(self, iface):
+        """The other host of a point-to-point (/30 or /31) subnet on `iface` = the
+        peer/master. None (warned) on a non-point-to-point interface or an unreadable
+        address, so we never guess a peer."""
+        info = self._iface_ipv4(iface)
+        if info is None:
+            self._warn_unresolved("backup egress: cannot read an IPv4 address on %s", iface)
+            return None
+        own, prefixlen = info
+        if prefixlen not in _PTP_PREFIXLENS:
+            self._warn_unresolved("backup egress: %s is /%d, not a point-to-point /30 or /31 "
+                                  "-- the peer is not unique, set an explicit gateway",
+                                  iface, prefixlen)
+            return None
+        net = ipaddress.ip_network(f"{own}/{prefixlen}", strict=False)
+        for host in net.hosts():
+            if str(host) != own:
+                return str(host)
+        return None
+
+    def _iface_ipv4(self, iface):
+        """(address, prefixlen) of the first IPv4 on `iface`, or None. Parses
+        `ifconfig <iface> inet` ('inet A netmask 0xMMMMMMMM ...')."""
+        res = self._run([_IFCONFIG, iface, "inet"])
+        if res is None or res.returncode != 0:
+            return None
+        toks = res.stdout.split()
+        addr = mask = None
+        for i, tok in enumerate(toks):
+            if tok == "inet" and addr is None and i + 1 < len(toks):
+                addr = toks[i + 1]
+            elif tok == "netmask" and mask is None and i + 1 < len(toks):
+                mask = toks[i + 1]
+        if addr is None or mask is None:
+            return None
+        try:
+            bits = bin(int(mask, 16)).count("1")
+            ipaddress.ip_address(addr)
+        except ValueError:
+            return None
+        return addr, bits
+
+    # ---- backup-egress FIB operations (idempotent, fail-safe on an unreadable table) ----
+
+    def _backup_owned_gateways(self):
+        """Gateway strings that mark a backup-egress route as managed by THIS feature: the
+        configured explicit gateway (stable across role and restart) and the gateway last
+        installed this session. A FIB entry for one of our prefixes is ours -- safe to
+        change or remove -- only when its next hop is one of these; any other next hop is a
+        foreign route (a full-tunnel VPN's /1, a static or connected route) we must never
+        touch. Empty when neither is known (e.g. a derived peer on a fresh master), which
+        makes cleanup best-effort there rather than risk clobbering an unrelated route."""
+        gateways = set()
+        if self._backup.gateway:
+            gateways.add(self._backup.gateway)
+        if self._backup_installed_gw:
+            gateways.add(self._backup_installed_gw)
+        return gateways
+
+    def _note_backup_collisions(self, prefixes, gateway):
+        """Warn (rising-edge) that a backup-egress prefix already has a foreign next hop, so
+        the operator sees it; re-arm the gate once a pass is collision-free. `gateway` is our
+        intended next hop on install, None on removal."""
+        if not prefixes:
+            self._backup_collision_warned = False
+            return
+        if not self._backup_collision_warned:
+            LOG.warning("backup egress: %s already routed via another next hop (not %s) -- "
+                        "leaving it untouched (not managed by this feature)",
+                        " ".join(prefixes), gateway or "our gateway")
+            self._backup_collision_warned = True
+
+    def _backup_install(self, route_set, gateway, changed):
+        if not route_set:
+            return
+        if self._mode == DefaultRouteMode.OBSERVE:
+            self._at(changed, self._backup_heartbeat)(
+                "[observe] would route backup egress via %s (%s)", gateway, " ".join(route_set))
+            return
+        have = self._fib_routes()
+        if have is None:
+            # netstat unreadable (already warned in _fib_routes); defer rather than
+            # blind-add, which would miss a needed change / stale-gateway correction.
+            return
+        owned = self._backup_owned_gateways() | {gateway}
+        pending, collisions = [], []
+        for prefix in route_set:
+            cur = have.get(self._net(prefix))
+            if cur == gateway:
+                continue                       # already ours and correct
+            if cur is None or cur in owned:
+                pending.append(prefix)         # absent -> ADD; our own stale gateway -> CHANGE
+            else:
+                collisions.append(prefix)      # foreign next hop -> never overwrite
+        self._note_backup_collisions(collisions, gateway)
+        if not pending:
+            if not collisions:
+                self._at(changed, self._backup_heartbeat)(
+                    "backup egress via %s (%s)", gateway, " ".join(route_set))
+            return
+        for prefix in pending:
+            verb = RouteCommand.ADD if have.get(self._net(prefix)) is None else RouteCommand.CHANGE
+            self._route(verb, prefix, gateway)
+        self._backup_installed_gw = gateway
+        now = self._fib_routes()
+        if now is None:
+            return   # adds issued but cannot confirm (already warned); re-check next tick
+        missing = [p for p in pending if now.get(self._net(p)) != gateway]
+        if not missing:
+            LOG.info("backup egress routed via %s (%s)", gateway, " ".join(pending))
+        else:
+            LOG.error("backup egress: failed to route %s via %s", " ".join(missing), gateway)
+
+    def _backup_remove(self, removal_set, changed, reason="now master"):
+        # `reason` distinguishes callers so the log does not assert a role change that
+        # did not happen: the reconcile master path uses the default, the shutdown
+        # boundary passes "keeper stopping".
+        if self._mode == DefaultRouteMode.OBSERVE:
+            self._at(changed, self._backup_heartbeat)(
+                "[observe] would remove backup egress (%s)", " ".join(removal_set))
+            return
+        have = self._fib_routes()
+        if have is None:
+            # Unreadable table: ownership cannot be verified, and the /1-split is also a
+            # full-tunnel-VPN pair, so a blind delete could tear down an unrelated route.
+            # Skip (already warned in _fib_routes); the next readable tick removes ours.
+            return
+        owned = self._backup_owned_gateways()
+        present, collisions = [], []
+        for prefix in removal_set:
+            cur = have.get(self._net(prefix))
+            if cur is None:
+                continue                       # not in the table
+            if cur in owned:
+                present.append(prefix)         # our next hop -> safe to remove
+            else:
+                collisions.append(prefix)      # foreign next hop -> leave it
+        self._note_backup_collisions(collisions, None)
+        if not present:
+            self._at(changed, self._backup_heartbeat)("no backup egress (%s)", reason)
+            return
+        for prefix in present:
+            self._route(RouteCommand.DELETE, prefix)
+        now = self._fib_routes()
+        if now is None:
+            return   # deletes issued but cannot confirm (already warned); re-check next tick
+        still = [p for p in present if now.get(self._net(p)) in owned]
+        if not still:
+            LOG.info("removed backup egress -- %s", reason)
+        else:
+            LOG.error("backup egress: failed to remove %s -- this node would loop its egress",
+                      " ".join(still))
+
+    def _fib_routes(self):
+        """{network: gateway} for the IPv4 FIB from one `netstat -rn` pass, or None when
+        the table cannot be read -- callers must not mistake an unreadable table for 'no
+        routes' and skip the master-side removal. A bare host address parses as /32;
+        header and default rows that are not a network are skipped."""
+        res = self._run([_NETSTAT, "-rn", "-f", "inet"])
+        if res is None or res.returncode != 0:
+            if not self._fib_unreadable_warned:   # once per unreadable episode (re-armed below)
+                # Neutral wording: on install this defers the write, but on the master
+                # removal path the deletes ARE issued and only the confirm is deferred.
+                LOG.warning("backup egress: cannot read the routing table (netstat) -- route "
+                            "state cannot be confirmed until it is readable")
+                self._fib_unreadable_warned = True
+            return None
+        self._fib_unreadable_warned = False
+        routes = {}
+        for line in res.stdout.splitlines():
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            try:
+                net = ipaddress.ip_network(parts[0], strict=False)
+            except ValueError:
+                continue
+            routes.setdefault(net, parts[1])
+        return routes
+
+    @staticmethod
+    def _net(prefix):
+        """Parse a (pre-validated) prefix string to a network, for FIB comparison."""
+        return ipaddress.ip_network(prefix, strict=False)
 
     # ---- role-unknown handling ----
 

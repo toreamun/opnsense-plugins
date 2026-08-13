@@ -5,7 +5,7 @@ tracks a single default nexthop plus the verbs issued, so tests assert both the
 resulting FIB and that idempotent / observe / off paths issue no mutation.
 
 Tests reach into private state by design; comments over per-test docstrings."""
-# pylint: disable=protected-access, missing-function-docstring
+# pylint: disable=protected-access, missing-function-docstring, too-many-lines
 import types
 
 import pytest

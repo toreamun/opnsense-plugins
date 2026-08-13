@@ -5,6 +5,7 @@ order. These tests pin the robustness that motivated the name-keyed format:
 field order does not matter, an unknown key is ignored, a missing key is simply
 absent (the caller defaults it), and a line without a request is skipped.
 """
+# pylint: disable=missing-function-docstring
 import importlib.util
 import os
 import re
@@ -17,6 +18,7 @@ _SCRIPT_DIR = os.path.join(
 def _load_keeperconf():
     path = os.path.join(_SCRIPT_DIR, "keeperconf.py")
     spec = importlib.util.spec_from_file_location("keeperconf", path)
+    assert spec and spec.loader, path
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -71,7 +73,7 @@ def test_lines_without_request_and_comments_are_skipped(tmp_path):
 
 
 def test_missing_file_yields_nothing(tmp_path):
-    assert list(keeperconf.keeper_records(str(tmp_path / "absent.conf"))) == []
+    assert not list(keeperconf.keeper_records(str(tmp_path / "absent.conf")))
 
 
 def _read_plugin_file(rel):

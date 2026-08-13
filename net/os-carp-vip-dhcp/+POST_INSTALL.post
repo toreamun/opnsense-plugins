@@ -4,14 +4,17 @@
 # current code. On a fresh install there is no keeper config yet, so this is a
 # no-op ("no config").
 #
-# Re-render keeper.conf BEFORE the restart. pkg only drops the new files; it does
-# not re-run the template, so on an upgrade the on-disk keeper.conf is still in
-# the format the previous version wrote. This version's reader dispatches by key
-# name, so an older positional file matches nothing -- the restart would stop
-# every keeper and start none. The template regenerates the file from config.xml
-# in the current format first. configd may be down in some install contexts (e.g.
-# firstboot, where a full config apply renders it anyway), so tolerate a failure.
+# Re-render keeper.conf BEFORE the restart, and ONLY restart if the render
+# succeeds. pkg only drops the new files; it does not re-run the template, so on
+# an upgrade the on-disk keeper.conf is still in the format the previous version
+# wrote. This version's reader dispatches by key name, so an older positional file
+# matches nothing -- restarting against it would stop every keeper and start none.
+# If the template cannot be rendered (e.g. configd is down on firstboot), leave
+# the already-supervised keepers running on the old in-memory code rather than
+# stop them into a broken parse; the next reconfigure (or the boot-time config
+# apply) renders keeper.conf and restarts them cleanly.
 if [ -x /usr/local/etc/rc.d/carpvipdhcp ]; then
-    /usr/local/sbin/configctl template reload OPNsense/CarpVipDhcp || true
-    /usr/local/etc/rc.d/carpvipdhcp restart || true
+    if /usr/local/sbin/configctl template reload OPNsense/CarpVipDhcp; then
+        /usr/local/etc/rc.d/carpvipdhcp restart || true
+    fi
 fi

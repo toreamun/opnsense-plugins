@@ -21,6 +21,10 @@ RUN_DIR="/var/run"
 MAX_AGE=3600
 [ -f "${CONF}" ] || exit 0
 
+# Shared keeper.conf line parser, also sourced by the rc.d service, so the two
+# readers cannot drift (and it is unit-tested against keeperconf.py).
+. /usr/local/opnsense/scripts/OPNsense/CarpVipDhcp/keeperconf.sh
+
 _id()
 {
     printf '%s' "$1" | tr -c 'A-Za-z0-9' '_'
@@ -29,16 +33,7 @@ _id()
 now=$(date +%s)
 while IFS= read -r line || [ -n "${line}" ]; do
     case "${line}" in ''|\#*) continue ;; esac
-    request='' demote=''
-    rec="${line}"
-    while [ -n "${rec}" ]; do
-        field="${rec%%|*}"
-        case "${rec}" in *"|"*) rec="${rec#*|}" ;; *) rec='' ;; esac
-        case "${field}" in
-            request=*) request="${field#*=}" ;;
-            demote=*) demote="${field#*=}" ;;
-        esac
-    done
+    carpvipdhcp_parse_line "${line}"
     [ -n "${request}" ] || continue
     [ "${demote}" = "1" ] || continue
     hb="${RUN_DIR}/carpvipdhcp-$(_id "${request}").hb"

@@ -95,7 +95,8 @@ carpvipdhcp_start()
         # Backup egress (keeper.conf columns 14-18): while CARP backup, route this
         # node's own internet traffic to the master. Only acts under observe/enforce
         # (the daemon gates on that); a blank gateway/interface/prefixes field passes
-        # nothing (the form defaults to split, so --backup-egress-form is always sent).
+        # nothing, and --backup-egress-form is only sent for "prefixes" (split relies on
+        # the daemon default).
         if [ "${backupegress}" = "1" ]; then
             set -- "$@" --backup-egress
             # Validate the form here (like default-route-mode above): passing an unknown

@@ -255,7 +255,7 @@ class DefaultRouteReconciler:
             return
         self._backup_remove(self._backup_removal_set(), changed=True, reason="keeper stopping")
         if self._mode == DefaultRouteMode.ENFORCE and self._fib_routes() is None:
-            LOG.warning("backup egress: could not confirm removal at shutdown (routing table "
+            LOG.warning("backup egress: could not clean up at shutdown (routing table "
                         "unreadable) -- a leftover /1 would loop egress if this node is master")
 
     def reconcile(self, is_master, bound, gateway):
@@ -387,7 +387,7 @@ class DefaultRouteReconciler:
         Call from the same tick as reconcile(), after it. A no-op unless the feature
         is enabled and the mode is observe/enforce (off is inert). is_master None (an
         unreadable role) touches nothing, like the 0/0 side."""
-        if not self.enabled or not self._backup.enabled or is_master is None:
+        if not self.backup_egress_enabled or is_master is None:
             return
         if is_master:
             self._backup_unresolved_warned = False   # re-arm so a returning backup re-warns once
@@ -568,14 +568,22 @@ class DefaultRouteReconciler:
     def _note_backup_collisions(self, prefixes, gateway):
         """Warn (rising-edge) that a backup-egress prefix already has a foreign next hop, so
         the operator sees it; re-arm the gate once a pass is collision-free. `gateway` is our
-        intended next hop on install, None on removal."""
+        intended next hop on install; None on the master-side removal, where an unattributable
+        /1 might actually be our own stale leftover looping this node's egress."""
         if not prefixes:
             self._backup_collision_warned = False
             return
         if not self._backup_collision_warned:
-            LOG.warning("backup egress: %s already routed via another next hop (not %s) -- "
-                        "leaving it untouched (not managed by this feature)",
-                        " ".join(prefixes), gateway or "our gateway")
+            if gateway is None:
+                LOG.warning("backup egress: %s present via a next hop this node does not own "
+                            "-- leaving it untouched; if it is a stale backup-egress route this "
+                            "node is now looping its own egress (clean it up, or set an explicit "
+                            "backup-egress gateway so ownership survives a restart)",
+                            " ".join(prefixes))
+            else:
+                LOG.warning("backup egress: %s already routed via another next hop (not %s) -- "
+                            "leaving it untouched (not managed by this feature)",
+                            " ".join(prefixes), gateway)
             self._backup_collision_warned = True
 
     def _backup_install(self, route_set, gateway, changed):
@@ -591,15 +599,23 @@ class DefaultRouteReconciler:
             # blind-add, which would miss a needed change / stale-gateway correction.
             return
         owned = self._backup_owned_gateways() | {gateway}
-        pending, collisions = [], []
+        pending, collisions, mine = [], [], False
         for prefix in route_set:
             cur = have.get(self._net(prefix))
             if cur == gateway:
-                continue                       # already ours and correct
+                mine = True                    # already ours and correct
+                continue
             if cur is None or cur in owned:
                 pending.append(prefix)         # absent -> ADD; our own stale gateway -> CHANGE
             else:
                 collisions.append(prefix)      # foreign next hop -> never overwrite
+        if pending or mine:
+            # Ownership is "the next hop we have resolved as ours", recorded whether we install
+            # or merely confirm the set already present -- so a restarted backup that inherited
+            # its own /1 still owns it and removes it on promotion. Without this, a derived-peer
+            # master (no configured gateway to fall back on) would see an empty ownership set,
+            # treat its own leftover /1 as foreign, and loop its egress.
+            self._backup_installed_gw = gateway
         self._note_backup_collisions(collisions, gateway)
         if not pending:
             if not collisions:
@@ -609,7 +625,6 @@ class DefaultRouteReconciler:
         for prefix in pending:
             verb = RouteCommand.ADD if have.get(self._net(prefix)) is None else RouteCommand.CHANGE
             self._route(verb, prefix, gateway)
-        self._backup_installed_gw = gateway
         now = self._fib_routes()
         if now is None:
             return   # adds issued but cannot confirm (already warned); re-check next tick

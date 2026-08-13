@@ -1173,6 +1173,25 @@ def test_backup_egress_reconciled_before_blocking_acquire_when_unbound(lk, monke
     assert order[:2] == [("backup", True), ("acquire", None)]     # real role, before the block
 
 
+def test_backup_egress_no_pre_acquire_probe_when_disabled(lk, monkeypatch):
+    # The unbound pre-acquire backup-egress settle runs only when the feature is enabled;
+    # with it off, the hot unbound loop adds no extra CARP probe or reconcile before acquire.
+    k = _keeper(lk, vhid=254, default_route_mode="enforce")
+    rec = _RecordingReconciler()
+    rec.backup_egress_enabled = False              # feature off
+    k._defroute = rec
+    order = []
+    monkeypatch.setattr(k, "_probe_carp_master", lambda: (order.append("probe"), True)[1])
+    monkeypatch.setattr(rec, "reconcile_backup_egress", lambda m: order.append(("backup", m)))
+    monkeypatch.setattr(k, "_acquire_step", lambda: order.append("acquire"))
+    k._dhcp.binding.yiaddr = None                  # unbound
+    k._maintain_step()
+    assert "acquire" in order
+    before = order[:order.index("acquire")]
+    assert "probe" not in before                   # no extra probe before the block
+    assert not any(isinstance(x, tuple) for x in before)   # no pre-acquire backup reconcile
+
+
 def test_default_route_bound_keyed_on_yiaddr_not_router(lk):
     # lease_router lingers after a lease loss (expire() clears only yiaddr); bound
     # must be keyed on yiaddr, so a lost lease (yiaddr None, gateway still set)

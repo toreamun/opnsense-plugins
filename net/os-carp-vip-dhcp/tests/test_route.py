@@ -620,6 +620,55 @@ def test_backup_egress_derive_non_ptp_inactive(lk, monkeypatch, caplog):
     assert any("not a point-to-point" in r.getMessage() for r in caplog.records)
 
 
+def test_backup_egress_derive_form_master_removes_own_route(lk, monkeypatch):
+    # Derive form (no configured gateway): ownership rests only on the gateway confirmed
+    # this session. A backup that inherits (or installs) its own /1 via the derived peer
+    # must still remove it on promotion -- else an empty ownership set on the derived-peer
+    # master would treat its own leftover as foreign and loop egress. Regression for the
+    # ownership-lost-on-restart bug: ownership is recorded on the confirmed-present path.
+    rec, fake = _rec(lk, monkeypatch, "enforce",
+                     backup_egress=_becfg(interface="sync0"),
+                     ifaces={"sync0": ("10.168.9.2", 30)})
+    fake.routes["0.0.0.0/1"] = fake.routes["128.0.0.0/1"] = "10.168.9.1"   # inherited via the peer
+    rec.reconcile_backup_egress(False)             # backup tick confirms the set is ours
+    rec.reconcile_backup_egress(True)              # promote -> must remove our own /1
+    assert "0.0.0.0/1" not in fake.routes and "128.0.0.0/1" not in fake.routes
+
+
+def test_backup_egress_derive_peer_change_uses_change(lk, monkeypatch):
+    # Derive form: when the interface is re-addressed so the derived peer changes, the /1
+    # is updated IN PLACE (CHANGE) to the new peer -- the only path that issues CHANGE
+    # (its ownership of the old next hop comes from the session-installed gateway).
+    rec, fake = _rec(lk, monkeypatch, "enforce",
+                     backup_egress=_becfg(interface="sync0"),
+                     ifaces={"sync0": ("10.168.9.2", 30)})
+    rec.reconcile_backup_egress(False)             # install via peer .1
+    assert fake.routes.get("0.0.0.0/1") == "10.168.9.1"
+    fake.ifaces["sync0"] = ("10.168.9.5", 30)      # re-addressed -> peer becomes .6
+    rec.reconcile_backup_egress(False)
+    assert fake.routes.get("0.0.0.0/1") == "10.168.9.6"
+    assert RouteCommand.CHANGE in fake.verbs
+
+
+def test_backup_egress_collision_warns_once_and_rearms(lk, monkeypatch, caplog):
+    # A persistent foreign /1 warns once (not per tick); once it clears and re-collides a
+    # second warning fires -- rising-edge parity with the unresolved-gateway gate.
+    rec, fake = _rec(lk, monkeypatch, "enforce", backup_egress=_becfg(gateway=BE_GW))
+    fake.routes["0.0.0.0/1"] = fake.routes["128.0.0.0/1"] = "10.9.9.9"   # both foreign
+    with caplog.at_level("WARNING", logger="lease-keeper"):
+        for _ in range(3):
+            rec.reconcile_backup_egress(False)
+    assert len([r for r in caplog.records if "another next hop" in r.getMessage()]) == 1
+    caplog.clear()
+    fake.routes.pop("0.0.0.0/1")
+    fake.routes.pop("128.0.0.0/1")                                  # foreign routes gone
+    with caplog.at_level("WARNING", logger="lease-keeper"):
+        rec.reconcile_backup_egress(False)                          # collision-free -> re-arm
+        fake.routes["0.0.0.0/1"] = fake.routes["128.0.0.0/1"] = "10.9.9.9"
+        rec.reconcile_backup_egress(False)                          # re-collide
+    assert any("another next hop" in r.getMessage() for r in caplog.records)
+
+
 def test_backup_egress_observe_dry_run(lk, monkeypatch, caplog):
     rec, fake = _rec(lk, monkeypatch, "observe", backup_egress=_becfg(gateway=BE_GW))
     with caplog.at_level("INFO", logger="lease-keeper"):
@@ -708,7 +757,7 @@ def test_backup_egress_remove_leaves_foreign_route(lk, monkeypatch, caplog):
         rec.reconcile_backup_egress(True)              # master -> remove ours only
     assert fake.routes.get("0.0.0.0/1") == "10.9.9.9"  # foreign left
     assert "128.0.0.0/1" not in fake.routes            # ours removed
-    assert any("already routed via another next hop" in r.getMessage() for r in caplog.records)
+    assert any("does not own" in r.getMessage() for r in caplog.records)
 
 
 def test_backup_egress_install_defers_on_unreadable_fib(lk, monkeypatch, caplog):
@@ -901,4 +950,4 @@ def test_backup_egress_shutdown_unconfirmed_removal_warns(lk, monkeypatch, caplo
     fake.routes["0.0.0.0/1"] = BE_GW
     with caplog.at_level("WARNING", logger="lease-keeper"):
         rec.withdraw_unless_master(lambda: False)
-    assert any("could not confirm removal at shutdown" in r.getMessage() for r in caplog.records)
+    assert any("could not clean up at shutdown" in r.getMessage() for r in caplog.records)

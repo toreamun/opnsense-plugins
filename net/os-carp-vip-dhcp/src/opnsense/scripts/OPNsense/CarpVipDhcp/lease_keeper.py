@@ -260,7 +260,11 @@ def main():
                    capture_backend=a.capture_backend, default_route_mode=a.default_route_mode,
                    backup_egress=backup_egress)
 
-        if a.arp_listen_promisc:
+        # Warn only when promiscuous capture is ACTUALLY in effect: it is gated on the ARP
+        # nudge (see Keeper.__init__), so a stale flag with the nudge disabled is ignored,
+        # not promiscuous -- warning off the raw flag would contradict that and misstate the
+        # node's security posture.
+        if a.arp_listen_promisc and a.arp_nudge > 0:
             LOG.warning("ARP listen: PROMISCUOUS capture enabled on %s -- the daemon now "
                         "sees all traffic on the segment (opt-in fallback for NICs that "
                         "drop the gateway's unicast ARP reply otherwise)", a.iface)

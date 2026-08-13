@@ -153,6 +153,15 @@ active locally, so the recommended VIP gateway is not caught by this guard.
   persists until that acquire returns and the post-acquire reconcile runs, bounded
   by the acquire/backoff wait. Detected-before-the-block promotion is handled up
   front.
+- **no-master state with a non-VIP gateway:** the feature installs the route while
+  this node is CARP backup and removes it while master, but it has no separate
+  "is there actually a master?" liveness gate. In a transient no-master state (both
+  nodes backup during a failover, or a split), a **point-to-point peer or derived
+  `/30`/`/31` gateway** points each node at the other, so both can install a `/1`
+  toward each other and briefly loop. The **recommended CARP-VIP gateway avoids
+  this**: with no master the VIP is answered by no one, so the route black-holes
+  harmlessly instead of looping. Prefer the CARP-VIP gateway; an install-time
+  liveness gate (as on the `0/0` side) is a possible follow-up.
 - **prefixes-list change across a crash:** the master-side cleanup removes the
   `/1`-split plus the **current** configured prefixes, so a `prefixes`-form list
   changed **after an ungraceful exit** that left an old prefix installed can

@@ -217,7 +217,6 @@ def main():
     # test: no guard and no FIB mutation, so it takes neither (pf stays None).
     pf = None if a.once else acquire_pidfile(a.pidfile)
     try:
-        # Built before the startup fail-stop so withdraw_unless_master ->
         # Built before the fail-stop so the startup reconciler can clean the backup-egress
         # routes this feature manages when it is enabled (else a node coming up as master
         # with a stale /1 a crashed predecessor left would loop its egress).
@@ -277,15 +276,18 @@ def main():
         signal.signal(signal.SIGINT, _sig)
         signal.signal(signal.SIGTERM, _sig)
 
+        # SIGUSR1/SIGUSR2 are POSIX-only (the daemon runs on FreeBSD); access them
+        # dynamically so a non-POSIX static-analysis host neither errors nor needs a
+        # suppression that is then flagged as useless where the attributes do exist.
         def _sig_arp_nudge(*_):
             # Operator-requested immediate ARP nudge (configd action / kill -USR1).
             k.trigger_nudge()
-        signal.signal(signal.SIGUSR1, _sig_arp_nudge)  # type: ignore[attr-defined]  # pylint: disable=no-member
+        signal.signal(getattr(signal, "SIGUSR1"), _sig_arp_nudge)
 
         def _sig_carp(*_):
             # CARP transition (rc.syshook.d/carp/50-carpvipdhcp sends SIGUSR2).
             k.recheck_carp_role()
-        signal.signal(signal.SIGUSR2, _sig_carp)  # type: ignore[attr-defined]  # pylint: disable=no-member
+        signal.signal(getattr(signal, "SIGUSR2"), _sig_carp)
 
         if a.once:
             return k.claim_once()

@@ -157,13 +157,16 @@
                     </OptionValues>
                 </backupEgressForm>
                 <!--
-                    The masks constrain each value to its own syntax and, like the
-                    DHCP-option fields above, forbid the pipe and any line break so the
-                    rendered keeper.conf line stays a single parseable record.
+                    Gateway and prefixes are NetworkField (proper IPv4 validation, rendered
+                    as address inputs); a valid address cannot contain the pipe or a line
+                    break, so the keeper.conf line stays a single parseable record. The
+                    interface is a device name, so it keeps a text mask that forbids both.
                 -->
-                <backupEgressGateway type="TextField">
-                    <Mask>/^[0-9.]{0,15}$/u</Mask>
-                    <ValidationMessage>Backup egress gateway: an IPv4 address (digits and dots only).</ValidationMessage>
+                <backupEgressGateway type="NetworkField">
+                    <AddressFamily>ipv4</AddressFamily>
+                    <NetMaskAllowed>N</NetMaskAllowed>
+                    <WildcardEnabled>N</WildcardEnabled>
+                    <ValidationMessage>Backup egress gateway: a valid IPv4 address, or blank to derive the peer from the interface.</ValidationMessage>
                     <Required>N</Required>
                 </backupEgressGateway>
                 <backupEgressInterface type="TextField">
@@ -171,9 +174,12 @@
                     <ValidationMessage>Backup egress interface: a device name (letters, digits, dot, underscore).</ValidationMessage>
                     <Required>N</Required>
                 </backupEgressInterface>
-                <backupEgressPrefixes type="TextField">
-                    <Mask>/^[0-9.,\/ ]{0,256}$/u</Mask>
-                    <ValidationMessage>Backup egress prefixes: IPv4 CIDRs separated by comma or space.</ValidationMessage>
+                <backupEgressPrefixes type="NetworkField">
+                    <AddressFamily>ipv4</AddressFamily>
+                    <NetMaskAllowed>Y</NetMaskAllowed>
+                    <WildcardEnabled>N</WildcardEnabled>
+                    <AsList>Y</AsList>
+                    <ValidationMessage>Backup egress prefixes: IPv4 CIDR destinations (CIDR notation like 10.0.0.0/24).</ValidationMessage>
                     <Required>N</Required>
                 </backupEgressPrefixes>
 

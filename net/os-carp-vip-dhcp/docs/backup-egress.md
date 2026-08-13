@@ -51,9 +51,8 @@ What gets installed on the backup. Two options; the `/1`-split is the default.
 
   This is the safe universal choice, and the only correct one when this node
   redistributes its default into a routing protocol.
-- **Specific prefixes** - a curated IPv4 CIDR list (for example your pkg mirror
-  and NTP hosts), separated by comma or space. Limited egress, leak-safe by the
-  same longest-prefix argument. A `0.0.0.0/0` entry in this list is dropped under
+- **Specific prefixes** - a curated IPv4 CIDR list. Limited egress, leak-safe by
+  the same longest-prefix argument. A `0.0.0.0/0` entry in this list is dropped under
   **enforce** with a one-time warning (it would both leak and fight enforce);
   non-IPv4 entries are ignored (the feature is IPv4-only).
 

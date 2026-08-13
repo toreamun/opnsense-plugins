@@ -83,18 +83,20 @@ def _read_plugin_file(rel):
 
 def test_keeper_conf_key_names_agree_across_readers():
     """The keeper.conf key names are hand-duplicated across the template (producer)
-    and every reader (the two sh scripts and the Python readers), which have no
-    shared source. A rename in one but not the others degrades SILENTLY -- worst
-    case rc.d skips every line and lease-keeping stops ("Started 0 keeper(s)").
-    Pin the contract: every key a reader consumes must be one the template emits.
-    Catches the rename-divergence class without a Volt/sh runtime."""
+    and every reader (the shared shell parser and the Python/PHP readers), which
+    have no common source. A rename in one but not the others degrades SILENTLY --
+    worst case the shell parser matches nothing, rc.d skips every line and
+    lease-keeping stops ("Started 0 keeper(s)"). Pin the contract: every key a
+    reader consumes must be one the template emits. Catches the rename-divergence
+    class without a Volt/sh runtime (test_reader_conformance runs the shell parser
+    for real)."""
     template = _read_plugin_file(
         "src/opnsense/service/templates/OPNsense/CarpVipDhcp/keeper.conf")
     emitted = set(re.findall(r"(\w+)=\{\{", template))
     # Guard the regex itself: the template really does emit the core keys.
     assert {"request", "iface", "chaddr", "defaultroutemode"} <= emitted
 
-    def sh_keys(rel):                       # rc.d/hook `case` arms: `key=*)`
+    def sh_keys(rel):                       # keeperconf.sh `case` arms: `key=*)`
         return set(re.findall(r"^\s*(\w+)=\*\)", _read_plugin_file(rel), re.MULTILINE))
 
     def py_get_keys(rel):                   # Python readers: `rec.get("key"...)`
@@ -106,8 +108,9 @@ def test_keeper_conf_key_names_agree_across_readers():
         return set(re.findall(r'\$field\b[^;\n]*?["\'](\w+)=', _read_plugin_file(rel)))
 
     readers = {
-        "rc.d": sh_keys("src/etc/rc.d/carpvipdhcp"),
-        "carp-hook": sh_keys("src/etc/rc.carp_service_status.d/carpvipdhcp"),
+        # The rc.d service and the CARP status hook both source this one parser.
+        "keeperconf.sh": sh_keys(
+            "src/opnsense/scripts/OPNsense/CarpVipDhcp/keeperconf.sh"),
         "status.py": py_get_keys(
             "src/opnsense/scripts/OPNsense/CarpVipDhcp/status.py"),
         "logparse.py": py_get_keys(

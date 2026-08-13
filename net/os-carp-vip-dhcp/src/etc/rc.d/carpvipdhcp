@@ -21,6 +21,10 @@ conf="/usr/local/etc/carpvipdhcp/keeper.conf"
 run_dir="/var/run"
 log_dir="/var/log"
 
+# Shared keeper.conf line parser, also sourced by the CARP status hook, so the
+# two readers cannot drift (and it is unit-tested against keeperconf.py).
+. /usr/local/opnsense/scripts/OPNsense/CarpVipDhcp/keeperconf.sh
+
 start_cmd="carpvipdhcp_start"
 stop_cmd="carpvipdhcp_stop"
 status_cmd="carpvipdhcp_status"
@@ -33,43 +37,19 @@ _id()
     printf '%s' "$1" | tr -c 'A-Za-z0-9' '_'
 }
 
+# The keeper-field variables used below are assigned by the sourced keeperconf.sh
+# parser (carpvipdhcp_parse_line); the linter cannot follow its absolute install
+# path, so scope-disable the "unassigned" warning to this function only.
+# shellcheck disable=SC2154
 carpvipdhcp_start()
 {
     [ -f "${conf}" ] || { echo "no config"; return 0; }
     count=0
     while IFS= read -r line || [ -n "${line}" ]; do
         case "${line}" in ''|\#*) continue ;; esac
-        # Parse the record's KEY=VALUE fields (pipe-separated, any order). Peel one
-        # field off the front at a time with parameter expansion -- no IFS/glob
-        # side effects -- and dispatch by key, so an unknown key is ignored and a
-        # missing key keeps the reset-below default.
-        request='' iface='' chaddr='' vhid='' follow='' vendorclass=''
-        clientid='' hostname='' arpnudge='' arplistenpromisc='' defaultroutemode=''
-        backupegress='' backupegressform='' backupegressgw='' backupegressiface=''
-        backupegressprefixes=''
-        rec="${line}"
-        while [ -n "${rec}" ]; do
-            field="${rec%%|*}"
-            case "${rec}" in *"|"*) rec="${rec#*|}" ;; *) rec='' ;; esac
-            case "${field}" in
-                request=*) request="${field#*=}" ;;
-                iface=*) iface="${field#*=}" ;;
-                chaddr=*) chaddr="${field#*=}" ;;
-                vhid=*) vhid="${field#*=}" ;;
-                follow=*) follow="${field#*=}" ;;
-                vendorclass=*) vendorclass="${field#*=}" ;;
-                clientid=*) clientid="${field#*=}" ;;
-                hostname=*) hostname="${field#*=}" ;;
-                arpnudge=*) arpnudge="${field#*=}" ;;
-                arplistenpromisc=*) arplistenpromisc="${field#*=}" ;;
-                defaultroutemode=*) defaultroutemode="${field#*=}" ;;
-                backupegress=*) backupegress="${field#*=}" ;;
-                backupegressform=*) backupegressform="${field#*=}" ;;
-                backupegressgateway=*) backupegressgw="${field#*=}" ;;
-                backupegressinterface=*) backupegressiface="${field#*=}" ;;
-                backupegressprefixes=*) backupegressprefixes="${field#*=}" ;;
-            esac
-        done
+        # Parse the record's KEY=VALUE fields into request/iface/chaddr/... (see
+        # keeperconf.sh, the shared reader).
+        carpvipdhcp_parse_line "${line}"
         if [ -z "${request}" ] || [ -z "${iface}" ] || [ -z "${chaddr}" ]; then
             # A non-comment line that yields no request/iface/chaddr is unexpected
             # (the template only renders resolvable keepers). Say so rather than

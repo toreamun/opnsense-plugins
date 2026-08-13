@@ -602,16 +602,21 @@ class DefaultRouteReconciler:
                 collisions.append(prefix)      # foreign next hop -> never overwrite
         return pending, collisions
 
-    def _record_backup_ownership(self, gateway, state, route_set):
-        """Own the gateways at which our prefixes are CONFIRMED present in `state` (a FIB
-        snapshot): fold in the just-resolved `gateway`, then keep only owned gateways still
-        hosting one of our prefixes. Never speculative -- a failed change keeps the still-
-        present old next hop owned (so promotion still removes it), while a succeeded change
-        retires it."""
+    def _prune_backup_ownership(self, state, route_set):
+        """Keep only owned gateways still hosting one of our prefixes in `state`, so a route
+        that was removed or migrated does not leave its old next hop retained as owned --
+        which would let a later CHANGE overwrite an unrelated route that reappears via it."""
         self._backup_installed_gws = {
-            gw for gw in (self._backup_installed_gws | {gateway})
+            gw for gw in self._backup_installed_gws
             if any(state.get(self._net(p)) == gw for p in route_set)
         }
+
+    def _record_backup_ownership(self, gateway, state, route_set):
+        """Fold in the just-resolved `gateway`, then prune to gateways still hosting one of
+        our prefixes. Never speculative -- a failed change keeps the still-present old next
+        hop owned (so promotion still removes it), while a succeeded change retires it."""
+        self._backup_installed_gws.add(gateway)
+        self._prune_backup_ownership(state, route_set)
 
     def _backup_install(self, route_set, gateway, changed):
         if not route_set:
@@ -673,6 +678,7 @@ class DefaultRouteReconciler:
                 collisions.append(prefix)      # foreign next hop -> leave it
         self._note_backup_collisions(collisions, None)
         if not present:
+            self._prune_backup_ownership(have, removal_set)   # nothing of ours here -> drop stale gws
             self._at(changed, self._backup_heartbeat)("no backup egress (%s)", reason)
             return
         for prefix in present:
@@ -680,6 +686,7 @@ class DefaultRouteReconciler:
         now = self._fib_routes()
         if now is None:
             return   # deletes issued but cannot confirm (already warned); re-check next tick
+        self._prune_backup_ownership(now, removal_set)        # removed routes -> retire their gws
         still = [p for p in present if now.get(self._net(p)) in owned]
         if not still:
             LOG.info("removed backup egress -- %s", reason)

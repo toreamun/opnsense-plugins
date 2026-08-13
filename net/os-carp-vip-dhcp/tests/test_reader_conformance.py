@@ -25,6 +25,12 @@ _SCRIPT_DIR = os.path.abspath(os.path.join(
     "src", "opnsense", "scripts", "OPNsense", "CarpVipDhcp"))
 _KEEPERCONF_SH = os.path.join(_SCRIPT_DIR, "keeperconf.sh")
 
+# The shell parser is exercised ONLY by this module. Under CI it MUST run, so a
+# missing sh there is a hard failure rather than a silent green skip; off CI a dev
+# box without a POSIX sh skips it (GitHub Actions sets CI=true).
+_HAS_SH = shutil.which("sh") is not None
+_UNDER_CI = os.environ.get("CI") == "true"
+
 # keeper.conf key -> the shell variable carpvipdhcp_parse_line sets for it. All
 # match the key name except the two backup-egress fields (shorter var names).
 _KEYS = [
@@ -60,6 +66,7 @@ _FIXTURES = [
 def _sh_parse(line):
     """{key: value} as keeperconf.sh's carpvipdhcp_parse_line extracts it (one
     `printf` per key, in _KEYS order, so the split lines up)."""
+    assert _HAS_SH, "POSIX sh not found -- required to exercise keeperconf.sh"
     dump = "\n".join(f'printf "%s\\n" "${{{_VAR[k]}}}"' for k in _KEYS)
     script = f'. "$1"\ncarpvipdhcp_parse_line "$2"\n{dump}\n'
     out = subprocess.run(
@@ -71,7 +78,8 @@ def _sh_parse(line):
     return dict(zip(_KEYS, out))
 
 
-@pytest.mark.skipif(shutil.which("sh") is None, reason="no POSIX sh available")
+@pytest.mark.skipif(not _HAS_SH and not _UNDER_CI,
+                    reason="no POSIX sh (dev box); the shell parser is validated under CI")
 @pytest.mark.parametrize("line", _FIXTURES)
 def test_sh_reader_matches_python(tmp_path, line):
     from keeperconf import keeper_records  # pylint: disable=import-outside-toplevel

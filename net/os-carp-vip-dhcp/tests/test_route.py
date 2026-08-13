@@ -669,6 +669,22 @@ def test_backup_egress_failed_change_keeps_old_ownership(lk, monkeypatch):
     assert "0.0.0.0/1" not in fake.routes and "128.0.0.0/1" not in fake.routes
 
 
+def test_backup_egress_ownership_pruned_after_removal(lk, monkeypatch):
+    # After removing our /1 on promotion, the old peer must NOT stay owned: if the peer then
+    # changes and a route reappears via the OLD peer (e.g. a VPN takes that address), it must
+    # be treated as foreign, not CHANGEd/overwritten (ownership is pruned on removal too).
+    rec, fake = _rec(lk, monkeypatch, "enforce",
+                     backup_egress=_becfg(interface="sync0"),
+                     ifaces={"sync0": ("10.168.9.2", 30)})
+    rec.reconcile_backup_egress(False)             # backup: install via peer .1 (own .1)
+    rec.reconcile_backup_egress(True)              # master: remove -> ownership of .1 pruned
+    fake.ifaces["sync0"] = ("10.168.9.5", 30)      # peer changes to .6
+    fake.routes["0.0.0.0/1"] = "10.168.9.1"        # a foreign route reappears at the OLD peer .1
+    rec.reconcile_backup_egress(False)             # back to backup, peer now .6
+    assert fake.routes.get("0.0.0.0/1") == "10.168.9.1"   # old-peer route left untouched (foreign)
+    assert RouteCommand.CHANGE not in fake.verbs          # never overwrote it
+
+
 def test_backup_egress_collision_warns_once_and_rearms(lk, monkeypatch, caplog):
     # A persistent foreign /1 warns once (not per tick); once it clears and re-collides a
     # second warning fires -- rising-edge parity with the unresolved-gateway gate.

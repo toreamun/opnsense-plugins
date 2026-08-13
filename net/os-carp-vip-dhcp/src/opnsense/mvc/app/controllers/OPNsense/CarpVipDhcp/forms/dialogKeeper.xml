@@ -84,7 +84,7 @@
         <label>ARP listen in promiscuous mode</label>
         <type>checkbox</type>
         <advanced>true</advanced>
-        <help><![CDATA[Fallback, default OFF. The keeper listens for the gateway's ARP reply to each nudge and shows on the Status page when the gateway last confirmed reachability. Normally the reply is captured without promiscuous mode (the CARP master already accepts the VIP's MAC). Enable this ONLY if the Status page shows the nudge is never confirmed on a bound master — some NICs drop frames addressed to a non-primary unicast MAC unless the interface is promiscuous. WARNING: promiscuous mode makes this root daemon receive ALL traffic on the segment, not just its own; leave it off unless you need it.]]></help>
+        <help><![CDATA[Fallback, default OFF. Applies only while the ARP nudge is enabled (interval > 0), since it only helps capture the nudge's reply; it is ignored when the nudge is off. The keeper listens for the gateway's ARP reply to each nudge and shows on the Status page when the gateway last confirmed reachability. Normally the reply is captured without promiscuous mode (the CARP master already accepts the VIP's MAC). Enable this ONLY if the Status page shows the nudge is never confirmed on a bound master, since some NICs drop frames addressed to a non-primary unicast MAC unless the interface is promiscuous. WARNING: promiscuous mode makes this root daemon receive ALL traffic on the segment, not just its own; leave it off unless you need it.]]></help>
     </field>
     <field>
         <id>keeper.chaddrOverride</id>

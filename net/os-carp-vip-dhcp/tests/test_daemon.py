@@ -873,11 +873,21 @@ def test_sniffer_filter_captures_arp_and_honours_promisc(lk, monkeypatch):
 
     # ScapyCapture looks AsyncSniffer up in its own module, so patch it there.
     monkeypatch.setattr("leasekeeper.capture_scapy.AsyncSniffer", _Cap)
-    keeper = _keeper(lk, arp_listen_promisc=True)
+    keeper = _keeper(lk, arp_listen_promisc=True, arp_nudge=240)   # promisc serves the nudge
     assert keeper._capture.start() is True
     assert "arp" in captured["filter"]        # ARP replies now reach the parser
     assert "port 67" in captured["filter"]     # ...alongside DHCP, unchanged
     assert captured["promisc"] is True         # opt-in flag reaches the socket
+
+
+def test_promisc_ignored_when_nudge_disabled(lk, caplog):
+    # Promiscuous capture only serves the ARP nudge reply; with the nudge disabled it is
+    # ignored rather than needlessly receiving all segment traffic, so a stale promisc flag
+    # (hidden in the GUI when the nudge is 0) has no runtime effect.
+    with caplog.at_level("INFO", logger="lease-keeper"):
+        keeper = _keeper(lk, arp_listen_promisc=True, arp_nudge=0)
+    assert keeper._capture.promisc is False
+    assert any("ARP nudge is disabled" in r.getMessage() for r in caplog.records)
 
 
 def test_ensure_sniffer_logs_when_restart_fails(lk, monkeypatch, caplog):

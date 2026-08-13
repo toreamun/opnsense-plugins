@@ -49,7 +49,7 @@
         <label>Backup egress route form</label>
         <type>dropdown</type>
         <advanced>true</advanced>
-        <help><![CDATA[<b>/1-split</b> (recommended): 0.0.0.0/1 + 128.0.0.0/1, full internet but not the default, so it never redistributes as a default nor collides with enforce. <b>Specific prefixes</b>: only the CIDR destinations listed below (e.g. pkg mirror / NTP hosts).]]></help>
+        <help><![CDATA[<b>/1-split</b> (recommended): 0.0.0.0/1 + 128.0.0.0/1, full internet but not the default, so it never redistributes as a default nor collides with enforce. <b>Specific prefixes</b>: only the CIDR destinations listed below.]]></help>
     </field>
     <field>
         <id>keeper.backupEgressGateway</id>
@@ -68,9 +68,11 @@
     <field>
         <id>keeper.backupEgressPrefixes</id>
         <label>Backup egress prefixes</label>
-        <type>text</type>
+        <style>tokenize</style>
+        <type>select_multiple</type>
+        <allownew>true</allownew>
         <advanced>true</advanced>
-        <help><![CDATA[Only used with route form "Specific prefixes": a comma- or space-separated list of IPv4 CIDR destinations to route via the gateway (e.g. your pkg mirror / NTP hosts). Do not list 0.0.0.0/0.]]></help>
+        <help><![CDATA[Only used with route form "Specific prefixes": the IPv4 CIDR destinations to route via the gateway, added one per token (CIDR notation like 10.0.0.0/24). Do not list 0.0.0.0/0.]]></help>
     </field>
     <field>
         <id>keeper.arpNudgeInterval</id>

@@ -184,7 +184,7 @@ class DefaultRouteReconciler:
         self._valid_prefixes = None            # cached validated prefixes (warn-once via the cache)
         self._backup_unresolved_warned = False  # rising-edge gate for gateway-resolution warnings
         self._fib_unreadable_warned = False    # rising-edge gate for the netstat-unreadable warning
-        self._backup_installed_gw = None       # the gateway last installed this session (ownership)
+        self._backup_installed_gws = set()     # gateways our prefixes are confirmed at (ownership)
         self._backup_collision_warned = False  # rising-edge gate for foreign-route collision warnings
 
     @property
@@ -552,17 +552,16 @@ class DefaultRouteReconciler:
 
     def _backup_owned_gateways(self):
         """Gateway strings that mark a backup-egress route as managed by THIS feature: the
-        configured explicit gateway (stable across role and restart) and the gateway last
-        installed this session. A FIB entry for one of our prefixes is ours -- safe to
-        change or remove -- only when its next hop is one of these; any other next hop is a
-        foreign route (a full-tunnel VPN's /1, a static or connected route) we must never
-        touch. Empty when neither is known (e.g. a derived peer on a fresh master), which
-        makes cleanup best-effort there rather than risk clobbering an unrelated route."""
-        gateways = set()
+        configured explicit gateway (stable across role and restart) plus every gateway our
+        prefixes are currently confirmed present at this session. A FIB entry for one of our
+        prefixes is ours -- safe to change or remove -- only when its next hop is one of
+        these; any other next hop is a foreign route (a full-tunnel VPN's /1, a static or
+        connected route) we must never touch. Empty when nothing is known (e.g. a derived
+        peer on a fresh master), which makes cleanup best-effort there rather than risk
+        clobbering an unrelated route."""
+        gateways = set(self._backup_installed_gws)
         if self._backup.gateway:
             gateways.add(self._backup.gateway)
-        if self._backup_installed_gw:
-            gateways.add(self._backup_installed_gw)
         return gateways
 
     def _note_backup_collisions(self, prefixes, gateway):
@@ -586,6 +585,34 @@ class DefaultRouteReconciler:
                             " ".join(prefixes), gateway)
             self._backup_collision_warned = True
 
+    def _classify_backup_prefixes(self, route_set, gateway, have):
+        """Split the desired prefixes against the current FIB `have` into (pending,
+        collisions): pending are absent or present via a gateway we already own (ADD/CHANGE
+        toward `gateway`); collisions are present via a foreign next hop we must never
+        overwrite. A prefix already correct via `gateway` needs neither."""
+        owned = self._backup_owned_gateways() | {gateway}
+        pending, collisions = [], []
+        for prefix in route_set:
+            cur = have.get(self._net(prefix))
+            if cur == gateway:
+                continue                       # already ours and correct
+            if cur is None or cur in owned:
+                pending.append(prefix)         # absent -> ADD; our own stale gateway -> CHANGE
+            else:
+                collisions.append(prefix)      # foreign next hop -> never overwrite
+        return pending, collisions
+
+    def _record_backup_ownership(self, gateway, state, route_set):
+        """Own the gateways at which our prefixes are CONFIRMED present in `state` (a FIB
+        snapshot): fold in the just-resolved `gateway`, then keep only owned gateways still
+        hosting one of our prefixes. Never speculative -- a failed change keeps the still-
+        present old next hop owned (so promotion still removes it), while a succeeded change
+        retires it."""
+        self._backup_installed_gws = {
+            gw for gw in (self._backup_installed_gws | {gateway})
+            if any(state.get(self._net(p)) == gw for p in route_set)
+        }
+
     def _backup_install(self, route_set, gateway, changed):
         if not route_set:
             return
@@ -598,37 +625,23 @@ class DefaultRouteReconciler:
             # netstat unreadable (already warned in _fib_routes); defer rather than
             # blind-add, which would miss a needed change / stale-gateway correction.
             return
-        owned = self._backup_owned_gateways() | {gateway}
-        pending, collisions, mine = [], [], False
-        for prefix in route_set:
-            cur = have.get(self._net(prefix))
-            if cur == gateway:
-                mine = True                    # already ours and correct
-                continue
-            if cur is None or cur in owned:
-                pending.append(prefix)         # absent -> ADD; our own stale gateway -> CHANGE
-            else:
-                collisions.append(prefix)      # foreign next hop -> never overwrite
-        if pending or mine:
-            # Ownership is "the next hop we have resolved as ours", recorded whether we install
-            # or merely confirm the set already present -- so a restarted backup that inherited
-            # its own /1 still owns it and removes it on promotion. Without this, a derived-peer
-            # master (no configured gateway to fall back on) would see an empty ownership set,
-            # treat its own leftover /1 as foreign, and loop its egress.
-            self._backup_installed_gw = gateway
+        pending, collisions = self._classify_backup_prefixes(route_set, gateway, have)
         self._note_backup_collisions(collisions, gateway)
+        state = have
+        if pending:
+            for prefix in pending:
+                verb = RouteCommand.ADD if have.get(self._net(prefix)) is None else RouteCommand.CHANGE
+                self._route(verb, prefix, gateway)
+            state = self._fib_routes()
+            if state is None:
+                return   # writes issued but cannot confirm (already warned); re-check next tick
+        self._record_backup_ownership(gateway, state, route_set)
         if not pending:
             if not collisions:
                 self._at(changed, self._backup_heartbeat)(
                     "backup egress via %s (%s)", gateway, " ".join(route_set))
             return
-        for prefix in pending:
-            verb = RouteCommand.ADD if have.get(self._net(prefix)) is None else RouteCommand.CHANGE
-            self._route(verb, prefix, gateway)
-        now = self._fib_routes()
-        if now is None:
-            return   # adds issued but cannot confirm (already warned); re-check next tick
-        missing = [p for p in pending if now.get(self._net(p)) != gateway]
+        missing = [p for p in pending if state.get(self._net(p)) != gateway]
         if not missing:
             LOG.info("backup egress routed via %s (%s)", gateway, " ".join(pending))
         else:

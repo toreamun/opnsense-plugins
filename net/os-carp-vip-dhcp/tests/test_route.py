@@ -650,6 +650,25 @@ def test_backup_egress_derive_peer_change_uses_change(lk, monkeypatch):
     assert RouteCommand.CHANGE in fake.verbs
 
 
+def test_backup_egress_failed_change_keeps_old_ownership(lk, monkeypatch):
+    # Derive form: if the peer changes A->B but `route change` FAILS, the /1 stays at A and
+    # ownership of A must be preserved (not overwritten by the unconfirmed B) -- else
+    # promotion would treat the still-present /1 at A as foreign and loop egress. (Ownership
+    # is recorded only for gateways CONFIRMED to host our prefixes.)
+    rec, fake = _rec(lk, monkeypatch, "enforce",
+                     backup_egress=_becfg(interface="sync0"),
+                     ifaces={"sync0": ("10.168.9.2", 30)})
+    rec.reconcile_backup_egress(False)             # install via peer .1
+    assert fake.routes.get("0.0.0.0/1") == "10.168.9.1"
+    fake.ifaces["sync0"] = ("10.168.9.5", 30)      # peer becomes .6
+    fake.broken.add(RouteCommand.CHANGE)           # the change to .6 fails
+    rec.reconcile_backup_egress(False)
+    assert fake.routes.get("0.0.0.0/1") == "10.168.9.1"   # still at .1 (change did not take)
+    fake.broken.discard(RouteCommand.CHANGE)
+    rec.reconcile_backup_egress(True)              # promote -> must remove the /1 still at .1
+    assert "0.0.0.0/1" not in fake.routes and "128.0.0.0/1" not in fake.routes
+
+
 def test_backup_egress_collision_warns_once_and_rearms(lk, monkeypatch, caplog):
     # A persistent foreign /1 warns once (not per tick); once it clears and re-collides a
     # second warning fires -- rising-edge parity with the unresolved-gateway gate.

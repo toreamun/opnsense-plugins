@@ -1095,15 +1095,20 @@ def test_backoff_jitter(lk):
 
 # ---- default-route ownership wiring (keeper <-> DefaultRouteReconciler) ----
 
-class _RecordingReconciler:  # pylint: disable=too-few-public-methods
+class _RecordingReconciler:
     """Stand-in for DefaultRouteReconciler that records reconcile() args, so the
     keeper-side wiring can be asserted without a real route(8) probe."""
     def __init__(self, enabled=True):
         self.enabled = enabled
+        self.backup_egress_enabled = enabled
         self.calls = []
+        self.backup_egress_calls = []
 
     def reconcile(self, is_master, bound, gateway):
         self.calls.append((is_master, bound, gateway))
+
+    def reconcile_backup_egress(self, is_master):
+        self.backup_egress_calls.append(is_master)
 
 
 def test_default_route_mode_off_is_inert(lk):
@@ -1125,6 +1130,21 @@ def test_default_route_forwards_role_bound_gateway(lk):
     k._dhcp.binding.lease_router = "100.64.4.1"
     k._reconcile_default_route(master=True)
     assert rec.calls == [(True, True, "100.64.4.1")]
+    # the same tick also drives the backup-egress reconcile with the CARP role.
+    assert rec.backup_egress_calls == [True]
+
+
+def test_backup_egress_uses_real_role_on_unbound_path(lk, monkeypatch):
+    # the unbound path drives the 0/0 withdraw with a fictional master=False; backup
+    # egress must get the REAL role so a CARP master-without-lease is not handed a
+    # backup route (which would black-hole/loop the master's own egress).
+    k = _keeper(lk, vhid=254, default_route_mode="enforce")
+    rec = _RecordingReconciler()
+    k._defroute = rec
+    monkeypatch.setattr(k, "_probe_carp_master", lambda: True)     # actually CARP master
+    k._reconcile_default_route(master=False, probe_for_backup=True)
+    assert rec.calls[0][0] is False                                # 0/0 got the fiction
+    assert rec.backup_egress_calls == [True]                       # backup egress got the true role
 
 
 def test_default_route_bound_keyed_on_yiaddr_not_router(lk):
@@ -1294,7 +1314,10 @@ def test_withdraw_unless_master_skips_when_master(lk, monkeypatch):
     fake = FakeRoute(initial=RGW)
     monkeypatch.setattr(lk.subprocess, "run", fake.run)
     lk.DefaultRouteReconciler("enforce").withdraw_unless_master(lambda: True)
-    assert fake.gw == RGW and not fake.calls   # kept, no route(8) call at all
+    # The default is kept: no route(8) verb touches it. The backup-egress boundary
+    # cleanup does read the table (a netstat pass) to clear any stale /1, but with none
+    # present it issues no route(8) mutation, so the master's default stands untouched.
+    assert fake.gw == RGW and not fake.verbs
 
 
 def test_withdraw_unless_master_off_is_inert_without_probing(lk, monkeypatch):

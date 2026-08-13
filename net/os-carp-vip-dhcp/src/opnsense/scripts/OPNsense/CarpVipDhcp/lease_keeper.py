@@ -64,7 +64,8 @@ from logging.handlers import RotatingFileHandler
 from leasekeeper.capture import CAPTURE_BACKENDS
 from leasekeeper.constants import LOGGER_NAME
 from leasekeeper.keeper import Keeper, carp_master
-from leasekeeper.route import DefaultRouteMode, DefaultRouteReconciler
+from leasekeeper.route import (
+    BackupEgressConfig, BackupEgressForm, DefaultRouteMode, DefaultRouteReconciler)
 from leasekeeper.util import MAC_RE
 
 LOG = logging.getLogger(LOGGER_NAME)
@@ -156,6 +157,19 @@ def _build_arg_parser():
                     help="own the IPv4 default route by CARP role: off (default), observe "
                          "(log what it would do, no FIB write), or enforce (install/withdraw "
                          "0/0 via the lease gateway while CARP master holding a lease)")
+    ap.add_argument("--backup-egress", action="store_true",
+                    help="while CARP backup, route this node's own internet traffic to the "
+                         "master (needs default-route-mode observe/enforce); see backup-egress docs")
+    ap.add_argument("--backup-egress-form", choices=[f.value for f in BackupEgressForm],
+                    default=BackupEgressForm.SPLIT.value,
+                    help="split (0.0.0.0/1+128.0.0.0/1, the default) or prefixes")
+    ap.add_argument("--backup-egress-gateway", default=None,
+                    help="stable next hop for backup egress (a CARP VIP or fallback-WAN gateway); "
+                         "blank derives the point-to-point peer of --backup-egress-interface")
+    ap.add_argument("--backup-egress-interface", default=None,
+                    help="interface to derive the backup-egress peer from when no gateway is set")
+    ap.add_argument("--backup-egress-prefixes", default=None,
+                    help="comma-separated prefixes for --backup-egress-form prefixes")
     ap.add_argument("--once", action="store_true")
     ap.add_argument("--release-on-exit", action="store_true")
     return ap
@@ -196,6 +210,17 @@ def main():
     # test: no guard and no FIB mutation, so it takes neither (pf stays None).
     pf = None if a.once else acquire_pidfile(a.pidfile)
     try:
+        # Built before the startup fail-stop so withdraw_unless_master ->
+        # withdraw_backup_egress can clean a /1-split a crashed predecessor left behind
+        # (else a node coming up as master with a stale /1 would loop its egress).
+        backup_egress = BackupEgressConfig(
+            enabled=a.backup_egress,
+            form=BackupEgressForm(a.backup_egress_form),
+            gateway=a.backup_egress_gateway or None,
+            interface=a.backup_egress_interface or None,
+            prefixes=tuple(p.strip() for p in a.backup_egress_prefixes.split(","))
+            if a.backup_egress_prefixes else ())
+
         # Fail-stop: a crashed predecessor (backend now missing, or a bad arg) may
         # have left a default in the FIB, still redistributed by FRR. Drop it here --
         # pure route(8), no capture backend -- BEFORE the backend preflight and the
@@ -203,8 +228,8 @@ def main():
         # (a master keeps its default, a backup withdraws; probe only when the mode
         # acts) lives in withdraw_unless_master. Skipped for --once and no vhid.
         if not a.once and a.vhid:
-            DefaultRouteReconciler(a.default_route_mode).withdraw_unless_master(
-                lambda: carp_master(a.iface, a.vhid))
+            DefaultRouteReconciler(a.default_route_mode, backup_egress=backup_egress) \
+                .withdraw_unless_master(lambda: carp_master(a.iface, a.vhid))
 
         # Fail fast (with a logged reason) if the selected backend cannot run on
         # this host -- checked uniformly through the registry so a future backend
@@ -225,7 +250,8 @@ def main():
                    vhid=a.vhid, follow=a.follow,
                    vendor_class=a.vendor_class, client_id=a.client_id, hostname=a.hostname,
                    arp_nudge=a.arp_nudge, arp_listen_promisc=a.arp_listen_promisc,
-                   capture_backend=a.capture_backend, default_route_mode=a.default_route_mode)
+                   capture_backend=a.capture_backend, default_route_mode=a.default_route_mode,
+                   backup_egress=backup_egress)
 
         if a.arp_listen_promisc:
             LOG.warning("ARP listen: PROMISCUOUS capture enabled on %s -- the daemon now "

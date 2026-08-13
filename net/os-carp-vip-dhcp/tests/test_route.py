@@ -10,7 +10,7 @@ import types
 
 import pytest
 
-from leasekeeper.route import RouteCommand
+from leasekeeper.route import BackupEgressConfig, BackupEgressForm, RouteCommand
 
 GW = "185.41.66.1"
 GW2 = "185.41.66.9"
@@ -18,51 +18,105 @@ CGNAT_GW = "100.64.4.1"   # the production case: a 100.64/10 single-IP CGNAT WAN
 
 
 class FakeRoute:
-    """In-memory stand-in for `/sbin/route`: one default nexthop, verb log."""
+    """In-memory stand-in for /sbin/route + /usr/bin/netstat + /sbin/ifconfig: a
+    dest->nexthop table (dest 'default' or a CIDR), a verb log, and per-interface
+    (addr, prefixlen) for backup-egress peer derivation. `gw` is the default's
+    nexthop, kept as a property so the default-route tests read it unchanged."""
 
-    def __init__(self, initial=None, broken=(), lying=()):
-        self.gw = initial
+    def __init__(self, initial=None, *, broken=(), lying=(),  # pylint: disable=too-many-arguments
+                 ifaces=None, netstat_fails=False, local_ips=()):
+        self.routes = {}
+        if initial is not None:
+            self.routes["default"] = initial
         self.calls = []
         self.broken = set(broken)  # verbs that fail with a genuine (non-benign) error
         self.lying = set(lying)    # verbs that exit 0 but do NOT mutate the FIB
+        self.ifaces = dict(ifaces or {})   # iface -> (addr, prefixlen)
+        self.netstat_fails = netstat_fails  # netstat -rn exits non-zero (unreadable table)
+        self.local_ips = set(local_ips)     # addresses a `route get` resolves to lo0 (own IPs)
+
+    @property
+    def gw(self):
+        return self.routes.get("default")
+
+    @gw.setter
+    def gw(self, value):
+        if value is None:
+            self.routes.pop("default", None)
+        else:
+            self.routes["default"] = value
 
     def run(self, cmd, **_kwargs):  # capture_output / errors / timeout -- ignored
-        # One return (accumulate rc/out/err) to keep the verb branches readable
-        # without tripping too-many-return-statements.
         self.calls.append(list(cmd))
-        verb = cmd[2]  # ["/sbin/route","-n",verb,"-inet","default"[,gw]]
+        prog = cmd[0]
+        if prog.endswith("netstat"):
+            if self.netstat_fails:
+                return self._reply(1, "", "netstat: routing table unavailable")
+            return self._reply(0, self._netstat_body())
+        if prog.endswith("ifconfig"):
+            return self._ifconfig(cmd[1])
+        return self._route(cmd)
+
+    def _route(self, cmd):
+        # ["/sbin/route","-n",verb,"-inet",dest[,gw]]; single return to keep the verb
+        # branches readable without tripping too-many-return-statements.
+        verb, dest = cmd[2], cmd[4]
         rc, out, err = 0, "", ""
         if verb in self.broken:  # a real failure: stuck route / bad socket, not a no-op
             rc, err = 1, "route: writing to routing socket: permission denied"
         elif verb == RouteCommand.GET:
-            has = self.gw is not None  # empty table exits non-zero
-            rc = 0 if has else 1
-            out = f"   gateway: {self.gw}\n   flags: <UP,GATEWAY>\n" if has else ""
-            err = "" if has else "route: not in table"
+            if dest in self.routes:                 # a known route dest (e.g. "default")
+                out = f"   gateway: {self.routes[dest]}\n   interface: vlan0\n"
+            elif dest == "default":                 # no default installed
+                rc, err = 1, "route: not in table"
+            else:                                   # host lookup (used by _gateway_is_own):
+                iface = "lo0" if dest in self.local_ips else "vlan0"  # own IP resolves to lo0
+                out = f"   gateway: {dest}\n   interface: {iface}\n"
         elif verb == RouteCommand.ADD:
-            if self.gw is not None:  # FreeBSD: add fails when a default already exists
+            if self.routes.get(dest) is not None:  # FreeBSD: add fails when it exists
                 rc, err = 1, "route: writing to routing socket: File exists"
             elif verb not in self.lying:  # a lying add exits 0 but leaves the FIB unchanged
-                self.gw = cmd[-1]
+                self.routes[dest] = cmd[-1]
         elif verb == RouteCommand.CHANGE:
-            if self.gw is None:  # FreeBSD: change fails when no route exists to change
-                rc, err = 1, "route: change net default: not in table"
+            if self.routes.get(dest) is None:  # change fails when no route exists
+                rc, err = 1, "route: change: not in table"
             else:
-                self.gw = cmd[-1]  # on-link swaps in place; off-link is broken={RouteCommand.CHANGE}
+                self.routes[dest] = cmd[-1]  # on-link swaps in place; off-link is broken={CHANGE}
         elif verb == RouteCommand.DELETE:
-            existed = self.gw is not None
-            self.gw = None
+            existed = self.routes.pop(dest, None) is not None
             rc, err = (0, "") if existed else (1, "not in table")
+        return self._reply(rc, out, err)
+
+    def _netstat_body(self):
+        lines = ["Routing tables", "", "Internet:",
+                 "Destination        Gateway            Flags     Netif"]
+        for dest, gw in self.routes.items():
+            shown = dest[:-3] if dest.endswith("/32") else dest  # FreeBSD prints host routes bare
+            lines.append(f"{shown}        {gw}        UGS       vlan0")
+        return "\n".join(lines) + "\n"
+
+    def _ifconfig(self, iface):
+        info = self.ifaces.get(iface)
+        if info is None:
+            return self._reply(1, "", f"ifconfig: interface {iface} does not exist")
+        addr, prefixlen = info
+        mask = (0xffffffff << (32 - prefixlen)) & 0xffffffff if prefixlen else 0
+        body = f"{iface}: flags=8843<UP>\n\tinet {addr} netmask 0x{mask:08x} broadcast 0.0.0.0\n"
+        return self._reply(0, body)
+
+    @staticmethod
+    def _reply(rc, out, err=""):
         return types.SimpleNamespace(returncode=rc, stdout=out, stderr=err)
 
     @property
     def verbs(self):
-        return [c[2] for c in self.calls]
+        return [c[2] for c in self.calls if c[0].endswith("route")]
 
 
 def _rec(lk, monkeypatch, mode, initial=None, *,  # pylint: disable=too-many-arguments
-         broken=(), lying=(), **kw):
-    fake = FakeRoute(initial, broken=broken, lying=lying)
+         broken=(), lying=(), ifaces=None, netstat_fails=False, local_ips=(), **kw):
+    fake = FakeRoute(initial, broken=broken, lying=lying, ifaces=ifaces,
+                     netstat_fails=netstat_fails, local_ips=local_ips)
     monkeypatch.setattr(lk.subprocess, "run", fake.run)
     return lk.DefaultRouteReconciler(mode=mode, **kw), fake
 
@@ -479,3 +533,344 @@ def test_gateway_change_relogs_ownership_at_info(lk, monkeypatch, caplog):
     assert _levels_for(caplog, f"owning default via {GW}") == ["INFO"]
     assert any(r.levelname == "INFO" and f"installed default via {GW2}" in r.getMessage()
                for r in caplog.records)
+
+
+# ---- backup egress (optional feature; docs/backup-egress.md) ----
+
+BE_GW = "10.168.9.1"
+
+
+def _becfg(**kw):
+    kw.setdefault("enabled", True)
+    return BackupEgressConfig(**kw)
+
+
+def test_backup_egress_disabled_is_inert(lk, monkeypatch):
+    # no backup_egress config -> the reconcile is a no-op, issues nothing.
+    rec, fake = _rec(lk, monkeypatch, "enforce")
+    rec.reconcile_backup_egress(False)
+    assert not fake.calls
+
+
+def test_backup_egress_off_mode_inert(lk, monkeypatch):
+    # off mode: even with the feature enabled, nothing runs.
+    rec, fake = _rec(lk, monkeypatch, "off", backup_egress=_becfg(gateway=BE_GW))
+    rec.reconcile_backup_egress(False)
+    assert not fake.calls
+
+
+def test_backup_egress_installs_split_on_backup(lk, monkeypatch):
+    rec, fake = _rec(lk, monkeypatch, "enforce", backup_egress=_becfg(gateway=BE_GW))
+    rec.reconcile_backup_egress(False)
+    assert fake.routes.get("0.0.0.0/1") == BE_GW
+    assert fake.routes.get("128.0.0.0/1") == BE_GW
+
+
+def test_backup_egress_removed_on_master(lk, monkeypatch):
+    rec, fake = _rec(lk, monkeypatch, "enforce", backup_egress=_becfg(gateway=BE_GW))
+    fake.routes["0.0.0.0/1"] = fake.routes["128.0.0.0/1"] = BE_GW
+    rec.reconcile_backup_egress(True)
+    assert "0.0.0.0/1" not in fake.routes and "128.0.0.0/1" not in fake.routes
+
+
+def test_backup_egress_role_swap(lk, monkeypatch):
+    rec, fake = _rec(lk, monkeypatch, "enforce", backup_egress=_becfg(gateway=BE_GW))
+    rec.reconcile_backup_egress(False)                 # backup -> installed
+    assert fake.routes.get("0.0.0.0/1") == BE_GW
+    rec.reconcile_backup_egress(True)                  # master -> removed
+    assert "0.0.0.0/1" not in fake.routes
+    rec.reconcile_backup_egress(False)                 # backup again -> reinstalled
+    assert fake.routes.get("0.0.0.0/1") == BE_GW
+
+
+def test_backup_egress_idempotent_no_churn(lk, monkeypatch):
+    rec, fake = _rec(lk, monkeypatch, "enforce", backup_egress=_becfg(gateway=BE_GW))
+    rec.reconcile_backup_egress(False)
+    n = len(fake.calls)
+    rec.reconcile_backup_egress(False)                 # already correct
+    # the second pass reads (own-check route get + netstat) but issues no route mutation.
+    mutations = [c for c in fake.calls[n:] if c[0].endswith("route")
+                 and c[2] in (RouteCommand.ADD, RouteCommand.CHANGE, RouteCommand.DELETE)]
+    assert fake.calls[n:] and not mutations
+
+
+def test_backup_egress_unknown_role_touches_nothing(lk, monkeypatch):
+    rec, fake = _rec(lk, monkeypatch, "enforce", backup_egress=_becfg(gateway=BE_GW))
+    rec.reconcile_backup_egress(None)
+    assert not fake.calls
+
+
+def test_backup_egress_derive_peer_on_ptp(lk, monkeypatch):
+    # gateway blank + a /30 interface -> derive the other host as the peer/master.
+    rec, fake = _rec(lk, monkeypatch, "enforce",
+                     backup_egress=_becfg(interface="sync0"),
+                     ifaces={"sync0": ("10.168.9.2", 30)})
+    rec.reconcile_backup_egress(False)
+    assert fake.routes.get("0.0.0.0/1") == "10.168.9.1"
+
+
+def test_backup_egress_derive_non_ptp_inactive(lk, monkeypatch, caplog):
+    # a /24 interface has no unique peer -> warn and install nothing.
+    rec, fake = _rec(lk, monkeypatch, "enforce",
+                     backup_egress=_becfg(interface="lan0"),
+                     ifaces={"lan0": ("10.168.1.3", 24)})
+    with caplog.at_level("WARNING", logger="lease-keeper"):
+        rec.reconcile_backup_egress(False)
+    assert "0.0.0.0/1" not in fake.routes
+    assert any("not a point-to-point" in r.getMessage() for r in caplog.records)
+
+
+def test_backup_egress_observe_dry_run(lk, monkeypatch, caplog):
+    rec, fake = _rec(lk, monkeypatch, "observe", backup_egress=_becfg(gateway=BE_GW))
+    with caplog.at_level("INFO", logger="lease-keeper"):
+        rec.reconcile_backup_egress(False)
+    assert "0.0.0.0/1" not in fake.routes              # observe never writes
+    assert any("would route backup egress" in r.getMessage() for r in caplog.records)
+
+
+def test_backup_egress_zero_prefix_dropped_under_enforce(lk, monkeypatch, caplog):
+    # a 0.0.0.0/0 inside a specific-prefix list is dropped under enforce (enforce owns
+    # the default); the other prefixes still install.
+    rec, fake = _rec(lk, monkeypatch, "enforce",
+                     backup_egress=_becfg(gateway=BE_GW, form=BackupEgressForm.PREFIXES,
+                                          prefixes=("0.0.0.0/0", "192.0.2.0/24")))
+    with caplog.at_level("WARNING", logger="lease-keeper"):
+        rec.reconcile_backup_egress(False)
+    assert "0.0.0.0/0" not in fake.routes and fake.routes.get("192.0.2.0/24") == BE_GW
+    assert any("0.0.0.0/0 is owned by enforce" in r.getMessage() for r in caplog.records)
+
+
+def test_backup_egress_specific_prefixes(lk, monkeypatch):
+    rec, fake = _rec(lk, monkeypatch, "enforce",
+                     backup_egress=_becfg(gateway=BE_GW, form=BackupEgressForm.PREFIXES,
+                                          prefixes=("192.0.2.0/24",)))
+    rec.reconcile_backup_egress(False)
+    assert fake.routes.get("192.0.2.0/24") == BE_GW
+    assert "0.0.0.0/1" not in fake.routes
+
+
+def test_backup_egress_host_prefix_round_trips(lk, monkeypatch):
+    # a /32 host prefix prints without a CIDR suffix in netstat; it must still round-
+    # trip so we do not re-add + false-ERROR every tick.
+    rec, fake = _rec(lk, monkeypatch, "enforce",
+                     backup_egress=_becfg(gateway=BE_GW, form=BackupEgressForm.PREFIXES,
+                                          prefixes=("192.0.2.5/32",)))
+    rec.reconcile_backup_egress(False)
+    assert fake.routes.get("192.0.2.5/32") == BE_GW
+    n = len(fake.calls)
+    rec.reconcile_backup_egress(False)                 # already correct -> no re-add
+    assert not any(c[2] in (RouteCommand.ADD, RouteCommand.CHANGE) for c in fake.calls[n:]
+                   if c[0].endswith("route"))
+
+
+def test_backup_egress_partial_install_uses_change(lk, monkeypatch):
+    # one /1 already correct, the other stale -> only the stale one is touched, via CHANGE.
+    rec, fake = _rec(lk, monkeypatch, "enforce", backup_egress=_becfg(gateway=BE_GW))
+    fake.routes["0.0.0.0/1"] = BE_GW                   # already correct
+    fake.routes["128.0.0.0/1"] = "10.9.9.9"            # stale gateway
+    rec.reconcile_backup_egress(False)
+    assert fake.routes["0.0.0.0/1"] == BE_GW and fake.routes["128.0.0.0/1"] == BE_GW
+    assert RouteCommand.CHANGE in fake.verbs and RouteCommand.ADD not in fake.verbs
+
+
+def test_backup_egress_remove_on_unreadable_fib_deletes_anyway(lk, monkeypatch):
+    # a leftover /1 on the master loops all egress; if netstat is unreadable when this
+    # node becomes master, the remove must delete unconditionally, not conclude "absent".
+    rec, fake = _rec(lk, monkeypatch, "enforce", backup_egress=_becfg(gateway=BE_GW),
+                     netstat_fails=True)
+    fake.routes["0.0.0.0/1"] = fake.routes["128.0.0.0/1"] = BE_GW
+    rec.reconcile_backup_egress(True)                  # master, table unreadable
+    assert "0.0.0.0/1" not in fake.routes and "128.0.0.0/1" not in fake.routes
+
+
+def test_backup_egress_install_defers_on_unreadable_fib(lk, monkeypatch, caplog):
+    # unreadable table on the backup: do not blind-add (would miss a needed CHANGE);
+    # defer to the next tick.
+    rec, fake = _rec(lk, monkeypatch, "enforce", backup_egress=_becfg(gateway=BE_GW),
+                     netstat_fails=True)
+    with caplog.at_level("WARNING", logger="lease-keeper"):
+        rec.reconcile_backup_egress(False)
+    assert "0.0.0.0/1" not in fake.routes
+    assert any("cannot read the routing table" in r.getMessage() for r in caplog.records)
+
+
+def test_backup_egress_readback_failure_is_error(lk, monkeypatch, caplog):
+    # a lying add (exits 0, FIB unchanged) must be caught by the read-back and reported
+    # as failed, not success -- the mirror of the 0/0 lying-add test.
+    rec, _ = _rec(lk, monkeypatch, "enforce", backup_egress=_becfg(gateway=BE_GW),
+                  lying=(RouteCommand.ADD,))
+    with caplog.at_level("INFO", logger="lease-keeper"):
+        rec.reconcile_backup_egress(False)
+    assert any(r.levelname == "ERROR" and "failed to route" in r.getMessage()
+               for r in caplog.records)
+    assert not any("backup egress routed via" in r.getMessage() for r in caplog.records)
+
+
+def test_backup_egress_broken_removal_is_error(lk, monkeypatch, caplog):
+    # a delete that does not take leaves a looping /1 on the master -> must surface ERROR.
+    rec, fake = _rec(lk, monkeypatch, "enforce", backup_egress=_becfg(gateway=BE_GW),
+                     broken=(RouteCommand.DELETE,))
+    fake.routes["0.0.0.0/1"] = fake.routes["128.0.0.0/1"] = BE_GW
+    with caplog.at_level("ERROR", logger="lease-keeper"):
+        rec.reconcile_backup_egress(True)
+    assert any("would loop its egress" in r.getMessage() for r in caplog.records)
+    assert "0.0.0.0/1" in fake.routes                  # the failed delete left the route (the hazard)
+
+
+def test_backup_egress_orphan_from_form_change_cleaned_on_master(lk, monkeypatch):
+    # a prefixes-form daemon still removes an orphaned /1-split (left by a prior split
+    # form) when it becomes master, via the union removal set.
+    rec, fake = _rec(lk, monkeypatch, "enforce",
+                     backup_egress=_becfg(gateway=BE_GW, form=BackupEgressForm.PREFIXES,
+                                          prefixes=("192.0.2.0/24",)))
+    fake.routes["0.0.0.0/1"] = fake.routes["128.0.0.0/1"] = BE_GW   # orphan from the old form
+    rec.reconcile_backup_egress(True)                  # master -> clean the union
+    assert "0.0.0.0/1" not in fake.routes and "128.0.0.0/1" not in fake.routes
+
+
+def test_backup_egress_rejects_own_ip_gateway(lk, monkeypatch, caplog):
+    # the config-sync trap: an explicit gateway equal to this node's own IP would route
+    # via self -> reject (route get resolves it to lo0) and install nothing.
+    rec, fake = _rec(lk, monkeypatch, "enforce",
+                     backup_egress=_becfg(gateway="10.168.9.2"), local_ips=("10.168.9.2",))
+    with caplog.at_level("WARNING", logger="lease-keeper"):
+        rec.reconcile_backup_egress(False)
+    assert "0.0.0.0/1" not in fake.routes
+    assert any("own address" in r.getMessage() for r in caplog.records)
+
+
+def test_backup_egress_derive_peer_on_31(lk, monkeypatch):
+    # RFC 3021 /31: both addresses are usable; the peer is the other one.
+    rec, fake = _rec(lk, monkeypatch, "enforce",
+                     backup_egress=_becfg(interface="sync0"),
+                     ifaces={"sync0": ("10.168.9.2", 31)})
+    rec.reconcile_backup_egress(False)
+    assert fake.routes.get("0.0.0.0/1") == "10.168.9.3"
+
+
+def test_backup_egress_resolve_warns_once_not_per_tick(lk, monkeypatch, caplog):
+    # an unresolvable gateway (no gateway, no interface) must warn once, not every tick.
+    rec, _ = _rec(lk, monkeypatch, "enforce", backup_egress=_becfg())
+    with caplog.at_level("WARNING", logger="lease-keeper"):
+        for _ in range(3):
+            rec.reconcile_backup_egress(False)
+    warns = [r for r in caplog.records if "no gateway set and no interface" in r.getMessage()]
+    assert len(warns) == 1
+
+
+def test_backup_egress_observe_would_remove(lk, monkeypatch, caplog):
+    rec, fake = _rec(lk, monkeypatch, "observe", backup_egress=_becfg(gateway=BE_GW))
+    fake.routes["0.0.0.0/1"] = BE_GW
+    with caplog.at_level("INFO", logger="lease-keeper"):
+        rec.reconcile_backup_egress(True)
+    assert fake.routes.get("0.0.0.0/1") == BE_GW        # observe never writes
+    assert any("would remove backup egress" in r.getMessage() for r in caplog.records)
+
+
+def test_backup_egress_independent_of_default_reconcile(lk, monkeypatch):
+    # the backup /1-split does not touch the 0/0 decision and vice versa.
+    rec, fake = _rec(lk, monkeypatch, "enforce", initial=GW,
+                     backup_egress=_becfg(gateway=BE_GW))
+    rec.reconcile(True, True, GW)                       # master: keeps 0/0 via WAN
+    rec.reconcile_backup_egress(True)                  # master: no /1-split
+    assert fake.routes.get("default") == GW and "0.0.0.0/1" not in fake.routes
+
+
+def test_backup_egress_derive_unreadable_interface_inactive(lk, monkeypatch, caplog):
+    # an interface with no readable IPv4 -> no peer, no install (warned).
+    rec, fake = _rec(lk, monkeypatch, "enforce",
+                     backup_egress=_becfg(interface="sync0"), ifaces={})
+    with caplog.at_level("WARNING", logger="lease-keeper"):
+        rec.reconcile_backup_egress(False)
+    assert "0.0.0.0/1" not in fake.routes
+    assert any("cannot read an IPv4 address" in r.getMessage() for r in caplog.records)
+
+
+def test_backup_egress_resolve_rearms_warning(lk, monkeypatch, caplog):
+    # unresolved -> warn; a successful resolve re-arms; unresolved again -> a 2nd warning.
+    rec, fake = _rec(lk, monkeypatch, "enforce",
+                     backup_egress=_becfg(interface="sync0"), ifaces={})
+    with caplog.at_level("WARNING", logger="lease-keeper"):
+        rec.reconcile_backup_egress(False)                 # warn #1 (no inet)
+        fake.ifaces["sync0"] = ("10.168.9.2", 30)          # now resolvable
+        rec.reconcile_backup_egress(False)                 # resolves -> re-arms
+        del fake.ifaces["sync0"]                           # unresolvable again
+        rec.reconcile_backup_egress(False)                 # warn #2
+    warns = [r for r in caplog.records if "cannot read an IPv4 address" in r.getMessage()]
+    assert len(warns) == 2
+
+
+def test_backup_egress_invalid_prefix_dropped(lk, monkeypatch, caplog):
+    rec, fake = _rec(lk, monkeypatch, "enforce",
+                     backup_egress=_becfg(gateway=BE_GW, form=BackupEgressForm.PREFIXES,
+                                          prefixes=("not-an-ip", "192.0.2.0/24")))
+    with caplog.at_level("WARNING", logger="lease-keeper"):
+        rec.reconcile_backup_egress(False)
+    assert fake.routes.get("192.0.2.0/24") == BE_GW
+    assert any("ignoring invalid prefix" in r.getMessage() for r in caplog.records)
+
+
+def test_backup_egress_ipv6_prefix_dropped(lk, monkeypatch, caplog):
+    # ip_network() accepts IPv6, but the FIB ops are IPv4-only (netstat/route -inet); a v6
+    # prefix must be dropped at validation rather than retried and failing every tick.
+    rec, fake = _rec(lk, monkeypatch, "enforce",
+                     backup_egress=_becfg(gateway=BE_GW, form=BackupEgressForm.PREFIXES,
+                                          prefixes=("2001:db8::/32", "192.0.2.0/24")))
+    with caplog.at_level("WARNING", logger="lease-keeper"):
+        rec.reconcile_backup_egress(False)
+    assert fake.routes.get("192.0.2.0/24") == BE_GW
+    assert "2001:db8::/32" not in fake.routes
+    assert any("non-IPv4 prefix" in r.getMessage() for r in caplog.records)
+
+
+def test_backup_egress_split_cleaned_at_boundary_when_feature_disabled(lk, monkeypatch):
+    # a crashed predecessor may have installed the /1-split under a config since changed to
+    # disable the feature; the boundary must still clear it so a later master does not loop.
+    rec, fake = _rec(lk, monkeypatch, "enforce")            # mode enabled, feature OFF
+    fake.routes["0.0.0.0/1"] = fake.routes["128.0.0.0/1"] = BE_GW
+    rec.withdraw_unless_master(lambda: False)
+    assert "0.0.0.0/1" not in fake.routes and "128.0.0.0/1" not in fake.routes
+
+
+def test_backup_egress_empty_prefixes_warns_and_installs_nothing(lk, monkeypatch, caplog):
+    rec, fake = _rec(lk, monkeypatch, "enforce",
+                     backup_egress=_becfg(gateway=BE_GW, form=BackupEgressForm.PREFIXES,
+                                          prefixes=()))
+    with caplog.at_level("WARNING", logger="lease-keeper"):
+        rec.reconcile_backup_egress(False)
+    assert not fake.routes                               # nothing routed
+    assert any("no valid prefixes" in r.getMessage() for r in caplog.records)
+
+
+def test_backup_egress_own_check_transient_defers_then_recovers(lk, monkeypatch, caplog):
+    # a transient own-check (route get) failure must defer (not route via a maybe-own
+    # gateway) AND not cache the indeterminate result -- it recovers once route get works.
+    rec, fake = _rec(lk, monkeypatch, "enforce", backup_egress=_becfg(gateway=BE_GW),
+                     broken=(RouteCommand.GET,))
+    with caplog.at_level("WARNING", logger="lease-keeper"):
+        rec.reconcile_backup_egress(False)               # own-check fails -> defer
+    assert "0.0.0.0/1" not in fake.routes
+    assert any("could not verify gateway" in r.getMessage() for r in caplog.records)
+    fake.broken.discard(RouteCommand.GET)                # own-check now works
+    rec.reconcile_backup_egress(False)
+    assert fake.routes.get("0.0.0.0/1") == BE_GW         # not permanently disabled
+
+
+def test_backup_egress_removed_at_shutdown(lk, monkeypatch):
+    # the shutdown boundary (withdraw_unless_master) cleans the backup-egress set so no
+    # orphan /1 loops if this node later becomes master with no reconciler running.
+    rec, fake = _rec(lk, monkeypatch, "enforce", backup_egress=_becfg(gateway=BE_GW))
+    fake.routes["0.0.0.0/1"] = fake.routes["128.0.0.0/1"] = BE_GW
+    rec.withdraw_unless_master(lambda: False)            # shutdown as backup
+    assert "0.0.0.0/1" not in fake.routes and "128.0.0.0/1" not in fake.routes
+
+
+def test_backup_egress_shutdown_unconfirmed_removal_warns(lk, monkeypatch, caplog):
+    # at shutdown there is no next tick to retry; an unconfirmable removal (unreadable
+    # table) must warn loudly rather than silently leave a possible orphan /1 that loops.
+    rec, fake = _rec(lk, monkeypatch, "enforce", backup_egress=_becfg(gateway=BE_GW),
+                     netstat_fails=True)
+    fake.routes["0.0.0.0/1"] = BE_GW
+    with caplog.at_level("WARNING", logger="lease-keeper"):
+        rec.withdraw_unless_master(lambda: False)
+    assert any("could not confirm removal at shutdown" in r.getMessage() for r in caplog.records)

@@ -25,8 +25,7 @@ jobs:
         with:
           python-version: '3.11'
       # pytest is imported by the test modules, so pylint/pyright need it to
-      # resolve; scapy stays intentionally absent (the code carries the
-      # pragmas for that).
+      # resolve. The daemon is pure stdlib, so there is nothing else to install.
       - run: pip install pylint pyright pytest
       # The repo .pylintrc holds the project conventions; every deviation from
       # the strict defaults is an inline pragma at its site. Any message fails
@@ -53,8 +52,8 @@ jobs:
         with:
           python-version: '3.11'
       - run: pip install pytest
-      # Daemon/status/logparse unit tests (scapy is stubbed in tests/conftest.py,
-      # so no dependency, root or interface is needed).
+      # Daemon/status/logparse unit tests (pure stdlib, so no dependency, root
+      # or interface is needed).
       - run: pytest -q net/os-carp-vip-dhcp/tests
 
   php:

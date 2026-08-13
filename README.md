@@ -43,7 +43,7 @@ If your WAN is static or PPPoE, you don't need this plugin.
 On the OPNsense box, as **root**:
 
 1. **Create a CARP VirtualIP** on the WAN (Interfaces ‣ Virtual IPs).
-2. **Install:** resolves the latest signed release, verifies its maintainer signature, and installs Scapy + the plugin:
+2. **Install:** resolves the latest signed release, verifies its maintainer signature, and installs the plugin:
    ```sh
    fetch -o - https://raw.githubusercontent.com/toreamun/opnsense-plugins/main/install.sh | sh
    ```
@@ -60,7 +60,7 @@ That's it - the VIP now holds a live lease. The defaults are sensible: it follow
 **You'll know it's working when**, on the **Status** page (or the dashboard widget): the keeper shows **bound** to the VIP's address, the node it runs on is CARP **master**, and gateway reachability shows a **green check** (the gateway is answering the ARP nudge). On the backup you'll instead see it **standing by** (or holding its own lease, depending on mode) - that's expected. A persistent problem raises a **dashboard banner**.
 
 - **Update:** re-run the exact same command (it always fetches the latest signed release and reinstalls in place; settings are preserved). Pin a version by appending its tag, e.g. `… | sh -s -- os-carp-vip-dhcp v1.4.0`.
-- **Uninstall:** `pkg delete os-carp-vip-dhcp` - stops the daemons and cleans up (Scapy is left in place). *(A manual, no-script install is documented below.)*
+- **Uninstall:** `pkg delete os-carp-vip-dhcp` - stops the daemons and cleans up. *(A manual, no-script install is documented below.)*
 
 ## Where it lives in the GUI
 
@@ -83,7 +83,7 @@ A **“CARP-VIP DHCP” dashboard widget** shows one row per keeper for an at-a-
 
 ## How it works
 
-A small root daemon keeps a DHCP lease alive for a chosen `chaddr` - the CARP virtual MAC (`00:00:5e:00:01:<vhid>`, last octet = the vhid in hex) of an existing CARP VIP. Standard `dhclient` can't do this because it ties the DHCP `chaddr` to the interface's hardware MAC; the daemon decouples them via a raw L2 socket (Scapy).
+A small root daemon keeps a DHCP lease alive for a chosen `chaddr` - the CARP virtual MAC (`00:00:5e:00:01:<vhid>`, last octet = the vhid in hex) of an existing CARP VIP. Standard `dhclient` can't do this because it ties the DHCP `chaddr` to the interface's hardware MAC; the daemon decouples them via a raw `/dev/bpf` socket (pure Python stdlib, no third-party dependency).
 
 Once the ISP routes the VIP address to that MAC, native OPNsense CARP answers ARP and egresses data as usual - so the VIP becomes failover-capable on a DHCP interface. The daemon references an existing CARP VirtualIP (deriving interface, vhid-to-chaddr and IP), follows the lease (RENEW at T1, REBIND at T2, re-DORA - a full Discover-Offer-Request-Ack - at expiry), and by default runs on **both** nodes redundantly - same lease, seamless failover, no split-brain. Because the lease lives on the CARP **virtual** MAC, a failover invalidates nothing upstream: the same MAC simply starts answering from the new master.
 
@@ -109,7 +109,6 @@ All per-keeper; sensible defaults mean most setups only pick a CARP VIP and enab
 - **ARP nudge** *(default on)*: keeps the upstream gateway's ARP entry for the VIP fresh and listens for the reply as a reachability signal. See *ARP nudge &amp; reachability*.
 - **CARP failover on lease loss** *(optional)*: demote this node (hand the VIP to the peer) if the keeper stops holding the correct lease.
 - **DHCP identity options** *(advanced)*: set a vendor-class (opt 60), client-id (61) or hostname (12) for servers that only lease to a known value. On a server that keys the lease on the **client-id** (not the chaddr), **both HA nodes must present the *same* client-id** - a divergent one gets them different addresses and breaks the shared VIP. HA config-sync keeps it identical.
-- **Capture backend** *(advanced, experimental)*: pick the packet-capture engine per keeper: **Default** (follow the host-wide `carpvipdhcp_backend` rc.conf flag if set, else Scapy), **scapy**, or **bpf** (the dependency-free raw `/dev/bpf` backend). Lets a bpf rollout be staged one VIP at a time; leave on Default unless you are testing bpf.
 - **Own the default route by CARP role** *(advanced, default off)*: make one keeper own the IPv4 default route as a function of CARP role and lease - only the master node holding the lease keeps a default (via the lease gateway), every other state has none, so a failover moves the default with the role instead of leaving a backup black-holing traffic. **observe** logs what it would do without touching the routing table; **enforce** installs and withdraws it. Pairs with marking the WAN gateway down (`force_down`) so OPNsense does not install a competing default. See *Owning the default route by CARP role*.
 - **HA config sync** *(optional)*: replicate the keeper config to the peer (System ‣ High Availability ‣ Settings), so you configure once on the master. Safe: the config is node-agnostic.
 - **Self-healing & health banner:** the daemon never exits on a transient fault (it keeps its heartbeat fresh so CARP doesn't falsely demote the node), and a GUI banner warns if any enabled keeper stops holding its lease - closing the silent-failure gap on a redundant spare.
@@ -192,7 +191,7 @@ Carrier access gear (BNG / access switches / OLTs) polices subscribers with mech
 
 - **IPv4 DHCP only.** DHCPv6 / IPv6 Neighbor Discovery are out of scope. The v6 side (e.g. a DHCPv6-PD prefix) does **not** float with the VIP, so after an IPv4 failover expect broken/asymmetric IPv6 on the surviving node until it re-acquires - plan v6 HA separately.
 - WAN is the typical - not required - placement.
-- Requires **root** (raw L2/BPF socket) and depends on **Scapy**. An experimental `bpf` capture backend (since 1.9.0) runs on a raw `/dev/bpf` descriptor with no Scapy dependency: opt in per host with `sysrc carpvipdhcp_backend=bpf` plus a service restart, or per keeper via the **Capture backend** field on the settings dialog (since 1.10.0). Remove the variable (`sysrc -x carpvipdhcp_backend`) or set the field back to **Default** to return to the default Scapy backend.
+- Requires **root** (raw L2/BPF socket). Runs on a raw `/dev/bpf` descriptor with no third-party dependency (pure Python stdlib).
 - **Shared-L2 exposure:** follow mode trusts the DHCP ACK, so on a genuinely shared segment a neighbour who can read the CARP adverts could forge one to relocate the VIP (the same untrusted-shared-L2 risk a plain firewall shares). Moot where the ISP isolates you per VLAN/port; pin the address (follow off) on a shared L2 otherwise.
 
 *Deliberately not included:* DHCP option 82 (inserted by the ISP, not the client); RFC 5227 address-conflict detection/arbitration (a rogue host claiming the VIP is beyond a subscriber device's control); DAI rate-limit pacing (one nudge / 120 s is orders of magnitude under any limit); a unicast-RENEW mode (the broadcast flag makes RFC-2131 servers broadcast OFFER/ACK to a non-promiscuous socket; a server that unicasts to the CARP MAC is still received on the master).
@@ -215,10 +214,7 @@ openssl dgst -sha256 -verify release.pub -signature SHA256SUMS.sig.bin SHA256SUM
 # 3. Verify the package matches the signed manifest.
 h=$(sha256 -q os-carp-vip-dhcp-*.pkg); grep -q "$h" SHA256SUMS && echo "package OK"
 
-# 4. Install the Scapy dependency (package name follows your box's Python version).
-pkg install -y "py3$(python3 -c 'import sys; print(sys.version_info.minor)')-scapy"
-
-# 5. Install the plugin.
+# 4. Install the plugin.
 pkg add ./os-carp-vip-dhcp-*.pkg
 ```
 
@@ -235,7 +231,7 @@ git clone https://github.com/toreamun/opnsense-plugins
 cd opnsense-plugins            # inspect the source you're about to run
 
 # 2. Build + install, as root. Fetches the official plugins tree for the build
-#    tooling, packages net/os-carp-vip-dhcp, ensures Scapy, and pkg-adds it.
+#    tooling, packages net/os-carp-vip-dhcp, and pkg-adds it.
 ./build.sh --install
 ```
 
@@ -262,7 +258,7 @@ for p in *.pkg; do grep -q "$(sha256 -q "$p")" SHA256SUMS && echo "$p: OK" || ec
 
 ## For maintainers
 
-- **Building & releasing:** see **[RELEASE.md](RELEASE.md)** for the build, sign, tag and publish process and the review gates each release passes. Packages must be built **on an OPNsense box** - GitHub Actions has no OPNsense/FreeBSD runner, and the dependency name differs from stock FreeBSD (OPNsense 26.x uses `py313-scapy`).
+- **Building & releasing:** see **[RELEASE.md](RELEASE.md)** for the build, sign, tag and publish process and the review gates each release passes. Packages must be built **on an OPNsense box** - GitHub Actions has no OPNsense/FreeBSD runner.
 - **Linting:** Python is PEP 8, max line length 120 (`flake8`, config in [setup.cfg](setup.cfg)); PHP is PSR-12 (`phpcs`). Run everything locally with [pre-commit](.pre-commit-config.yaml) (`pre-commit install && pre-commit run --all-files`); CI ([.github/workflows/lint.yml](.github/workflows/lint.yml)) runs the same checks on every push and PR.
 
 ## License

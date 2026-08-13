@@ -7,7 +7,7 @@ max-line-length=120
 
 [BASIC]
 # Short names idiomatic across this codebase's network code and tests:
-# p = scapy packet, rx = parsed reply, b = BOOTP layer, gw = gateway,
+# p = packet, rx = parsed reply, b = BOOTP layer, gw = gateway,
 # c/k/n = component or keeper instances in tests, t1/t2 = DHCP timers,
 # m = MAC string, e = exception, f = file handle, fd/pf = descriptors,
 # a/ap = parsed args / parser, s = formatted string, ok = loop result,

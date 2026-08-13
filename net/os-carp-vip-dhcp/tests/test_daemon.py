@@ -1095,15 +1095,20 @@ def test_backoff_jitter(lk):
 
 # ---- default-route ownership wiring (keeper <-> DefaultRouteReconciler) ----
 
-class _RecordingReconciler:  # pylint: disable=too-few-public-methods
+class _RecordingReconciler:
     """Stand-in for DefaultRouteReconciler that records reconcile() args, so the
     keeper-side wiring can be asserted without a real route(8) probe."""
     def __init__(self, enabled=True):
         self.enabled = enabled
+        self.backup_egress_enabled = enabled
         self.calls = []
+        self.backup_egress_calls = []
 
     def reconcile(self, is_master, bound, gateway):
         self.calls.append((is_master, bound, gateway))
+
+    def reconcile_backup_egress(self, is_master):
+        self.backup_egress_calls.append(is_master)
 
 
 def test_default_route_mode_off_is_inert(lk):
@@ -1125,6 +1130,37 @@ def test_default_route_forwards_role_bound_gateway(lk):
     k._dhcp.binding.lease_router = "100.64.4.1"
     k._reconcile_default_route(master=True)
     assert rec.calls == [(True, True, "100.64.4.1")]
+    # the same tick also drives the backup-egress reconcile with the CARP role.
+    assert rec.backup_egress_calls == [True]
+
+
+def test_backup_egress_uses_real_role_on_unbound_path(lk, monkeypatch):
+    # the unbound path drives the 0/0 withdraw with a fictional master=False; backup
+    # egress must get the REAL role so a CARP master-without-lease is not handed a
+    # backup route (which would black-hole/loop the master's own egress).
+    k = _keeper(lk, vhid=254, default_route_mode="enforce")
+    rec = _RecordingReconciler()
+    k._defroute = rec
+    monkeypatch.setattr(k, "_probe_carp_master", lambda: True)     # actually CARP master
+    k._reconcile_default_route(master=False, probe_for_backup=True)
+    assert rec.calls[0][0] is False                                # 0/0 got the fiction
+    assert rec.backup_egress_calls == [True]                       # backup egress got the true role
+
+
+def test_backup_egress_reconciled_before_blocking_acquire_when_unbound(lk, monkeypatch):
+    # A routed backup promoted to master while unbound must shed its /1 BEFORE the (possibly
+    # long) acquire blocks, or the /1 loops the new master's egress for the whole acquire.
+    # So the unbound path reconciles backup egress with the real CARP role ahead of acquire.
+    k = _keeper(lk, vhid=254, default_route_mode="enforce")
+    rec = _RecordingReconciler()
+    k._defroute = rec
+    monkeypatch.setattr(k, "_probe_carp_master", lambda: True)     # promoted to master
+    order = []
+    monkeypatch.setattr(rec, "reconcile_backup_egress", lambda m: order.append(("backup", m)))
+    monkeypatch.setattr(k, "_acquire_step", lambda: order.append(("acquire", None)))
+    k._dhcp.binding.yiaddr = None                                 # unbound
+    k._maintain_step()
+    assert order[:2] == [("backup", True), ("acquire", None)]     # real role, before the block
 
 
 def test_default_route_bound_keyed_on_yiaddr_not_router(lk):
@@ -1306,6 +1342,17 @@ def test_withdraw_unless_master_off_is_inert_without_probing(lk, monkeypatch):
     probed = []
     lk.DefaultRouteReconciler("off").withdraw_unless_master(lambda: probed.append(1))
     assert fake.gw == RGW and not fake.calls and not probed
+
+
+def test_split_prefixes_accepts_commas_and_whitespace():
+    # the model mask and docs allow both separators; a space-separated list must not
+    # collapse into one invalid token (which would install neither route).
+    import lease_keeper  # noqa: E402  # pylint: disable=import-outside-toplevel
+    both = ("192.0.2.0/24", "198.51.100.0/24")
+    assert lease_keeper._split_prefixes("192.0.2.0/24 198.51.100.0/24") == both   # spaces
+    assert lease_keeper._split_prefixes("192.0.2.0/24,198.51.100.0/24") == both   # commas
+    assert lease_keeper._split_prefixes("192.0.2.0/24, 198.51.100.0/24") == both  # mixed
+    assert not lease_keeper._split_prefixes("") and not lease_keeper._split_prefixes(None)
 
 
 def test_carp_master_decision_from_ifconfig_text(lk):

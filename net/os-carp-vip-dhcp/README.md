@@ -15,6 +15,7 @@ Quick pointers:
 
 - **Install** (as root): `fetch -o - https://raw.githubusercontent.com/toreamun/opnsense-plugins/main/install.sh | sh` - see the landing page for the verified / manual / build-from-source paths.
 - **Single-IP WAN deep-dive:** [docs/single-ip-wan-carp.md](docs/single-ip-wan-carp.md).
+- **Backup egress (internet for the non-master node):** [docs/backup-egress.md](docs/backup-egress.md).
 - **This directory** holds the plugin sources (`src/`, `tests/`, `docs/`); the repo mirrors the [opnsense/plugins](https://github.com/opnsense/plugins) ports-tree layout.
 
 If this is useful to you, ⭐ [star the repo](https://github.com/toreamun/opnsense-plugins) - I intend to propose it for the official OPNsense community plugins if there's enough interest.

@@ -32,8 +32,13 @@
 
         // CARP failover on lease loss applies only to a fixed reservation, so it is
         // mutually exclusive with "Follow dynamic DHCP address" (a follower adopts a new
-        // address instead of losing the lease).
-        advRow("demoteOnLeaseLoss", !$("#keeper\\.followIp").is(":checked"));
+        // address instead of losing the lease). Clear it while following so no stale value
+        // lingers to trip the model's mutual-exclusivity check on a now-hidden field.
+        let following = $("#keeper\\.followIp").is(":checked");
+        if (following) {
+            $("#keeper\\.demoteOnLeaseLoss").prop("checked", false);
+        }
+        advRow("demoteOnLeaseLoss", !following);
 
         // Backup egress needs "Own default route by CARP role" on observe/enforce; its
         // sub-fields need the feature enabled, and the prefix list needs the prefixes form.

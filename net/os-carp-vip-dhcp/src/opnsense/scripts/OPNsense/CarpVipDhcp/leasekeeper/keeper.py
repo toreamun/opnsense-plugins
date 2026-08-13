@@ -191,8 +191,16 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         # back (DHCP replies and ARP replies, routed below). Promiscuous
         # capture is off by default; the rationale lives in the module
         # docstring's security section.
+        # Promiscuous capture serves ONLY the ARP nudge reply (unicast to the CARP vMAC);
+        # DHCP replies are forced broadcast, so they are caught without it. With the nudge
+        # disabled (interval 0) there is nothing for it to catch, so a stale promisc flag is
+        # ignored rather than needlessly receiving all segment traffic.
+        effective_promisc = bool(arp_listen_promisc and arp_nudge > 0)
+        if arp_listen_promisc and not effective_promisc:
+            LOG.info("ARP listen promiscuous is set but the ARP nudge is disabled (interval "
+                     "0) -- ignoring it; promiscuous capture only serves the nudge reply")
         self._capture = CAPTURE_BACKENDS[capture_backend](
-            iface, arp_listen_promisc, self._on_dhcp_reply, self._on_arp_reply)
+            iface, effective_promisc, self._on_dhcp_reply, self._on_arp_reply)
 
         # ARP nudge component: owns the pacing and reachability state; the
         # keeper supplies the lease binding per nudge (_arp_nudge) and the

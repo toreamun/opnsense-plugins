@@ -136,6 +136,47 @@
                     </OptionValues>
                 </defaultRouteMode>
 
+                <!--
+                    Backup egress: while this node is the CARP backup (and so holds
+                    no WAN default), route its OWN internet traffic to the master.
+                    Needs defaultRouteMode observe/enforce. Route form defaults to the
+                    /1-split (leak-safe, never collides with enforce). Gateway is a
+                    stable next hop (a CARP VIP or a fallback-WAN gateway); leave blank
+                    to derive the peer from a point-to-point /30/31 interface. See the
+                    backup-egress docs.
+                -->
+                <backupEgress type="BooleanField">
+                    <Default>0</Default>
+                </backupEgress>
+                <backupEgressForm type="OptionField">
+                    <Required>N</Required>
+                    <Default>split</Default>
+                    <OptionValues>
+                        <split>/1-split (full internet, recommended)</split>
+                        <prefixes>Specific prefixes</prefixes>
+                    </OptionValues>
+                </backupEgressForm>
+                <!--
+                    The masks constrain each value to its own syntax and, like the
+                    DHCP-option fields above, forbid the pipe and any line break so the
+                    rendered keeper.conf line stays a single parseable record.
+                -->
+                <backupEgressGateway type="TextField">
+                    <Mask>/^[0-9.]{0,15}$/u</Mask>
+                    <ValidationMessage>Backup egress gateway: an IPv4 address (digits and dots only).</ValidationMessage>
+                    <Required>N</Required>
+                </backupEgressGateway>
+                <backupEgressInterface type="TextField">
+                    <Mask>/^[A-Za-z0-9_.]{0,32}$/u</Mask>
+                    <ValidationMessage>Backup egress interface: a device name (letters, digits, dot, underscore).</ValidationMessage>
+                    <Required>N</Required>
+                </backupEgressInterface>
+                <backupEgressPrefixes type="TextField">
+                    <Mask>/^[0-9.,\/ ]{0,256}$/u</Mask>
+                    <ValidationMessage>Backup egress prefixes: IPv4 CIDRs separated by comma or space.</ValidationMessage>
+                    <Required>N</Required>
+                </backupEgressPrefixes>
+
                 <description type="DescriptionField"/>
             </keeper>
         </keepers>

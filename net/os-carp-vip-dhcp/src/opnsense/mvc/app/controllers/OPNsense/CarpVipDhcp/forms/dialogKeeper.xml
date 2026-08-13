@@ -38,6 +38,41 @@
         <help><![CDATA[Default OFF. Make this keeper own the IPv4 default route (0.0.0.0/0) by CARP role: the master node holding this keeper's lease keeps a default via the lease gateway, every other state keeps none, so a node offers a default only while it can actually route one (a failover moves it, a backup withdraws it, instead of black-holing). <b>Off</b>: inert. <b>Observe</b>: log the decision it would make, without touching the routing table (use this first). <b>Enforce</b>: actually install and withdraw the default. Only ONE keeper (the WAN VIP) may enforce. In enforce mode, also tick the WAN gateway's "Mark Gateway as Down" (force_down) so OPNsense does not install a competing default. With os-frr the redistributed kernel default then follows the CARP role automatically; it also works without FRR. See the README.]]></help>
     </field>
     <field>
+        <id>keeper.backupEgress</id>
+        <label>Backup egress (internet while not master)</label>
+        <type>checkbox</type>
+        <advanced>true</advanced>
+        <help><![CDATA[Default OFF. While this node is the CARP <b>backup</b> (and so holds no WAN default), route its OWN internet traffic (updates, NTP, DNS) to the master, which NATs it out the single WAN. Needs "Own default route by CARP role" set to observe or enforce; the route is removed automatically when this node becomes master. See the backup-egress docs.]]></help>
+    </field>
+    <field>
+        <id>keeper.backupEgressForm</id>
+        <label>Backup egress route form</label>
+        <type>dropdown</type>
+        <advanced>true</advanced>
+        <help><![CDATA[<b>/1-split</b> (recommended): 0.0.0.0/1 + 128.0.0.0/1, full internet but not the default, so it never redistributes as a default nor collides with enforce. <b>Specific prefixes</b>: only the CIDR destinations listed below (e.g. pkg mirror / NTP hosts).]]></help>
+    </field>
+    <field>
+        <id>keeper.backupEgressGateway</id>
+        <label>Backup egress gateway</label>
+        <type>text</type>
+        <advanced>true</advanced>
+        <help><![CDATA[The next hop = "the master". Best a stable internal <b>CARP VIP</b> (e.g. the LAN VIP), which always points at the master and follows failover; or a separate fallback-WAN gateway (independent egress). Leave <b>blank</b> to derive the peer automatically from the point-to-point /30 or /31 interface set below. Do not enter a plain peer address that differs per node: it syncs identically and would be wrong on one node.]]></help>
+    </field>
+    <field>
+        <id>keeper.backupEgressInterface</id>
+        <label>Backup egress interface (for auto-derive)</label>
+        <type>text</type>
+        <advanced>true</advanced>
+        <help><![CDATA[Only used when the gateway above is blank: a point-to-point /30 or /31 interface (typically the SYNC link) whose other host is the master. The peer is derived per node, so it stays correct after a failover. Enter the interface device name.]]></help>
+    </field>
+    <field>
+        <id>keeper.backupEgressPrefixes</id>
+        <label>Backup egress prefixes</label>
+        <type>text</type>
+        <advanced>true</advanced>
+        <help><![CDATA[Only used with route form "Specific prefixes": a comma- or space-separated list of IPv4 CIDR destinations to route via the gateway (e.g. your pkg mirror / NTP hosts). Do not list 0.0.0.0/0.]]></help>
+    </field>
+    <field>
         <id>keeper.arpNudgeInterval</id>
         <label>ARP nudge interval (s)</label>
         <type>text</type>

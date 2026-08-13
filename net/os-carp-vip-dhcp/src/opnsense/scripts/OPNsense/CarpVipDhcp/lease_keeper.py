@@ -155,6 +155,13 @@ def _build_arg_parser():
                     help="put the capture socket in promiscuous mode so the gateway's "
                          "unicast ARP reply is seen on NICs that filter non-primary "
                          "unicast MACs (default off; only needed if replies aren't seen)")
+    # Backward compatibility for one upgrade cycle: the capture-backend selector
+    # was removed (bpf is the only backend now), but a keeper started by the
+    # previous version has a daemon(8) supervisor whose command line still carries
+    # --capture-backend. Accept and ignore it so that supervisor's next restart
+    # runs this script without exiting 2 and crash-looping until a reconfigure
+    # re-renders the arguments.
+    ap.add_argument("--capture-backend", help=argparse.SUPPRESS)
     # No argparse `choices` on the two enum args below: an unrecognised value is
     # coerced to a safe default with a warning in main() (see DefaultRouteMode /
     # BackupEgressForm .coerce), not rejected with exit 2 -- which daemon(8) -r

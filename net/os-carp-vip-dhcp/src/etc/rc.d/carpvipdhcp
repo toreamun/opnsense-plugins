@@ -35,7 +35,7 @@ carpvipdhcp_start()
 {
     [ -f "${conf}" ] || { echo "no config"; return 0; }
     count=0
-    while IFS='|' read -r request iface chaddr demote vhid follow vendorclass clientid hostname arpnudge arplistenpromisc capturebackend defaultroutemode || [ -n "${request}" ]; do
+    while IFS='|' read -r request iface chaddr demote vhid follow vendorclass clientid hostname arpnudge arplistenpromisc capturebackend defaultroutemode backupegress backupegressform backupegressgw backupegressiface backupegressprefixes || [ -n "${request}" ]; do
         [ -n "${request}" ] || continue
         case "${request}" in \#*) continue ;; esac
         if [ -z "${iface}" ] || [ -z "${chaddr}" ]; then
@@ -92,6 +92,24 @@ carpvipdhcp_start()
             observe|enforce) set -- "$@" --default-route-mode "${defaultroutemode}" ;;
             *) echo "carpvipdhcp: ignoring unknown default-route mode '${defaultroutemode}' (use off, observe or enforce)" >&2 ;;
         esac
+        # Backup egress (keeper.conf columns 14-18): while CARP backup, route this
+        # node's own internet traffic to the master. Only acts under observe/enforce
+        # (the daemon gates on that); a blank gateway/interface/prefixes field passes
+        # nothing (the form defaults to split, so --backup-egress-form is always sent).
+        if [ "${backupegress}" = "1" ]; then
+            set -- "$@" --backup-egress
+            # Validate the form here (like default-route-mode above): passing an unknown
+            # legacy value straight to the daemon's argparse choices would exit-loop the
+            # supervised daemon every few seconds instead of falling back to split.
+            case "${backupegressform}" in
+                ''|split) : ;;
+                prefixes) set -- "$@" --backup-egress-form prefixes ;;
+                *) echo "carpvipdhcp: ignoring unknown backup-egress form '${backupegressform}' (use split or prefixes)" >&2 ;;
+            esac
+            [ -n "${backupegressgw}" ] && set -- "$@" --backup-egress-gateway "${backupegressgw}"
+            [ -n "${backupegressiface}" ] && set -- "$@" --backup-egress-interface "${backupegressiface}"
+            [ -n "${backupegressprefixes}" ] && set -- "$@" --backup-egress-prefixes "${backupegressprefixes}"
+        fi
         # -f detach; -r supervise/restart on crash; -R 5 restart delay; -P supervisor pidfile.
         /usr/sbin/daemon -f -r -R 5 -P "${pidfile}" -t "${name}-${id}" "${keeper}" "$@"
         count=$((count + 1))

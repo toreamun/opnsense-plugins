@@ -61,7 +61,7 @@
     <field>
         <id>keeper.backupEgressInterface</id>
         <label>Backup egress interface (for auto-derive)</label>
-        <type>text</type>
+        <type>dropdown</type>
         <advanced>true</advanced>
         <help><![CDATA[Only used when the gateway above is blank: a point-to-point /30 or /31 interface (typically the SYNC link) whose other host is the master. The peer is derived per node, so it stays correct after a failover. Enter the interface device name.]]></help>
     </field>

@@ -21,6 +21,35 @@
  #}
 
 <script>
+    // Base dialogs have no declarative "show-if-other-field", so field couplings are
+    // toggled in JS, mirroring the core pattern (the OpenVPN instance dialog does the
+    // same). Hidden rows keep their values (the daemon ignores an inapplicable field);
+    // this only declutters the dialog. Every field toggled here is advanced, so it never
+    // appears unless advanced mode is on, gated on the toggle state exactly as core does.
+    function cvdToggleConditionalFields() {
+        let advancedOn = $("#DialogKeeper [id^='show_advanced_']").hasClass("fa-toggle-on");
+        function advRow(id, show) { $("#keeper\\." + id).closest("tr").toggle(show && advancedOn); }
+
+        // CARP failover on lease loss applies only to a fixed reservation, so it is
+        // mutually exclusive with "Follow dynamic DHCP address" (a follower adopts a new
+        // address instead of losing the lease).
+        advRow("demoteOnLeaseLoss", !$("#keeper\\.followIp").is(":checked"));
+
+        // Backup egress needs "Own default route by CARP role" on observe/enforce; its
+        // sub-fields need the feature enabled, and the prefix list needs the prefixes form.
+        let routeOwned = $("#keeper\\.defaultRouteMode").val() !== "off";
+        let backupOn = routeOwned && $("#keeper\\.backupEgress").is(":checked");
+        advRow("backupEgress", routeOwned);
+        advRow("backupEgressForm", backupOn);
+        advRow("backupEgressGateway", backupOn);
+        advRow("backupEgressInterface", backupOn);
+        advRow("backupEgressPrefixes", backupOn && $("#keeper\\.backupEgressForm").val() === "prefixes");
+
+        // Promiscuous ARP listen only has a reply to catch while the ARP nudge is enabled
+        // (interval 0 disables the nudge).
+        advRow("arpListenPromisc", parseInt($("#keeper\\.arpNudgeInterval").val(), 10) > 0);
+    }
+
     $(document).ready(function () {
         $("#grid-keepers").UIBootgrid({
             search: '/api/carpvipdhcp/settings/searchKeeper',
@@ -32,6 +61,17 @@
         });
         updateServiceControlUI('carpvipdhcp');
         $("#reconfigureAct").SimpleActionButton();
+
+        // Re-evaluate when the dialog opens (values are mapped in without firing change),
+        // when any trigger field changes, and after the advanced-mode toggle (deferred so
+        // it runs once the framework has shown/hidden the advanced rows).
+        let cvdTriggers = "#keeper\\.followIp, #keeper\\.defaultRouteMode, #keeper\\.backupEgress, "
+            + "#keeper\\.backupEgressForm, #keeper\\.arpNudgeInterval";
+        $("#DialogKeeper").on("shown.bs.modal", function () { setTimeout(cvdToggleConditionalFields, 0); });
+        $(cvdTriggers).on("change", cvdToggleConditionalFields);
+        $("#DialogKeeper").on("click", "[id^='show_advanced_']", function () {
+            setTimeout(cvdToggleConditionalFields, 0);
+        });
     });
 </script>
 

@@ -11,6 +11,10 @@
 # per keeper, pipe-separated KEY=VALUE fields in no fixed order; we dispatch by
 # key name and use only request= and demote= here.
 
+# request/demote are assigned by the sourced keeperconf.sh parser, which
+# shellcheck cannot follow across its absolute install path; do not flag them as
+# unassigned (file-wide, before any command).
+# shellcheck disable=SC2154
 CONF="/usr/local/etc/carpvipdhcp/keeper.conf"
 RUN_DIR="/var/run"
 # The daemon refreshes the heartbeat every ~30s while holding a lease; the

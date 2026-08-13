@@ -12,6 +12,10 @@
 # added or removed without shifting a positional column.
 # Starts one supervised daemon per line, keyed by a filesystem-safe request-IP id.
 
+# The keeper-field variables (request, iface, chaddr, ...) are assigned by the
+# sourced keeperconf.sh parser, which shellcheck cannot follow across its absolute
+# install path; do not flag them as unassigned (file-wide, before any command).
+# shellcheck disable=SC2154
 . /etc/rc.subr
 
 name="carpvipdhcp"

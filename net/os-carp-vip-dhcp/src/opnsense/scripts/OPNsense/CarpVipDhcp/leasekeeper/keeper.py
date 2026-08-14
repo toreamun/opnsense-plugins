@@ -360,6 +360,8 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         replaces this daemon with one bound to the new address."""
         cmd = ["/usr/local/sbin/configctl", "-d", "carpvipdhcp", "follow_update", old_ip, new_ip]
         cmd += gw_args   # cross-subnet: [old_gw, new_gw, bits]; empty on a same-subnet move
+        # Fire-and-forget: this configctl triggers a service restart that replaces
+        # this very daemon, so we must not wait on the child (`with` would block).
         subprocess.Popen(cmd)  # pylint: disable=consider-using-with
 
     # ---- CARP role (master probe, transitions) ----

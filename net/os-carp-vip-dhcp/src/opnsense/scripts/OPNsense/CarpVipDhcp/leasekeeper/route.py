@@ -535,10 +535,8 @@ class DefaultRouteReconciler:
                                   iface, prefixlen)
             return None
         net = ipaddress.ip_network(f"{own}/{prefixlen}", strict=False)
-        for host in net.hosts():
-            if str(host) != own:
-                return str(host)
-        return None
+        # The peer is the other host of the /30 or /31 (the one that is not us).
+        return next((str(host) for host in net.hosts() if str(host) != own), None)
 
     def _iface_ipv4(self, iface):
         """(address, prefixlen) of the first IPv4 on `iface`, or None. Parses

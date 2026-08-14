@@ -9,6 +9,7 @@ import os
 import select
 import struct
 import threading
+from dataclasses import dataclass
 from typing import Any
 
 from .constants import (
@@ -39,7 +40,19 @@ except ImportError:
     fcntl = None  # pylint: disable=invalid-name
 
 
-class BpfCapture:  # pylint: disable=too-many-instance-attributes
+@dataclass
+class _ReaderGen:
+    """One reader generation (one start()): the bpf fd, the reader thread, its
+    stop signal, and the write end of its wake pipe. start() installs the whole
+    generation and stop() clears it as a unit; a reader that outlives its stop()
+    keeps its own fd/wake_reader copies, so nothing here is reused under it."""
+    fd: int
+    thread: threading.Thread
+    stop_event: threading.Event
+    wake_writer: int
+
+
+class BpfCapture:
     """Capture/send on a raw /dev/bpf descriptor -- no packet library. A
     reader thread walks the bpf buffer and hands decoded backend-neutral frames
     to the Capture protocol's callbacks. FreeBSD-only (OPNsense's platform).
@@ -57,11 +70,8 @@ class BpfCapture:  # pylint: disable=too-many-instance-attributes
         self.promisc = promisc
         self._on_bootp = on_bootp
         self._on_arp = on_arp
-        self._fd = None                # the live capture fd, or None when stopped
         self._buflen = 0               # kernel buffer size, from BIOCGBLEN in _configure
-        self._thread = None            # the current reader thread
-        self._stop_event = None        # set to ask the current reader to exit
-        self._wake_writer = None       # write end of this generation's wake pipe
+        self._gen = None               # the current _ReaderGen, or None when stopped
         # Throttle the untrusted-input parse-error line: a malformed/spoof storm
         # must not churn the log (DEBUG still hits disk regardless of the view).
         self._parse_errs = _RateLimit(PARSE_ERROR_LOG_INTERVAL)
@@ -101,13 +111,11 @@ class BpfCapture:  # pylint: disable=too-many-instance-attributes
             return False
         stop_event = threading.Event()
         # The reader owns fd and wake_reader and closes them when it exits.
-        self._thread = threading.Thread(
+        thread = threading.Thread(
             target=self._read_loop, args=(fd, wake_reader, stop_event),
             name="bpf-capture", daemon=True)
-        self._fd = fd
-        self._stop_event = stop_event
-        self._wake_writer = wake_writer
-        self._thread.start()
+        self._gen = _ReaderGen(fd=fd, thread=thread, stop_event=stop_event, wake_writer=wake_writer)
+        thread.start()
         return True
 
     def _configure(self, fd):
@@ -151,34 +159,29 @@ class BpfCapture:  # pylint: disable=too-many-instance-attributes
         closes its own fd, so stop() only signals and joins; a reader still
         alive after the join (stuck in a slow callback) is left to exit on its
         own -- it holds its own fd, so nothing here can be reused under it."""
-        thread = self._thread
-        stop_event = self._stop_event
-        wake_writer = self._wake_writer
-        self._fd = None
-        self._thread = None
-        self._stop_event = None
-        self._wake_writer = None
+        gen = self._gen
+        self._gen = None
+        if gen is None:
+            return
 
-        if stop_event is not None:
-            stop_event.set()
-        if wake_writer is not None:
-            try:
-                os.write(wake_writer, b"\x00")   # wake the reader's select() at once
-            except OSError:
-                pass
-            try:
-                os.close(wake_writer)
-            except OSError:
-                pass
-        if thread is not None and thread.is_alive():
-            thread.join(timeout=THREAD_JOIN_TIMEOUT)
-            if thread.is_alive():
+        gen.stop_event.set()
+        try:
+            os.write(gen.wake_writer, b"\x00")   # wake the reader's select() at once
+        except OSError:
+            pass
+        try:
+            os.close(gen.wake_writer)
+        except OSError:
+            pass
+        if gen.thread.is_alive():
+            gen.thread.join(timeout=THREAD_JOIN_TIMEOUT)
+            if gen.thread.is_alive():
                 LOG.warning("bpf reader did not exit within %ss -- leaving it to "
                             "finish; its fd is not reused", THREAD_JOIN_TIMEOUT)
 
     def alive(self):
         """True while the descriptor is open and the reader thread runs."""
-        return self._fd is not None and self._thread is not None and self._thread.is_alive()
+        return self._gen is not None and self._gen.thread.is_alive()
 
     def _read_loop(self, fd, wake_reader, stop_event):
         """Reader thread: block in select() on the bpf fd and the wake pipe;
@@ -229,11 +232,11 @@ class BpfCapture:  # pylint: disable=too-many-instance-attributes
 
     def _write(self, frame):
         """Inject one raw Ethernet frame on the interface. Main-thread only (the
-        capture thread never sends), so reading self._fd needs no lock."""
-        fd = self._fd
-        if fd is None:
+        capture thread never sends), so reading self._gen needs no lock."""
+        gen = self._gen
+        if gen is None:
             raise OSError("bpf capture not started")
-        os.write(fd, frame)
+        os.write(gen.fd, frame)
 
     def send_dhcp(self, msg):
         """Broadcast one DHCP client message (a DhcpSend) as raw encoded frames."""

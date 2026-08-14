@@ -97,23 +97,27 @@ carpvipdhcp_start()
             set -- "$@" --follow
         fi
         # Optional DHCP request options -- only passed when the operator set them.
-        [ -n "${vendorclass}" ] && set -- "$@" --vendor-class "${vendorclass}"
-        [ -n "${clientid}" ] && set -- "$@" --client-id "${clientid}"
-        [ -n "${hostname}" ] && set -- "$@" --hostname "${hostname}"
+        # Use the --flag=value form: these masks allow a leading '-', and a separate
+        # "-foo" token would be read as another option (argparse exit 2, a crash loop
+        # under daemon(8) -r) instead of the value.
+        [ -n "${vendorclass}" ] && set -- "$@" --vendor-class="${vendorclass}"
+        [ -n "${clientid}" ] && set -- "$@" --client-id="${clientid}"
+        [ -n "${hostname}" ] && set -- "$@" --hostname="${hostname}"
         [ -n "${arpnudge}" ] && set -- "$@" --arp-nudge "${arpnudge}"
         # Promiscuous ARP capture is an opt-in fallback (default off).
         [ "${arplistenpromisc}" = "1" ] && set -- "$@" --arp-listen-promisc
-        # Default-route ownership by CARP role. Passed through verbatim; the daemon
-        # coerces an empty or unrecognised value to the inert "off" default (it no
-        # longer rejects on an argparse choice, so a typo can't crash-loop it).
-        [ -n "${defaultroutemode}" ] && set -- "$@" --default-route-mode "${defaultroutemode}"
+        # Default-route ownership by CARP role. Passed through as --flag=value (so a
+        # leading-'-' value reaches the daemon, not argparse); the daemon coerces an
+        # empty or unrecognised value to the inert "off" default, so a typo can't
+        # crash-loop it.
+        [ -n "${defaultroutemode}" ] && set -- "$@" --default-route-mode="${defaultroutemode}"
         # Backup egress: while CARP backup, route this node's own internet traffic to
         # the master. Only acts under observe/enforce (the daemon gates on that); a
         # blank gateway/interface/prefixes field passes nothing. The form is passed
         # through verbatim (the daemon coerces an unrecognised value to "split").
         if [ "${backupegress}" = "1" ]; then
             set -- "$@" --backup-egress
-            [ -n "${backupegressform}" ] && set -- "$@" --backup-egress-form "${backupegressform}"
+            [ -n "${backupegressform}" ] && set -- "$@" --backup-egress-form="${backupegressform}"
             [ -n "${backupegressgw}" ] && set -- "$@" --backup-egress-gateway "${backupegressgw}"
             [ -n "${backupegressiface}" ] && set -- "$@" --backup-egress-interface "${backupegressiface}"
             [ -n "${backupegressprefixes}" ] && set -- "$@" --backup-egress-prefixes "${backupegressprefixes}"

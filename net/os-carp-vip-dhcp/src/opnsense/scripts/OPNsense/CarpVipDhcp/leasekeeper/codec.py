@@ -8,7 +8,7 @@ access is bounds-checked and a malformed frame decodes to None (dropped).
 import ipaddress
 import struct
 
-from .constants import ArpOp, BootpOp, DhcpOpt, DhcpOptName, ETHER_ZERO, MsgType
+from .constants import ArpOp, BootpOp, DhcpOpt, DhcpOptName, ETHER_ZERO, MsgType, SendMsgType
 from .util import mac2raw
 from .wire import ArpFrame, BootpFrame
 
@@ -33,9 +33,9 @@ IP_HDR_LEN = 20             # fixed IPv4 header we build (no options)
 UDP_HDR_LEN = 8             # UDP header (src/dst port, length, checksum)
 
 # The DHCP message types the keeper SENDS, keyed by the option name the outbound
-# option lists carry (the lowercased MsgType name -- "discover" etc.). Derived
-# from MsgType so nothing is hand-duplicated; only these three are ever sent.
-_MTYPE_CODES = {m.name.lower(): m for m in (MsgType.DISCOVER, MsgType.REQUEST, MsgType.RELEASE)}
+# option lists carry (a SendMsgType, which IS the lowercased MsgType name). Keyed
+# by that send type -> its wire code (the MsgType value); only these three are sent.
+_MTYPE_CODES = {t: MsgType[t.name] for t in SendMsgType}
 
 
 def _ip4(ip):

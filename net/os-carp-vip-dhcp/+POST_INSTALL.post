@@ -16,5 +16,17 @@
 if [ -x /usr/local/etc/rc.d/carpvipdhcp ]; then
     if /usr/local/sbin/configctl template reload OPNsense/CarpVipDhcp; then
         /usr/local/etc/rc.d/carpvipdhcp restart || true
+    else
+        # Could not re-render (configd down -- abnormal on a live upgrade; a
+        # firstboot/image build has no running keepers and applies the full
+        # config later, so it is safe). The running keepers keep their lease on
+        # the old in-memory code, but the newly installed status page and CARP
+        # gating hook now expect the new keeper.conf format and will not see
+        # keepers in the stale positional file until a reconfigure re-renders it.
+        # Say so loudly rather than let that degrade silently.
+        echo "carpvipdhcp: could not re-render keeper.conf (is configd running?);" >&2
+        echo "carpvipdhcp: kept the existing keepers on the old code. Reconfigure the service" >&2
+        echo "carpvipdhcp: or reboot to finish the upgrade; until then this plugin's status" >&2
+        echo "carpvipdhcp: page and CARP lease-loss demotion gating may be stale." >&2
     fi
 fi

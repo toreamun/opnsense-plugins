@@ -36,10 +36,6 @@ def _drop(*_args, **_kwargs):
     steady-state repeat, so a suppressed heartbeat is a no-op with the same
     call shape as LOG.debug/LOG.info."""
 
-# Daemon log-and-continue posture: broad catch-alls are deliberate (see the
-# package docstring / module docstrings).
-# pylint: disable=broad-exception-caught
-
 
 class DefaultRouteMode(StrEnum):
     """Per-keeper default-route mode (the values the model's defaultRouteMode
@@ -772,7 +768,7 @@ class DefaultRouteReconciler:
             return False
         try:
             return self._liveness_probe() is False
-        except Exception:
+        except Exception:  # pylint: disable=broad-exception-caught
             # A broken liveness probe must not block routing.
             return False
 

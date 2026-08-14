@@ -50,9 +50,6 @@ Usage:
   lease_keeper.py ... --once            # one-shot claim+verify+release (test)
 """
 
-# The daemon must never die on unexpected input: the components log-and-continue
-# on a catch-all (see the docstring); main() and one-shot mode do the same.
-# pylint: disable=broad-exception-caught
 import argparse
 import logging
 import os
@@ -197,7 +194,7 @@ def _setup_logging(logfile):
     if logfile:
         try:
             handlers.append(RotatingFileHandler(logfile, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUPS))
-        except Exception as e:
+        except OSError as e:
             # No log sink is configured yet, so stash the reason and emit it
             # once logging is up -- otherwise a bad --logfile (unwritable dir,
             # bad path) leaves an empty log with no explanation.
@@ -317,7 +314,7 @@ def main():
         if pf and os.path.exists(pf):
             try:
                 os.unlink(pf)
-            except Exception:
+            except OSError:
                 pass
 
 

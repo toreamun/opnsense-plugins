@@ -26,10 +26,6 @@ from .wire import _deliver
 
 LOG = logging.getLogger(LOGGER_NAME)
 
-# Daemon log-and-continue posture: broad catch-alls are deliberate (see the
-# package docstring / module docstrings).
-# pylint: disable=broad-exception-caught
-
 
 # The raw /dev/bpf backend drives its ioctls through fcntl, which does not
 # exist on non-POSIX development hosts. Import it defensively so the module still
@@ -97,7 +93,7 @@ class BpfCapture:  # pylint: disable=too-many-instance-attributes
             return False
         try:
             self._configure(fd)
-        except Exception as e:
+        except OSError as e:
             os.close(fd)
             os.close(wake_reader)
             os.close(wake_writer)
@@ -225,7 +221,8 @@ class BpfCapture:  # pylint: disable=too-many-instance-attributes
                     decoded, handler = _decode_arp(frame[ETHER_HDR_LEN:]), self._on_arp
                 elif ethertype == ETHERTYPE_IPV4:
                     decoded, handler = _decode_ipv4_bootp(frame[ETHER_HDR_LEN:]), self._on_bootp
-        except Exception as e:
+        except Exception as e:  # pylint: disable=broad-exception-caught
+            # Untrusted wire bytes: any decode failure is malformed input, not a bug.
             self._parse_errs.emit(LOG.debug, "bpf frame parse error: %s", e)
             return
         _deliver(handler, decoded)

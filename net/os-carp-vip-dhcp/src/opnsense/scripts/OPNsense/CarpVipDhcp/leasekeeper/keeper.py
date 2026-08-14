@@ -26,10 +26,6 @@ from .wire import _parse_reply
 
 LOG = logging.getLogger(LOGGER_NAME)
 
-# Daemon log-and-continue posture: broad catch-alls are deliberate (see the
-# package docstring / module docstrings).
-# pylint: disable=broad-exception-caught
-
 # The keeper's dependency on ifconfig(8) output text, named in one place. The
 # trailing space in the CARP format is load-bearing: it stops vhid 1 matching
 # "vhid 11".
@@ -328,7 +324,7 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
             return
         try:
             _atomic_write(self._cfg.hbfile, content)
-        except Exception as e:
+        except OSError as e:
             # The heartbeat drives CARP gating, so a write failure is worth surfacing.
             LOG.warning("heartbeat write failed (%s): %s", self._cfg.hbfile, e)
 
@@ -754,11 +750,11 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
             # and retry after a short backoff.
             try:
                 self._maintain_step()
-            except Exception:
+            except Exception:  # pylint: disable=broad-exception-caught
                 LOG.exception("unexpected error in main loop -- recovering")
                 try:
                     self._hb()
-                except Exception:
+                except Exception:  # pylint: disable=broad-exception-caught
                     pass
                 self._sleep(LOOP_ERROR_BACKOFF)
 

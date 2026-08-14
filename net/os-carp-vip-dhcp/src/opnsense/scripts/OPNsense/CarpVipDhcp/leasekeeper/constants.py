@@ -27,6 +27,17 @@ class MsgType(IntEnum):
 OFFER, ACK, NAK = MsgType.OFFER, MsgType.ACK, MsgType.NAK
 
 
+class SendMsgType(StrEnum):
+    """The message types the keeper SENDS, as the lowercased-name strings the
+    option list and codec's send map carry. Derived from MsgType so nothing is
+    hand-duplicated; a member IS its string, so it flows through wire/codec
+    unchanged while making the send-site values typo-proof instead of bare
+    literals."""
+    DISCOVER = MsgType.DISCOVER.name.lower()
+    REQUEST = MsgType.REQUEST.name.lower()
+    RELEASE = MsgType.RELEASE.name.lower()
+
+
 class BootpOp(IntEnum):
     """BOOTP op field (RFC 951): client-to-server messages are REQUEST, the
     server's answers are REPLY. Distinct from the DHCP message type -- every

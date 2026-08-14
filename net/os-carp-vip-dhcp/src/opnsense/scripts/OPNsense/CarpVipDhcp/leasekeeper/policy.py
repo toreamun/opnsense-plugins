@@ -16,10 +16,6 @@ from .util import (
 
 LOG = logging.getLogger(LOGGER_NAME)
 
-# Daemon log-and-continue posture: broad catch-alls are deliberate (see the
-# package docstring / module docstrings).
-# pylint: disable=broad-exception-caught
-
 # "CARP-master value not supplied by the caller" sentinel: the maintain loop
 # passes the role it already probed this tick, but None is itself a valid probe
 # result (probe failed), so a distinct sentinel means "probe it yourself".
@@ -99,7 +95,7 @@ class ArpNudge:  # pylint: disable=too-many-instance-attributes
                 self._gw = gateway
             else:
                 LOG.debug("ARP nudge sent: who-has %s tell %s", gateway, yiaddr)
-        except Exception as e:
+        except Exception as e:  # pylint: disable=broad-exception-caught
             # A persistently failing send stays periodically visible (throttled with
             # a suppressed count), not spammed every interval nor latched silent.
             self._nudge_fail_log.emit(LOG.warning, "ARP nudge failed (target %s): %s", gateway, e)
@@ -271,7 +267,7 @@ class FollowPolicy:  # pylint: disable=too-many-instance-attributes
             # spawn failure is retried next cycle instead of getting stuck.
             self._attempt.followed_ip = new_ip
             LOG.info("requested CARP VIP update %s -> %s", self.target, new_ip)
-        except Exception as e:
+        except Exception as e:  # pylint: disable=broad-exception-caught
             LOG.error("follow_update request failed: %s", e)
 
     def _fire_follow_update(self, old_ip, new_ip):
@@ -298,7 +294,7 @@ class FollowPolicy:  # pylint: disable=too-many-instance-attributes
                     att.follow_from, att.followed_ip, FOLLOW_RETRY_DEADLINE)
         try:
             self._fire_follow_update(att.follow_from, att.followed_ip)
-        except Exception as e:
+        except Exception as e:  # pylint: disable=broad-exception-caught
             LOG.error("follow_update retry failed: %s", e)
 
     def observe(self, rx):

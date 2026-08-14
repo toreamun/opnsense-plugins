@@ -19,10 +19,6 @@ from .wire import DhcpReply, DhcpSend, _dhcp_options, _fmt_reply, _msg_text
 
 LOG = logging.getLogger(LOGGER_NAME)
 
-# Daemon log-and-continue posture: broad catch-alls are deliberate (see the
-# package docstring / module docstrings).
-# pylint: disable=broad-exception-caught
-
 
 @dataclass
 class Lease:  # pylint: disable=too-many-instance-attributes
@@ -205,7 +201,7 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
             self._rx = None
             try:
                 self._send_dhcp("discover", extra)
-            except Exception as e:
+            except Exception as e:  # pylint: disable=broad-exception-caught
                 LOG.warning("DHCP DISCOVER send failed (attempt %d, xid 0x%08x): %s",
                             attempt, self.xid, e)
                 time.sleep(SEND_RETRY_DELAY)
@@ -237,7 +233,7 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
                     "request",
                     [(DhcpOptName.SERVER_ID, self.binding.server), (DhcpOptName.REQUESTED_ADDR, self.binding.yiaddr)],
                 )
-            except Exception as e:
+            except Exception as e:  # pylint: disable=broad-exception-caught
                 LOG.warning("DHCP REQUEST send failed (attempt %d, xid 0x%08x): %s",
                             attempt, self.xid, e)
                 time.sleep(SEND_RETRY_DELAY)
@@ -283,7 +279,7 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
             self._rx = None
             try:
                 self._send_dhcp("request", extra)
-            except Exception as e:
+            except Exception as e:  # pylint: disable=broad-exception-caught
                 LOG.warning("DHCP INIT-REBOOT send failed (attempt %d, xid 0x%08x): %s",
                             attempt, self.xid, e)
                 time.sleep(SEND_RETRY_DELAY)
@@ -332,7 +328,7 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
             try:
                 # RENEW/REBIND carry no extra options -- ciaddr identifies the lease.
                 self._send_dhcp("request", [], ciaddr=yiaddr)
-            except Exception as e:
+            except Exception as e:  # pylint: disable=broad-exception-caught
                 LOG.warning("DHCP %s send failed (xid 0x%08x, ciaddr %s): %s",
                             phase, self.xid, yiaddr, e)
                 return False
@@ -375,7 +371,7 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
                 chaddr=self.chraw, xid=self.xid, ciaddr=yiaddr, flags=0,
                 options=[(DhcpOptName.MESSAGE_TYPE, "release"), (DhcpOptName.SERVER_ID, server), "end"]))
             LOG.info("DHCP RELEASE of %s sent (server %s)", yiaddr, server or "broadcast")
-        except Exception as e:
+        except Exception as e:  # pylint: disable=broad-exception-caught
             LOG.warning("DHCP RELEASE of %s failed (server %s): %s",
                         yiaddr, server or "broadcast", e)
 

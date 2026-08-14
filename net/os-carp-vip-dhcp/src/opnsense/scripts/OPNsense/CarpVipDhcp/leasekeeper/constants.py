@@ -68,10 +68,11 @@ class DhcpOpt(IntEnum):
 class DhcpOptName(StrEnum):
     """The keeper's option-name vocabulary: the (name, value) keys in
     BootpFrame.options, built by _dhcp_options and read by _parse_reply. These
-    ARE scapy's own option names (ScapyCapture relays the outbound list verbatim),
-    so the values must match scapy; a StrEnum keeps them scapy-compatible (each
-    member IS the string) while giving one typo-proof source instead of literals
-    repeated across the codec tables, _parse_reply and the client."""
+    are internal identifiers (not on the wire -- codec maps them to numeric DHCP
+    option codes); a StrEnum (each member IS the string) gives one typo-proof
+    source instead of the literals repeated across the codec tables, _parse_reply
+    and the client. The member spellings are historical, so they stay fixed to
+    match codec's _OPT_ENCODERS/_OPT_DECODERS keys."""
     MESSAGE_TYPE = "message-type"
     PARAM_REQ_LIST = "param_req_list"
     REQUESTED_ADDR = "requested_addr"
@@ -96,7 +97,7 @@ def mtype_name(code):
         return f"type={code}"
 
 
-# Bound for joining a helper thread on stop (both capture backends): a stuck
+# Bound for joining the capture backend's reader thread on stop: a stuck
 # reader/sniffer is left to exit on its own rather than hang the main thread.
 THREAD_JOIN_TIMEOUT = 2
 

@@ -285,8 +285,8 @@ are examples, substitute your own.*
 >   the virtual MAC - conclusive, but it *takes* a lease, so on a MAC-binding line expect
 >   a brief WAN blip and a possible cooldown ([section 7](#s7) *First cutover*) on revert
 >   (clear the MAC field + Apply).
-> - **Non-disturbing:** send a `DISCOVER`-only probe on the virtual chaddr (a small Scapy
->   script) and watch the reply in _Interfaces ‣ Diagnostics ‣ Packet Capture_ (or
+> - **Non-disturbing:** send a `DISCOVER`-only probe on the virtual chaddr and watch
+>   the reply in _Interfaces ‣ Diagnostics ‣ Packet Capture_ (or
 >   `tcpdump -ni <wan> udp port 67 or udp port 68`): `OFFER`/`ACK` to the virtual MAC = good,
 >   NAK-then-silence = MAC-bound. A `DISCOVER` takes no lease, so it leaves the live line
 >   untouched. (OPNsense's `dhclient` has **no `-r`/release** flag; for a maximally clean
@@ -540,7 +540,7 @@ Most of these are edge cases - a WAN where the ISP isolates you per VLAN/port (t
   single-IP design at all - just give each node its own lease). Others bind one lease
   per line. **Test safely** with a DHCP `DISCOVER`-only probe before committing - a
   `DISCOVER` does not take a lease, so it does not disturb the live line. (Verified on
-  a fiber ISP: a small Scapy `DISCOVER` from a throwaway MAC drew a normal `OFFER`
+  a fiber ISP: a small crafted `DISCOVER` from a throwaway MAC drew a normal `OFFER`
   with no effect on the live lease. Use a **throwaway** locally-administered MAC, not
   the real virtual MAC, so a lease-binding ISP cannot associate the probe with your
   VIP.)

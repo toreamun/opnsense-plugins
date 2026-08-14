@@ -6,8 +6,10 @@
 # Exit !0 = at least one gated keeper is NOT holding its lease   -> node demoted,
 #           so the CARP VIP(s) move to the peer that DOES hold them.
 #
-# Only keepers with DEMOTE_ON_LEASE_LOSS=1 influence CARP. If none are set the
-# check always passes. Keep this test lightweight (it may run often).
+# Only keepers with demote=1 influence CARP. If none are set the check always
+# passes. Keep this test lightweight (it may run often). keeper.conf is one line
+# per keeper, pipe-separated KEY=VALUE fields in no fixed order; we dispatch by
+# key name and use only request= and demote= here.
 
 CONF="/usr/local/etc/carpvipdhcp/keeper.conf"
 RUN_DIR="/var/run"
@@ -25,9 +27,19 @@ _id()
 }
 
 now=$(date +%s)
-while IFS='|' read -r request iface chaddr demote vhid follow vendorclass clientid hostname arpnudge arplistenpromisc || [ -n "${request}" ]; do
+while IFS= read -r line || [ -n "${line}" ]; do
+    case "${line}" in ''|\#*) continue ;; esac
+    request='' demote=''
+    rec="${line}"
+    while [ -n "${rec}" ]; do
+        field="${rec%%|*}"
+        case "${rec}" in *"|"*) rec="${rec#*|}" ;; *) rec='' ;; esac
+        case "${field}" in
+            request=*) request="${field#*=}" ;;
+            demote=*) demote="${field#*=}" ;;
+        esac
+    done
     [ -n "${request}" ] || continue
-    case "${request}" in \#*) continue ;; esac
     [ "${demote}" = "1" ] || continue
     hb="${RUN_DIR}/carpvipdhcp-$(_id "${request}").hb"
     [ -f "${hb}" ] || exit 1

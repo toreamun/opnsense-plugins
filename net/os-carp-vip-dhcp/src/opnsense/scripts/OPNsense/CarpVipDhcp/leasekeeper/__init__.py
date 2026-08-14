@@ -6,9 +6,9 @@ wires up and runs the Keeper defined here. Modules, leaf-first:
   constants  -- protocol codes, timing tunables, phase/message-type tables
   util       -- pure helpers (MAC/IP/mask, jitter, atomic write, clock)
   wire       -- neutral BootpFrame/ArpFrame, DhcpReply/DhcpSend, reply parse/format/build
-  codec      -- raw wire encode/decode + the embedded BPF filter (bpf backend)
-  capture_scapy / capture_bpf -- the two capture backends
-  capture    -- the Capture protocol + the backend registry
+  codec      -- raw wire encode/decode + the embedded BPF filter
+  capture_bpf -- the raw /dev/bpf capture backend
+  capture    -- the Capture protocol (the single-backend seam)
   dhcpclient -- Lease + the RFC 2131 client (DORA/renew/release)
   policy     -- ArpNudge + FollowPolicy
   keeper     -- Keeper orchestration
@@ -18,4 +18,4 @@ wires up and runs the Keeper defined here. Modules, leaf-first:
 # PLUGIN_VERSION from this line (so the package version and the daemon's own
 # reported version can never drift). Keep the assignment on one line as
 # __version__ = "X.Y.Z" so the Makefile's sed can read it.
-__version__ = "1.12.0"
+__version__ = "1.13.0"

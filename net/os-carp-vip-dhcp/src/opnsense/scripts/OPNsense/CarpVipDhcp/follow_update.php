@@ -224,9 +224,14 @@ for ($i = 0; $i < 10; $i++) {
     $conf = @file_get_contents($keeperconf);
     if ($conf !== false) {
         foreach (explode("\n", $conf) as $line) {
-            if (strpos($line, "{$new_ip}|") === 0) {
-                $rendered_ok = true;
-                break 2;
+            // keeper.conf is pipe-separated key=value fields in no fixed order;
+            // match the request= field by name (exact, so 1.2.3.4 does not match
+            // 1.2.3.40).
+            foreach (explode('|', $line) as $field) {
+                if ($field === "request={$new_ip}") {
+                    $rendered_ok = true;
+                    break 3;
+                }
             }
         }
     }

@@ -28,14 +28,13 @@ DHCP_MAGIC = b"\x63\x82\x53\x63"   # RFC 2131 options magic cookie
 BOOTP_HDR_LEN = 236          # fixed BOOTP header before the magic cookie
 BOOTP_MIN_PAYLOAD = 300      # RFC 1542 4.1 minimum BOOTP message; reference clients pad to it
 IPPROTO_UDP = 17
-IPV4_TTL = 64                # conventional default TTL (BSD/Linux/scapy send 64)
+IPV4_TTL = 64                # conventional default TTL (BSD/Linux send 64)
 IP_HDR_LEN = 20             # fixed IPv4 header we build (no options)
 UDP_HDR_LEN = 8             # UDP header (src/dst port, length, checksum)
 
-# The DHCP message types the keeper SENDS, keyed by the scapy-style option name
-# the outbound option lists carry (the lowercased MsgType name -- "discover"
-# etc.). Derived from MsgType so nothing is hand-duplicated; only these three
-# are ever sent.
+# The DHCP message types the keeper SENDS, keyed by the option name the outbound
+# option lists carry (the lowercased MsgType name -- "discover" etc.). Derived
+# from MsgType so nothing is hand-duplicated; only these three are ever sent.
 _MTYPE_CODES = {m.name.lower(): m for m in (MsgType.DISCOVER, MsgType.REQUEST, MsgType.RELEASE)}
 
 
@@ -69,9 +68,9 @@ _OPT_ENCODERS = {
 
 
 def _encode_dhcp_options(options):
-    """A scapy-style option list (name/value tuples + "end") -> the raw options
-    field. Options with a None value are dropped (a broadcast RELEASE carries
-    no server-id); the end option is always appended."""
+    """An option list (name/value tuples + "end") -> the raw options field.
+    Options with a None value are dropped (a broadcast RELEASE carries no
+    server-id); the end option is always appended."""
     out = bytearray()
     for o in options:
         if not isinstance(o, tuple) or o[1] is None:

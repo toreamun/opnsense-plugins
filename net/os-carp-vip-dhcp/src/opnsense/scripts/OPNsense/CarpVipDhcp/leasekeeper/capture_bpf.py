@@ -32,9 +32,8 @@ LOG = logging.getLogger(LOGGER_NAME)
 
 
 # The raw /dev/bpf backend drives its ioctls through fcntl, which does not
-# exist on non-POSIX development hosts. Import it defensively (same pattern as
-# scapy below) so the module still loads there; BpfCapture.start() reports the
-# missing module at runtime instead.
+# exist on non-POSIX development hosts. Import it defensively so the module still
+# loads there; BpfCapture.start() reports the missing module at runtime instead.
 try:
     import fcntl as _fcntl_module
     # Typed Any: the POSIX-only stubs would flag every ioctl call on the
@@ -46,9 +45,8 @@ except ImportError:
 
 class BpfCapture:  # pylint: disable=too-many-instance-attributes
     """Capture/send on a raw /dev/bpf descriptor -- no packet library. A
-    reader thread walks the bpf buffer and hands decoded neutral frames to
-    the same callbacks the scapy backend feeds. FreeBSD-only (OPNsense's
-    platform); selected with --capture-backend bpf (experimental).
+    reader thread walks the bpf buffer and hands decoded backend-neutral frames
+    to the Capture protocol's callbacks. FreeBSD-only (OPNsense's platform).
 
     Shutdown uses a self-pipe rather than a poll timeout: the reader blocks in
     select() on both the bpf fd and a wake pipe, and stop() writes one byte to

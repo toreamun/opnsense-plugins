@@ -5,8 +5,7 @@ PLUGIN_VERSION!=	sed -n 's/^__version__ = "\(.*\)"$$/\1/p' ${.CURDIR}/src/opnsen
 .endif
 PLUGIN_COMMENT=		Keep a DHCP lease alive for a CARP virtual IP (DHCP/CGNAT WAN failover)
 PLUGIN_MAINTAINER=	tore@amundsen.org
-# PLUGIN_PYTHON (from Mk/plugins.mk) tracks the target release's base Python,
-# so the scapy dependency follows OPNsense upgrades without manual bumps.
-PLUGIN_DEPENDS=		py${PLUGIN_PYTHON}-scapy
+# No PLUGIN_DEPENDS: the daemon is pure Python stdlib over raw /dev/bpf (the
+# scapy backend and its py-scapy dependency were dropped), so nothing to install.
 
 .include "../../Mk/plugins.mk"

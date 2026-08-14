@@ -76,8 +76,8 @@ def test_parse_heartbeat_without_nudge_tokens(tmp_path):
 def test_read_keepers_arp_nudge_field(tmp_path, monkeypatch):
     conf = tmp_path / "keeper.conf"
     conf.write_text(
-        "100.64.4.7|eth0|00:00:5e:00:01:fe|0|254|1||||240|0\n"
-        "100.64.4.8|eth0|00:00:5e:00:01:fd|0|253|1|||\n")   # short line (no arp-nudge field)
+        "request=100.64.4.7|iface=eth0|chaddr=00:00:5e:00:01:fe|demote=0|vhid=254|follow=1|arpnudge=240\n"
+        "request=100.64.4.8|iface=eth0|chaddr=00:00:5e:00:01:fd|demote=0|vhid=253|follow=1\n")  # no arpnudge key
     monkeypatch.setattr(status, "CONFFILE", str(conf))
     monkeypatch.setattr(status, "RUN_DIR", str(tmp_path))
     keepers = status.read_keepers({}, {})
@@ -95,9 +95,9 @@ def test_read_keepers_arp_confirmed_fresh_and_stale(tmp_path, monkeypatch):
     now = int(time.time())
     conf = tmp_path / "keeper.conf"
     conf.write_text(
-        "100.64.4.7|eth0|00:00:5e:00:01:fe|0|254|1||||240|0\n"    # fresh reply
-        "100.64.4.8|eth0|00:00:5e:00:01:fd|0|253|1||||240|0\n"    # stale reply
-        "100.64.4.9|eth0|00:00:5e:00:01:fc|0|252|1||||240|0\n")   # no reply seen
+        "request=100.64.4.7|iface=eth0|chaddr=00:00:5e:00:01:fe|demote=0|vhid=254|follow=1|arpnudge=240\n"  # fresh
+        "request=100.64.4.8|iface=eth0|chaddr=00:00:5e:00:01:fd|demote=0|vhid=253|follow=1|arpnudge=240\n"  # stale
+        "request=100.64.4.9|iface=eth0|chaddr=00:00:5e:00:01:fc|demote=0|vhid=252|follow=1|arpnudge=240\n")  # no reply
     monkeypatch.setattr(status, "CONFFILE", str(conf))
     monkeypatch.setattr(status, "RUN_DIR", str(tmp_path))
     _write_hb(tmp_path / "carpvipdhcp-100_64_4_7.hb", 5, now)       # 5s ago -> fresh

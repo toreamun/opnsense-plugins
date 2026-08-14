@@ -3,8 +3,7 @@
 # One-line installer / updater for a toreamun/opnsense-plugins plugin on OPNsense.
 #
 # Resolves the LATEST signed release (no version to hard-code), verifies its
-# maintainer signature, installs the Scapy runtime dependency for this box's
-# Python, and installs the plugin. Run as root on the OPNsense box:
+# maintainer signature, and installs the plugin. Run as root on the OPNsense box:
 #
 #   fetch -o - https://raw.githubusercontent.com/toreamun/opnsense-plugins/main/install.sh | sh
 #
@@ -89,10 +88,6 @@ if [ -z "${want}" ] || [ "${want}" != "${got}" ]; then
     exit 1
 fi
 
-echo ">>> Installing the Scapy dependency for this box's Python..."
-pyver="$(python3 -c 'import sys; print("py3%d" % sys.version_info.minor)' 2>/dev/null || echo py313)"
-pkg install -y "${pyver}-scapy"
-
 # Note the currently-installed version (if any) so the final line can say
 # "installed" vs "updated". `|| true` keeps set -e happy when it is absent.
 prev="$(pkg query '%v' "${PLUGIN}" 2>/dev/null || true)"
@@ -100,8 +95,7 @@ prev="$(pkg query '%v' "${PLUGIN}" 2>/dev/null || true)"
 if [ -n "${prev}" ]; then verb="Updating"; else verb="Installing"; fi
 echo ">>> ${verb} ${PLUGIN}..."
 # -f so the verified release is (re)installed even when an older/other build is
-# already present -- i.e. the one-liner also upgrades. The Scapy dependency was
-# installed just above (set -e aborts otherwise), so it is present.
+# already present -- i.e. the one-liner also upgrades.
 pkg add -f "${WORK}/${pkgfile}"
 new="$(pkg query '%v' "${PLUGIN}" 2>/dev/null || true)"
 

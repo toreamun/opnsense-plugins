@@ -74,14 +74,6 @@ if [ -z "${found}" ]; then
     echo "error: no .pkg produced — check the build output above" >&2
     exit 1
 fi
-# The plugin depends on Scapy (py3<minor>-scapy); `pkg add` does not resolve deps,
-# so ensure it once up front (as install.sh does) before adding the .pkg.
-if [ "${INSTALL}" = "1" ]; then
-    pyver="py3$(python3 -c 'import sys; print(sys.version_info.minor)')"
-    echo ">>> Ensuring dependency ${pyver}-scapy"
-    pkg install -y "${pyver}-scapy"
-fi
-
 echo "${found}" | while read -r pkg; do
     cp -v "${pkg}" "${DIST}/"
     if [ "${INSTALL}" = "1" ]; then

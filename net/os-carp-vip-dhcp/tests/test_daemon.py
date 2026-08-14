@@ -8,7 +8,6 @@ import re
 import select
 import time
 import types
-from typing import Any
 
 import pytest
 
@@ -319,7 +318,7 @@ def _ack(lk, yiaddr, server="100.64.4.1"):
 
 def _dhcp_frame(lk, xid, options, *, yiaddr="100.64.4.7",  # pylint: disable=too-many-arguments
                 chaddr=CHADDR, op=None, giaddr="0.0.0.0"):
-    """A backend-neutral BootpFrame as either capture backend would hand it
+    """A backend-neutral BootpFrame as the capture backend would hand it
     to the keeper."""
     return lk.BootpFrame(lk.BootpOp.REPLY if op is None else op, xid, yiaddr, chaddr, giaddr, options)
 
@@ -550,8 +549,33 @@ def test_id_opts_built_from_args(lk):
     assert ("hostname", "vip") in keeper._dhcp._id_opts
 
 
+class _FakeCapture:
+    """A no-op capture for tests that drive the keeper's send paths (nudge/DORA) without a
+    real /dev/bpf socket: the send methods just succeed, so the ArpNudge stamps its clock."""
+    def __init__(self, *_a, **_k):
+        self.promisc = False
+
+    def start(self):
+        return True
+
+    def stop(self):
+        pass
+
+    def alive(self):
+        return True
+
+    def send_arp_request(self, *_a):
+        pass
+
+    def send_dhcp(self, _msg):
+        pass
+
+
 def _nudge_keeper(lk, arp_nudge=240, hbfile=None, **kwargs):
     keeper = _keeper(lk, hbfile=hbfile, arp_nudge=arp_nudge, **kwargs)
+    # No-op send so the nudge succeeds without a real bpf fd. The ArpNudge holds its own
+    # capture reference (bound at construction), so swap both.
+    keeper._capture = keeper._nudge._capture = _FakeCapture()
     keeper._dhcp.binding.yiaddr = "100.64.4.7"
     keeper._dhcp.binding.server = "100.64.4.1"
     keeper._probe_carp_master = lambda: True   # the real probe needs ifconfig
@@ -602,11 +626,6 @@ def test_maybe_nudge_uses_supplied_master_skipping_probe(lk):
 
 
 def test_backend_unavailable_reason_contract(lk, monkeypatch):
-    # scapy: None when the import succeeded, a reason (with the install hint) when it failed.
-    assert lk.ScapyCapture.unavailable_reason() is None    # scapy is present in the test env
-    monkeypatch.setattr("leasekeeper.capture_scapy._SCAPY_IMPORT_ERROR", ImportError("boom"))
-    reason = lk.ScapyCapture.unavailable_reason()
-    assert reason and "boom" in reason and "scapy" in reason
     # bpf: a reason when fcntl is missing (non-POSIX), None when present.
     monkeypatch.setattr("leasekeeper.capture_bpf.fcntl", None)
     assert lk.BpfCapture.unavailable_reason() is not None
@@ -857,27 +876,10 @@ def test_sniffer_filter_is_static(lk):
     assert "arp[6:2] = 2" in lk.SNIFFER_FILTER   # reachability clause
 
 
-def test_sniffer_filter_captures_arp_and_honours_promisc(lk, monkeypatch):
-    captured = {}
-
-    class _Cap:
-        def __init__(self, *_a, **k):
-            captured.update(k)
-            self.thread = types.SimpleNamespace(is_alive=lambda: True)
-
-        def start(self):
-            pass
-
-        def stop(self):
-            pass
-
-    # ScapyCapture looks AsyncSniffer up in its own module, so patch it there.
-    monkeypatch.setattr("leasekeeper.capture_scapy.AsyncSniffer", _Cap)
-    keeper = _keeper(lk, arp_listen_promisc=True, arp_nudge=240)   # promisc serves the nudge
-    assert keeper._capture.start() is True
-    assert "arp" in captured["filter"]        # ARP replies now reach the parser
-    assert "port 67" in captured["filter"]     # ...alongside DHCP, unchanged
-    assert captured["promisc"] is True         # opt-in flag reaches the socket
+def test_promisc_honoured_when_nudge_enabled(lk):
+    # With the ARP nudge enabled, the opt-in promiscuous flag reaches the capture backend.
+    keeper = _keeper(lk, arp_listen_promisc=True, arp_nudge=240)
+    assert keeper._capture.promisc is True
 
 
 def test_promisc_ignored_when_nudge_disabled(lk, caplog):
@@ -901,77 +903,24 @@ def test_ensure_sniffer_logs_when_restart_fails(lk, monkeypatch, caplog):
     assert any("capture restart failed" in r.getMessage() for r in caplog.records)
 
 
-# ---- capture backends: selection and the scapy packet -> frame adapter ----
+# ---- capture backend ----
 
-def test_backend_selection_defaults_scapy(lk):
-    assert isinstance(_keeper(lk)._capture, lk.ScapyCapture)
-    assert isinstance(_keeper(lk, capture_backend="bpf")._capture, lk.BpfCapture)
-
-
-class _ScapyDhcpPkt:
-    """Minimal stand-in for a scapy DHCP reply: p[BOOTP].xid/op/yiaddr/chaddr/
-    giaddr and p[DHCP].options, with haslayer() -- what ScapyCapture decodes.
-    chaddr is typed Any: one test hands it a non-bytes value on purpose."""
-    def __init__(self, lk, xid, options, *, yiaddr="100.64.4.7",  # pylint: disable=too-many-arguments
-                 chaddr: Any = CHADDR, op=None, giaddr="0.0.0.0"):
-        self._lk = lk
-        self._bootp = types.SimpleNamespace(xid=xid, op=(lk.BootpOp.REPLY if op is None else op),
-                                            yiaddr=yiaddr, chaddr=chaddr, giaddr=giaddr)
-        self._dhcp = types.SimpleNamespace(options=options)
-
-    def haslayer(self, layer):
-        return layer in (self._lk.BOOTP, self._lk.DHCP)
-
-    def __getitem__(self, layer):
-        return self._bootp if layer is self._lk.BOOTP else self._dhcp
+def test_keeper_uses_bpf_capture(lk):
+    # The raw /dev/bpf backend is the sole capture backend the keeper wires up.
+    assert isinstance(_keeper(lk)._capture, lk.BpfCapture)
 
 
-class _ScapyArpPkt:
-    """Minimal stand-in for a scapy ARP packet: p[ARP] -> op/psrc/pdst."""
-    def __init__(self, lk, op, psrc, pdst):
-        self._lk = lk
-        self._arp = types.SimpleNamespace(op=op, psrc=psrc, pdst=pdst)
-
-    def haslayer(self, layer):
-        return layer is self._lk.ARP
-
-    def __getitem__(self, layer):
-        return self._arp
-
-
-def _capture_pair(lk):
-    """A ScapyCapture wired to recording callbacks."""
-    frames = {"bootp": [], "arp": []}
-    cap = lk.ScapyCapture("eth0", False, frames["bootp"].append, frames["arp"].append)
-    return cap, frames
-
-
-def test_scapy_adapter_decodes_dhcp_to_frame(lk):
-    cap, frames = _capture_pair(lk)
-    cap._on_packet(_ScapyDhcpPkt(lk, 0x1234, [("message-type", lk.ACK), "end"],
-                                 yiaddr="100.64.4.7", giaddr="100.64.4.9"))
-    frame = frames["bootp"][0]
-    assert frame.op == lk.BootpOp.REPLY and frame.xid == 0x1234
-    assert frame.yiaddr == "100.64.4.7" and frame.giaddr == "100.64.4.9"
-    assert frame.chaddr[:6] == CHADDR
-    assert ("message-type", lk.ACK) in frame.options
-    assert not frames["arp"]
-
-
-def test_scapy_adapter_decodes_arp_to_frame(lk):
-    cap, frames = _capture_pair(lk)
-    cap._on_packet(_ScapyArpPkt(lk, 2, "100.64.4.1", "100.64.4.7"))
-    assert frames["arp"] == [lk.ArpFrame(2, "100.64.4.1", "100.64.4.7")]
-    assert not frames["bootp"]
-
-
-def test_scapy_adapter_tolerates_malformed_chaddr(lk):
-    # An unconvertible chaddr must not drop the reply: it decodes to empty
-    # bytes (the frame still reaches the first-party xid path).
-    cap, frames = _capture_pair(lk)
-    cap._on_packet(_ScapyDhcpPkt(lk, 0x1234, [("message-type", lk.ACK), "end"],
-                                 chaddr="not-raw-bytes"))   # bytes(str) raises TypeError
-    assert frames["bootp"][0].chaddr == b""
+def test_enum_args_accept_unknown_value_without_argparse_rejection():
+    # The two enum args deliberately carry NO argparse `choices`: a bad value must
+    # PARSE (main() coerces it to a safe default), not exit 2 -- which daemon(8) -r
+    # would turn into a crash loop. This pins the contract the coerce tests assume,
+    # so a future re-add of choices= (which those tests would not catch) fails here.
+    import lease_keeper  # pylint: disable=import-outside-toplevel
+    a = lease_keeper._build_arg_parser().parse_args(
+        ["--iface", "eth0", "--chaddr", CHADDR_STR, "--request", "100.64.4.7",
+         "--default-route-mode", "bogus", "--backup-egress-form", "bogus"])
+    assert a.default_route_mode == "bogus"
+    assert a.backup_egress_form == "bogus"
 
 
 # ---- follow across a changed gateway (cross-subnet renumber) ----

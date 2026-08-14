@@ -14,9 +14,14 @@ def keeper_id(request_ip):
     return re.sub(r"[^A-Za-z0-9]", "_", request_ip)
 
 
-def keeper_lines(path):
-    """Yield the |-split field list of each active (non-comment) keeper.conf
-    line; yields nothing when the file is absent or unreadable."""
+def keeper_records(path):
+    """Yield each active (non-comment) keeper.conf line as a {key: value} dict.
+
+    Each line is a pipe-separated list of KEY=VALUE fields in no fixed order (see
+    the template); we dispatch by key, so a missing key is simply absent from the
+    dict and the caller supplies its default. Lines without a request= field are
+    skipped, mirroring the rc.d reader. Yields nothing when the file is absent or
+    unreadable."""
     try:
         with open(path, encoding="utf-8") as f:
             lines = f.read().splitlines()
@@ -24,6 +29,12 @@ def keeper_lines(path):
         return
     for line in lines:
         line = line.strip()
-        if not line or line.startswith("#") or "|" not in line:
+        if not line or line.startswith("#"):
             continue
-        yield line.split("|")
+        record = {}
+        for field in line.split("|"):
+            key, sep, value = field.partition("=")
+            if sep:
+                record[key] = value
+        if record.get("request"):
+            yield record

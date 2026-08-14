@@ -18,7 +18,7 @@ import subprocess
 import time
 import xml.etree.ElementTree as ET
 
-from keeperconf import CONFFILE, keeper_id, keeper_lines
+from keeperconf import CONFFILE, keeper_id, keeper_records
 
 CONFIG_XML = "/conf/config.xml"
 RUN_DIR = "/var/run"
@@ -150,18 +150,16 @@ def read_keepers(states, names):
     """One status entry per keeper.conf line: config, process, CARP role and
     heartbeat fields, plus the derived arp_confirmed freshness flag."""
     keepers = []
-    for parts in keeper_lines(CONFFILE):
-        if len(parts) < 4:
-            continue
-        # keeper.conf field order (keep in lockstep with the template + rc.d readers):
-        # 0 request|1 iface|2 chaddr|3 demote|4 vhid|5 follow|6 vendor|7 client-id|
-        # 8 hostname|9 arp-nudge|10 arp-listen-promisc|11 capture-backend
-        request, iface, chaddr, demote = parts[0], parts[1], parts[2], parts[3]
-        vhid = parts[4] if len(parts) > 4 else ""
-        follow = parts[5] if len(parts) > 5 else "0"
-        arp_nudge = 0
-        if len(parts) > 9:
-            arp_nudge = _int_token(parts[9]) or 0
+    for rec in keeper_records(CONFFILE):
+        # Fields are keyed by name (see keeperconf.keeper_records); a missing key
+        # falls back to its default here.
+        request = rec.get("request", "")
+        iface = rec.get("iface", "")
+        chaddr = rec.get("chaddr", "")
+        demote = rec.get("demote", "0")
+        vhid = rec.get("vhid", "")
+        follow = rec.get("follow", "0")
+        arp_nudge = _int_token(rec.get("arpnudge", "")) or 0
         kid = keeper_id(request)
         pid = pid_alive(f"{RUN_DIR}/carpvipdhcp-{kid}.pid")
         entry = {

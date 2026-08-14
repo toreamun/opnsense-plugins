@@ -8,9 +8,8 @@ traffic are handled by CARP. The BOOTP broadcast flag is set so OFFER/ACK are
 broadcast. Optionally (--arp-nudge) it refreshes the upstream gateway's ARP
 entry for the leased address, for gateways that never re-ARP an expired entry
 (traffic then silently blackholes until they get an ARP *request*). Runs on both
-HA nodes for redundancy. Packet capture and send go through a pluggable backend
-(--capture-backend): scapy (the default), or a dependency-free raw /dev/bpf
-backend (experimental).
+HA nodes for redundancy. Packet capture and send go through a dependency-free
+raw /dev/bpf backend (pure Python stdlib, no packet library).
 
 Robustness:
   * Full DHCP lifecycle: DORA (Discover/Offer/Request/Ack) -> BOUND, RENEW at
@@ -61,7 +60,7 @@ import signal
 import sys
 from logging.handlers import RotatingFileHandler
 
-from leasekeeper.capture import CAPTURE_BACKENDS
+from leasekeeper.capture_bpf import BpfCapture
 from leasekeeper.constants import LOGGER_NAME
 from leasekeeper.keeper import Keeper, carp_master
 from leasekeeper.route import (
@@ -156,19 +155,25 @@ def _build_arg_parser():
                     help="put the capture socket in promiscuous mode so the gateway's "
                          "unicast ARP reply is seen on NICs that filter non-primary "
                          "unicast MACs (default off; only needed if replies aren't seen)")
-    ap.add_argument("--capture-backend", choices=sorted(CAPTURE_BACKENDS), default="scapy",
-                    help="packet capture/send backend: scapy (default), or bpf -- a raw "
-                         "/dev/bpf backend with no packet-library dependency (experimental)")
-    ap.add_argument("--default-route-mode", choices=[m.value for m in DefaultRouteMode],
-                    default=DefaultRouteMode.OFF.value,
+    # Backward compatibility for one upgrade cycle: the capture-backend selector
+    # was removed (bpf is the only backend now), but a keeper started by the
+    # previous version has a daemon(8) supervisor whose command line still carries
+    # --capture-backend. Accept and ignore it so that supervisor's next restart
+    # runs this script without exiting 2 and crash-looping until a reconfigure
+    # re-renders the arguments.
+    ap.add_argument("--capture-backend", help=argparse.SUPPRESS)
+    # No argparse `choices` on the two enum args below: an unrecognised value is
+    # coerced to a safe default with a warning in main() (see DefaultRouteMode /
+    # BackupEgressForm .coerce), not rejected with exit 2 -- which daemon(8) -r
+    # would turn into a crash loop. rc.d passes them through unchecked.
+    ap.add_argument("--default-route-mode", default=DefaultRouteMode.OFF.value,
                     help="own the IPv4 default route by CARP role: off (default), observe "
                          "(log what it would do, no FIB write), or enforce (install/withdraw "
                          "0/0 via the lease gateway while CARP master holding a lease)")
     ap.add_argument("--backup-egress", action="store_true",
                     help="while CARP backup, route this node's own internet traffic to the "
                          "master (needs default-route-mode observe/enforce); see backup-egress docs")
-    ap.add_argument("--backup-egress-form", choices=[f.value for f in BackupEgressForm],
-                    default=BackupEgressForm.SPLIT.value,
+    ap.add_argument("--backup-egress-form", default=BackupEgressForm.SPLIT.value,
                     help="split (0.0.0.0/1+128.0.0.0/1, the default) or prefixes")
     ap.add_argument("--backup-egress-gateway", default=None,
                     help="stable next hop for backup egress (a CARP VIP or fallback-WAN gateway); "
@@ -209,6 +214,12 @@ def main():
     a = _build_arg_parser().parse_args()
     _setup_logging(a.logfile)
 
+    # Validate the two free-string enum args now that logging is up: an unknown
+    # value (only reachable via a hand-edited config.xml) falls back to a safe
+    # default with a warning instead of crash-looping under daemon(8) -r.
+    a.default_route_mode = DefaultRouteMode.coerce(a.default_route_mode)
+    a.backup_egress_form = BackupEgressForm.coerce(a.backup_egress_form)
+
     # Single-instance guard BEFORE any FIB mutation: the startup fail-stop withdraw
     # below deletes a default, so a duplicate start (pidfile held by the live owner)
     # must exit HERE -- already running -- rather than clobber the owner's default
@@ -222,7 +233,7 @@ def main():
         # with a stale /1 a crashed predecessor left would loop its egress).
         backup_egress = BackupEgressConfig(
             enabled=a.backup_egress,
-            form=BackupEgressForm(a.backup_egress_form),
+            form=a.backup_egress_form,
             gateway=a.backup_egress_gateway or None,
             interface=a.backup_egress_interface or None,
             prefixes=_split_prefixes(a.backup_egress_prefixes))
@@ -237,13 +248,11 @@ def main():
             DefaultRouteReconciler(a.default_route_mode, backup_egress=backup_egress) \
                 .withdraw_unless_master(lambda: carp_master(a.iface, a.vhid))
 
-        # Fail fast (with a logged reason) if the selected backend cannot run on
-        # this host -- checked uniformly through the registry so a future backend
-        # with an optional dependency is covered without a special case here.
-        reason = CAPTURE_BACKENDS[a.capture_backend].unavailable_reason()
+        # Fail fast (with a logged reason) if the raw /dev/bpf backend cannot run
+        # on this host (e.g. fcntl missing off FreeBSD).
+        reason = BpfCapture.unavailable_reason()
         if reason is not None:
-            LOG.critical("capture backend %r cannot run: %s -- the lease keeper cannot start",
-                         a.capture_backend, reason)
+            LOG.critical("capture backend cannot run: %s -- the lease keeper cannot start", reason)
             return 3
 
         for label, mac in (("chaddr", a.chaddr), ("eth-src", a.eth_src)):
@@ -256,7 +265,7 @@ def main():
                    vhid=a.vhid, follow=a.follow,
                    vendor_class=a.vendor_class, client_id=a.client_id, hostname=a.hostname,
                    arp_nudge=a.arp_nudge, arp_listen_promisc=a.arp_listen_promisc,
-                   capture_backend=a.capture_backend, default_route_mode=a.default_route_mode,
+                   default_route_mode=a.default_route_mode,
                    backup_egress=backup_egress)
 
         # Warn only when promiscuous capture is ACTUALLY in effect: it is gated on the ARP

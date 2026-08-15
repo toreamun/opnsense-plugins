@@ -52,7 +52,7 @@ class DhcpHooks:
     adjudicates an ACK whose address differs from the expected one."""
     should_stop: Callable[[], bool]
     ensure_sniffer: Callable[[], None]
-    on_changed_address: Callable[..., bool]
+    on_changed_address: Callable[[str | None, DhcpReply, Phase, bool], bool]
 
 
 class DhcpClient:  # pylint: disable=too-many-instance-attributes
@@ -64,7 +64,7 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
     to feed(). Policy stays with the caller through the injected DhcpHooks
     (should_stop / ensure_sniffer / on_changed_address; see that type)."""
 
-    def __init__(self, capture, chaddr, eth_src, id_opts, *, hooks):
+    def __init__(self, capture, chaddr, eth_src, id_opts, *, hooks: DhcpHooks):
         self._capture = capture
         self.chaddr = chaddr
         self.chraw = mac2raw(chaddr)

@@ -133,7 +133,7 @@ class FollowHooks:
     """FollowPolicy's two injected side-effect seams, grouped so the system
     coupling stays out of this decision module: hb_mismatch(got, want) records a
     lease vs heartbeat disagreement, and dispatch(old, new, gw_args) drives the
-    configd CARP-VIP rewrite. Both returns are ignored (fire-and-forget)."""
+    configd CARP-VIP rewrite. Both return values are ignored (fire-and-forget)."""
     hb_mismatch: Callable[[str, str], None]
     dispatch: Callable[[str, str, list], None]
 
@@ -148,7 +148,7 @@ class FollowPolicy:  # pylint: disable=too-many-instance-attributes
     (rewritten on a successful follow), the persisted follow throttle, the
     apply-retry watchdog and the peer-ACK observation handoff."""
 
-    def __init__(self, target, follow, chaddr, dhcp, *, hooks):
+    def __init__(self, target, follow, chaddr, dhcp, *, hooks: FollowHooks):
         self.target = target           # the address this keeper is meant to hold
         self.follow = follow
         self._dhcp = dhcp

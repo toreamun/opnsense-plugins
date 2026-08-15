@@ -1055,17 +1055,23 @@ def test_backoff_jitter(lk):
 
 # ---- default-route ownership wiring (keeper <-> DefaultRouteReconciler) ----
 
-class _RecordingReconciler:
+class _RecordingReconciler:  # pylint: disable=too-few-public-methods
     """Stand-in for DefaultRouteReconciler that records reconcile() args, so the
-    keeper-side wiring can be asserted without a real route(8) probe."""
+    keeper-side 0/0 wiring can be asserted without a real route(8) probe."""
     def __init__(self, enabled=True):
         self.enabled = enabled
-        self.backup_egress_enabled = enabled
         self.calls = []
-        self.backup_egress_calls = []
 
     def reconcile(self, is_master, bound, gateway):
         self.calls.append((is_master, bound, gateway))
+
+
+class _RecordingBackup:  # pylint: disable=too-few-public-methods
+    """Stand-in for BackupEgressReconciler that records reconcile_backup_egress()
+    args, so the keeper-side backup-egress wiring can be asserted the same way."""
+    def __init__(self, enabled=True):
+        self.enabled = enabled
+        self.backup_egress_calls = []
 
     def reconcile_backup_egress(self, is_master):
         self.backup_egress_calls.append(is_master)
@@ -1085,13 +1091,15 @@ def test_default_route_mode_off_is_inert(lk):
 def test_default_route_forwards_role_bound_gateway(lk):
     k = _keeper(lk, vhid=254, default_route_mode="enforce")
     rec = _RecordingReconciler()
+    brec = _RecordingBackup()
     k._defroute = rec
+    k._backup = brec
     k._dhcp.binding.yiaddr = "100.64.4.7"
     k._dhcp.binding.lease_router = "100.64.4.1"
     k._reconcile_default_route(master=True)
     assert rec.calls == [(True, True, "100.64.4.1")]
     # the same tick also drives the backup-egress reconcile with the CARP role.
-    assert rec.backup_egress_calls == [True]
+    assert brec.backup_egress_calls == [True]
 
 
 def test_backup_egress_uses_real_role_on_unbound_path(lk, monkeypatch):
@@ -1100,11 +1108,13 @@ def test_backup_egress_uses_real_role_on_unbound_path(lk, monkeypatch):
     # backup route (which would black-hole/loop the master's own egress).
     k = _keeper(lk, vhid=254, default_route_mode="enforce")
     rec = _RecordingReconciler()
+    brec = _RecordingBackup()
     k._defroute = rec
+    k._backup = brec
     monkeypatch.setattr(k, "_probe_carp_master", lambda: True)     # actually CARP master
     k._reconcile_default_route(master=False, probe_for_backup=True)
     assert rec.calls[0][0] is False                                # 0/0 got the fiction
-    assert rec.backup_egress_calls == [True]                       # backup egress got the true role
+    assert brec.backup_egress_calls == [True]                      # backup egress got the true role
 
 
 def test_backup_egress_reconciled_before_blocking_acquire_when_unbound(lk, monkeypatch):
@@ -1113,10 +1123,12 @@ def test_backup_egress_reconciled_before_blocking_acquire_when_unbound(lk, monke
     # So the unbound path reconciles backup egress with the real CARP role ahead of acquire.
     k = _keeper(lk, vhid=254, default_route_mode="enforce")
     rec = _RecordingReconciler()
+    brec = _RecordingBackup()
     k._defroute = rec
+    k._backup = brec
     monkeypatch.setattr(k, "_probe_carp_master", lambda: True)     # promoted to master
     order = []
-    monkeypatch.setattr(rec, "reconcile_backup_egress", lambda m: order.append(("backup", m)))
+    monkeypatch.setattr(brec, "reconcile_backup_egress", lambda m: order.append(("backup", m)))
     monkeypatch.setattr(k, "_acquire_step", lambda: order.append(("acquire", None)))
     k._dhcp.binding.yiaddr = None                                 # unbound
     k._maintain_step()
@@ -1128,11 +1140,12 @@ def test_backup_egress_no_pre_acquire_probe_when_disabled(lk, monkeypatch):
     # with it off, the hot unbound loop adds no extra CARP probe or reconcile before acquire.
     k = _keeper(lk, vhid=254, default_route_mode="enforce")
     rec = _RecordingReconciler()
-    rec.backup_egress_enabled = False              # feature off
+    brec = _RecordingBackup(enabled=False)         # feature off
     k._defroute = rec
+    k._backup = brec
     order = []
     monkeypatch.setattr(k, "_probe_carp_master", lambda: (order.append("probe"), True)[1])
-    monkeypatch.setattr(rec, "reconcile_backup_egress", lambda m: order.append(("backup", m)))
+    monkeypatch.setattr(brec, "reconcile_backup_egress", lambda m: order.append(("backup", m)))
     monkeypatch.setattr(k, "_acquire_step", lambda: order.append("acquire"))
     k._dhcp.binding.yiaddr = None                  # unbound
     k._maintain_step()
@@ -1297,7 +1310,8 @@ def test_withdraw_unless_master_withdraws_when_not_master(lk, monkeypatch):
     from test_route import FakeRoute, GW as RGW  # noqa: E402  # pylint: disable=import-outside-toplevel
     fake = FakeRoute(initial=RGW)
     monkeypatch.setattr(lk.subprocess, "run", fake.run)
-    lk.DefaultRouteReconciler("enforce").withdraw_unless_master(lambda: False)
+    lk.withdraw_unless_master(lk.DefaultRouteReconciler("enforce"),
+                              lk.BackupEgressReconciler("enforce"), lambda: False)
     assert "delete" in fake.verbs and fake.gw is None
 
 
@@ -1308,7 +1322,8 @@ def test_withdraw_unless_master_skips_when_master(lk, monkeypatch):
     from test_route import FakeRoute, GW as RGW  # noqa: E402  # pylint: disable=import-outside-toplevel
     fake = FakeRoute(initial=RGW)
     monkeypatch.setattr(lk.subprocess, "run", fake.run)
-    lk.DefaultRouteReconciler("enforce").withdraw_unless_master(lambda: True)
+    lk.withdraw_unless_master(lk.DefaultRouteReconciler("enforce"),
+                              lk.BackupEgressReconciler("enforce"), lambda: True)
     assert fake.gw == RGW and not fake.calls   # kept, no route(8) call at all
 
 
@@ -1319,7 +1334,8 @@ def test_withdraw_unless_master_off_is_inert_without_probing(lk, monkeypatch):
     fake = FakeRoute(initial=RGW)
     monkeypatch.setattr(lk.subprocess, "run", fake.run)
     probed = []
-    lk.DefaultRouteReconciler("off").withdraw_unless_master(lambda: probed.append(1))
+    lk.withdraw_unless_master(lk.DefaultRouteReconciler("off"),
+                              lk.BackupEgressReconciler("off"), lambda: probed.append(1))
     assert fake.gw == RGW and not fake.calls and not probed
 
 
@@ -1365,7 +1381,7 @@ def test_carp_master_standalone_probes_via_ifconfig(lk, monkeypatch):
     assert lk.carp_master("lagg1", "199") is None
 
 
-def test_duplicate_start_guards_before_any_withdraw(lk, monkeypatch):
+def test_duplicate_start_guards_before_any_withdraw(monkeypatch):
     # Regression: the startup fail-stop withdraw must run AFTER the single-instance
     # guard, so a duplicate start (pidfile held by the live owner) exits "already
     # running" WITHOUT deleting the owner's live default. Assert the guard fires and
@@ -1378,8 +1394,8 @@ def test_duplicate_start_guards_before_any_withdraw(lk, monkeypatch):
         raise SystemExit(4)   # another live instance holds the pidfile
     monkeypatch.setattr(lease_keeper, "_setup_logging", lambda _logfile: None)
     monkeypatch.setattr(lease_keeper, "acquire_pidfile", fake_guard)
-    monkeypatch.setattr(lk.DefaultRouteReconciler, "withdraw_unless_master",
-                        lambda _self, _probe: calls.append("withdraw"))
+    monkeypatch.setattr(lease_keeper, "withdraw_unless_master",
+                        lambda _d, _b, _probe: calls.append("withdraw"))
     monkeypatch.setattr("sys.argv", [
         "lease_keeper", "--iface", "eth0", "--chaddr", CHADDR_STR, "--request",
         "100.64.4.7", "--vhid", "254", "--default-route-mode", "enforce"])

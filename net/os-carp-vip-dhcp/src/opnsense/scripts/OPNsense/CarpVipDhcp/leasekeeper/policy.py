@@ -6,6 +6,7 @@ rewrite the VIP, or alarm and refuse).
 import logging
 import time
 from dataclasses import dataclass, field
+from typing import Callable
 
 from .constants import (
     LOGGER_NAME,
@@ -127,6 +128,16 @@ class _FollowAttempt:
     gw_args: list = field(default_factory=list)  # [old_gw, new_gw, bits] cross-subnet; else []
 
 
+@dataclass(frozen=True)
+class FollowHooks:
+    """FollowPolicy's two injected side-effect seams, grouped so the system
+    coupling stays out of this decision module: hb_mismatch(got, want) records a
+    lease vs heartbeat disagreement, and dispatch(old, new, gw_args) drives the
+    configd CARP-VIP rewrite. Both return values are ignored (fire-and-forget)."""
+    hb_mismatch: Callable[[str, str], None]
+    dispatch: Callable[[str, str, list], None]
+
+
 class FollowPolicy:  # pylint: disable=too-many-instance-attributes
     """Decides what happens when the server grants a DIFFERENT address than
     the target this keeper exists to hold. In follow mode: validate the new
@@ -137,17 +148,12 @@ class FollowPolicy:  # pylint: disable=too-many-instance-attributes
     (rewritten on a successful follow), the persisted follow throttle, the
     apply-retry watchdog and the peer-ACK observation handoff."""
 
-    def __init__(self, target, follow, chaddr, dhcp, hb_mismatch,  # pylint: disable=too-many-arguments
-                 *, dispatch):
+    def __init__(self, target, follow, chaddr, dhcp, *, hooks: FollowHooks):
         self.target = target           # the address this keeper is meant to hold
         self.follow = follow
         self._dhcp = dhcp
-        self._hb_mismatch = hb_mismatch
-        # Injected side-effect seam: the callable that dispatches the CARP-VIP
-        # rewrite (old, new, gw_args). Kept out of this decision module so the
-        # system coupling (configd) lives in the orchestration layer, like the
-        # other hooks.
-        self._dispatch = dispatch
+        self._hb_mismatch = hooks.hb_mismatch
+        self._dispatch = hooks.dispatch    # configd CARP-VIP rewrite; see FollowHooks
 
         self._attempt = _FollowAttempt()   # the in-flight follow (watchdog re-drive state)
 

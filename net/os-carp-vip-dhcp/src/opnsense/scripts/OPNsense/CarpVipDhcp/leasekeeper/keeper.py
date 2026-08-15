@@ -18,8 +18,8 @@ from .constants import (
     ACK, BootpOp, DhcpOptName, HB_REFRESH, LEASE_PULSE_INTERVAL, LINK_KICK_DEBOUNCE,
     LINK_POLL_STEP, LOOP_ERROR_BACKOFF, Phase, REBIND_POLL_STEP, REDORA_MAX, REDORA_MIN,
     SNIFFER_RETRY, SNIFFER_WARMUP)
-from .dhcpclient import DhcpClient
-from .policy import ArpNudge, FollowPolicy
+from .dhcpclient import DhcpClient, DhcpHooks
+from .policy import ArpNudge, FollowHooks, FollowPolicy
 from .route import DefaultRouteReconciler
 from .util import _RateLimit, _atomic_write, _clock_at, _jittered, _sane_ipv4
 from .wire import _parse_reply
@@ -166,6 +166,10 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
     operator actions. The lease lives in DhcpClient; the changed-address
     decision and the target address live in FollowPolicy."""
 
+    # Composition root: where the parsed CLI/config surface becomes live
+    # collaborators, so it names every tunable once. Folding the args into a
+    # config object would only relocate that surface (_Config/DhcpHooks/
+    # FollowHooks already group them downstream), so the count is inherent here.
     def __init__(self, iface, chaddr, request_ip=None,  # pylint: disable=too-many-arguments,too-many-locals
                  eth_src=None, *,
                  hbfile=None, release_on_exit=False, vhid=None,
@@ -217,15 +221,17 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         self._dhcp = DhcpClient(
             self._capture, self._cfg.chaddr, self._cfg.eth_src,
             _identity_options(vendor_class, client_id, hostname),
-            should_stop=lambda: self._signals.stopping,
-            ensure_sniffer=self._ensure_sniffer,
-            on_changed_address=self._on_changed_address)
+            hooks=DhcpHooks(
+                should_stop=lambda: self._signals.stopping,
+                ensure_sniffer=self._ensure_sniffer,
+                on_changed_address=self._on_changed_address))
 
         # Follow/enforce policy component: owns the target address and the
         # follow bookkeeping; drives the client via adopt()/release()/expire().
-        self._follow = FollowPolicy(request_ip, follow, self._cfg.chaddr, self._dhcp,
-                                    self._hb_mismatch,
-                                    dispatch=self._dispatch_follow_update)
+        self._follow = FollowPolicy(
+            request_ip, follow, self._cfg.chaddr, self._dhcp,
+            hooks=FollowHooks(hb_mismatch=self._hb_mismatch,
+                              dispatch=self._dispatch_follow_update))
 
         # Default-route ownership component (opt-in via defaultRouteMode): owns
         # the IPv4 default route as a function of (CARP role, lease-held, lease

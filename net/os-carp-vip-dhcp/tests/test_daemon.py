@@ -44,9 +44,10 @@ def _client(lk, id_opts=None, on_changed=None):
     """A bare DhcpClient with stub hooks and a captured send list -- the
     protocol tests need no Keeper and no capture backend."""
     c = lk.DhcpClient(None, CHADDR_STR, CHADDR_STR, id_opts or [],
-                      should_stop=lambda: False,
-                      ensure_sniffer=lambda: None,
-                      on_changed_address=on_changed or (lambda *a: False))
+                      hooks=lk.DhcpHooks(
+                          should_stop=lambda: False,
+                          ensure_sniffer=lambda: None,
+                          on_changed_address=on_changed or (lambda *a: False)))
     c.sent = []
     c._send_dhcp = lambda mtype, extra, ciaddr="0.0.0.0": c.sent.append((mtype, extra, ciaddr))
     return c

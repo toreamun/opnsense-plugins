@@ -7,6 +7,7 @@ import logging
 import threading
 import time
 from dataclasses import dataclass
+from typing import Callable
 
 from .constants import (
     LOGGER_NAME,
@@ -42,20 +43,28 @@ class Lease:  # pylint: disable=too-many-instance-attributes
     lease_router: str | None = None
 
 
+@dataclass(frozen=True)
+class DhcpHooks:
+    """The three policy hooks the caller injects into DhcpClient, grouped so the
+    follow/keeper policy (not the protocol engine) owns them: should_stop aborts
+    a sequence mid-flight, ensure_sniffer guarantees the capture is live before a
+    send, and on_changed_address(got, rx, phase, release_on_enforce) -> bool
+    adjudicates an ACK whose address differs from the expected one."""
+    should_stop: Callable[[], bool]
+    ensure_sniffer: Callable[[], None]
+    on_changed_address: Callable[..., bool]
+
+
 class DhcpClient:  # pylint: disable=too-many-instance-attributes
     """RFC 2131 client for one chaddr: owns the held binding (a Lease)
     and the stateful protocol sequences
     (INIT-REBOOT / DORA / RENEW / REBIND / RELEASE) with their send/await
     machinery. It does NOT own the packet capture: sends travel through the
     injected capture backend, and the capture owner hands xid-matched replies
-    to feed(). Policy stays with the caller through three
-    injected hooks: should_stop (abort mid-sequence), ensure_sniffer (capture
-    must be alive before a send), and on_changed_address(got, rx, phase,
-    release_on_enforce) -> bool for an ACK whose address differs from the
-    expected one (True = the caller validated and adopted it, see adopt())."""
+    to feed(). Policy stays with the caller through the injected DhcpHooks
+    (should_stop / ensure_sniffer / on_changed_address; see that type)."""
 
-    def __init__(self, capture, chaddr, eth_src, id_opts, *,  # pylint: disable=too-many-arguments
-                 should_stop, ensure_sniffer, on_changed_address):
+    def __init__(self, capture, chaddr, eth_src, id_opts, *, hooks):
         self._capture = capture
         self.chaddr = chaddr
         self.chraw = mac2raw(chaddr)
@@ -64,9 +73,9 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
         # Optional DHCP request options (empty -> not sent); added to every
         # DISCOVER/REQUEST/RENEW so the server sees a consistent client identity.
         self._id_opts = id_opts
-        self._should_stop = should_stop
-        self._ensure_sniffer = ensure_sniffer
-        self._on_changed = on_changed_address
+        self._should_stop = hooks.should_stop
+        self._ensure_sniffer = hooks.ensure_sniffer
+        self._on_changed = hooks.on_changed_address
 
         self.xid = _new_xid()
         self.binding = Lease()         # the held (or last-held) DHCP binding

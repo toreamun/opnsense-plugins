@@ -20,7 +20,8 @@ from .constants import (
     SNIFFER_RETRY, SNIFFER_WARMUP)
 from .dhcpclient import DhcpClient, DhcpHooks
 from .policy import ArpNudge, FollowHooks, FollowPolicy
-from .route import DefaultRouteReconciler
+from .route import (BackupEgressReconciler, DefaultRouteMode, DefaultRouteReconciler,
+                    withdraw_unless_master)
 from .util import _RateLimit, _atomic_write, _clock_at, _jittered, _sane_ipv4
 from .wire import _parse_reply
 
@@ -241,7 +242,11 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         # split-brain install-gate is a deliberate follow-up that needs a
         # debounced carrier signal (a single transient ifconfig miss must not
         # flap the default); see docs/single-ip-wan-carp.md.
-        self._defroute = DefaultRouteReconciler(default_route_mode, backup_egress=backup_egress)
+        # Coerce the mode once and hand the same value to both reconcilers so an
+        # unrecognised mode string warns once, not twice.
+        mode = DefaultRouteMode.coerce(default_route_mode)
+        self._defroute = DefaultRouteReconciler(mode)
+        self._backup = BackupEgressReconciler(mode, backup_egress=backup_egress)
 
         self.redora_wait = REDORA_MIN
         # Link-return fast path (only while UNBOUND): a carrier down->up edge
@@ -513,7 +518,7 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         # wrongly install a backup route on a master-without-lease. probe_for_backup
         # re-probes there so that edge is decided on the true role.
         backup_master = self._probe_carp_master() if probe_for_backup else master
-        self._defroute.reconcile_backup_egress(backup_master)
+        self._backup.reconcile_backup_egress(backup_master)
 
     def _role_tick(self, master=_UNSET):
         """One shared CARP-role probe driving both the role poll and the
@@ -769,7 +774,7 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         # shutdown: relinquish an owned default unless we are the CARP master, so a
         # keeper restart on a master does not flap 0/0 (the rationale and the accepted
         # trade-off live in withdraw_unless_master).
-        self._defroute.withdraw_unless_master(self._probe_carp_master)
+        withdraw_unless_master(self._defroute, self._backup, self._probe_carp_master)
         if self._cfg.release_on_exit:
             self._dhcp.release()
         self._capture.stop()
@@ -811,15 +816,15 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
             # acquire; a still-backup keeps its route. The 0/0 deliberately stays after the
             # acquire (the no-flap restart path above). A promotion that lands mid-acquire is
             # caught by the post-acquire reconcile on the next iteration.
-            if self._defroute.backup_egress_enabled:
-                self._defroute.reconcile_backup_egress(self._probe_carp_master())
+            if self._backup.enabled:
+                self._backup.reconcile_backup_egress(self._probe_carp_master())
             self._acquire_step()
             if not b.yiaddr:
                 # master=False is the fictional role for the role-independent 0/0
                 # withdraw; backup egress needs the true role (a master-without-lease
                 # must not get a backup route), so probe when the feature is enabled.
                 self._reconcile_default_route(
-                    master=False, probe_for_backup=self._defroute.backup_egress_enabled)
+                    master=False, probe_for_backup=self._backup.enabled)
             return
         # Bound: own the default by CARP role, here at the loop head. _maintain_step
         # is re-entered after every transition (a just-acquired lease, a renew that

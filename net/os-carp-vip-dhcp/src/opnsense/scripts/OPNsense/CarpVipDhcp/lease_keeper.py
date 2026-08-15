@@ -61,7 +61,8 @@ from leasekeeper.capture_bpf import BpfCapture
 from leasekeeper.constants import LOGGER_NAME
 from leasekeeper.keeper import Keeper, carp_master
 from leasekeeper.route import (
-    BackupEgressConfig, BackupEgressForm, DefaultRouteMode, DefaultRouteReconciler)
+    BackupEgressConfig, BackupEgressForm, BackupEgressReconciler, DefaultRouteMode,
+    DefaultRouteReconciler, withdraw_unless_master)
 from leasekeeper.util import MAC_RE
 
 LOG = logging.getLogger(LOGGER_NAME)
@@ -242,8 +243,13 @@ def main():
         # (a master keeps its default, a backup withdraws; probe only when the mode
         # acts) lives in withdraw_unless_master. Skipped for --once and no vhid.
         if not a.once and a.vhid:
-            DefaultRouteReconciler(a.default_route_mode, backup_egress=backup_egress) \
-                .withdraw_unless_master(lambda: carp_master(a.iface, a.vhid))
+            # a.default_route_mode is already coerced (above), so both reconcilers take
+            # it verbatim; the backup set is cleaned before the 0/0 withdraw inside
+            # withdraw_unless_master, the one sequence that spans the two reconcilers.
+            withdraw_unless_master(
+                DefaultRouteReconciler(a.default_route_mode),
+                BackupEgressReconciler(a.default_route_mode, backup_egress=backup_egress),
+                lambda: carp_master(a.iface, a.vhid))
 
         # Fail fast (with a logged reason) if the raw /dev/bpf backend cannot run
         # on this host (e.g. fcntl missing off FreeBSD).

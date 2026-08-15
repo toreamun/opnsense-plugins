@@ -7,6 +7,12 @@ node with no default advertises none (via os-frr redistribute kernel), so the
 failure mode is a withdrawn default, never a black-holed one. See
 docs/single-ip-wan-carp.md.
 
+Two independent reconcilers live here: DefaultRouteReconciler owns the 0/0
+decision, and the optional BackupEgressReconciler owns the backup-egress route
+set (docs/backup-egress.md). They share nothing but the /sbin/route exec helpers
+below; the one cross-cutting sequence -- clean the backup set BEFORE withdrawing
+0/0 at a process boundary -- lives in the module-level withdraw_unless_master().
+
 Concurrency: reconcile() must be called only from the keeper's main loop thread;
 the caller is Keeper._reconcile_default_route -- the per-tick poll, the acquire
 arm (unbound and just after a successful acquire) and the SIGUSR2 CARP edge, plus
@@ -105,6 +111,16 @@ class BackupEgressConfig:
     prefixes: "tuple[str, ...]" = ()
 
 
+@dataclass
+class _WarnGates:
+    """The backup reconciler's rising-edge one-shot warn flags, each re-armed when
+    its condition clears so a node that sits as backup for a long time does not
+    churn the log with a repeated warning."""
+    unresolved: bool = False       # the backup gateway could not be resolved
+    fib_unreadable: bool = False   # netstat could not read the routing table
+    collision: bool = False        # a backup prefix is present via a foreign next hop
+
+
 class RouteCommand(StrEnum):
     """The `/sbin/route` commands we issue (route(8) calls add/delete/get
     'commands'). StrEnum so a member drops straight into the argv list and logs
@@ -152,6 +168,86 @@ _DEFAULT_NET = ipaddress.ip_network("0.0.0.0/0")
 _PTP_PREFIXLENS = (30, 31)
 
 
+# ---- /sbin/route exec helpers (stateless; shared by both reconcilers) ----
+
+def _run(cmd):
+    """Run a `/sbin/route` argv, capturing output and bounded by a timeout;
+    return the CompletedProcess, or None if it could not be executed at all
+    (logged)."""
+    try:
+        return subprocess.run(cmd, capture_output=True, errors="replace",
+                              timeout=_SUBPROC_TIMEOUT, check=False)
+    except (OSError, subprocess.SubprocessError) as e:
+        LOG.warning("route command failed to run (%s): %s", " ".join(cmd), e)
+        return None
+
+
+def _route(command, dest, gateway=None):
+    """Issue a `/sbin/route` command (best effort). The caller confirms the
+    resulting FIB state, so a non-zero exit -- an idempotent no-op or a real
+    failure alike -- is only debug-logged and left for that confirm to judge,
+    rather than guessed from route(8)'s wording here."""
+    cmd = [_ROUTE, _NUMERIC, command, _AF_INET, dest]
+    if gateway is not None:
+        cmd.append(gateway)
+    res = _run(cmd)
+    if res is not None and res.returncode != 0:
+        LOG.debug("route %s %s exit %d: %s", command, dest, res.returncode,
+                  (res.stderr or "").strip())
+
+
+def _at(changed, heartbeat):
+    """Pick the log callable for a desired-state confirmation. A state change
+    logs at INFO the first time the state is entered, and re-arms the heartbeat
+    so the identical DEBUG repeat does not fire on the very next tick. An
+    unchanged repeat logs at DEBUG at most once per RECONCILE_HEARTBEAT_INTERVAL
+    (proof the reconciler is alive and its decision); the ticks in between are
+    dropped, so a steady node does not fill the log file with a per-tick
+    heartbeat and churn the rotation. `heartbeat` is the deciding reconciler's own
+    throttle -- the 0/0 and backup-egress decisions pass separate ones so the two
+    do not interfere."""
+    if changed:
+        heartbeat.reset()
+        return LOG.info
+    ok, _ = heartbeat.ready()
+    return LOG.debug if ok else _drop
+
+
+def withdraw_unless_master(default_route, backup_egress, probe):
+    """Drop an owned default UNLESS this node is the CARP master, cleaning the
+    backup-egress set first. `probe` is a callable() -> bool|None returning the
+    CARP-master role; it runs only once the mode would act, so off never spawns it.
+    A confirmed master KEEPS its default (a keeper restart -- a config change or an
+    upgrade -- must not tear it down and flap 0/0; the maintain loop re-adopts it).
+    A backup or an unreadable role (False / None) withdraws, fail-closed, so a stale
+    default is never left for FRR to keep advertising with nothing managing it.
+
+    Run at the two process boundaries: main()'s startup fail-stop (on throwaway
+    reconcilers, before the Keeper / capture backend exist and ahead of any
+    arg/backend early-exit that would skip Keeper.run()) and Keeper.run()'s
+    graceful shutdown. off is a no-op; observe logs a would-withdraw without
+    touching the FIB; enforce actually withdraws. The caller gates on a CARP vhid.
+
+    Ordering: the backup-egress set is cleaned BEFORE the 0/0 withdraw so a stopped
+    keeper leaves no route a later master would loop through (withdraw_backup_egress
+    no-ops when the feature is disabled and cleans only what it owns; see it for why).
+    This is the one sequence that spans the two reconcilers, so it lives here rather
+    than in either object.
+
+    Trade-off: a GENUINE permanent stop (an operator disabling the plugin) on a
+    node that is still CARP master keeps the default in the FIB with nothing
+    managing it after -- the state this withdraw otherwise prevents. That window
+    is narrow (the node is still master, so the default is at least
+    static-correct) and telling it apart from a restart would need a fragile
+    stop-vs-restart signal, so it is accepted."""
+    if not default_route.enabled:
+        return    # off is fully inert: no FIB read/write, no probe.
+    backup_egress.withdraw_backup_egress()
+    if probe() is True:
+        return
+    default_route.reconcile(is_master=False, bound=False, gateway=None)
+
+
 class DefaultRouteReconciler:
     """Reconciles the IPv4 default route against (CARP role, lease-held,
     gateway). Level-triggered and idempotent: reconcile() may be called as often
@@ -161,13 +257,9 @@ class DefaultRouteReconciler:
     All methods run on the keeper's main loop thread only; the class holds no
     lock because nothing else in the keeper mutates routes."""
 
-    # The 0/0 decision and the optional backup-egress decision each carry their own
-    # last-state + heartbeat, so the attribute count is intentional.
-    # pylint: disable=too-many-instance-attributes
-
     def __init__(self, mode: "str | DefaultRouteMode" = DefaultRouteMode.OFF, *,
                  unreadable_role_strikes=DEFAULT_UNREADABLE_ROLE_STRIKES,
-                 liveness_probe=None, backup_egress: "BackupEgressConfig | None" = None):
+                 liveness_probe=None):
         # mode flows in from the model verbatim (keeper.conf -> rc.d -> argparse)
         # as a plain string; coerce it, treating any unrecognised value as inert
         # OFF (never guess an active mode). Set-once: exposed read-only via `mode`.
@@ -190,16 +282,6 @@ class DefaultRouteReconciler:
         # backup/master does not log its (identical) decision every tick and churn
         # the log rotation. A change re-arms it (see _at).
         self._heartbeat = _RateLimit(RECONCILE_HEARTBEAT_INTERVAL)
-        # Optional backup-egress (docs/backup-egress.md), with its own last-state and
-        # heartbeat so its logging does not interfere with the 0/0 decision's.
-        self._backup = backup_egress or BackupEgressConfig()
-        self._last_backup_desired = _UNSET
-        self._backup_heartbeat = _RateLimit(RECONCILE_HEARTBEAT_INTERVAL)
-        self._valid_prefixes = None            # cached validated prefixes (warn-once via the cache)
-        self._backup_unresolved_warned = False  # rising-edge gate for gateway-resolution warnings
-        self._fib_unreadable_warned = False    # rising-edge gate for the netstat-unreadable warning
-        self._backup_installed_gws = set()     # gateways our prefixes are confirmed at (ownership)
-        self._backup_collision_warned = False  # rising-edge gate for foreign-route collision warnings
 
     @property
     def mode(self):
@@ -210,67 +292,6 @@ class DefaultRouteReconciler:
     def enabled(self):
         """True in observe/enforce (off is inert); see DefaultRouteMode."""
         return self._mode in (DefaultRouteMode.OBSERVE, DefaultRouteMode.ENFORCE)
-
-    @property
-    def backup_egress_enabled(self):
-        """True when the backup-egress feature is active (mode observe/enforce AND the
-        feature enabled). Lets the caller decide whether the unbound path must probe the
-        real CARP role for backup egress (the 0/0 withdraw there uses a fictional role)."""
-        return self.enabled and self._backup.enabled
-
-    def withdraw_unless_master(self, probe):
-        """Drop an owned default UNLESS this node is the CARP master. `probe` is a
-        callable() -> bool|None returning the CARP-master role; it runs only once the
-        mode would act, so off never spawns it. A confirmed master KEEPS its default
-        (a keeper restart -- a config change or an upgrade -- must not tear it down
-        and flap 0/0; the maintain loop re-adopts it). A backup or an unreadable role
-        (False / None) withdraws, fail-closed, so a stale default is never left for
-        FRR to keep advertising with nothing managing it.
-
-        Run at the two process boundaries: main()'s startup fail-stop (on a throwaway
-        reconciler, before the Keeper / capture backend exist and ahead of any
-        arg/backend early-exit that would skip Keeper.run()) and Keeper.run()'s
-        graceful shutdown. off is a no-op; observe logs a would-withdraw without
-        touching the FIB; enforce actually withdraws. The caller gates on a CARP vhid.
-
-        Trade-off: a GENUINE permanent stop (an operator disabling the plugin) on a
-        node that is still CARP master keeps the default in the FIB with nothing
-        managing it after -- the state this withdraw otherwise prevents. That window
-        is narrow (the node is still master, so the default is at least
-        static-correct) and telling it apart from a restart would need a fragile
-        stop-vs-restart signal, so it is accepted."""
-        if not self.enabled:
-            return    # off is fully inert: no FIB read/write, no probe.
-        # Clean the backup-egress set at the boundary so a stopped keeper leaves no route a
-        # later master would loop through. Only routes this feature actually manages are
-        # touched (withdraw_backup_egress no-ops when the feature is disabled): the /1-split
-        # is also the classic full-tunnel-VPN pair, so a keeper that never installed it must
-        # not delete a /1 it does not own.
-        self.withdraw_backup_egress()
-        if probe() is True:
-            return
-        self.reconcile(is_master=False, bound=False, gateway=None)
-
-    def withdraw_backup_egress(self):
-        """Remove the backup-egress routes (the /1-split plus any configured prefixes) at a
-        process boundary, so a stopped keeper leaves none that a later master would loop
-        through. A no-op unless the feature is enabled: the /1-split (0.0.0.0/1 +
-        128.0.0.0/1) is also the classic full-tunnel-VPN split, so a keeper that never
-        managed backup egress must not delete a /1 it does not own -- routes are cleaned by
-        ownership, not by matching a shape. observe logs, enforce deletes. Unlike the
-        reconcile loop there is no next tick to retry, so an unconfirmable removal is
-        surfaced loudly here rather than left to a silent re-check.
-
-        Accepted limit: a /1 left by a crashed predecessor whose feature (or mode) is then
-        disabled before restart is not cleaned, because it can no longer be told apart from
-        an unrelated VPN /1. That narrow crash-then-disable case needs manual cleanup (or
-        the deferred persisted-ownership follow-up); see docs/backup-egress.md."""
-        if not self.backup_egress_enabled:
-            return
-        self._backup_remove(self._backup_removal_set(), changed=True, reason="keeper stopping")
-        if self._mode == DefaultRouteMode.ENFORCE and self._fib_routes() is None:
-            LOG.warning("backup egress: could not clean up at shutdown (routing table "
-                        "unreadable) -- a leftover /1 would loop egress if this node is master")
 
     def reconcile(self, is_master, bound, gateway):
         """Drive the FIB default toward the desired state for the current
@@ -348,22 +369,6 @@ class DefaultRouteReconciler:
             else:
                 self._withdraw(changed, have, reason)
 
-    def _at(self, changed, heartbeat=None):
-        """Pick the log callable for a desired-state confirmation. A state change
-        logs at INFO the first time the state is entered, and re-arms the heartbeat
-        so the identical DEBUG repeat does not fire on the very next tick. An
-        unchanged repeat logs at DEBUG at most once per RECONCILE_HEARTBEAT_INTERVAL
-        (proof the reconciler is alive and its decision); the ticks in between are
-        dropped, so a steady node does not fill the log file with a per-tick
-        heartbeat and churn the rotation. `heartbeat` defaults to the 0/0 decision's;
-        the backup-egress decision passes its own so the two do not interfere."""
-        hb = heartbeat if heartbeat is not None else self._heartbeat
-        if changed:
-            hb.reset()
-            return LOG.info
-        ok, _ = hb.ready()
-        return LOG.debug if ok else _drop
-
     @staticmethod
     def _no_default_reason(blocked, is_master, holds_lease):
         """Why the desired state is 'no default' -- the informative half of the
@@ -381,30 +386,169 @@ class DefaultRouteReconciler:
         gateway, so there is nothing to install -- state ownership positively
         instead of returning silently."""
         if self._mode == DefaultRouteMode.OBSERVE:
-            self._at(changed)("[observe] default already via %s -- would own", gateway)
+            _at(changed, self._heartbeat)("[observe] default already via %s -- would own", gateway)
         else:
-            self._at(changed)("owning default via %s", gateway)
+            _at(changed, self._heartbeat)("owning default via %s", gateway)
 
     def _confirm_no_default(self, changed, reason):
         """Steady-state no-default heartbeat: there is correctly no default to
         hold (backup / no lease / liveness-gated)."""
         if self._mode == DefaultRouteMode.OBSERVE:
-            self._at(changed)("[observe] no default held (%s) -- as wanted", reason)
+            _at(changed, self._heartbeat)("[observe] no default held (%s) -- as wanted", reason)
         else:
-            self._at(changed)("no default held (%s)", reason)
+            _at(changed, self._heartbeat)("no default held (%s)", reason)
 
-    # ---- backup egress (optional; docs/backup-egress.md) ----
+    def _on_unknown_role(self):
+        """An unreadable (is_master is None) probe: do not install when unsure,
+        but after a bounded number of consecutive unknown probes, withdraw any
+        default we still hold so a former master stops advertising once its role
+        can no longer be confirmed. The warning fires once per unreadable episode
+        (re-armed when the role reads definite again), not every tick."""
+        self._strikes += 1
+        if self._strikes < self._strike_limit:
+            return
+        have = self._fib_default_gateway()
+        if have is None:
+            return
+        first_time = not self._unreadable_warned
+        if first_time:
+            LOG.warning("CARP role unreadable for %d checks -- failing closed on "
+                        "the default", self._strikes)
+            self._unreadable_warned = True
+        self._withdraw(first_time, have, "CARP role unreadable")
+
+    def _liveness_blocks(self):
+        """True only when the liveness probe is present and returns an explicit
+        False. A missing probe or a None result never blocks."""
+        if self._liveness_probe is None:
+            return False
+        try:
+            return self._liveness_probe() is False
+        except Exception:  # pylint: disable=broad-exception-caught
+            # A broken liveness probe must not block routing.
+            return False
+
+    # ---- FIB operations (idempotent, error-tolerant, main-loop only) ----
+
+    def _install(self, changed, gateway, replacing=None):
+        if self._mode == DefaultRouteMode.OBSERVE:
+            _at(changed, self._heartbeat)("[observe] would install default via %s%s", gateway,
+                                          "" if replacing is None else f" (replacing {replacing})")
+            return
+        # Replace atomically with `route change`, not delete-then-add. A bench
+        # check on FreeBSD 14.3 confirmed both halves: `route change` to an on-link
+        # gateway swaps in place (no momentary no-default gap for FRR
+        # redistribute-kernel to flap on), and to an off-link gateway it fails
+        # ("Invalid argument") and leaves the old default intact -- so a still-usable
+        # default is never torn down for one we cannot install (e.g. a cross-subnet
+        # lease whose new gateway is not on-link until the interface moves). A first
+        # install (no prior default) uses `add`: `change` requires the route to
+        # exist. Then CONFIRM the FIB reached the desired state -- reading the result
+        # back is wording-independent, unlike parsing route(8)'s exit/stderr, and a
+        # rejected change simply reads back as the old gateway (surfaced below).
+        verb = RouteCommand.ADD if replacing is None else RouteCommand.CHANGE
+        _route(verb, _DEFAULT, gateway)
+        have = self._fib_default_gateway()
+        if have == gateway:
+            LOG.info("installed default via %s%s", gateway,
+                     "" if replacing is None else f" (was {replacing})")
+        else:
+            LOG.error("failed to install default via %s (the FIB default is now %s)",
+                      gateway, have or "absent")
+
+    def _withdraw(self, changed, current, reason):
+        if self._mode == DefaultRouteMode.OBSERVE:
+            _at(changed, self._heartbeat)("[observe] would withdraw default (currently via %s) -- %s",
+                                          current, reason)
+            return
+        _route(RouteCommand.DELETE, _DEFAULT)
+        # Confirm the FIB, not the exit code: a silently failed delete would leave
+        # a backup advertising a black-hole default -- the one outcome this feature
+        # exists to prevent -- so surface it at ERROR. The level-triggered
+        # reconcile retries the withdraw next tick.
+        if self._fib_default_gateway() is None:
+            LOG.info("withdrew default (was via %s) -- %s", current, reason)
+        else:
+            LOG.error("failed to withdraw default (still via %s) -- this node keeps "
+                      "advertising it", current)
+
+    def _fib_default_gateway(self):
+        """Current IPv4 default gateway, or None when there is no default. Any
+        `route get` failure (an empty table exits non-zero) reads as 'no default'
+        -- the common, quiet steady state on a backup -- rather than an error; a
+        genuinely stuck route op is surfaced by the install/withdraw confirm, not
+        by second-guessing this read."""
+        res = _run([_ROUTE, _NUMERIC, RouteCommand.GET, _AF_INET, _DEFAULT])
+        if res is None or res.returncode != 0:
+            return None
+        for line in res.stdout.splitlines():
+            stripped = line.strip()
+            if stripped.startswith(_GATEWAY_FIELD):
+                return stripped[len(_GATEWAY_FIELD):].strip() or None
+        return None
+
+
+class BackupEgressReconciler:
+    """Reconciles the optional backup-egress route set (docs/backup-egress.md):
+    while a node is the CARP backup (no WAN default) it routes its own internet
+    traffic to the master via a leak-safe /1-split (or configured prefixes), and
+    removes that set while it is master (the inverse of the 0/0 the default-route
+    reconciler manages). Level-triggered and idempotent, main-loop thread only.
+
+    Ownership, not shape, decides what it touches: the /1-split is also the classic
+    full-tunnel-VPN pair, so a foreign next hop is never overwritten or removed."""
+
+    def __init__(self, mode: "str | DefaultRouteMode" = DefaultRouteMode.OFF, *,
+                 backup_egress: "BackupEgressConfig | None" = None):
+        # mode is coerced (as in DefaultRouteReconciler) so an unrecognised value is
+        # inert OFF; the backup set only acts under observe/enforce.
+        self._mode = DefaultRouteMode.coerce(mode)
+        self._backup = backup_egress or BackupEgressConfig()
+        self._last_backup_desired = _UNSET
+        self._backup_heartbeat = _RateLimit(RECONCILE_HEARTBEAT_INTERVAL)
+        self._valid_prefixes = None            # cached validated prefixes (warn-once via the cache)
+        self._backup_installed_gws = set()     # gateways our prefixes are confirmed at (ownership)
+        self._warn = _WarnGates()              # rising-edge one-shot warn flags
+
+    @property
+    def enabled(self):
+        """True when the backup-egress feature is active (mode observe/enforce AND the
+        feature enabled). Lets the caller decide whether the unbound path must probe the
+        real CARP role for backup egress (the 0/0 withdraw there uses a fictional role)."""
+        return (self._mode in (DefaultRouteMode.OBSERVE, DefaultRouteMode.ENFORCE)
+                and self._backup.enabled)
+
+    def withdraw_backup_egress(self):
+        """Remove the backup-egress routes (the /1-split plus any configured prefixes) at a
+        process boundary, so a stopped keeper leaves none that a later master would loop
+        through. A no-op unless the feature is enabled: the /1-split (0.0.0.0/1 +
+        128.0.0.0/1) is also the classic full-tunnel-VPN split, so a keeper that never
+        managed backup egress must not delete a /1 it does not own -- routes are cleaned by
+        ownership, not by matching a shape. observe logs, enforce deletes. Unlike the
+        reconcile loop there is no next tick to retry, so an unconfirmable removal is
+        surfaced loudly here rather than left to a silent re-check.
+
+        Accepted limit: a /1 left by a crashed predecessor whose feature (or mode) is then
+        disabled before restart is not cleaned, because it can no longer be told apart from
+        an unrelated VPN /1. That narrow crash-then-disable case needs manual cleanup (or
+        the deferred persisted-ownership follow-up); see docs/backup-egress.md."""
+        if not self.enabled:
+            return
+        self._backup_remove(self._backup_removal_set(), changed=True, reason="keeper stopping")
+        if self._mode == DefaultRouteMode.ENFORCE and self._fib_routes() is None:
+            LOG.warning("backup egress: could not clean up at shutdown (routing table "
+                        "unreadable) -- a leftover /1 would loop egress if this node is master")
 
     def reconcile_backup_egress(self, is_master):
         """Keep the backup-egress route set present while this node is the CARP
         backup and absent while it is master (the inverse of the 0/0 it manages).
-        Call from the same tick as reconcile(), after it. A no-op unless the feature
-        is enabled and the mode is observe/enforce (off is inert). is_master None (an
-        unreadable role) touches nothing, like the 0/0 side."""
-        if not self.backup_egress_enabled or is_master is None:
+        Call from the same tick as the default-route reconcile, after it. A no-op
+        unless the feature is enabled and the mode is observe/enforce (off is inert).
+        is_master None (an unreadable role) touches nothing, like the 0/0 side."""
+        if not self.enabled or is_master is None:
             return
         if is_master:
-            self._backup_unresolved_warned = False   # re-arm so a returning backup re-warns once
+            self._warn.unresolved = False   # re-arm so a returning backup re-warns once
             desired = (_BackupState.ABSENT, None)
         else:
             gateway = self._resolve_backup_gateway()
@@ -474,7 +618,7 @@ class DefaultRouteReconciler:
         peer of the configured interface. None (warned, rising-edge) when it cannot be
         worked out; a successful resolve re-arms the warning."""
         gateway = self._backup_gateway()
-        self._backup_unresolved_warned = gateway is None
+        self._warn.unresolved = gateway is None
         return gateway
 
     def _backup_gateway(self):
@@ -500,7 +644,7 @@ class DefaultRouteReconciler:
     def _warn_unresolved(self, fmt, *args):
         """Log a gateway-resolution failure at most once per unresolved episode: a node
         can sit as backup for a long time, so the message must not churn the log."""
-        if not self._backup_unresolved_warned:
+        if not self._warn.unresolved:
             LOG.warning(fmt, *args)
 
     def _gateway_is_own(self, gateway):
@@ -511,7 +655,7 @@ class DefaultRouteReconciler:
         not active locally, so it resolves via the real interface, not lo0 -- the
         recommended VIP gateway is not caught. Never cached: a transient route-get failure
         must not permanently disable the guard, so the caller defers on None and re-checks."""
-        res = self._run([_ROUTE, _NUMERIC, RouteCommand.GET, _AF_INET, gateway])
+        res = _run([_ROUTE, _NUMERIC, RouteCommand.GET, _AF_INET, gateway])
         if res is None or res.returncode != 0:
             return None   # could not determine -> caller defers rather than routing blind
         for line in res.stdout.splitlines():
@@ -541,7 +685,7 @@ class DefaultRouteReconciler:
     def _iface_ipv4(self, iface):
         """(address, prefixlen) of the first IPv4 on `iface`, or None. Parses
         `ifconfig <iface> inet` ('inet A netmask 0xMMMMMMMM ...')."""
-        res = self._run([_IFCONFIG, iface, "inet"])
+        res = _run([_IFCONFIG, iface, "inet"])
         if res is None or res.returncode != 0:
             return None
         toks = res.stdout.split()
@@ -582,9 +726,9 @@ class DefaultRouteReconciler:
         intended next hop on install; None on the master-side removal, where an unattributable
         /1 might actually be our own stale leftover looping this node's egress."""
         if not prefixes:
-            self._backup_collision_warned = False
+            self._warn.collision = False
             return
-        if not self._backup_collision_warned:
+        if not self._warn.collision:
             if gateway is None:
                 LOG.warning("backup egress: %s present via a next hop this node does not own "
                             "-- leaving it untouched; if it is a stale backup-egress route this "
@@ -595,7 +739,7 @@ class DefaultRouteReconciler:
                 LOG.warning("backup egress: %s already routed via another next hop (not %s) -- "
                             "leaving it untouched (not managed by this feature)",
                             " ".join(prefixes), gateway)
-            self._backup_collision_warned = True
+            self._warn.collision = True
 
     def _classify_backup_prefixes(self, route_set, gateway, have):
         """Split the desired prefixes against the current FIB `have` into (pending,
@@ -634,7 +778,7 @@ class DefaultRouteReconciler:
         if not route_set:
             return
         if self._mode == DefaultRouteMode.OBSERVE:
-            self._at(changed, self._backup_heartbeat)(
+            _at(changed, self._backup_heartbeat)(
                 "[observe] would route backup egress via %s (%s)", gateway, " ".join(route_set))
             return
         have = self._fib_routes()
@@ -648,14 +792,14 @@ class DefaultRouteReconciler:
         if pending:
             for prefix in pending:
                 verb = RouteCommand.ADD if have.get(self._net(prefix)) is None else RouteCommand.CHANGE
-                self._route(verb, prefix, gateway)
+                _route(verb, prefix, gateway)
             state = self._fib_routes()
             if state is None:
                 return   # writes issued but cannot confirm (already warned); re-check next tick
         self._record_backup_ownership(gateway, state, route_set)
         if not pending:
             if not collisions:
-                self._at(changed, self._backup_heartbeat)(
+                _at(changed, self._backup_heartbeat)(
                     "backup egress via %s (%s)", gateway, " ".join(route_set))
             return
         missing = [p for p in pending if state.get(self._net(p)) != gateway]
@@ -669,7 +813,7 @@ class DefaultRouteReconciler:
         # did not happen: the reconcile master path uses the default, the shutdown
         # boundary passes "keeper stopping".
         if self._mode == DefaultRouteMode.OBSERVE:
-            self._at(changed, self._backup_heartbeat)(
+            _at(changed, self._backup_heartbeat)(
                 "[observe] would remove backup egress (%s)", " ".join(removal_set))
             return
         have = self._fib_routes()
@@ -691,10 +835,10 @@ class DefaultRouteReconciler:
         self._note_backup_collisions(collisions, None)
         if not present:
             self._prune_backup_ownership(have, removal_set)   # nothing of ours here -> drop stale gws
-            self._at(changed, self._backup_heartbeat)("no backup egress (%s)", reason)
+            _at(changed, self._backup_heartbeat)("no backup egress (%s)", reason)
             return
         for prefix in present:
-            self._route(RouteCommand.DELETE, prefix)
+            _route(RouteCommand.DELETE, prefix)
         now = self._fib_routes()
         if now is None:
             return   # deletes issued but cannot confirm (already warned); re-check next tick
@@ -711,16 +855,16 @@ class DefaultRouteReconciler:
         the table cannot be read -- callers must not mistake an unreadable table for 'no
         routes' and skip the master-side removal. A bare host address parses as /32;
         header and default rows that are not a network are skipped."""
-        res = self._run([_NETSTAT, "-rn", "-f", "inet"])
+        res = _run([_NETSTAT, "-rn", "-f", "inet"])
         if res is None or res.returncode != 0:
-            if not self._fib_unreadable_warned:   # once per unreadable episode (re-armed below)
+            if not self._warn.fib_unreadable:   # once per unreadable episode (re-armed below)
                 # Neutral wording: on install this defers the write, but on the master
                 # removal path the deletes ARE issued and only the confirm is deferred.
                 LOG.warning("backup egress: cannot read the routing table (netstat) -- route "
                             "state cannot be confirmed until it is readable")
-                self._fib_unreadable_warned = True
+                self._warn.fib_unreadable = True
             return None
-        self._fib_unreadable_warned = False
+        self._warn.fib_unreadable = False
         routes = {}
         for line in res.stdout.splitlines():
             parts = line.split()
@@ -737,118 +881,3 @@ class DefaultRouteReconciler:
     def _net(prefix):
         """Parse a (pre-validated) prefix string to a network, for FIB comparison."""
         return ipaddress.ip_network(prefix, strict=False)
-
-    # ---- role-unknown handling ----
-
-    def _on_unknown_role(self):
-        """An unreadable (is_master is None) probe: do not install when unsure,
-        but after a bounded number of consecutive unknown probes, withdraw any
-        default we still hold so a former master stops advertising once its role
-        can no longer be confirmed. The warning fires once per unreadable episode
-        (re-armed when the role reads definite again), not every tick."""
-        self._strikes += 1
-        if self._strikes < self._strike_limit:
-            return
-        have = self._fib_default_gateway()
-        if have is None:
-            return
-        first_time = not self._unreadable_warned
-        if first_time:
-            LOG.warning("CARP role unreadable for %d checks -- failing closed on "
-                        "the default", self._strikes)
-            self._unreadable_warned = True
-        self._withdraw(first_time, have, "CARP role unreadable")
-
-    def _liveness_blocks(self):
-        """True only when the liveness probe is present and returns an explicit
-        False. A missing probe or a None result never blocks."""
-        if self._liveness_probe is None:
-            return False
-        try:
-            return self._liveness_probe() is False
-        except Exception:  # pylint: disable=broad-exception-caught
-            # A broken liveness probe must not block routing.
-            return False
-
-    # ---- FIB operations (idempotent, error-tolerant, main-loop only) ----
-
-    def _install(self, changed, gateway, replacing=None):
-        if self._mode == DefaultRouteMode.OBSERVE:
-            self._at(changed)("[observe] would install default via %s%s", gateway,
-                              "" if replacing is None else f" (replacing {replacing})")
-            return
-        # Replace atomically with `route change`, not delete-then-add. A bench
-        # check on FreeBSD 14.3 confirmed both halves: `route change` to an on-link
-        # gateway swaps in place (no momentary no-default gap for FRR
-        # redistribute-kernel to flap on), and to an off-link gateway it fails
-        # ("Invalid argument") and leaves the old default intact -- so a still-usable
-        # default is never torn down for one we cannot install (e.g. a cross-subnet
-        # lease whose new gateway is not on-link until the interface moves). A first
-        # install (no prior default) uses `add`: `change` requires the route to
-        # exist. Then CONFIRM the FIB reached the desired state -- reading the result
-        # back is wording-independent, unlike parsing route(8)'s exit/stderr, and a
-        # rejected change simply reads back as the old gateway (surfaced below).
-        verb = RouteCommand.ADD if replacing is None else RouteCommand.CHANGE
-        self._route(verb, _DEFAULT, gateway)
-        have = self._fib_default_gateway()
-        if have == gateway:
-            LOG.info("installed default via %s%s", gateway,
-                     "" if replacing is None else f" (was {replacing})")
-        else:
-            LOG.error("failed to install default via %s (the FIB default is now %s)",
-                      gateway, have or "absent")
-
-    def _withdraw(self, changed, current, reason):
-        if self._mode == DefaultRouteMode.OBSERVE:
-            self._at(changed)("[observe] would withdraw default (currently via %s) -- %s",
-                              current, reason)
-            return
-        self._route(RouteCommand.DELETE, _DEFAULT)
-        # Confirm the FIB, not the exit code: a silently failed delete would leave
-        # a backup advertising a black-hole default -- the one outcome this feature
-        # exists to prevent -- so surface it at ERROR. The level-triggered
-        # reconcile retries the withdraw next tick.
-        if self._fib_default_gateway() is None:
-            LOG.info("withdrew default (was via %s) -- %s", current, reason)
-        else:
-            LOG.error("failed to withdraw default (still via %s) -- this node keeps "
-                      "advertising it", current)
-
-    def _fib_default_gateway(self):
-        """Current IPv4 default gateway, or None when there is no default. Any
-        `route get` failure (an empty table exits non-zero) reads as 'no default'
-        -- the common, quiet steady state on a backup -- rather than an error; a
-        genuinely stuck route op is surfaced by the install/withdraw confirm, not
-        by second-guessing this read."""
-        res = self._run([_ROUTE, _NUMERIC, RouteCommand.GET, _AF_INET, _DEFAULT])
-        if res is None or res.returncode != 0:
-            return None
-        for line in res.stdout.splitlines():
-            stripped = line.strip()
-            if stripped.startswith(_GATEWAY_FIELD):
-                return stripped[len(_GATEWAY_FIELD):].strip() or None
-        return None
-
-    def _route(self, command, dest, gateway=None):
-        """Issue a `/sbin/route` command (best effort). The caller confirms the
-        resulting FIB state, so a non-zero exit -- an idempotent no-op or a real
-        failure alike -- is only debug-logged and left for that confirm to judge,
-        rather than guessed from route(8)'s wording here."""
-        cmd = [_ROUTE, _NUMERIC, command, _AF_INET, dest]
-        if gateway is not None:
-            cmd.append(gateway)
-        res = self._run(cmd)
-        if res is not None and res.returncode != 0:
-            LOG.debug("route %s %s exit %d: %s", command, dest, res.returncode,
-                      (res.stderr or "").strip())
-
-    def _run(self, cmd):
-        """Run a `/sbin/route` argv, capturing output and bounded by a timeout;
-        return the CompletedProcess, or None if it could not be executed at all
-        (logged)."""
-        try:
-            return subprocess.run(cmd, capture_output=True, errors="replace",
-                                  timeout=_SUBPROC_TIMEOUT, check=False)
-        except (OSError, subprocess.SubprocessError) as e:
-            LOG.warning("route command failed to run (%s): %s", " ".join(cmd), e)
-            return None

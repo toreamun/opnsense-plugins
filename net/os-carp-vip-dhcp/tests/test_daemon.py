@@ -12,6 +12,7 @@ import types
 import pytest
 
 from conftest import CHADDR, CHADDR_STR
+from fakes import FakeRoute, GW as RGW
 
 
 def _woken(keeper):
@@ -74,14 +75,13 @@ def test_redora_max_bounded(lk):
 
 def test_dhcpreply_giaddr_defaults_none(lk):
     # the new giaddr field defaults, so shorter DhcpReply constructions stay valid.
-    rx = lk.DhcpReply(5, "1.2.3.4", "1.2.3.1", 1800, None, None, None)
+    rx = _reply(lk, 5, "1.2.3.4", server="1.2.3.1")
     assert rx.giaddr is None
 
 
 def test_reboot_request_shape_and_bind(lk):
     c = _client(lk)
-    c._wait_for_dhcp_reply = lambda want, timeout, *a: lk.DhcpReply(
-        lk.ACK, "100.64.4.7", "100.64.4.1", 1800, None, None, None)
+    c._wait_for_dhcp_reply = lambda want, timeout, *a: _reply(lk, lk.ACK, "100.64.4.7")
     assert c.reboot("100.64.4.7") is True
     assert c.binding.yiaddr == "100.64.4.7" and c.binding.server == "100.64.4.1"
     mtype, extra, ciaddr = c.sent[0]
@@ -92,8 +92,7 @@ def test_reboot_request_shape_and_bind(lk):
 
 def test_reboot_nak_falls_through(lk):
     c = _client(lk)
-    c._wait_for_dhcp_reply = lambda want, timeout, *a: lk.DhcpReply(
-        lk.NAK, None, None, None, None, None, None)
+    c._wait_for_dhcp_reply = lambda want, timeout, *a: _reply(lk, lk.NAK, server=None, lease=None)
     assert c.reboot("100.64.4.7") is False
     assert c.binding.yiaddr is None
 
@@ -119,9 +118,9 @@ def test_absorb_reply_floors_lease(lk):
     # A tiny (or spoofed) opt-51 must not drive a tight renew spin: the accepted
     # lease is floored at MIN_LEASE, while a normal lease passes through.
     c = _client(lk)
-    c.adopt(lk.DhcpReply(lk.ACK, "100.64.4.7", "100.64.4.1", 1, None, None, None))
+    c.adopt(_reply(lk, lk.ACK, "100.64.4.7", lease=1))
     assert c.binding.lease_secs == lk.MIN_LEASE
-    c.adopt(lk.DhcpReply(lk.ACK, "100.64.4.7", "100.64.4.1", 3600, None, None, None))
+    c.adopt(_reply(lk, lk.ACK, "100.64.4.7", lease=3600))
     assert c.binding.lease_secs == 3600
 
 
@@ -137,13 +136,12 @@ def test_msg_text_scrubs_control_chars(lk):
 def test_adopt_binds_and_refreshes_server(lk):
     c = _client(lk)
     c.binding.server = "100.64.4.1"   # from the OFFER
-    ack = lk.DhcpReply(lk.ACK, "100.64.4.7", "100.64.4.2", 1800, None, None,
-                       "100.64.4.1", None, "255.255.255.0")
+    ack = _reply(lk, lk.ACK, "100.64.4.7", server="100.64.4.2", router="100.64.4.1", mask="255.255.255.0")
     c.adopt(ack)
     assert c.binding.yiaddr == "100.64.4.7"
     assert c.binding.server == "100.64.4.2"          # ACK's server-id wins...
     assert c.binding.lease_secs == 1800 and c.binding.mask_bits == 24
-    c.adopt(lk.DhcpReply(lk.ACK, "100.64.4.8", None, 900, None, None, None))
+    c.adopt(_reply(lk, lk.ACK, "100.64.4.8", server=None, lease=900))
     assert c.binding.server == "100.64.4.2"          # ...and is kept when the ACK has none
 
 
@@ -163,20 +161,18 @@ def test_renew_requires_binding(lk):
 
 def test_feed_wakes_the_waiting_sequence(lk):
     c = _client(lk)
-    rx = lk.DhcpReply(lk.ACK, "100.64.4.7", "100.64.4.1", 1800, None, None, None)
+    rx = _reply(lk, lk.ACK, "100.64.4.7")
     c.feed(rx)
     assert c._rx is rx
     assert c._ev.is_set()        # the waiting _wait_for_dhcp_reply returns at once
 
 
 def test_fmt_reply_readable(lk):
-    off = lk.DhcpReply(2, "100.64.4.74", "100.64.4.1", 120, 60, 105, "100.64.4.1",
-                       None, "255.255.255.0", None)
+    off = _reply(lk, 2, "100.64.4.74", lease=120, t1=60, t2=105, router="100.64.4.1", mask="255.255.255.0")
     s = lk._fmt_reply(off)
     assert "OFFER" in s and "yiaddr=100.64.4.74" in s and "server=100.64.4.1" in s
     assert "giaddr=none" in s          # directly attached: no relay in path
-    nak = lk.DhcpReply(6, None, "100.64.4.1", None, None, None, None,
-                       b"no free leases", None, "100.64.4.9")
+    nak = _reply(lk, 6, lease=None, message=b"no free leases", giaddr="100.64.4.9")
     s2 = lk._fmt_reply(nak)
     assert "NAK" in s2 and "giaddr=100.64.4.9" in s2 and "no free leases" in s2
 
@@ -313,8 +309,18 @@ def _follow_keeper(lk, tmp_path):
     return keeper
 
 
+def _reply(lk, mtype, yiaddr: "str | None" = None, *,  # pylint: disable=too-many-arguments
+           server: "str | None" = "100.64.4.1", lease: "int | None" = 1800,
+           t1: "int | None" = None, t2: "int | None" = None, router: "str | None" = None,
+           message: "bytes | str | None" = None, mask: "str | None" = None, giaddr: "str | None" = None):
+    # Keyword builder for DhcpReply so call sites name the field they set instead
+    # of padding positional Nones (the NamedTuple order is mtype, yiaddr, server,
+    # lease, t1, t2, router, message, subnet_mask, giaddr).
+    return lk.DhcpReply(mtype, yiaddr, server, lease, t1, t2, router, message, mask, giaddr)
+
+
 def _ack(lk, yiaddr, server="100.64.4.1"):
-    return lk.DhcpReply(5, yiaddr, server, 1800, None, None, None)
+    return _reply(lk, lk.ACK, yiaddr, server=server)
 
 
 def _dhcp_frame(lk, xid, options, *, yiaddr="100.64.4.7",  # pylint: disable=too-many-arguments
@@ -355,7 +361,7 @@ def test_on_dhcp_reply_captures_option56_message(lk):
 ])
 def test_dhcpnak_logs_reason(lk, caplog, message, expect):
     keeper = _keeper(lk)
-    keeper._dhcp._rx = lk.DhcpReply(lk.NAK, None, "100.64.4.1", None, None, None, None, message)
+    keeper._dhcp._rx = _reply(lk, lk.NAK, lease=None, message=message)
     with caplog.at_level("WARNING", logger="lease-keeper"):
         assert keeper._dhcp._wait_for_dhcp_reply(lk.ACK, 0.2, "DORA").mtype == lk.NAK
     assert any(expect in r.getMessage() for r in caplog.records)
@@ -427,25 +433,19 @@ def test_observed_peer_ack_records_change_and_wakes(lk, tmp_path):
     assert _woken(keeper)       # ...and the maintain-loop sleep is woken at once
 
 
-def test_ignored_observation_does_not_wake(lk, tmp_path):
+@pytest.mark.parametrize("frame_factory", [
+    lambda lk: _peer_ack(lk, "100.64.4.7"),                                       # same address -> no change
+    lambda lk: _peer_ack(lk, "100.64.4.60", chaddr=b"\xaa\xbb\xcc\xdd\xee\xff"),  # not our chaddr
+    lambda lk: _dhcp_frame(lk, 0x22222222,
+                           [("message-type", lk.OFFER), ("server_id", "100.64.4.1"), "end"],
+                           yiaddr="100.64.4.60"),                                 # not an ACK
+], ids=["same-address", "wrong-chaddr", "non-ack"])
+def test_observed_peer_ack_ignored(lk, tmp_path, frame_factory):
+    # A peer ACK carrying no follow-worthy change (same address / not our chaddr / not an
+    # ACK) is dropped: no observation recorded and the maintain loop is not woken.
     keeper = _observe_keeper(lk, tmp_path)
-    keeper._on_dhcp_reply(_peer_ack(lk, "100.64.4.7"))     # same address -> no change
-    assert keeper._follow._observed is None
-    assert not _woken(keeper)
-
-
-def test_observed_ignores_wrong_chaddr(lk, tmp_path):
-    keeper = _observe_keeper(lk, tmp_path)
-    keeper._on_dhcp_reply(_peer_ack(lk, "100.64.4.60", chaddr=b"\xaa\xbb\xcc\xdd\xee\xff"))
-    assert keeper._follow._observed is None
-
-
-def test_observed_ignores_non_ack(lk, tmp_path):
-    keeper = _observe_keeper(lk, tmp_path)
-    keeper._on_dhcp_reply(_dhcp_frame(lk, 0x22222222,
-                                      [("message-type", lk.OFFER), ("server_id", "100.64.4.1"), "end"],
-                                      yiaddr="100.64.4.60"))
-    assert keeper._follow._observed is None
+    keeper._on_dhcp_reply(frame_factory(lk))
+    assert keeper._follow._observed is None and not _woken(keeper)
 
 
 def test_observed_ignored_when_not_follow(lk):
@@ -927,7 +927,7 @@ def test_enum_args_accept_unknown_value_without_argparse_rejection():
 # ---- follow across a changed gateway (cross-subnet renumber) ----
 
 def _ack_gw(lk, yiaddr, router, server="100.64.4.1", mask=None):
-    return lk.DhcpReply(5, yiaddr, server, 1800, None, None, router, None, mask)
+    return _reply(lk, lk.ACK, yiaddr, server=server, router=router, mask=mask)
 
 
 def test_follow_across_subnet_with_mask(lk, tmp_path, caplog):
@@ -1017,8 +1017,7 @@ def test_absorb_reply_captures_gw_and_mask(lk):
     # The PRL asks for opt 3 (router) + opt 1 (mask); _absorb_reply keeps both so
     # the BOUND log can surface them (and follow mode can use the mask).
     c = _client(lk)
-    rx = lk.DhcpReply(lk.ACK, "100.64.4.7", "100.64.4.1", 1800, None, None,
-                      "100.64.4.1", None, "255.255.255.0")
+    rx = _reply(lk, lk.ACK, "100.64.4.7", router="100.64.4.1", mask="255.255.255.0")
     c._absorb_reply(rx, lk.DEFAULT_LEASE)
     assert c.binding.router == "100.64.4.1"
     assert c.binding.mask_bits == 24
@@ -1029,8 +1028,7 @@ def test_renew_omits_server_id_and_requested_addr(lk):
     # requested_addr, and ciaddr MUST be the client's address.
     c = _client(lk)
     c.binding.server, c.binding.yiaddr, c.binding.lease_secs = "100.64.4.1", "100.64.4.7", 1800
-    c._wait_for_dhcp_reply = lambda want, timeout, *a: lk.DhcpReply(
-        lk.ACK, c.binding.yiaddr, c.binding.server, 1800, None, None, None)
+    c._wait_for_dhcp_reply = lambda want, timeout, *a: _reply(lk, lk.ACK, c.binding.yiaddr, server=c.binding.server)
     assert c.renew() is True   # RENEW (T1)
     assert c.renew(rebind=True) is True  # REBIND (T2)
     assert c.sent, "renew sent nothing"
@@ -1272,7 +1270,6 @@ def _run_to_shutdown(lk, monkeypatch, *, master, initial):
     # Run a stopped enforcing keeper straight to its shutdown path (real reconciler
     # over a FakeRoute) with the CARP role stubbed; return the FakeRoute so the caller
     # asserts whether the shutdown withdrew the default.
-    from test_route import FakeRoute  # noqa: E402  # pylint: disable=import-outside-toplevel
     monkeypatch.setattr(lk.time, "sleep", lambda *_a, **_k: None)
     fake = FakeRoute(initial=initial)
     monkeypatch.setattr(lk.subprocess, "run", fake.run)
@@ -1285,58 +1282,41 @@ def _run_to_shutdown(lk, monkeypatch, *, master, initial):
     return fake
 
 
-def test_shutdown_withdraws_default_when_not_master(lk, monkeypatch):
-    from test_route import GW as RGW  # noqa: E402  # pylint: disable=import-outside-toplevel
-    # Stopping a NON-master keeper relinquishes its default so it is not left in the
-    # FIB (and redistributed by FRR) with nothing managing it.
-    fake = _run_to_shutdown(lk, monkeypatch, master=False, initial=RGW)
-    assert "delete" in fake.verbs and fake.gw is None
+@pytest.mark.parametrize("master, expect_delete", [
+    (False, True),   # non-master relinquishes its default (not left in the FIB for FRR)
+    (True, False),   # master keeps it across a restart (else redistribute-kernel flaps 0/0)
+])
+def test_shutdown_withdraws_default_only_when_not_master(lk, monkeypatch, master, expect_delete):
+    fake = _run_to_shutdown(lk, monkeypatch, master=master, initial=RGW)
+    if expect_delete:
+        assert "delete" in fake.verbs and fake.gw is None
+    else:
+        assert fake.gw == RGW and "delete" not in fake.verbs
 
 
-def test_shutdown_keeps_default_when_master(lk, monkeypatch):
-    from test_route import GW as RGW  # noqa: E402  # pylint: disable=import-outside-toplevel
-    # A master keeps its default across a keeper restart (config change / upgrade):
-    # shutdown must NOT withdraw, else redistribute-kernel flaps 0/0 and the WAN blips
-    # until the restarted keeper re-adopts the lease.
-    fake = _run_to_shutdown(lk, monkeypatch, master=True, initial=RGW)
-    assert fake.gw == RGW and "delete" not in fake.verbs
-
-
-def test_withdraw_unless_master_withdraws_when_not_master(lk, monkeypatch):
-    # The fail-stop lives on the reconciler (no Keeper, no capture backend), so main()
-    # runs it BEFORE the backend preflight / arg checks -- any of which can exit before
-    # Keeper.run(). A crashed non-master predecessor's default is withdrawn here even
-    # when the backend can no longer load.
-    from test_route import FakeRoute, GW as RGW  # noqa: E402  # pylint: disable=import-outside-toplevel
-    fake = FakeRoute(initial=RGW)
-    monkeypatch.setattr(lk.subprocess, "run", fake.run)
-    lk.withdraw_unless_master(lk.DefaultRouteReconciler("enforce"),
-                              lk.BackupEgressReconciler("enforce"), lambda: False)
-    assert "delete" in fake.verbs and fake.gw is None
-
-
-def test_withdraw_unless_master_skips_when_master(lk, monkeypatch):
-    # A CARP master owns the default and re-adopts it in the maintain loop, so the
-    # fail-stop must NOT withdraw -- otherwise a keeper restart tears the master's
-    # default down before it is re-installed.
-    from test_route import FakeRoute, GW as RGW  # noqa: E402  # pylint: disable=import-outside-toplevel
-    fake = FakeRoute(initial=RGW)
-    monkeypatch.setattr(lk.subprocess, "run", fake.run)
-    lk.withdraw_unless_master(lk.DefaultRouteReconciler("enforce"),
-                              lk.BackupEgressReconciler("enforce"), lambda: True)
-    assert fake.gw == RGW and not fake.calls   # kept, no route(8) call at all
-
-
-def test_withdraw_unless_master_off_is_inert_without_probing(lk, monkeypatch):
-    # off never touches the FIB AND never even spawns the CARP probe (the reconciler
-    # short-circuits on `enabled` before calling `probe`).
-    from test_route import FakeRoute, GW as RGW  # noqa: E402  # pylint: disable=import-outside-toplevel
+@pytest.mark.parametrize("mode, probe_return, expect_delete", [
+    ("enforce", False, True),   # non-master: withdraw a crashed predecessor's default
+    ("enforce", True, False),   # master: keep it (probe ran, no FIB write)
+    ("off", None, False),       # off: inert, and the probe is never even spawned
+])
+def test_withdraw_unless_master_fail_stop(lk, monkeypatch, mode, probe_return, expect_delete):
+    # The startup fail-stop (module withdraw_unless_master, no Keeper/capture): a
+    # non-master withdraws, a master keeps, and off short-circuits on `enabled` before
+    # touching the FIB or even calling the CARP probe.
     fake = FakeRoute(initial=RGW)
     monkeypatch.setattr(lk.subprocess, "run", fake.run)
     probed = []
-    lk.withdraw_unless_master(lk.DefaultRouteReconciler("off"),
-                              lk.BackupEgressReconciler("off"), lambda: probed.append(1))
-    assert fake.gw == RGW and not fake.calls and not probed
+
+    def probe():
+        probed.append(1)
+        return probe_return
+    lk.withdraw_unless_master(lk.DefaultRouteReconciler(mode),
+                              lk.BackupEgressReconciler(mode), probe)
+    assert bool(probed) is (mode != "off")   # off never spawns the probe
+    if expect_delete:
+        assert "delete" in fake.verbs and fake.gw is None
+    else:
+        assert fake.gw == RGW and not fake.calls
 
 
 def test_split_prefixes_accepts_commas_and_whitespace():
@@ -1409,9 +1389,9 @@ def test_lease_router_reset_on_fresh_bind_without_option3(lk):
     # (the route reconciler installs from lease_router; a stale value would route
     # the new lease via the old, possibly wrong-subnet, gateway).
     c = _client(lk)
-    c.adopt(lk.DhcpReply(lk.ACK, "100.64.4.7", "100.64.4.1", 1800, None, None, "100.64.4.1"))
+    c.adopt(_reply(lk, lk.ACK, "100.64.4.7", router="100.64.4.1"))
     assert c.binding.lease_router == "100.64.4.1"
-    c.adopt(lk.DhcpReply(lk.ACK, "100.64.5.7", "100.64.5.1", 1800, None, None, None))  # new addr, no opt 3
+    c.adopt(_reply(lk, lk.ACK, "100.64.5.7", server="100.64.5.1"))  # new addr, no opt 3
     assert c.binding.lease_router is None      # reset -> reconciler withdraws, does not install stale
     assert c.binding.router == "100.64.4.1"    # the sticky nudge/log hint is untouched
 
@@ -1419,8 +1399,8 @@ def test_lease_router_reset_on_fresh_bind_without_option3(lk):
 def test_lease_router_kept_across_option3_less_renew(lk):
     # A RENEW of the SAME lease that omits option 3 keeps the current gateway.
     c = _client(lk)
-    c.adopt(lk.DhcpReply(lk.ACK, "100.64.4.7", "100.64.4.1", 1800, None, None, "100.64.4.1"))
-    c._absorb_reply(lk.DhcpReply(lk.ACK, "100.64.4.7", "100.64.4.1", 1800, None, None, None), 1800)
+    c.adopt(_reply(lk, lk.ACK, "100.64.4.7", router="100.64.4.1"))
+    c._absorb_reply(_reply(lk, lk.ACK, "100.64.4.7"), 1800)
     assert c.binding.lease_router == "100.64.4.1"
 
 
@@ -1431,8 +1411,8 @@ def test_failed_dora_clears_unconfirmed_offer(lk):
     c = _client(lk)
     c._ensure_sniffer = lambda: None
     replies = iter([
-        lk.DhcpReply(lk.OFFER, "100.64.4.7", "100.64.4.1", 1800, None, None, "100.64.4.1"),  # OFFER
-        lk.DhcpReply(lk.NAK, None, "100.64.4.1", None, None, None, None),                     # REQUEST -> NAK
+        _reply(lk, lk.OFFER, "100.64.4.7", router="100.64.4.1"),  # OFFER
+        _reply(lk, lk.NAK, lease=None),                     # REQUEST -> NAK
     ])
     c._wait_for_dhcp_reply = lambda want, timeout, *a: next(replies, None)
     assert c.dora("100.64.4.7") is False
@@ -1452,7 +1432,7 @@ def test_failed_dora_after_offer_timeout_clears_yiaddr(lk, monkeypatch):
         calls["n"] += 1
         # the first wait is the DISCOVER's OFFER; every REQUEST wait after it times out
         if calls["n"] == 1:
-            return lk.DhcpReply(lk.OFFER, "100.64.4.7", "100.64.4.1", 1800, None, None, "100.64.4.1")
+            return _reply(lk, lk.OFFER, "100.64.4.7", router="100.64.4.1")
         return None
     c._wait_for_dhcp_reply = reply
     assert c.dora("100.64.4.7") is False
@@ -1465,11 +1445,10 @@ def test_renew_keeps_lease_router_when_ack_omits_option3(lk):
     # would clear lease_router mid-lease -> reconcile sees gateway None -> withdraws
     # the default under a still-healthy master. Drives renew(), not _absorb_reply.
     c = _client(lk)
-    c.adopt(lk.DhcpReply(lk.ACK, "100.64.4.7", "100.64.4.1", 1800, None, None, "100.64.4.1"))
+    c.adopt(_reply(lk, lk.ACK, "100.64.4.7", router="100.64.4.1"))
     assert c.binding.lease_router == "100.64.4.1"
     c._ensure_sniffer = lambda: None
-    c._wait_for_dhcp_reply = lambda _want, _timeout, *a: lk.DhcpReply(
-        lk.ACK, "100.64.4.7", "100.64.4.1", 1800, None, None, None)   # same lease, no opt 3
+    c._wait_for_dhcp_reply = lambda _want, _timeout, *a: _reply(lk, lk.ACK, "100.64.4.7")   # same lease, no opt 3
     assert c.renew() is True
     assert c.binding.lease_router == "100.64.4.1"
 
@@ -1506,10 +1485,9 @@ def test_renew_nak_forgets_binding(lk):
     # forgotten so the caller withdraws the default and re-acquires, rather than
     # REBINDing an address the server refused. Hints stay for the re-DORA (expire()).
     c = _client(lk)
-    c.adopt(lk.DhcpReply(lk.ACK, "100.64.4.7", "100.64.4.1", 1800, None, None, "100.64.4.1"))
+    c.adopt(_reply(lk, lk.ACK, "100.64.4.7", router="100.64.4.1"))
     c._ensure_sniffer = lambda: None
-    c._wait_for_dhcp_reply = lambda _want, _timeout, *a: lk.DhcpReply(
-        lk.NAK, None, "100.64.4.1", None, None, None, None)
+    c._wait_for_dhcp_reply = lambda _want, _timeout, *a: _reply(lk, lk.NAK, lease=None)
     assert c.renew() is False
     assert c.binding.yiaddr is None          # forgotten -> reconcile withdraws, next step re-acquires
     assert c.binding.server == "100.64.4.1"  # hint kept

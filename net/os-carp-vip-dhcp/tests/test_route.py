@@ -6,112 +6,13 @@ tracks a single default nexthop plus the verbs issued, so tests assert both the
 resulting FIB and that idempotent / observe / off paths issue no mutation.
 
 Tests reach into private state by design; comments over per-test docstrings."""
-# pylint: disable=protected-access, missing-function-docstring, too-many-lines
+# pylint: disable=protected-access, missing-function-docstring
 import types
 
 import pytest
 
 from leasekeeper.route import BackupEgressConfig, BackupEgressForm, RouteCommand
-
-GW = "185.41.66.1"
-GW2 = "185.41.66.9"
-CGNAT_GW = "100.64.4.1"   # the production case: a 100.64/10 single-IP CGNAT WAN
-
-
-class FakeRoute:
-    """In-memory stand-in for /sbin/route + /usr/bin/netstat + /sbin/ifconfig: a
-    dest->nexthop table (dest 'default' or a CIDR), a verb log, and per-interface
-    (addr, prefixlen) for backup-egress peer derivation. `gw` is the default's
-    nexthop, kept as a property so the default-route tests read it unchanged."""
-
-    def __init__(self, initial=None, *, broken=(), lying=(),  # pylint: disable=too-many-arguments
-                 ifaces=None, netstat_fails=False, local_ips=()):
-        self.routes = {}
-        if initial is not None:
-            self.routes["default"] = initial
-        self.calls = []
-        self.broken = set(broken)  # verbs that fail with a genuine (non-benign) error
-        self.lying = set(lying)    # verbs that exit 0 but do NOT mutate the FIB
-        self.ifaces = dict(ifaces or {})   # iface -> (addr, prefixlen)
-        self.netstat_fails = netstat_fails  # netstat -rn exits non-zero (unreadable table)
-        self.local_ips = set(local_ips)     # addresses a `route get` resolves to lo0 (own IPs)
-
-    @property
-    def gw(self):
-        return self.routes.get("default")
-
-    @gw.setter
-    def gw(self, value):
-        if value is None:
-            self.routes.pop("default", None)
-        else:
-            self.routes["default"] = value
-
-    def run(self, cmd, **_kwargs):  # capture_output / errors / timeout -- ignored
-        self.calls.append(list(cmd))
-        prog = cmd[0]
-        if prog.endswith("netstat"):
-            if self.netstat_fails:
-                return self._reply(1, "", "netstat: routing table unavailable")
-            return self._reply(0, self._netstat_body())
-        if prog.endswith("ifconfig"):
-            return self._ifconfig(cmd[1])
-        return self._route(cmd)
-
-    def _route(self, cmd):
-        # ["/sbin/route","-n",verb,"-inet",dest[,gw]]; single return to keep the verb
-        # branches readable without tripping too-many-return-statements.
-        verb, dest = cmd[2], cmd[4]
-        rc, out, err = 0, "", ""
-        if verb in self.broken:  # a real failure: stuck route / bad socket, not a no-op
-            rc, err = 1, "route: writing to routing socket: permission denied"
-        elif verb == RouteCommand.GET:
-            if dest in self.routes:                 # a known route dest (e.g. "default")
-                out = f"   gateway: {self.routes[dest]}\n   interface: vlan0\n"
-            elif dest == "default":                 # no default installed
-                rc, err = 1, "route: not in table"
-            else:                                   # host lookup (used by _gateway_is_own):
-                iface = "lo0" if dest in self.local_ips else "vlan0"  # own IP resolves to lo0
-                out = f"   gateway: {dest}\n   interface: {iface}\n"
-        elif verb == RouteCommand.ADD:
-            if self.routes.get(dest) is not None:  # FreeBSD: add fails when it exists
-                rc, err = 1, "route: writing to routing socket: File exists"
-            elif verb not in self.lying:  # a lying add exits 0 but leaves the FIB unchanged
-                self.routes[dest] = cmd[-1]
-        elif verb == RouteCommand.CHANGE:
-            if self.routes.get(dest) is None:  # change fails when no route exists
-                rc, err = 1, "route: change: not in table"
-            else:
-                self.routes[dest] = cmd[-1]  # on-link swaps in place; off-link is broken={CHANGE}
-        elif verb == RouteCommand.DELETE:
-            existed = self.routes.pop(dest, None) is not None
-            rc, err = (0, "") if existed else (1, "not in table")
-        return self._reply(rc, out, err)
-
-    def _netstat_body(self):
-        lines = ["Routing tables", "", "Internet:",
-                 "Destination        Gateway            Flags     Netif"]
-        for dest, gw in self.routes.items():
-            shown = dest[:-3] if dest.endswith("/32") else dest  # FreeBSD prints host routes bare
-            lines.append(f"{shown}        {gw}        UGS       vlan0")
-        return "\n".join(lines) + "\n"
-
-    def _ifconfig(self, iface):
-        info = self.ifaces.get(iface)
-        if info is None:
-            return self._reply(1, "", f"ifconfig: interface {iface} does not exist")
-        addr, prefixlen = info
-        mask = (0xffffffff << (32 - prefixlen)) & 0xffffffff if prefixlen else 0
-        body = f"{iface}: flags=8843<UP>\n\tinet {addr} netmask 0x{mask:08x} broadcast 0.0.0.0\n"
-        return self._reply(0, body)
-
-    @staticmethod
-    def _reply(rc, out, err=""):
-        return types.SimpleNamespace(returncode=rc, stdout=out, stderr=err)
-
-    @property
-    def verbs(self):
-        return [c[2] for c in self.calls if c[0].endswith("route")]
+from fakes import CGNAT_GW, GW, GW2, FakeRoute
 
 
 def _fake(lk, monkeypatch, initial=None, **fake_kw):
@@ -244,13 +145,20 @@ def test_enforce_backup_absent_is_noop(lk, monkeypatch):
     assert fake.verbs == [RouteCommand.GET]  # nothing to withdraw
 
 
-def test_master_without_lease_withdraws_despite_sticky_gateway(lk, monkeypatch):
-    # bound=False even though a (sticky) gateway is still known: must not keep
-    # the default -- this is the MasterNoLease fail-stop.
+@pytest.mark.parametrize("is_master, bound, gateway", [
+    (True, False, GW),        # master but no lease -- a sticky gateway lingers (MasterNoLease fail-stop)
+    (True, True, "0.0.0.0"),  # master+bound but an unusable gateway it cannot honour
+    (True, True, None),       # bound but no router option -- _sane_ipv4(None) must be handled, not raise
+    (None, False, None),      # unreadable role, unbound -- withdraw now, not after the strike tolerance
+    (None, True, "0.0.0.0"),  # unreadable role, unusable gateway -- same immediate withdraw
+])
+def test_reconcile_withdraws_existing_default(lk, monkeypatch, is_master, bound, gateway):
+    # Every one of these states cannot back a default, so an existing one is withdrawn.
+    # The two unreadable-role rows withdraw immediately (the strike tolerance is reserved
+    # for a bound node that might still legitimately be master).
     rec, fake = _rec(lk, monkeypatch, "enforce", initial=GW)
-    rec.reconcile(True, False, GW)
-    assert fake.gw is None
-    assert RouteCommand.DELETE in fake.verbs
+    rec.reconcile(is_master, bound, gateway)
+    assert fake.gw is None and RouteCommand.DELETE in fake.verbs
 
 
 # ---- unreadable role: fail-safe install, fail-closed withdraw ----
@@ -272,24 +180,6 @@ def test_unreadable_role_withdraws_after_strike_limit(lk, monkeypatch):
     rec.reconcile(None, True, GW)     # third strike -> fail closed
     assert fake.gw is None
     assert RouteCommand.DELETE in fake.verbs
-
-
-def test_unreadable_role_but_unbound_withdraws_immediately(lk, monkeypatch):
-    # Role unreadable AND no lease held: nothing to be master of, so withdraw at
-    # once instead of holding the default through the strike tolerance (which is
-    # reserved for a bound node that might still legitimately be master).
-    rec, fake = _rec(lk, monkeypatch, "enforce", initial=GW, unreadable_role_strikes=3)
-    rec.reconcile(None, False, None)   # probe failed, but we hold no lease
-    assert fake.gw is None             # withdrawn on the first call, not after 3 strikes
-    assert RouteCommand.DELETE in fake.verbs
-
-
-def test_unreadable_role_with_unusable_gateway_withdraws_immediately(lk, monkeypatch):
-    # Same: an unusable (0.0.0.0) gateway is not a lease to be master of, so an
-    # unreadable role does not earn the strike tolerance -- withdraw now.
-    rec, fake = _rec(lk, monkeypatch, "enforce", initial=GW, unreadable_role_strikes=3)
-    rec.reconcile(None, True, "0.0.0.0")
-    assert fake.gw is None and RouteCommand.DELETE in fake.verbs
 
 
 def test_definite_role_resets_strikes(lk, monkeypatch):
@@ -405,24 +295,21 @@ def test_mode_is_read_only(lk, monkeypatch):
         rec.mode = lk.DefaultRouteMode.ENFORCE  # set-once, no setter
 
 
-def test_default_route_mode_coerce(lk, caplog):
-    # Valid values (string or member) pass through; anything else is inert OFF + a warning,
-    # so a hand-edited config never activates a mode nor crash-loops the daemon.
-    assert lk.DefaultRouteMode.coerce("enforce") is lk.DefaultRouteMode.ENFORCE
-    assert lk.DefaultRouteMode.coerce(lk.DefaultRouteMode.OBSERVE) is lk.DefaultRouteMode.OBSERVE
+@pytest.mark.parametrize("enum, valid_str, str_member, id_member, fallback, warn_needle", [
+    ("DefaultRouteMode", "enforce", "ENFORCE", "OBSERVE", "OFF", "unknown default-route mode"),
+    ("BackupEgressForm", "prefixes", "PREFIXES", "SPLIT", "SPLIT", "unknown backup-egress form"),
+])
+def test_strenum_coerce(  # pylint: disable=too-many-arguments,too-many-positional-arguments
+        lk, caplog, enum, valid_str, str_member, id_member, fallback, warn_needle):
+    # coerce maps a valid string or member through unchanged; anything else falls back to a
+    # safe default (inert OFF / leak-safe SPLIT) with a warning, so a hand-edited config
+    # never activates an unintended value nor crash-loops the supervised daemon.
+    cls = getattr(lk, enum)
+    assert cls.coerce(valid_str) is getattr(cls, str_member)
+    assert cls.coerce(getattr(cls, id_member)) is getattr(cls, id_member)   # member in, member out
     with caplog.at_level("WARNING", logger="lease-keeper"):
-        assert lk.DefaultRouteMode.coerce("bogus") is lk.DefaultRouteMode.OFF
-    assert any("unknown default-route mode" in r.getMessage() for r in caplog.records)
-
-
-def test_backup_egress_form_coerce(lk, caplog):
-    # Same contract for the egress form: unrecognised -> leak-safe SPLIT + a warning
-    # (previously a bad value raised and crash-looped the supervised daemon).
-    assert lk.BackupEgressForm.coerce("prefixes") is lk.BackupEgressForm.PREFIXES
-    assert lk.BackupEgressForm.coerce(lk.BackupEgressForm.SPLIT) is lk.BackupEgressForm.SPLIT
-    with caplog.at_level("WARNING", logger="lease-keeper"):
-        assert lk.BackupEgressForm.coerce("bogus") is lk.BackupEgressForm.SPLIT
-    assert any("unknown backup-egress form" in r.getMessage() for r in caplog.records)
+        assert cls.coerce("bogus") is getattr(cls, fallback)
+    assert any(warn_needle in r.getMessage() for r in caplog.records)
 
 
 def test_strike_limit_must_be_positive(lk):
@@ -436,21 +323,6 @@ def test_bogus_gateway_is_not_installed(lk, monkeypatch):
     rec, fake = _rec(lk, monkeypatch, "enforce")
     rec.reconcile(True, True, "0.0.0.0")  # rogue / malformed option 3
     assert fake.gw is None and RouteCommand.ADD not in fake.verbs
-
-
-def test_bogus_gateway_withdraws_existing(lk, monkeypatch):
-    # master+bound but an unusable gateway must not KEEP a default it can't honour.
-    rec, fake = _rec(lk, monkeypatch, "enforce", initial=GW)
-    rec.reconcile(True, True, "0.0.0.0")
-    assert fake.gw is None and RouteCommand.DELETE in fake.verbs
-
-
-def test_bound_without_gateway_withdraws(lk, monkeypatch):
-    # a lease with no router option (gateway None) cannot back a default -> withdraw,
-    # and _sane_ipv4(None) must be handled, not raise.
-    rec, fake = _rec(lk, monkeypatch, "enforce", initial=GW)
-    rec.reconcile(True, True, None)
-    assert fake.gw is None and RouteCommand.DELETE in fake.verbs
 
 
 # ---- a genuine route-command failure is surfaced, not buried as a no-op ----
@@ -497,43 +369,22 @@ def _levels_for(caplog, needle):
     return [r.levelname for r in caplog.records if needle in r.getMessage()]
 
 
-def test_enforce_owning_heartbeat_states_at_info(lk, monkeypatch, caplog):
-    # a steady, already-correct master states ownership positively (not silence) at
-    # INFO on entry; the immediate per-tick repeat is throttled away.
-    rec, _ = _rec(lk, monkeypatch, "enforce", initial=GW)
+@pytest.mark.parametrize("mode, initial, reconcile_args, needle", [
+    ("enforce", GW, (True, True, GW), f"owning default via {GW}"),           # steady master owns
+    ("enforce", None, (False, True, GW), "no default held (CARP backup)"),   # backup names the reason
+    ("observe", None, (True, True, GW), "would install default"),            # observe would-install persists
+    ("observe", GW, (False, False, None), "would withdraw default"),         # observe would-withdraw persists
+])
+def test_reconcile_heartbeat_states_once_at_info(  # pylint: disable=too-many-arguments,too-many-positional-arguments
+        lk, monkeypatch, caplog, mode, initial, reconcile_args, needle):
+    # A steady decision states itself positively at INFO on entry (owning / no-default /
+    # would-install / would-withdraw), then the identical per-tick repeat is throttled
+    # away -- exactly one INFO line for the needle.
+    rec, _ = _rec(lk, monkeypatch, mode, initial=initial)
     with caplog.at_level("DEBUG", logger="lease-keeper"):
-        rec.reconcile(True, True, GW)   # already correct -> entry
-        rec.reconcile(True, True, GW)   # unchanged repeat -> throttled
-    assert _levels_for(caplog, f"owning default via {GW}") == ["INFO"]
-
-
-def test_enforce_no_default_heartbeat_names_reason(lk, monkeypatch, caplog):
-    # a backup that holds the (shared-vMAC) lease but is not master confirms it has
-    # correctly no default, with the reason, at INFO on entry (the repeat throttled).
-    rec, _ = _rec(lk, monkeypatch, "enforce")
-    with caplog.at_level("DEBUG", logger="lease-keeper"):
-        rec.reconcile(False, True, GW)
-        rec.reconcile(False, True, GW)
-    msgs = [r for r in caplog.records if "no default held (CARP backup)" in r.getMessage()]
-    assert [r.levelname for r in msgs] == ["INFO"]
-
-
-def test_observe_would_install_states_at_info(lk, monkeypatch, caplog):
-    # observe never writes the FIB, so the would-install condition persists every
-    # tick; log it once at INFO instead of forever (the repeat throttled).
-    rec, _ = _rec(lk, monkeypatch, "observe")
-    with caplog.at_level("DEBUG", logger="lease-keeper"):
-        rec.reconcile(True, True, GW)
-        rec.reconcile(True, True, GW)
-    assert _levels_for(caplog, "would install default") == ["INFO"]
-
-
-def test_observe_would_withdraw_states_at_info(lk, monkeypatch, caplog):
-    rec, _ = _rec(lk, monkeypatch, "observe", initial=GW)
-    with caplog.at_level("DEBUG", logger="lease-keeper"):
-        rec.reconcile(False, False, None)
-        rec.reconcile(False, False, None)
-    assert _levels_for(caplog, "would withdraw default") == ["INFO"]
+        rec.reconcile(*reconcile_args)
+        rec.reconcile(*reconcile_args)
+    assert _levels_for(caplog, needle) == ["INFO"]
 
 
 def test_reconcile_heartbeat_throttle_cycle(lk, monkeypatch, caplog):
@@ -595,17 +446,15 @@ def _becfg(**kw):
     return BackupEgressConfig(**kw)
 
 
-def test_backup_egress_disabled_is_inert(lk, monkeypatch):
-    # no backup_egress config -> the reconcile is a no-op, issues nothing.
-    rec, fake = _backup(lk, monkeypatch, "enforce")
-    rec.reconcile_backup_egress(False)
-    assert not fake.calls
-
-
-def test_backup_egress_off_mode_inert(lk, monkeypatch):
-    # off mode: even with the feature enabled, nothing runs.
-    rec, fake = _backup(lk, monkeypatch, "off", backup_egress=_becfg(gateway=BE_GW))
-    rec.reconcile_backup_egress(False)
+@pytest.mark.parametrize("mode, backup_egress, role", [
+    ("enforce", None, False),                  # feature not configured -> disabled
+    ("off", _becfg(gateway=BE_GW), False),     # off mode: even when configured, inert
+    ("enforce", _becfg(gateway=BE_GW), None),  # unreadable role (None) -> touch nothing
+])
+def test_backup_egress_inert(lk, monkeypatch, mode, backup_egress, role):
+    # No FIB calls at all when the reconcile must do nothing (disabled / off / unknown role).
+    rec, fake = _backup(lk, monkeypatch, mode, backup_egress=backup_egress)
+    rec.reconcile_backup_egress(role)
     assert not fake.calls
 
 
@@ -642,12 +491,6 @@ def test_backup_egress_idempotent_no_churn(lk, monkeypatch):
     mutations = [c for c in fake.calls[n:] if c[0].endswith("route")
                  and c[2] in (RouteCommand.ADD, RouteCommand.CHANGE, RouteCommand.DELETE)]
     assert fake.calls[n:] and not mutations
-
-
-def test_backup_egress_unknown_role_touches_nothing(lk, monkeypatch):
-    rec, fake = _backup(lk, monkeypatch, "enforce", backup_egress=_becfg(gateway=BE_GW))
-    rec.reconcile_backup_egress(None)
-    assert not fake.calls
 
 
 def test_backup_egress_derive_peer_on_ptp(lk, monkeypatch):
@@ -762,16 +605,22 @@ def test_backup_egress_observe_dry_run(lk, monkeypatch, caplog):
     assert any("would route backup egress" in r.getMessage() for r in caplog.records)
 
 
-def test_backup_egress_zero_prefix_dropped_under_enforce(lk, monkeypatch, caplog):
-    # a 0.0.0.0/0 inside a specific-prefix list is dropped under enforce (enforce owns
-    # the default); the other prefixes still install.
+@pytest.mark.parametrize("bad_prefix, warn_needle", [
+    ("0.0.0.0/0", "0.0.0.0/0 is owned by enforce"),   # enforce owns the default
+    ("not-an-ip", "ignoring invalid prefix"),          # not a network at all
+    ("2001:db8::/32", "non-IPv4 prefix"),              # FIB ops are IPv4-only (netstat/route -inet)
+])
+def test_backup_egress_prefix_dropped(lk, monkeypatch, caplog, bad_prefix, warn_needle):
+    # An unusable prefix in a PREFIXES list is dropped at validation (not retried every
+    # tick); the good prefix still installs and the drop is warned.
     rec, fake = _backup(lk, monkeypatch, "enforce",
                         backup_egress=_becfg(gateway=BE_GW, form=BackupEgressForm.PREFIXES,
-                                             prefixes=("0.0.0.0/0", "192.0.2.0/24")))
+                                             prefixes=(bad_prefix, "192.0.2.0/24")))
     with caplog.at_level("WARNING", logger="lease-keeper"):
         rec.reconcile_backup_egress(False)
-    assert "0.0.0.0/0" not in fake.routes and fake.routes.get("192.0.2.0/24") == BE_GW
-    assert any("0.0.0.0/0 is owned by enforce" in r.getMessage() for r in caplog.records)
+    assert fake.routes.get("192.0.2.0/24") == BE_GW
+    assert bad_prefix not in fake.routes
+    assert any(warn_needle in r.getMessage() for r in caplog.records)
 
 
 def test_backup_egress_specific_prefixes(lk, monkeypatch):
@@ -960,29 +809,6 @@ def test_backup_egress_resolve_rearms_warning(lk, monkeypatch, caplog):
         rec.reconcile_backup_egress(False)                 # warn #2
     warns = [r for r in caplog.records if "cannot read an IPv4 address" in r.getMessage()]
     assert len(warns) == 2
-
-
-def test_backup_egress_invalid_prefix_dropped(lk, monkeypatch, caplog):
-    rec, fake = _backup(lk, monkeypatch, "enforce",
-                        backup_egress=_becfg(gateway=BE_GW, form=BackupEgressForm.PREFIXES,
-                                             prefixes=("not-an-ip", "192.0.2.0/24")))
-    with caplog.at_level("WARNING", logger="lease-keeper"):
-        rec.reconcile_backup_egress(False)
-    assert fake.routes.get("192.0.2.0/24") == BE_GW
-    assert any("ignoring invalid prefix" in r.getMessage() for r in caplog.records)
-
-
-def test_backup_egress_ipv6_prefix_dropped(lk, monkeypatch, caplog):
-    # ip_network() accepts IPv6, but the FIB ops are IPv4-only (netstat/route -inet); a v6
-    # prefix must be dropped at validation rather than retried and failing every tick.
-    rec, fake = _backup(lk, monkeypatch, "enforce",
-                        backup_egress=_becfg(gateway=BE_GW, form=BackupEgressForm.PREFIXES,
-                                             prefixes=("2001:db8::/32", "192.0.2.0/24")))
-    with caplog.at_level("WARNING", logger="lease-keeper"):
-        rec.reconcile_backup_egress(False)
-    assert fake.routes.get("192.0.2.0/24") == BE_GW
-    assert "2001:db8::/32" not in fake.routes
-    assert any("non-IPv4 prefix" in r.getMessage() for r in caplog.records)
 
 
 def test_backup_egress_boundary_leaves_unowned_split_when_disabled(lk, monkeypatch):

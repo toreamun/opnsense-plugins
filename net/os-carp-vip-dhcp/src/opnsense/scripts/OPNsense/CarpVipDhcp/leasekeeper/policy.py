@@ -13,14 +13,14 @@ from .constants import (
     ARP_NUDGE_MIN, ArpOp, FOLLOW_RETRY_DEADLINE, MIN_FOLLOW_INTERVAL,
     NUDGE_FAIL_LOG_INTERVAL, Phase)
 from .util import (
-    _RateLimit, _atomic_write, _fs_safe, _mask_to_bits, _same_ip_class, _sane_ipv4)
+    _UNSET, _RateLimit, _atomic_write, _fs_safe, _mask_to_bits, _same_ip_class, _sane_ipv4)
 
 LOG = logging.getLogger(LOGGER_NAME)
 
-# "CARP-master value not supplied by the caller" sentinel: the maintain loop
+# _UNSET marks "CARP-master value not supplied by the caller": the maintain loop
 # passes the role it already probed this tick, but None is itself a valid probe
-# result (probe failed), so a distinct sentinel means "probe it yourself".
-_UNSET = object()
+# result (probe failed), so the sentinel means "probe it yourself". Shared via
+# util so the identity check is the same object everywhere (see util._UNSET).
 
 
 class ArpNudge:  # pylint: disable=too-many-instance-attributes

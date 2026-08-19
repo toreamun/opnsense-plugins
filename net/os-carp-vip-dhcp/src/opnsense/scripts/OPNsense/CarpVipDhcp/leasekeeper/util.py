@@ -12,6 +12,13 @@ import time
 
 MAC_RE = re.compile(r"^([0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}$")
 
+# Shared sentinel: a unique object distinct from every real value AND from None,
+# for the two places None is itself meaningful -- "argument not supplied" keyword
+# defaults (an optional CARP-role probe result) and "no state recorded yet"
+# markers. One canonical object so identity/equality checks agree across modules;
+# policy / route / keeper import it rather than each minting their own.
+_UNSET = object()
+
 
 class _RateLimit:
     """Monotonic-time throttle for noisy, possibly attacker-driven log lines.

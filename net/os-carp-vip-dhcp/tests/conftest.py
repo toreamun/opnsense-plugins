@@ -50,11 +50,23 @@ def lk():
         keeper, policy, route, util, wire)
 
     ns = types.SimpleNamespace()
-    for mod in (constants, util, wire, codec, capture,
-                capture_bpf, dhcpclient, policy, route, keeper):
-        for name in dir(mod):
-            if not name.startswith("__"):
-                setattr(ns, name, getattr(mod, name))
+    _flatten(ns, (constants, util, wire, codec, capture,
+                  capture_bpf, dhcpclient, policy, route, keeper))
     ns.subprocess = subprocess
     ns.time = time
     return ns
+
+
+def _flatten(ns, mods):
+    """Copy every public name from each module in `mods` onto `ns`, in order.
+    Guards the flatten: a name already bound to a DIFFERENT object means two
+    submodules define distinct symbols under one name and the facade would
+    silently expose only the last (re-exports -- the same object imported into
+    several modules -- are expected and fine)."""
+    for mod in mods:
+        for name in dir(mod):
+            if name.startswith("__"):
+                continue
+            val = getattr(mod, name)
+            assert getattr(ns, name, val) is val, f"lk facade name collision: {name}"
+            setattr(ns, name, val)

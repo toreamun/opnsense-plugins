@@ -22,7 +22,7 @@ from .dhcpclient import DhcpClient, DhcpHooks
 from .policy import ArpNudge, FollowHooks, FollowPolicy
 from .route import (BackupEgressReconciler, DefaultRouteMode, DefaultRouteReconciler,
                     withdraw_unless_master)
-from .util import _RateLimit, _atomic_write, _clock_at, _jittered, _sane_ipv4
+from .util import _UNSET, _RateLimit, _atomic_write, _clock_at, _jittered, _sane_ipv4
 from .wire import _parse_reply
 
 LOG = logging.getLogger(LOGGER_NAME)
@@ -34,10 +34,9 @@ CARP_MASTER_FMT = "carp: MASTER vhid {vhid} "
 IFCONFIG_STATUS_ACTIVE = "status: active"    # carrier up
 IFCONFIG_STATUS = "status: "                 # any status line present (up or down)
 
-# "CARP-master value not supplied" sentinel: the maintain loop probes the role
-# once per tick and shares it, but None is a valid probe result, so a distinct
-# sentinel means "probe it now".
-_UNSET = object()
+# _UNSET (shared, from util) marks "CARP-master value not supplied": the maintain
+# loop probes the role once per tick and shares it, but None is a valid probe
+# result, so the sentinel means "probe it now".
 
 
 def _ifconfig_text(iface):

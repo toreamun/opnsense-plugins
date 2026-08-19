@@ -32,7 +32,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 from .constants import LOGGER_NAME, RECONCILE_HEARTBEAT_INTERVAL
-from .util import _RateLimit, _sane_ipv4
+from .util import _UNSET, _RateLimit, _sane_ipv4
 
 LOG = logging.getLogger(LOGGER_NAME)
 
@@ -136,11 +136,11 @@ class RouteCommand(StrEnum):
 # leak to gate.
 _DEFAULT = "default"
 
-# Sentinel for "no desired state recorded yet". The first reconcile then reads as
-# a change, so the entry state (owning / no default / would-install / ...) is
-# logged once at INFO -- the mode-entry heartbeat -- and every unchanged repeat
-# after it drops to DEBUG, keeping steady state out of the default INFO view.
-_UNSET = object()
+# _UNSET (shared, from util) marks "no desired state recorded yet". The first
+# reconcile then reads as a change, so the entry state (owning / no default /
+# would-install / ...) is logged once at INFO -- the mode-entry heartbeat -- and
+# every unchanged repeat after it drops to DEBUG, keeping steady state out of the
+# default INFO view.
 
 # Consecutive unreadable CARP-role probes tolerated while we still hold a
 # default before we withdraw it. An unreadable probe (ifconfig failed) is

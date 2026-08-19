@@ -154,22 +154,22 @@ def iface_names():
     return names
 
 
-def read_keepers(states, names):
+def read_keepers(states, names, conffile=CONFFILE, run_dir=RUN_DIR):
     """One status entry per keeper.conf line: config, process, CARP role and
-    heartbeat fields, plus the derived arp_confirmed freshness flag."""
+    heartbeat fields, plus the derived arp_confirmed freshness flag. conffile /
+    run_dir default to the production paths and are parameters so a caller (a
+    test) can point them at a fixture directory without mutating module state."""
     keepers = []
-    for rec in keeper_records(CONFFILE):
+    for rec in keeper_records(conffile):
         # Fields are keyed by name (see keeperconf.keeper_records); a missing key
         # falls back to its default here.
         request = rec.get("request", "")
         iface = rec.get("iface", "")
         chaddr = rec.get("chaddr", "")
-        demote = rec.get("demote", "0")
         vhid = rec.get("vhid", "")
-        follow = rec.get("follow", "0")
         arp_nudge = _int_token(rec.get("arpnudge", "")) or 0
         kid = keeper_id(request)
-        pid = pid_alive(f"{RUN_DIR}/carpvipdhcp-{kid}.pid")
+        pid = pid_alive(f"{run_dir}/carpvipdhcp-{kid}.pid")
         entry = {
             "request": request,
             "iface": iface,
@@ -177,13 +177,13 @@ def read_keepers(states, names):
             "chaddr": chaddr,
             "vhid": vhid,
             "carp_state": states.get(vhid) if vhid else None,
-            "demote_on_lease_loss": demote == "1",
-            "follow_ip": follow == "1",
+            "demote_on_lease_loss": rec.get("demote", "0") == "1",
+            "follow_ip": rec.get("follow", "0") == "1",
             "arp_nudge": arp_nudge,
             "running": pid is not None,
             "pid": pid,
         }
-        entry.update(parse_heartbeat(f"{RUN_DIR}/carpvipdhcp-{kid}.hb"))
+        entry.update(parse_heartbeat(f"{run_dir}/carpvipdhcp-{kid}.hb"))
         age = entry.get("arp_reply_age")
         entry["arp_confirmed"] = (
             age is not None and age <= max(ARP_CONFIRM_FLOOR, arp_nudge * ARP_CONFIRM_INTERVALS))

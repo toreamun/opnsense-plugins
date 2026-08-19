@@ -67,14 +67,12 @@ def test_parse_heartbeat_without_nudge_tokens():
     assert result["nudge_age"] is None
 
 
-def test_read_keepers_arp_nudge_field(tmp_path, monkeypatch):
+def test_read_keepers_arp_nudge_field(tmp_path):
     conf = tmp_path / "keeper.conf"
     conf.write_text(
         "request=100.64.4.7|iface=eth0|chaddr=00:00:5e:00:01:fe|demote=0|vhid=254|follow=1|arpnudge=240\n"
         "request=100.64.4.8|iface=eth0|chaddr=00:00:5e:00:01:fd|demote=0|vhid=253|follow=1\n")  # no arpnudge key
-    monkeypatch.setattr(status, "CONFFILE", str(conf))
-    monkeypatch.setattr(status, "RUN_DIR", str(tmp_path))
-    keepers = status.read_keepers({}, {})
+    keepers = status.read_keepers({}, {}, conffile=str(conf), run_dir=str(tmp_path))
     assert keepers[0]["arp_nudge"] == 240
     assert keepers[1]["arp_nudge"] == 0
 
@@ -85,21 +83,20 @@ def _write_hb(path, arpok_age, now):
         f" nudge={now - 5} arpok={now - arpok_age} gw=100.64.4.1\n")
 
 
-def test_read_keepers_arp_confirmed_fresh_and_stale(tmp_path, monkeypatch):
+def test_read_keepers_arp_confirmed_fresh_and_stale(tmp_path):
     now = int(time.time())
     conf = tmp_path / "keeper.conf"
     conf.write_text(
         "request=100.64.4.7|iface=eth0|chaddr=00:00:5e:00:01:fe|demote=0|vhid=254|follow=1|arpnudge=240\n"  # fresh
         "request=100.64.4.8|iface=eth0|chaddr=00:00:5e:00:01:fd|demote=0|vhid=253|follow=1|arpnudge=240\n"  # stale
         "request=100.64.4.9|iface=eth0|chaddr=00:00:5e:00:01:fc|demote=0|vhid=252|follow=1|arpnudge=240\n")  # no reply
-    monkeypatch.setattr(status, "CONFFILE", str(conf))
-    monkeypatch.setattr(status, "RUN_DIR", str(tmp_path))
     _write_hb(tmp_path / "carpvipdhcp-100_64_4_7.hb", 5, now)       # 5s ago -> fresh
     _write_hb(tmp_path / "carpvipdhcp-100_64_4_8.hb", 5000, now)    # 5000s ago -> stale
     (tmp_path / "carpvipdhcp-100_64_4_9.hb").write_text(
         f"{now} bound=100.64.4.9 lease=1800 t1=900 t2=1575 src=derived"
         f" nudge={now - 5} arpok=0 gw=100.64.4.1\n")   # arpok=0 -> never
-    by_ip = {k["request"]: k for k in status.read_keepers({}, {})}
+    by_ip = {k["request"]: k
+             for k in status.read_keepers({}, {}, conffile=str(conf), run_dir=str(tmp_path))}
     assert by_ip["100.64.4.7"]["arp_confirmed"] is True
     assert by_ip["100.64.4.8"]["arp_confirmed"] is False
     assert by_ip["100.64.4.9"]["arp_confirmed"] is False

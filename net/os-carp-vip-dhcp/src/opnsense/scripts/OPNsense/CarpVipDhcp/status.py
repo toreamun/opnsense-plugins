@@ -81,18 +81,14 @@ _HB_TOKENS = {
 }
 
 
-def parse_heartbeat(path):
-    """Parse one heartbeat file into the per-keeper status fields (all None /
-    False when the file is absent or unreadable)."""
+def parse_heartbeat_text(raw):
+    """Parse heartbeat text into the per-keeper status fields (all None / False
+    when the text is empty or malformed) -- the pure parser, no file IO
+    (parse_heartbeat reads the file)."""
     result = {"bound": None, "lease": None, "t1": None, "t2": None, "timing_source": None,
               "mismatch": False, "mismatch_got": None, "mismatch_want": None,
               "hb_epoch": None, "hb_age": None, "nudge_epoch": None, "nudge_age": None, "gw": None,
               "arp_reply_epoch": None, "arp_reply_age": None}
-    try:
-        with open(path, encoding="utf-8") as f:
-            raw = f.read().strip()
-    except OSError:
-        return result
     parts = raw.split()
     if not parts:
         return result
@@ -112,6 +108,18 @@ def parse_heartbeat(path):
             fields, parse = spec
             result.update(zip(fields, parse(value)))
     return result
+
+
+def parse_heartbeat(path):
+    """Parse one heartbeat file into the per-keeper status fields (all None /
+    False when the file is absent or unreadable); parsing lives in
+    parse_heartbeat_text."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            raw = f.read()
+    except OSError:
+        raw = ""
+    return parse_heartbeat_text(raw)
 
 
 def carp_states():

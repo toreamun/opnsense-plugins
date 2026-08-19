@@ -27,43 +27,37 @@ def _load_keeperconf():
 keeperconf = _load_keeperconf()
 
 
-def _records(tmp_path, text):
-    conf = tmp_path / "keeper.conf"
-    conf.write_text(text)
-    return list(keeperconf.keeper_records(str(conf)))
+def _records(text):
+    return list(keeperconf.keeper_records_text(text))
 
 
-def test_fields_are_keyed_by_name_not_position(tmp_path):
+def test_fields_are_keyed_by_name_not_position():
     recs = _records(
-        tmp_path,
         "request=100.64.0.7|iface=eth0|chaddr=00:00:5e:00:01:fe|vhid=254\n")
     assert recs == [{
         "request": "100.64.0.7", "iface": "eth0",
         "chaddr": "00:00:5e:00:01:fe", "vhid": "254"}]
 
 
-def test_field_order_does_not_matter(tmp_path):
+def test_field_order_does_not_matter():
     recs = _records(
-        tmp_path,
         "vhid=254|chaddr=aa|iface=eth0|request=100.64.0.7\n")
     assert recs[0] == {
         "request": "100.64.0.7", "iface": "eth0", "chaddr": "aa", "vhid": "254"}
 
 
-def test_unknown_key_is_kept_but_harmless_and_missing_key_absent(tmp_path):
+def test_unknown_key_is_kept_but_harmless_and_missing_key_absent():
     # An added/unknown key round-trips into the dict; a caller reads only the
     # keys it knows and defaults the rest. An empty value stays an empty string.
     recs = _records(
-        tmp_path,
         "request=100.64.0.7|newfield=x|vendorclass=\n")
     assert recs[0]["newfield"] == "x"
     assert recs[0]["vendorclass"] == ""
     assert "arpnudge" not in recs[0]
 
 
-def test_lines_without_request_and_comments_are_skipped(tmp_path):
+def test_lines_without_request_and_comments_are_skipped():
     recs = _records(
-        tmp_path,
         "# a comment\n"
         "iface=eth0|chaddr=aa\n"          # no request key -> skipped
         "request=|iface=eth0\n"           # empty request value -> skipped
@@ -73,6 +67,7 @@ def test_lines_without_request_and_comments_are_skipped(tmp_path):
 
 
 def test_missing_file_yields_nothing(tmp_path):
+    # the file-reading wrapper: an absent/unreadable file yields nothing.
     assert not list(keeperconf.keeper_records(str(tmp_path / "absent.conf")))
 
 

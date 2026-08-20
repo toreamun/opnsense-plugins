@@ -10,10 +10,9 @@ def test_keeper_id():
     assert status.keeper_id("00:00:5e:00:01:fe") == "00_00_5e_00_01_fe"
 
 
-def test_parse_heartbeat_bound(tmp_path):
-    hb = tmp_path / "hb"
-    hb.write_text("1783350773 bound=100.64.4.7 lease=1800 t1=900 t2=1575 src=derived\n")
-    result = status.parse_heartbeat(str(hb))
+def test_parse_heartbeat_bound():
+    result = status.parse_heartbeat_text(
+        "1783350773 bound=100.64.4.7 lease=1800 t1=900 t2=1575 src=derived\n")
     assert result["bound"] == "100.64.4.7"
     assert result["lease"] == 1800
     assert result["t1"] == 900
@@ -22,30 +21,27 @@ def test_parse_heartbeat_bound(tmp_path):
     assert not result["mismatch"]
 
 
-def test_parse_heartbeat_unbound(tmp_path):
-    hb = tmp_path / "hb"
-    hb.write_text("1783350773 bound=- lease=1800 t1=900 t2=1575 src=derived\n")
-    assert status.parse_heartbeat(str(hb))["bound"] is None
+def test_parse_heartbeat_unbound():
+    text = "1783350773 bound=- lease=1800 t1=900 t2=1575 src=derived\n"
+    assert status.parse_heartbeat_text(text)["bound"] is None
 
 
-def test_parse_heartbeat_mismatch(tmp_path):
-    hb = tmp_path / "hb"
-    hb.write_text("1783350773 MISMATCH got=1.2.3.4 want=100.64.4.7\n")
-    result = status.parse_heartbeat(str(hb))
+def test_parse_heartbeat_mismatch():
+    result = status.parse_heartbeat_text("1783350773 MISMATCH got=1.2.3.4 want=100.64.4.7\n")
     assert result["mismatch"] is True
     assert result["mismatch_got"] == "1.2.3.4"
     assert result["mismatch_want"] == "100.64.4.7"
 
 
 def test_parse_heartbeat_missing(tmp_path):
+    # the file-reading wrapper: an absent file parses to the empty result.
     assert status.parse_heartbeat(str(tmp_path / "absent"))["bound"] is None
 
 
-def test_parse_heartbeat_nudge_and_arpok(tmp_path):
-    hb = tmp_path / "hb"
-    hb.write_text("1783350773 bound=100.64.4.7 lease=1800 t1=900 t2=1575 src=derived"
-                  " nudge=1783350700 arpok=1783350710 gw=100.64.4.1\n")
-    result = status.parse_heartbeat(str(hb))
+def test_parse_heartbeat_nudge_and_arpok():
+    result = status.parse_heartbeat_text(
+        "1783350773 bound=100.64.4.7 lease=1800 t1=900 t2=1575 src=derived"
+        " nudge=1783350700 arpok=1783350710 gw=100.64.4.1\n")
     assert result["nudge_epoch"] == 1783350700
     assert isinstance(result["nudge_age"], int) and result["nudge_age"] > 0
     assert result["arp_reply_epoch"] == 1783350710
@@ -53,11 +49,10 @@ def test_parse_heartbeat_nudge_and_arpok(tmp_path):
     assert result["gw"] == "100.64.4.1"
 
 
-def test_parse_heartbeat_nudge_and_arpok_zero(tmp_path):
-    hb = tmp_path / "hb"
-    hb.write_text("1783350773 bound=100.64.4.7 lease=1800 t1=900 t2=1575 src=derived"
-                  " nudge=0 arpok=0\n")
-    result = status.parse_heartbeat(str(hb))
+def test_parse_heartbeat_nudge_and_arpok_zero():
+    result = status.parse_heartbeat_text(
+        "1783350773 bound=100.64.4.7 lease=1800 t1=900 t2=1575 src=derived"
+        " nudge=0 arpok=0\n")
     assert result["nudge_epoch"] == 0
     assert result["nudge_age"] is None
     assert result["arp_reply_epoch"] == 0
@@ -65,10 +60,9 @@ def test_parse_heartbeat_nudge_and_arpok_zero(tmp_path):
     assert result["gw"] is None
 
 
-def test_parse_heartbeat_without_nudge_tokens(tmp_path):
-    hb = tmp_path / "hb"
-    hb.write_text("1783350773 bound=100.64.4.7 lease=1800 t1=900 t2=1575 src=derived\n")
-    result = status.parse_heartbeat(str(hb))
+def test_parse_heartbeat_without_nudge_tokens():
+    result = status.parse_heartbeat_text(
+        "1783350773 bound=100.64.4.7 lease=1800 t1=900 t2=1575 src=derived\n")
     assert result["nudge_epoch"] is None
     assert result["nudge_age"] is None
 

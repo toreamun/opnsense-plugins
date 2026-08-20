@@ -14,20 +14,15 @@ def keeper_id(request_ip):
     return re.sub(r"[^A-Za-z0-9]", "_", request_ip)
 
 
-def keeper_records(path):
-    """Yield each active (non-comment) keeper.conf line as a {key: value} dict.
+def keeper_records_text(text):
+    """Yield each active (non-comment) keeper.conf line in `text` as a {key: value}
+    dict -- the pure parser, with no file IO (keeper_records reads the file).
 
     Each line is a pipe-separated list of KEY=VALUE fields in no fixed order (see
     the template); we dispatch by key, so a missing key is simply absent from the
     dict and the caller supplies its default. Lines without a request= field are
-    skipped, mirroring the rc.d reader. Yields nothing when the file is absent or
-    unreadable."""
-    try:
-        with open(path, encoding="utf-8") as f:
-            lines = f.read().splitlines()
-    except OSError:
-        return
-    for line in lines:
+    skipped, mirroring the rc.d reader."""
+    for line in text.splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
             continue
@@ -38,3 +33,14 @@ def keeper_records(path):
                 record[key] = value
         if record.get("request"):
             yield record
+
+
+def keeper_records(path):
+    """Yield each active keeper.conf record from the file at `path`. Yields nothing
+    when the file is absent or unreadable; the parsing lives in keeper_records_text."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+    except OSError:
+        return
+    yield from keeper_records_text(text)

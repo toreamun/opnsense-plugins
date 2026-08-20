@@ -9,7 +9,7 @@
         <id>keeper.carpVip</id>
         <label>CARP virtual IP</label>
         <type>dropdown</type>
-        <help>The CARP VirtualIP to keep a lease for. Interface, VHID (chaddr) and IP are derived from it.</help>
+        <help>The CARP virtual IP to keep a lease for. Interface, VHID and IP are derived from it; the DHCP client MAC (chaddr) is the CARP virtual MAC for that VHID, so the lease follows the VIP to the peer on failover.</help>
     </field>
     <field>
         <id>keeper.followIp</id>
@@ -79,7 +79,7 @@
         <label>ARP nudge interval (s)</label>
         <type>text</type>
         <advanced>true</advanced>
-        <help><![CDATA[Periodically broadcast an ARP request from the VIP (with its CARP MAC) for the upstream gateway, so the gateway's ARP entry for the VIP never expires. Use when the upstream ignores gratuitous ARP and never re-ARPs an expired entry — the symptom is that traffic NATed to the VIP works right after a CARP event or DHCP exchange, then silently blackholes some minutes later (outbound packets leave, nothing returns). Only sent while this node is CARP master for the VIP. Default: 120 (on) — one broadcast ARP per interval; lower toward the 30 s floor if a short-ARP-timeout gateway still blackholes the VIP between nudges. Setting 0 disables the nudge entirely: the periodic nudge, the automatic nudge on CARP failover AND the manual nudge button on the status page (the early lease renew on failover is unaffected).]]></help>
+        <help><![CDATA[Periodically broadcast an ARP request from the VIP (with its CARP virtual MAC) for the upstream gateway, so the gateway's ARP entry for the VIP never expires. Use when the upstream ignores gratuitous ARP and never re-ARPs an expired entry. The symptom is that traffic NATed to the VIP works right after a CARP event or DHCP exchange, then silently blackholes some minutes later (outbound packets leave, nothing returns). Only sent while this node is CARP master for the VIP. Default: 120 (on), one broadcast ARP per interval; lower toward the 30 s floor if a short-ARP-timeout gateway still blackholes the VIP between nudges. Setting 0 disables the nudge entirely: the periodic nudge, the automatic nudge on CARP failover AND the manual nudge button on the status page (the early lease renew on failover is unaffected).]]></help>
     </field>
     <field>
         <id>keeper.arpListenPromisc</id>
@@ -90,10 +90,10 @@
     </field>
     <field>
         <id>keeper.chaddrOverride</id>
-        <label>chaddr override</label>
+        <label>Client MAC override (chaddr)</label>
         <type>text</type>
         <advanced>true</advanced>
-        <help><![CDATA[Only if the ISP reservation MAC differs from the CARP virtual MAC. Empty = use the derived CARP MAC.]]></help>
+        <help><![CDATA[Leave blank. By default the keeper's DHCP client uses the CARP virtual MAC, which is what you want: the lease, the ISP's IP-to-MAC binding and the VIP's own outbound traffic all sit on one MAC, and the lease follows the VIP to the peer on failover. Override ONLY if your ISP has a fixed reservation bound to a specific, different MAC that you cannot change. Do NOT enter this node's own interface MAC: the VIP still sends from the CARP virtual MAC, so on an ISP that binds the leased IP to the MAC (IP source guard) the gateway becomes unreachable ("No route to host"). Empty = the derived CARP virtual MAC.]]></help>
     </field>
     <field>
         <id>keeper.vendorClass</id>

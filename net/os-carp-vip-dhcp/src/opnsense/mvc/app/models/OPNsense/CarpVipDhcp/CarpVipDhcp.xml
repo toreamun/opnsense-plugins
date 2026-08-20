@@ -21,7 +21,9 @@
                     <ValidationMessage>Select a CARP virtual IP.</ValidationMessage>
                 </carpVip>
 
-                <!-- Override the chaddr when the ISP reservation MAC differs from the CARP MAC. -->
+                <!-- DHCP client MAC. Blank (default) = the derived CARP virtual MAC, which HA
+                     needs; override only when the ISP reservation is bound to a specific
+                     different MAC that cannot be changed. See the field help. -->
                 <chaddrOverride type="MacAddressField">
                     <Required>N</Required>
                 </chaddrOverride>

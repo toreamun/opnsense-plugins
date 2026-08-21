@@ -190,7 +190,7 @@ class FollowPolicy:  # pylint: disable=too-many-instance-attributes
         except OSError as e:
             LOG.warning("could not persist follow timestamp: %s", e)
 
-    def on_changed_address(self, got, rx, phase, release_on_enforce):
+    def on_changed_address(self, got, rx, phase, release_on_enforce):  # pylint: disable=too-many-return-statements
         """An ACK arrived whose address differs from the one we hold/request.
 
         In follow mode: validate the address (sane, same routability class, from
@@ -242,11 +242,24 @@ class FollowPolicy:  # pylint: disable=too-many-instance-attributes
                               "interface prefix + System->Gateways by hand", self.target,
                               got, old_router, rx.router)
 
-            self._record_follow()
             # _follow_update reads target as the old address, so remember it
             # (for the retry watchdog) and fire before overwriting target.
             self._attempt.follow_from = self.target
-            self._follow_update(got)
+            if not self._follow_update(got):
+                # The dispatch could not even be launched (e.g. fork/exec failure).
+                # Do NOT advance the target, adopt the binding, or arm the throttle
+                # below: leaving all three untouched means the next renewal ACK for
+                # `got` re-enters here and re-drives the follow promptly. The
+                # throttle is only for real, dispatched follows (a spoof/flap
+                # storm), so a never-dispatched attempt must not delay its own
+                # retry. Advancing would strand the daemon on `got` with the CARP
+                # VIP config still on the old address and no way to re-fire.
+                return False
+            # A real follow was dispatched: arm the spoof-storm throttle now (only
+            # on success -- arming before the dispatch would make a failed launch
+            # throttle its own retry). Persisted so it survives the follow-induced
+            # restart.
+            self._record_follow()
             self.target = got
             self._dhcp.adopt(rx)
             return True
@@ -264,17 +277,23 @@ class FollowPolicy:  # pylint: disable=too-many-instance-attributes
     def _follow_update(self, new_ip):
         """Ask configd to rewrite the CARP VIP (and this keeper's reference) from
         the target to new_ip, then reconfigure. Fire-and-forget: the resulting
-        service restart replaces this daemon with one bound to the new address."""
+        service restart replaces this daemon with one bound to the new address.
+        Returns True once the request was dispatched (or was already asked for),
+        False if the dispatch failed -- launch failure or any other exception from
+        the dispatch hook -- in which case the caller defers without advancing the
+        target, so the next renewal re-drives (see on_changed_address)."""
         if new_ip == self._attempt.followed_ip:
-            return   # already asked for this address
+            return True   # already asked for this address
         try:
             self._fire_follow_update(self.target, new_ip)
             # Only mark as handled once the request was actually dispatched, so a
-            # spawn failure is retried next cycle instead of getting stuck.
+            # dispatch that could not be launched is retried, not latched.
             self._attempt.followed_ip = new_ip
             LOG.info("requested CARP VIP update %s -> %s", self.target, new_ip)
+            return True
         except Exception as e:  # pylint: disable=broad-exception-caught
-            LOG.error("follow_update request failed: %s", e)
+            LOG.error("follow_update request failed: %s -- deferring to the next renewal", e)
+            return False
 
     def _fire_follow_update(self, old_ip, new_ip):
         """Dispatch the follow_update side effect (old -> new, plus any

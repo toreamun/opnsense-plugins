@@ -1,7 +1,8 @@
 # Backup egress: internet for the non-master node
 
 Companion to the default-route-by-CARP-role feature (`Own default route by CARP
-role` = observe/enforce). That feature makes the keeper own the WAN default as a
+role` = observe/enforce; see also the [single-IP WAN CARP guide](single-ip-wan-carp.md),
+sections 8-9, for how this fits the overall failover topology). That feature makes the keeper own the WAN default as a
 function of CARP role: the master installs `0.0.0.0/0`, every other state has
 none (fail-stop). A direct consequence is that **the CARP backup node has no
 route to the internet for its own traffic** (pkg/firmware updates, NTP, DNS,
@@ -179,13 +180,13 @@ active locally, so the recommended VIP gateway is not caught by this guard.
 
 ## Config fields
 
-| Field | Meaning |
+| Field (GUI label) | Meaning |
 |---|---|
-| Enable backup egress | Off by default. Turn on to give the backup node egress via the master. |
-| Route form | `/1`-split (default, full internet, leak-safe) or specific prefixes. |
-| Gateway | A stable next hop that means "the master": a CARP VIP (recommended) or a separate uplink gateway. Leave blank to derive the peer from an interface. |
-| Interface | Used only to derive the `/30`/`/31` peer when Gateway is blank. Ignored when a Gateway is set (the route uses the gateway's own on-link interface). |
-| Prefixes | For the specific-prefixes form: IPv4 CIDRs separated by comma or space. |
+| Backup egress (internet while not master) | Off by default. Turn on to give the backup node egress via the master. |
+| Backup egress route form | `/1`-split (default, full internet, leak-safe) or specific prefixes. |
+| Backup egress gateway | A stable next hop that means "the master": a CARP VIP (recommended) or a separate uplink gateway. Leave blank to derive the peer from an interface. |
+| Backup egress interface (for auto-derive) | Used only to derive the `/30`/`/31` peer when the gateway is blank. Ignored when a gateway is set (the route uses the gateway's own on-link interface). |
+| Backup egress prefixes | For the specific-prefixes form: IPv4 CIDRs separated by comma or space. |
 
 ## Leak-safety guardrail
 

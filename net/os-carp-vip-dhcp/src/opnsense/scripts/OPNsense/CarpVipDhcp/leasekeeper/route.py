@@ -27,11 +27,11 @@ collapsed onto one boolean flag -- converges quietly rather than raising.
 """
 import ipaddress
 import logging
-import subprocess
 from dataclasses import dataclass
 from enum import StrEnum
 
 from .constants import LOGGER_NAME, RECONCILE_HEARTBEAT_INTERVAL
+from .syscmd import run
 from .util import _UNSET, _RateLimit, _sane_ipv4
 
 LOG = logging.getLogger(LOGGER_NAME)
@@ -156,7 +156,6 @@ _IFCONFIG = "/sbin/ifconfig"
 _NUMERIC = "-n"              # numeric output, no name resolution
 _AF_INET = "-inet"          # IPv4 address family modifier; the v6 twin: -inet6
 _GATEWAY_FIELD = "gateway:"  # the field label parsed from `route get` output
-_SUBPROC_TIMEOUT = 5
 
 # The /1-split: two half-internet routes that together cover 0.0.0.0/0 but are each
 # more specific than it (so they win over any default) and are not the default (so
@@ -168,19 +167,7 @@ _DEFAULT_NET = ipaddress.ip_network("0.0.0.0/0")
 _PTP_PREFIXLENS = (30, 31)
 
 
-# ---- /sbin/route exec helpers (stateless; shared by both reconcilers) ----
-
-def _run(cmd):
-    """Run a `/sbin/route` argv, capturing output and bounded by a timeout;
-    return the CompletedProcess, or None if it could not be executed at all
-    (logged)."""
-    try:
-        return subprocess.run(cmd, capture_output=True, errors="replace",
-                              timeout=_SUBPROC_TIMEOUT, check=False)
-    except (OSError, subprocess.SubprocessError) as e:
-        LOG.warning("route command failed to run (%s): %s", " ".join(cmd), e)
-        return None
-
+# ---- /sbin/route helpers (stateless; wrap syscmd.run; shared by both reconcilers) ----
 
 def _route(command, dest, gateway=None):
     """Issue a `/sbin/route` command (best effort). The caller confirms the
@@ -190,7 +177,7 @@ def _route(command, dest, gateway=None):
     cmd = [_ROUTE, _NUMERIC, command, _AF_INET, dest]
     if gateway is not None:
         cmd.append(gateway)
-    res = _run(cmd)
+    res = run(cmd)
     if res is not None and res.returncode != 0:
         LOG.debug("route %s %s exit %d: %s", command, dest, res.returncode,
                   (res.stderr or "").strip())
@@ -478,7 +465,7 @@ class DefaultRouteReconciler:
         -- the common, quiet steady state on a backup -- rather than an error; a
         genuinely stuck route op is surfaced by the install/withdraw confirm, not
         by second-guessing this read."""
-        res = _run([_ROUTE, _NUMERIC, RouteCommand.GET, _AF_INET, _DEFAULT])
+        res = run([_ROUTE, _NUMERIC, RouteCommand.GET, _AF_INET, _DEFAULT])
         if res is None or res.returncode != 0:
             return None
         for line in res.stdout.splitlines():
@@ -655,7 +642,7 @@ class BackupEgressReconciler:
         not active locally, so it resolves via the real interface, not lo0 -- the
         recommended VIP gateway is not caught. Never cached: a transient route-get failure
         must not permanently disable the guard, so the caller defers on None and re-checks."""
-        res = _run([_ROUTE, _NUMERIC, RouteCommand.GET, _AF_INET, gateway])
+        res = run([_ROUTE, _NUMERIC, RouteCommand.GET, _AF_INET, gateway])
         if res is None or res.returncode != 0:
             return None   # could not determine -> caller defers rather than routing blind
         for line in res.stdout.splitlines():
@@ -685,7 +672,7 @@ class BackupEgressReconciler:
     def _iface_ipv4(self, iface):
         """(address, prefixlen) of the first IPv4 on `iface`, or None. Parses
         `ifconfig <iface> inet` ('inet A netmask 0xMMMMMMMM ...')."""
-        res = _run([_IFCONFIG, iface, "inet"])
+        res = run([_IFCONFIG, iface, "inet"])
         if res is None or res.returncode != 0:
             return None
         toks = res.stdout.split()
@@ -855,7 +842,7 @@ class BackupEgressReconciler:
         the table cannot be read -- callers must not mistake an unreadable table for 'no
         routes' and skip the master-side removal. A bare host address parses as /32;
         header and default rows that are not a network are skipped."""
-        res = _run([_NETSTAT, "-rn", "-f", "inet"])
+        res = run([_NETSTAT, "-rn", "-f", "inet"])
         if res is None or res.returncode != 0:
             if not self._warn.fib_unreadable:   # once per unreadable episode (re-armed below)
                 # Neutral wording: on install this defers the write, but on the master

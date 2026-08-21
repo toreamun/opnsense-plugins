@@ -14,11 +14,11 @@ The heartbeat file is written by lease_keeper.py in one of two forms:
 import json
 import os
 import re
-import subprocess
 import time
 import xml.etree.ElementTree as ET
 
 from keeperconf import CONFFILE, keeper_id, keeper_records
+from leasekeeper.syscmd import ifconfig, run
 
 CONFIG_XML = "/conf/config.xml"
 RUN_DIR = "/var/run"
@@ -125,12 +125,9 @@ def parse_heartbeat(path):
 def carp_states():
     """Map vhid -> live CARP role (MASTER/BACKUP/INIT) from ifconfig."""
     states = {}
-    try:
-        out = subprocess.check_output(["/sbin/ifconfig"], errors="replace")
-    except (OSError, subprocess.SubprocessError):
+    out = ifconfig()
+    if out is None:
         return states
-    if isinstance(out, bytes):
-        out = out.decode(errors="replace")
     for match in re.finditer(r"carp:\s+(\w+)\s+vhid\s+(\d+)", out):
         states[match.group(2)] = match.group(1)
     return states
@@ -193,10 +190,12 @@ def read_keepers(states, names, conffile=CONFFILE, run_dir=RUN_DIR):
 
 def carp_demotion():
     """The kernel CARP demotion counter, or None when unreadable."""
+    res = run(["/sbin/sysctl", "-n", "net.inet.carp.demotion"], quiet=True)
+    if res is None or res.returncode != 0:
+        return None
     try:
-        out = subprocess.check_output(["/sbin/sysctl", "-n", "net.inet.carp.demotion"])
-        return int(out.strip())
-    except (OSError, ValueError, subprocess.SubprocessError):
+        return int(res.stdout.strip())
+    except ValueError:
         return None
 
 

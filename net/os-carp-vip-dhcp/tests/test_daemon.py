@@ -187,21 +187,24 @@ def _link_keeper(lk):
     return _keeper(lk)
 
 
+def _ifc(monkeypatch, lk, text):
+    # Stub the shared syscmd.run (via subprocess.run) with one ifconfig text output.
+    monkeypatch.setattr(lk.subprocess, "run",
+                        lambda *a, **kw: types.SimpleNamespace(returncode=0, stdout=text))
+
+
 def test_iface_link_up_parsing(lk, monkeypatch):
     k = _link_keeper(lk)
-    monkeypatch.setattr(lk.subprocess, "check_output",
-                        lambda *a, **kw: "igc1: flags=...\n\tstatus: active\n")
+    _ifc(monkeypatch, lk, "igc1: flags=...\n\tstatus: active\n")
     assert k._iface_link_up() is True
-    monkeypatch.setattr(lk.subprocess, "check_output",
-                        lambda *a, **kw: "igc1: flags=...\n\tstatus: no carrier\n")
+    _ifc(monkeypatch, lk, "igc1: flags=...\n\tstatus: no carrier\n")
     assert k._iface_link_up() is False
-    monkeypatch.setattr(lk.subprocess, "check_output",
-                        lambda *a, **kw: "igc1: flags=...\n\t(no status line)\n")
+    _ifc(monkeypatch, lk, "igc1: flags=...\n\t(no status line)\n")
     assert k._iface_link_up() is None
 
     def boom(*a, **kw):
         raise OSError("iface gone")
-    monkeypatch.setattr(lk.subprocess, "check_output", boom)
+    monkeypatch.setattr(lk.subprocess, "run", boom)
     assert k._iface_link_up() is None
 
 
@@ -303,7 +306,13 @@ def _follow_keeper(lk, tmp_path):
     keeper._dhcp.binding.server = "100.64.4.1"
     keeper._dhcp.binding.yiaddr = "100.64.4.7"
     keeper.fired = []
-    keeper._follow._follow_update = keeper.fired.append
+
+    # Record the dispatched address and report success (True), matching the real
+    # _follow_update's bool contract that on_changed_address now branches on.
+    def _rec_follow_update(ip):
+        keeper.fired.append(ip)
+        return True
+    keeper._follow._follow_update = _rec_follow_update
     keeper._follow._hb_mismatch = lambda got, want: None
     keeper._dhcp.release = lambda *a: None
     return keeper
@@ -647,6 +656,107 @@ def test_dispatch_follow_update_builds_configctl_command(lk, monkeypatch):
     assert calls[1][-3:] == ["100.64.4.1", "203.0.113.1", "24"]   # gw args appended
 
 
+def test_follow_deferred_when_dispatch_launch_fails(lk, tmp_path, monkeypatch):
+    # END-TO-END through the REAL seam (keeper._dispatch_follow_update ->
+    # syscmd.spawn -> subprocess.Popen): if configctl cannot even be launched, the
+    # follow must be DEFERRED, not lost. The daemon must not advance the target or
+    # adopt the binding, or it would strand itself on the new address with the CARP
+    # VIP config still on the old one and no way to re-fire. The next renewal (with
+    # a working launch) then completes the follow. This is the outcome the whole
+    # spawn-raises contract exists for -- not just that _dispatch_follow_update
+    # propagates the OSError, but that FollowPolicy turns it into a retry.
+    keeper = _keeper(lk, follow=True)
+    keeper._follow._state_file = str(tmp_path / "follow_state")   # REAL throttle, tmp-backed
+    keeper._dhcp.binding.server = "100.64.4.1"
+    keeper._dhcp.binding.yiaddr = "100.64.4.7"
+
+    launched = []
+
+    def boom(cmd, *_a, **_k):
+        launched.append(cmd)
+        raise OSError("fork/exec failed")
+    monkeypatch.setattr(lk.subprocess, "Popen", boom)
+
+    assert keeper._follow.on_changed_address(
+        "100.64.4.60", _ack(lk, "100.64.4.60"), "DORA", True) is False   # deferred
+    assert launched                                        # the real Popen seam was reached
+    assert keeper._follow.target == "100.64.4.7"           # target NOT advanced
+    assert keeper._dhcp.binding.yiaddr == "100.64.4.7"     # binding NOT adopted
+    assert keeper._follow._attempt.followed_ip is None     # not latched -> watchdog stays inert
+    # The failed dispatch must NOT arm the follow throttle, or it would delay its
+    # own retry by MIN_FOLLOW_INTERVAL. With the real throttle in place, the
+    # immediate retry below only completes if the throttle was left disarmed.
+    assert keeper._follow._last_follow_time() == 0.0
+
+    ok = []
+    monkeypatch.setattr(lk.subprocess, "Popen", lambda cmd, *a, **k: ok.append(cmd))
+    assert keeper._follow.on_changed_address(
+        "100.64.4.60", _ack(lk, "100.64.4.60"), "DORA", True) is True    # prompt retry completes it
+    assert ok and ok[0][4:6] == ["100.64.4.7", "100.64.4.60"]   # dispatched old -> new
+    assert keeper._follow.target == "100.64.4.60"          # now advanced
+    assert keeper._dhcp.binding.yiaddr == "100.64.4.60"
+    assert keeper._follow._last_follow_time() > 0.0        # a real follow DID arm the throttle
+
+
+def test_watchdog_redrives_stalled_follow(lk, tmp_path, monkeypatch):
+    # The second re-drive mechanism: a follow that WAS dispatched but whose service
+    # restart never replaced us (still alive past FOLLOW_RETRY_DEADLINE) is
+    # re-dispatched through the real seam. Guarded by followed_ip + follow_from.
+    keeper = _keeper(lk, follow=True)
+    keeper._follow._state_file = str(tmp_path / "follow_state")
+    calls = []
+    monkeypatch.setattr(lk.subprocess, "Popen", lambda cmd, *a, **k: calls.append(cmd))
+    att = keeper._follow._attempt
+    att.follow_from = "100.64.4.7"
+    att.followed_ip = "100.64.4.60"
+    att.fired_at = 0.0                                     # long past the retry deadline
+    keeper._follow.watchdog()
+    assert calls and calls[0][:4] == ["/usr/local/sbin/configctl", "-d", "carpvipdhcp", "follow_update"]
+    assert calls[0][4:6] == ["100.64.4.7", "100.64.4.60"]   # re-driven old -> new
+
+
+def test_watchdog_waits_within_deadline(lk, tmp_path, monkeypatch):
+    # A dispatched follow that is still WITHIN FOLLOW_RETRY_DEADLINE must be left
+    # alone: re-driving early would restart the daemon every maintain tick. This is
+    # the negative of test_watchdog_redrives_stalled_follow.
+    keeper = _keeper(lk, follow=True)
+    keeper._follow._state_file = str(tmp_path / "follow_state")
+    calls = []
+    monkeypatch.setattr(lk.subprocess, "Popen", lambda cmd, *a, **k: calls.append(cmd))
+    att = keeper._follow._attempt
+    att.follow_from = "100.64.4.7"
+    att.followed_ip = "100.64.4.60"
+    att.fired_at = time.time()                             # just fired -> inside the deadline
+    keeper._follow.watchdog()
+    assert not calls                                       # no premature re-drive
+
+
+def test_watchdog_inert_without_dispatched_follow(lk, tmp_path, monkeypatch):
+    # The guard: with no dispatched follow in flight (fresh _attempt, followed_ip
+    # None -- e.g. after a launch failure), the watchdog must not fire anything.
+    keeper = _keeper(lk, follow=True)
+    keeper._follow._state_file = str(tmp_path / "follow_state")
+    calls = []
+    monkeypatch.setattr(lk.subprocess, "Popen", lambda cmd, *a, **k: calls.append(cmd))
+    keeper._follow.watchdog()                              # fresh _attempt
+    assert not calls
+
+
+def test_follow_update_idempotent_for_same_address(lk, tmp_path, monkeypatch):
+    # _follow_update's guard: once we have asked configd for an address, asking
+    # again returns True WITHOUT a second dispatch/restart (the watchdog owns retry
+    # via _fire_follow_update, which bypasses this guard).
+    keeper = _keeper(lk, follow=True)
+    keeper._follow._state_file = str(tmp_path / "follow_state")
+    keeper._follow.target = "100.64.4.7"
+    calls = []
+    monkeypatch.setattr(lk.subprocess, "Popen", lambda cmd, *a, **k: calls.append(cmd))
+    assert keeper._follow._follow_update("100.64.4.60") is True   # dispatched once
+    assert len(calls) == 1
+    assert keeper._follow._follow_update("100.64.4.60") is True   # already asked -> no 2nd dispatch
+    assert len(calls) == 1
+
+
 def test_nudge_interval_floor(lk):
     keeper = _keeper(lk, arp_nudge=1)
     assert keeper._nudge.interval == lk.ARP_NUDGE_MIN
@@ -703,7 +813,7 @@ def test_probe_failure_skips_nudge(lk, monkeypatch):
 
     def boom(*a, **k):
         raise OSError("ifconfig unavailable")
-    monkeypatch.setattr(lk.subprocess, "check_output", boom)
+    monkeypatch.setattr(lk.subprocess, "run", boom)
     assert keeper._probe_carp_master() is None
     keeper._arp_nudge(force=True)
     assert keeper._nudge.last_nudge == 0.0
@@ -719,8 +829,8 @@ def test_ifconfig_probe_failure_warns_once_then_logs_recovery(lk, monkeypatch, c
     def flaky(*_a, **_k):
         if calls["fail"]:
             raise OSError("ifconfig unavailable")
-        return "\tcarp: MASTER vhid 199 advbase 1\n\tstatus: active\n"
-    monkeypatch.setattr(lk.subprocess, "check_output", flaky)
+        return types.SimpleNamespace(returncode=0, stdout="\tcarp: MASTER vhid 199 advbase 1\n\tstatus: active\n")
+    monkeypatch.setattr(lk.subprocess, "run", flaky)
 
     with caplog.at_level("INFO", logger="lease-keeper"):
         assert keeper._ifconfig() is None      # first failure
@@ -1351,13 +1461,12 @@ def test_carp_master_vhid_is_word_bounded(lk):
 def test_carp_master_standalone_probes_via_ifconfig(lk, monkeypatch):
     # carp_master(iface, vhid) runs ifconfig itself (no Keeper) and applies the same
     # decision; a probe failure reads as None.
-    monkeypatch.setattr(lk.subprocess, "check_output",
-                        lambda *_a, **_k: b"\tcarp: MASTER vhid 199 advbase 1 advskew 0\n")
+    _ifc(monkeypatch, lk, "\tcarp: MASTER vhid 199 advbase 1 advskew 0\n")
     assert lk.carp_master("lagg1", "199") is True
 
     def boom(*_a, **_k):
         raise OSError("no ifconfig")
-    monkeypatch.setattr(lk.subprocess, "check_output", boom)
+    monkeypatch.setattr(lk.subprocess, "run", boom)
     assert lk.carp_master("lagg1", "199") is None
 
 

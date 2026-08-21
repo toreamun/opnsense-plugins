@@ -6,7 +6,6 @@ operator actions.
 import logging
 import select
 import socket
-import subprocess
 import time
 from dataclasses import dataclass
 
@@ -22,6 +21,7 @@ from .dhcpclient import DhcpClient, DhcpHooks
 from .policy import ArpNudge, FollowHooks, FollowPolicy
 from .route import (BackupEgressReconciler, DefaultRouteMode, DefaultRouteReconciler,
                     withdraw_unless_master)
+from .syscmd import ifconfig, spawn
 from .util import _UNSET, _RateLimit, _atomic_write, _clock_at, _jittered, _sane_ipv4
 from .wire import _parse_reply
 
@@ -37,16 +37,6 @@ IFCONFIG_STATUS = "status: "                 # any status line present (up or do
 # _UNSET (shared, from util) marks "CARP-master value not supplied": the maintain
 # loop probes the role once per tick and shares it, but None is a valid probe
 # result, so the sentinel means "probe it now".
-
-
-def _ifconfig_text(iface):
-    """Raw `ifconfig <iface>` text, or None if it could not run (no logging -- each
-    caller adds its own error policy)."""
-    try:
-        out = subprocess.check_output(["/sbin/ifconfig", iface], errors="replace")
-    except (OSError, subprocess.SubprocessError):
-        return None
-    return out.decode(errors="replace") if isinstance(out, bytes) else out
 
 
 def _carp_master(ifconfig_text, vhid):
@@ -65,7 +55,7 @@ def carp_master(iface, vhid):
     fail-stop default withdraw on the role before the Keeper / capture backend
     exist; the Keeper's per-tick probe (_probe_carp_master) shares CARP_MASTER_FMT
     through _carp_master."""
-    return _carp_master(_ifconfig_text(iface), vhid)
+    return _carp_master(ifconfig(iface), vhid)
 
 
 @dataclass
@@ -370,9 +360,11 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         replaces this daemon with one bound to the new address."""
         cmd = ["/usr/local/sbin/configctl", "-d", "carpvipdhcp", "follow_update", old_ip, new_ip]
         cmd += gw_args   # cross-subnet: [old_gw, new_gw, bits]; empty on a same-subnet move
-        # Fire-and-forget: this configctl triggers a service restart that replaces
-        # this very daemon, so we must not wait on the child (`with` would block).
-        subprocess.Popen(cmd)  # pylint: disable=consider-using-with
+        # Fire-and-forget via syscmd.spawn: this configctl triggers a service restart
+        # that replaces this very daemon, so we must not wait on it. spawn does NOT
+        # swallow a launch failure -- it raises, so FollowPolicy catches it, leaves the
+        # target unadvanced, and defers the follow to the next renewal.
+        spawn(cmd)
 
     # ---- CARP role (master probe, transitions) ----
 
@@ -385,7 +377,7 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         nudge fails closed, the transition poll skips), so warn once per failure
         episode -- otherwise a wrong --iface or a broken ifconfig looks identical
         to a healthy backup in the log."""
-        out = _ifconfig_text(self._cfg.iface)
+        out = ifconfig(self._cfg.iface)
         if out is None:
             if not self._link.ifconfig_failed:
                 LOG.warning("ifconfig %s probe failed -- CARP role and carrier "

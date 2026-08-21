@@ -1,8 +1,10 @@
 """Unit tests for status.py heartbeat / keeper-id parsing (comments over docstrings)."""
 # pylint: disable=missing-function-docstring
 import time
+import types
 
 import status  # sys.path via conftest  # type: ignore
+from leasekeeper import syscmd  # status runs commands through it  # type: ignore
 
 
 def test_keeper_id():
@@ -100,3 +102,66 @@ def test_read_keepers_arp_confirmed_fresh_and_stale(tmp_path):
     assert by_ip["100.64.4.7"]["arp_confirmed"] is True
     assert by_ip["100.64.4.8"]["arp_confirmed"] is False
     assert by_ip["100.64.4.9"]["arp_confirmed"] is False
+
+
+# ---- carp_states / carp_demotion: the two functions that shell out via syscmd.
+# Stub subprocess.run (what syscmd calls) so the real syscmd layer is exercised.
+
+def test_carp_states_maps_vhid_to_role(monkeypatch):
+    text = ("em0: flags=8843\n\tcarp: MASTER vhid 149 advbase 1 advskew 0\n"
+            "em1: flags=8843\n\tcarp: BACKUP vhid 20 advbase 1 advskew 100\n")
+    monkeypatch.setattr(syscmd.subprocess, "run",
+                        lambda *a, **k: types.SimpleNamespace(returncode=0, stdout=text))
+    assert status.carp_states() == {"149": "MASTER", "20": "BACKUP"}
+
+
+def test_carp_states_empty_when_ifconfig_unavailable(monkeypatch):
+    # ifconfig probe fails -> syscmd.ifconfig returns None -> no roles, not a crash.
+    def boom(*_a, **_k):
+        raise OSError("no ifconfig")
+    monkeypatch.setattr(syscmd.subprocess, "run", boom)
+    assert not status.carp_states()
+
+
+def test_carp_demotion_parses_counter(monkeypatch):
+    monkeypatch.setattr(syscmd.subprocess, "run",
+                        lambda *a, **k: types.SimpleNamespace(returncode=0, stdout="2\n"))
+    assert status.carp_demotion() == 2
+
+
+def test_carp_demotion_none_on_nonzero_exit(monkeypatch):
+    monkeypatch.setattr(syscmd.subprocess, "run",
+                        lambda *a, **k: types.SimpleNamespace(returncode=1, stdout=""))
+    assert status.carp_demotion() is None
+
+
+def test_carp_demotion_none_on_garbled_value(monkeypatch):
+    monkeypatch.setattr(syscmd.subprocess, "run",
+                        lambda *a, **k: types.SimpleNamespace(returncode=0, stdout="not-an-int\n"))
+    assert status.carp_demotion() is None
+
+
+def test_carp_demotion_none_on_launch_failure(monkeypatch):
+    # sysctl could not be launched -> syscmd.run returns None -> the `res is None`
+    # guard arm (distinct from the non-zero-exit arm), no AttributeError.
+    def boom(*_a, **_k):
+        raise OSError("no sysctl")
+    monkeypatch.setattr(syscmd.subprocess, "run", boom)
+    assert status.carp_demotion() is None
+
+
+def test_carp_states_includes_init_and_ignores_non_carp(monkeypatch):
+    # INIT is a real role (docstring lists MASTER/BACKUP/INIT); non-CARP lines are skipped.
+    text = ("em0: flags\n\tcarp: INIT vhid 30 advbase 1 advskew 0\n"
+            "em1: flags\n\tstatus: active\n")
+    monkeypatch.setattr(syscmd.subprocess, "run",
+                        lambda *a, **k: types.SimpleNamespace(returncode=0, stdout=text))
+    assert status.carp_states() == {"30": "INIT"}
+
+
+def test_carp_states_empty_when_no_carp_interfaces(monkeypatch):
+    # ifconfig succeeds but the box has no CARP configured -> {} (distinct from the
+    # ifconfig-unavailable case), never a crash.
+    monkeypatch.setattr(syscmd.subprocess, "run",
+                        lambda *a, **k: types.SimpleNamespace(returncode=0, stdout="em0: flags\n\tstatus: active\n"))
+    assert not status.carp_states()

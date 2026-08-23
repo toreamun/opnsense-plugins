@@ -42,10 +42,11 @@ except ImportError:
 
 @dataclass
 class _ReaderGeneration:
-    """One reader generation (one start()): the bpf fd, the reader thread, its
-    stop signal, and the write end of its wake pipe. start() installs the whole
-    generation and stop() clears it as a unit; a reader that outlives its stop()
-    keeps its own fd/wake_reader copies, so nothing here is reused under it."""
+    """One reader generation (one start()): the bpf fd, the reader thread, its stop
+    signal, and the write end of its wake pipe. start() installs the whole generation
+    and stop() clears it as a unit; a reader that outlives its stop() keeps its own
+    fd/wake_reader copies (and its read size, a thread arg -- see BpfCapture), so
+    nothing here is reused under it."""
     fd: int
     thread: threading.Thread
     stop_event: threading.Event
@@ -63,14 +64,17 @@ class BpfCapture:
     stop latency). The stop signal and the wake pipe are created fresh per
     start(), and the reader owns and closes its own bpf fd on exit, so a reader
     that outlives its stop() (e.g. stalled in a slow log write) can neither be
-    revived by the next start() nor have its fd number reused underneath it."""
+    revived by the next start() nor have its fd number reused underneath it.
+    Every per-generation input the reader needs -- fd, wake pipe, stop signal
+    AND the bpf read size -- is handed to it as a thread argument, never read
+    back off the shared instance, so a concurrent restart's _configure cannot
+    disturb a still-running old reader."""
 
     def __init__(self, iface, promisc, on_bootp, on_arp):
         self.iface = iface
         self.promisc = promisc
         self._on_bootp = on_bootp
         self._on_arp = on_arp
-        self._buflen = 0               # kernel buffer size, from BIOCGBLEN in _configure
         self._gen = None               # the current _ReaderGeneration, or None when stopped
         # Throttle the untrusted-input parse-error line: a malformed/spoof storm
         # must not churn the log (DEBUG still hits disk regardless of the view).
@@ -102,7 +106,7 @@ class BpfCapture:
             LOG.error("bpf open /dev/bpf failed (iface %s): %s", self.iface, e)
             return False
         try:
-            self._configure(fd)
+            buflen = self._configure(fd)
         except OSError as e:
             os.close(fd)
             os.close(wake_reader)
@@ -110,16 +114,20 @@ class BpfCapture:
             LOG.error("bpf configure failed on %s: %s", self.iface, e)
             return False
         stop_event = threading.Event()
-        # The reader owns fd and wake_reader and closes them when it exits.
+        # The reader owns fd and wake_reader and closes them when it exits; buflen
+        # rides along as an arg so a later start()'s _configure never rebinds the
+        # read size under a still-running old reader.
         thread = threading.Thread(
-            target=self._read_loop, args=(fd, wake_reader, stop_event),
+            target=self._read_loop, args=(fd, wake_reader, stop_event, buflen),
             name="bpf-capture", daemon=True)
-        self._gen = _ReaderGeneration(fd=fd, thread=thread, stop_event=stop_event, wake_writer=wake_writer)
+        self._gen = _ReaderGeneration(
+            fd=fd, thread=thread, stop_event=stop_event, wake_writer=wake_writer)
         thread.start()
         return True
 
     def _configure(self, fd):
-        """Bind, tune and filter a fresh bpf descriptor.
+        """Bind, tune and filter a fresh bpf descriptor; returns the kernel
+        buffer size (BIOCGBLEN) the reader must request per read(2).
 
         BIOCSETIF (bind) has to come first -- it is what libpcap does and what
         BIOCGDLT needs -- so the filter is attached immediately after, keeping
@@ -152,7 +160,7 @@ class BpfCapture:
         if self.promisc:
             fcntl.ioctl(fd, BIOCPROMISC)
         # bpf read(2) calls must request exactly the kernel buffer size.
-        self._buflen = struct.unpack("I", fcntl.ioctl(fd, BIOCGBLEN, b"\x00" * 4))[0]
+        return struct.unpack("I", fcntl.ioctl(fd, BIOCGBLEN, b"\x00" * 4))[0]
 
     def stop(self):
         """Ask the current reader to exit and wait briefly for it. The reader
@@ -183,11 +191,12 @@ class BpfCapture:
         """True while the descriptor is open and the reader thread runs."""
         return self._gen is not None and self._gen.thread.is_alive()
 
-    def _read_loop(self, fd, wake_reader, stop_event):
+    def _read_loop(self, fd, wake_reader, stop_event, buflen):
         """Reader thread: block in select() on the bpf fd and the wake pipe;
         stop() writes to the pipe to end the wait. Owns fd and wake_reader and
         closes both on exit, so the fd's lifetime ends exactly when this thread
-        does."""
+        does. buflen is this generation's own read size (an arg, not read off the
+        instance), so a concurrent restart cannot change it under us."""
         try:
             while not stop_event.is_set():
                 try:
@@ -197,7 +206,7 @@ class BpfCapture:
                 if wake_reader in readable:      # stop() rang -- loop condition ends us
                     continue
                 try:
-                    data = os.read(fd, self._buflen)
+                    data = os.read(fd, buflen)
                 except (OSError, ValueError):
                     if not stop_event.is_set():
                         LOG.warning("bpf read failed on %s -- capture thread exiting", self.iface)

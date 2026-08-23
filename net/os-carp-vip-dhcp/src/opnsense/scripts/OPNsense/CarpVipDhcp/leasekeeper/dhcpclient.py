@@ -14,7 +14,8 @@ from .constants import (
     ACK, ATTEMPT_BACKOFF_CAP, BROADCAST_FLAG, DEFAULT_LEASE, DhcpOptName, DORA_ATTEMPTS,
     IPV4_BROADCAST, MIN_LEASE, MIN_T1, NAK, OFFER, Phase, REBIND_MARGIN,
     REBOOT_ATTEMPTS, RENEW_ATTEMPTS,
-    RENEW_TIMEOUT, REPLY_TIMEOUT, SEND_RETRY_DELAY, SendMsgType, T1_FACTOR, T2_FACTOR)
+    RENEW_TIMEOUT, REPLY_TIMEOUT, SEND_RETRY_DELAY, SendMsgType, T1_FACTOR, T2_FACTOR,
+    TimingSource)
 from .util import _jittered, _mask_to_bits, _new_xid, mac2raw
 from .wire import DhcpReply, DhcpSend, _dhcp_options, _fmt_reply, _msg_text
 
@@ -399,5 +400,6 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
         if lease > MIN_T1:
             t1 = max(MIN_T1, t1)
         t2 = min(max(t1 + REBIND_MARGIN, t2), lease)
-        src = "server" if (self.binding.t1_server or self.binding.t2_server) else "derived"
+        src = (TimingSource.SERVER if (self.binding.t1_server or self.binding.t2_server)
+               else TimingSource.DERIVED)
         return t1, t2, src

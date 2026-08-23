@@ -186,3 +186,11 @@ class Phase(StrEnum):
     RENEW = "RENEW"
     REBIND = "REBIND"
     OBSERVED = "OBSERVED"
+
+
+class TimingSource(StrEnum):
+    """Where the lease timers (T1/T2) came from: the heartbeat 'src' token and the
+    log label. A StrEnum (like Phase) so the member both is its wire token and
+    formats to that token in the heartbeat / log lines status.py parses."""
+    SERVER = "server"     # DHCP option 58/59 supplied them
+    DERIVED = "derived"   # RFC 0.5 / 0.875 of the lease

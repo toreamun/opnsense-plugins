@@ -57,7 +57,7 @@ def _client(lk, id_opts=None, on_changed=None):
 def test_timing_derived(lk):
     c = _client(lk)
     c.binding.lease_secs = 1800
-    assert c.timing() == (900, 1575, "derived")
+    assert c.timing() == (900, 1575, lk.TimingSource.DERIVED)
 
 
 def test_timing_honours_server(lk):
@@ -65,7 +65,14 @@ def test_timing_honours_server(lk):
     c.binding.lease_secs = 1800
     c.binding.t1_server = 600
     c.binding.t2_server = 1200
-    assert c.timing() == (600, 1200, "server")
+    assert c.timing() == (600, 1200, lk.TimingSource.SERVER)
+
+
+def test_timing_source_tokens_are_wire_stable(lk):
+    # The heartbeat 'src=' token and log label: the StrEnum must format to the
+    # exact wire strings status.py parses (server/derived), not "TimingSource.X".
+    assert f"{lk.TimingSource.SERVER}" == "server"
+    assert f"{lk.TimingSource.DERIVED}" == "derived"
 
 
 def test_redora_max_bounded(lk):

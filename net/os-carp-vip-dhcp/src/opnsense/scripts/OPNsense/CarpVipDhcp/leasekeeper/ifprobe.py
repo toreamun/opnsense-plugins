@@ -12,9 +12,10 @@ from enum import StrEnum
 
 # One regex owns the CARP line shape ("carp: <ROLE> vhid <N> ..."). The role is a
 # complete whitespace-bounded token (\S+, so the lossless contract holds even for a
-# token with non-word characters), and the vhid is the whole number bounded by \b, so
-# vhid 199 matches neither 19, 1990, nor a malformed "199x".
-_CARP_LINE = re.compile(r"carp:\s+(\S+)\s+vhid\s+(\d+)\b")
+# token with non-word characters). The vhid is the whole number followed by (?!\S) --
+# whitespace or end of text -- so vhid 199 matches neither 19, 1990, nor a malformed
+# "199x" / "199-foo" (a bare \b would still accept a trailing non-word char like '-').
+_CARP_LINE = re.compile(r"carp:\s+(\S+)\s+vhid\s+(\d+)(?!\S)")
 _STATUS_ACTIVE = "status: active"    # carrier up
 _STATUS_ANY = "status: "             # a status line is present at all (up or down)
 

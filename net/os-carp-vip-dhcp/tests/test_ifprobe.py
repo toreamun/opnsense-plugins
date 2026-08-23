@@ -54,10 +54,12 @@ def test_is_carp_master():
 
 def test_is_carp_master_matches_vhid_exactly():
     # 199 must never read as 19 or 1990 (the whole number is captured, not a prefix),
-    # and a trailing non-digit must not let "199x" read as vhid 199 (\b bounds it).
+    # and a trailing non-whitespace char must not let "199x" or "199-foo" read as vhid
+    # 199 (the number must be a complete whitespace-delimited token).
     assert ifprobe.is_carp_master("carp: MASTER vhid 19 advbase 1\n", "199") is False
     assert ifprobe.is_carp_master("carp: MASTER vhid 1990 advbase 1\n", "199") is False
     assert ifprobe.is_carp_master("carp: MASTER vhid 199x advbase 1\n", "199") is False
+    assert ifprobe.is_carp_master("carp: MASTER vhid 199-foo advbase 1\n", "199") is False
 
 
 def test_carrier_up():

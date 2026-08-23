@@ -6,6 +6,7 @@ are interpreted instead of each carrying its own parser (they used to -- keeper
 matched the CARP role by substring, status by a separate regex). Pure text in,
 values out; no IO.
 """
+import ipaddress
 import re
 from enum import StrEnum
 
@@ -57,3 +58,26 @@ def carrier_up(ifconfig_text):
     if _STATUS_ANY in ifconfig_text:
         return False
     return None
+
+
+def iface_ipv4(ifconfig_text):
+    """(address, prefixlen) of the first IPv4 in `ifconfig <iface> inet` text
+    ('inet A netmask 0xMMMMMMMM ...'), or None when the text is missing or has no
+    valid inet+netmask pair."""
+    if not ifconfig_text:
+        return None
+    toks = ifconfig_text.split()
+    addr = mask = None
+    for i, tok in enumerate(toks):
+        if tok == "inet" and addr is None and i + 1 < len(toks):
+            addr = toks[i + 1]
+        elif tok == "netmask" and mask is None and i + 1 < len(toks):
+            mask = toks[i + 1]
+    if addr is None or mask is None:
+        return None
+    try:
+        bits = bin(int(mask, 16)).count("1")
+        ipaddress.ip_address(addr)
+    except ValueError:
+        return None
+    return addr, bits

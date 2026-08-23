@@ -59,6 +59,21 @@ def test_carrier_up():
     assert ifprobe.carrier_up(None) is None                                  # probe failed
 
 
+def test_iface_ipv4():
+    assert ifprobe.iface_ipv4(
+        "\tinet 100.64.4.7 netmask 0xffffff00 broadcast 100.64.4.255\n") == ("100.64.4.7", 24)
+    assert ifprobe.iface_ipv4("\tinet 10.0.0.1 netmask 0xfffffe00\n") == ("10.0.0.1", 23)
+
+
+def test_iface_ipv4_none_cases():
+    assert ifprobe.iface_ipv4(None) is None
+    assert ifprobe.iface_ipv4("") is None
+    assert ifprobe.iface_ipv4("igc0: flags\n\tstatus: active\n") is None       # no inet
+    assert ifprobe.iface_ipv4("\tinet 100.64.4.7\n") is None                   # no netmask
+    assert ifprobe.iface_ipv4("\tinet nope netmask 0xffffff00\n") is None      # bad address
+    assert ifprobe.iface_ipv4("\tinet 100.64.4.7 netmask zzz\n") is None       # bad mask
+
+
 def test_carp_role_values_are_the_ifconfig_tokens():
     # .value is what status.py puts on the wire (JSON); keep it the exact token.
     assert CarpRole.MASTER.value == "MASTER"

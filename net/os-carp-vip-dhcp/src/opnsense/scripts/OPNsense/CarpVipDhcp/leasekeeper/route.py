@@ -31,6 +31,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 from .constants import LOGGER_NAME, RECONCILE_HEARTBEAT_INTERVAL
+from .ifprobe import iface_ipv4
 from .syscmd import run
 from .util import _UNSET, _RateLimit, _sane_ipv4
 
@@ -670,26 +671,12 @@ class BackupEgressReconciler:
         return next((str(host) for host in net.hosts() if str(host) != own), None)
 
     def _iface_ipv4(self, iface):
-        """(address, prefixlen) of the first IPv4 on `iface`, or None. Parses
-        `ifconfig <iface> inet` ('inet A netmask 0xMMMMMMMM ...')."""
+        """(address, prefixlen) of the first IPv4 on `iface`, or None. Runs
+        `ifconfig <iface> inet`; ifprobe.iface_ipv4 does the parse."""
         res = run([_IFCONFIG, iface, "inet"])
         if res is None or res.returncode != 0:
             return None
-        toks = res.stdout.split()
-        addr = mask = None
-        for i, tok in enumerate(toks):
-            if tok == "inet" and addr is None and i + 1 < len(toks):
-                addr = toks[i + 1]
-            elif tok == "netmask" and mask is None and i + 1 < len(toks):
-                mask = toks[i + 1]
-        if addr is None or mask is None:
-            return None
-        try:
-            bits = bin(int(mask, 16)).count("1")
-            ipaddress.ip_address(addr)
-        except ValueError:
-            return None
-        return addr, bits
+        return iface_ipv4(res.stdout)
 
     # ---- backup-egress FIB operations (idempotent, fail-safe on an unreadable table) ----
 

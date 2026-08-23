@@ -525,7 +525,7 @@ def test_check_observed_rejects_wrong_server(lk, tmp_path):
 def test_observed_serviced_by_maintain_loop(lk, tmp_path):
     keeper = _observe_keeper(lk, tmp_path)
     keeper._follow._observed = _ack(lk, "100.64.4.60")
-    keeper._signal_wake()   # as the sniffer would -> loop returns at once
+    keeper._wake_loop()   # as the sniffer would -> loop returns at once
     keeper._sleep_interruptible(1)
     assert keeper.fired == ["100.64.4.60"]
     assert not _woken(keeper)   # the wake byte was drained -> the loop paces at 1s again
@@ -538,7 +538,7 @@ def test_peer_ack_wakes_and_is_serviced_end_to_end(lk, tmp_path):
     the loop does not then busy-spin (a leftover byte would make every
     subsequent select return at once)."""
     keeper = _observe_keeper(lk, tmp_path)
-    keeper._on_dhcp_reply(_peer_ack(lk, "100.64.4.60"))   # real observe + real _signal_wake
+    keeper._on_dhcp_reply(_peer_ack(lk, "100.64.4.60"))   # real observe + real _wake_loop
     assert _woken(keeper)                    # the capture thread woke the loop
     keeper._sleep_interruptible(1)
     assert keeper.fired == ["100.64.4.60"]   # ...and the loop serviced the follow

@@ -39,7 +39,7 @@ LOG = logging.getLogger(LOGGER_NAME)
 
 
 def _drop(*_args, **_kwargs):
-    """A log-callable that discards its call: what _at returns for a throttled
+    """A log-callable that discards its call: what _log_at returns for a throttled
     steady-state repeat, so a suppressed heartbeat is a no-op with the same
     call shape as LOG.debug/LOG.info."""
 
@@ -184,7 +184,7 @@ def _route(command, dest, gateway=None):
                   (res.stderr or "").strip())
 
 
-def _at(changed, heartbeat):
+def _log_at(changed, heartbeat):
     """Pick the log callable for a desired-state confirmation. A state change
     logs at INFO the first time the state is entered, and re-arms the heartbeat
     so the identical DEBUG repeat does not fire on the very next tick. An
@@ -264,11 +264,11 @@ class DefaultRouteReconciler:
         self._strikes = 0
         self._unreadable_warned = False   # rising-edge gate for the fail-closed warning
         # Last (want, gateway) we logged, so a steady desired state is confirmed
-        # once at INFO then repeats at DEBUG (see _at / _UNSET).
+        # once at INFO then repeats at DEBUG (see _log_at / _UNSET).
         self._last_desired = _UNSET
         # Throttle for the unchanged steady-state DEBUG heartbeat, so a quiet
         # backup/master does not log its (identical) decision every tick and churn
-        # the log rotation. A change re-arms it (see _at).
+        # the log rotation. A change re-arms it (see _log_at).
         self._heartbeat = _RateLimit(RECONCILE_HEARTBEAT_INTERVAL)
 
     @property
@@ -374,17 +374,17 @@ class DefaultRouteReconciler:
         gateway, so there is nothing to install -- state ownership positively
         instead of returning silently."""
         if self._mode == DefaultRouteMode.OBSERVE:
-            _at(changed, self._heartbeat)("[observe] default already via %s -- would own", gateway)
+            _log_at(changed, self._heartbeat)("[observe] default already via %s -- would own", gateway)
         else:
-            _at(changed, self._heartbeat)("owning default via %s", gateway)
+            _log_at(changed, self._heartbeat)("owning default via %s", gateway)
 
     def _confirm_no_default(self, changed, reason):
         """Steady-state no-default heartbeat: there is correctly no default to
         hold (backup / no lease / liveness-gated)."""
         if self._mode == DefaultRouteMode.OBSERVE:
-            _at(changed, self._heartbeat)("[observe] no default held (%s) -- as wanted", reason)
+            _log_at(changed, self._heartbeat)("[observe] no default held (%s) -- as wanted", reason)
         else:
-            _at(changed, self._heartbeat)("no default held (%s)", reason)
+            _log_at(changed, self._heartbeat)("no default held (%s)", reason)
 
     def _on_unknown_role(self):
         """An unreadable (is_master is None) probe: do not install when unsure,
@@ -420,8 +420,8 @@ class DefaultRouteReconciler:
 
     def _install(self, changed, gateway, replacing=None):
         if self._mode == DefaultRouteMode.OBSERVE:
-            _at(changed, self._heartbeat)("[observe] would install default via %s%s", gateway,
-                                          "" if replacing is None else f" (replacing {replacing})")
+            _log_at(changed, self._heartbeat)("[observe] would install default via %s%s", gateway,
+                                              "" if replacing is None else f" (replacing {replacing})")
             return
         # Replace atomically with `route change`, not delete-then-add. A bench
         # check on FreeBSD 14.3 confirmed both halves: `route change` to an on-link
@@ -446,8 +446,8 @@ class DefaultRouteReconciler:
 
     def _withdraw(self, changed, current, reason):
         if self._mode == DefaultRouteMode.OBSERVE:
-            _at(changed, self._heartbeat)("[observe] would withdraw default (currently via %s) -- %s",
-                                          current, reason)
+            _log_at(changed, self._heartbeat)("[observe] would withdraw default (currently via %s) -- %s",
+                                              current, reason)
             return
         _route(RouteCommand.DELETE, _DEFAULT)
         # Confirm the FIB, not the exit code: a silently failed delete would leave
@@ -752,7 +752,7 @@ class BackupEgressReconciler:
         if not route_set:
             return
         if self._mode == DefaultRouteMode.OBSERVE:
-            _at(changed, self._backup_heartbeat)(
+            _log_at(changed, self._backup_heartbeat)(
                 "[observe] would route backup egress via %s (%s)", gateway, " ".join(route_set))
             return
         have = self._fib_routes()
@@ -773,7 +773,7 @@ class BackupEgressReconciler:
         self._record_backup_ownership(gateway, state, route_set)
         if not pending:
             if not collisions:
-                _at(changed, self._backup_heartbeat)(
+                _log_at(changed, self._backup_heartbeat)(
                     "backup egress via %s (%s)", gateway, " ".join(route_set))
             return
         missing = [p for p in pending if state.get(self._net(p)) != gateway]
@@ -787,7 +787,7 @@ class BackupEgressReconciler:
         # did not happen: the reconcile master path uses the default, the shutdown
         # boundary passes "keeper stopping".
         if self._mode == DefaultRouteMode.OBSERVE:
-            _at(changed, self._backup_heartbeat)(
+            _log_at(changed, self._backup_heartbeat)(
                 "[observe] would remove backup egress (%s)", " ".join(removal_set))
             return
         have = self._fib_routes()
@@ -809,7 +809,7 @@ class BackupEgressReconciler:
         self._note_backup_collisions(collisions, None)
         if not present:
             self._prune_backup_ownership(have, removal_set)   # nothing of ours here -> drop stale gws
-            _at(changed, self._backup_heartbeat)("no backup egress (%s)", reason)
+            _log_at(changed, self._backup_heartbeat)("no backup egress (%s)", reason)
             return
         for prefix in present:
             _route(RouteCommand.DELETE, prefix)

@@ -187,8 +187,8 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
 
         # ARP nudge component: owns the pacing and reachability state; the
         # keeper supplies the lease binding per nudge (_arp_nudge) and the
-        # CARP-role probe (via the _carp_master_probe shim).
-        self._nudge = ArpNudge(self._capture, self._cfg.chaddr, arp_nudge, self._carp_master_probe)
+        # CARP-role probe (via the _nudge_is_master shim).
+        self._nudge = ArpNudge(self._capture, self._cfg.chaddr, arp_nudge, self._nudge_is_master)
 
         self._was_master = None        # CARP role at the last nudge check (None = unknown yet)
 
@@ -238,7 +238,7 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         self._link = _LinkState()
 
         # Wake pipe for the maintain-loop sleep: _sleep_interruptible selects on
-        # the read end, and _signal_wake() writes one byte to make it return at
+        # the read end, and _wake_loop() writes one byte to make it return at
         # once instead of waiting out the 1s tick. Woken from two places: the
         # capture thread on an observed peer ACK (so the follow fires in
         # milliseconds), and the operator signal handlers (SIGTERM/USR1/USR2) so
@@ -309,7 +309,7 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         if (rx.mtype == ACK and rx.yiaddr and rx.yiaddr != self._dhcp.binding.yiaddr
                 and _sane_ipv4(rx.yiaddr)):
             self._follow.observe(rx)
-            self._signal_wake()   # wake the maintain-loop sleep now, don't wait for the tick
+            self._wake_loop()   # wake the maintain-loop sleep now, don't wait for the tick
 
     # ---- heartbeat / status file ----
 
@@ -391,7 +391,7 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         Uses the warn-once _ifconfig(), unlike the standalone carp_master()."""
         return _carp_master(self._ifconfig(), self._cfg.vhid)
 
-    def _carp_master_probe(self) -> "bool | None":
+    def _nudge_is_master(self) -> "bool | None":
         """ArpNudge's is_master hook -> the CARP probe (late-bound through the
         attribute so tests can stub _probe_carp_master)."""
         return self._probe_carp_master()
@@ -584,7 +584,7 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
     # ---- operator/signal API (signal handlers set a flag only -- see the
     # _SignalFlags invariant for why that rule is load-bearing; the
     # loop wakes via the wake socket -- from the capture thread through
-    # _signal_wake, and from signal delivery through signal.set_wakeup_fd(
+    # _wake_loop, and from signal delivery through signal.set_wakeup_fd(
     # wake_fileno) wired in main(), which is async-signal-safe C-level machinery) ----
 
     def wake_fileno(self):
@@ -592,7 +592,7 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         delivered signal wakes the maintain-loop sleep at once."""
         return self._wake_w.fileno()
 
-    def _signal_wake(self):
+    def _wake_loop(self):
         """Wake the maintain-loop sleep by sending one byte to the wake socket.
         Called from the capture thread (a normal thread) on a peer-ACK
         observation; socket.send works on every platform. The operator SIGNAL

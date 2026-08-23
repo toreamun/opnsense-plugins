@@ -592,6 +592,14 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         delivered signal wakes the maintain-loop sleep at once."""
         return self._wake_w.fileno()
 
+    def close(self):
+        """Release the wake socketpair. The entry point calls this in its finally
+        AFTER signal.set_wakeup_fd(-1), so the C-level signal writer can never
+        target this fd once it is closed -- a signal in the shutdown window would
+        otherwise write to a closed (or, astronomically, a reused) fd."""
+        self._wake_r.close()
+        self._wake_w.close()
+
     def _wake_loop(self):
         """Wake the maintain-loop sleep by sending one byte to the wake socket.
         Called from the capture thread (a normal thread) on a peer-ACK
@@ -757,8 +765,6 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         if self._cfg.release_on_exit:
             self._dhcp.release()
         self._capture.stop()
-        self._wake_r.close()
-        self._wake_w.close()
         LOG.info("stopped (lease-keeper %s)", __version__)
         return 0
 

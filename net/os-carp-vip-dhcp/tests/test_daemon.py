@@ -554,6 +554,15 @@ def test_wake_fileno_is_the_nonblocking_write_end(lk):
     assert keeper._wake_w.getblocking() is False
 
 
+def test_close_releases_the_wake_socket(lk):
+    # run() no longer closes the wake socket; the entry point calls close() AFTER
+    # set_wakeup_fd(-1) so a shutdown-window signal can never hit a closed fd.
+    keeper = _keeper(lk)
+    keeper.close()
+    with pytest.raises(OSError):
+        keeper._wake_w.send(b"\x00")   # write end is closed
+
+
 def test_id_opts_empty_by_default(lk):
     keeper = _keeper(lk)
     assert keeper._dhcp._id_opts == []
@@ -1396,6 +1405,7 @@ def _run_to_shutdown(lk, monkeypatch, *, master, initial):
     k._capture.stop = lambda: None
     k._signals.request_stop()          # exit at once -> straight to the shutdown path
     assert k.run() == 0
+    k.close()                          # mirror the entry point: close the wake socket after run()
     return fake
 
 

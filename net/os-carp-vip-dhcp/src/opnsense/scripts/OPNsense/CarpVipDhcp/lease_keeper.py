@@ -312,10 +312,13 @@ def main():
         try:
             return keeper.run()
         finally:
-            # Stop the C-level signal machinery from writing to the wake socket
-            # before run() closes it; otherwise a signal in the shutdown window
-            # writes to a closed fd (harmless, but noisy on stderr).
+            # Order matters: unregister the C-level signal wakeup fd BEFORE
+            # closing the wake socket it points at. Otherwise a signal in the
+            # shutdown window makes the C machinery write to a closed (or, in the
+            # worst case, a reused) fd. keeper.close() therefore runs only after
+            # set_wakeup_fd(-1).
             signal.set_wakeup_fd(-1)
+            keeper.close()
     finally:
         if pf and os.path.exists(pf):
             try:

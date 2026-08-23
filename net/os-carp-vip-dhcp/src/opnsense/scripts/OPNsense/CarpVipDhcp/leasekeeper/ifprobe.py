@@ -10,9 +10,11 @@ import ipaddress
 import re
 from enum import StrEnum
 
-# One regex owns the CARP line shape ("carp: <ROLE> vhid <N> ..."). Capturing the
-# whole vhid number (not a substring) is what keeps vhid 199 from matching 19/1990.
-_CARP_LINE = re.compile(r"carp:\s+(\w+)\s+vhid\s+(\d+)")
+# One regex owns the CARP line shape ("carp: <ROLE> vhid <N> ..."). The role is a
+# complete whitespace-bounded token (\S+, so the lossless contract holds even for a
+# token with non-word characters), and the vhid is the whole number bounded by \b, so
+# vhid 199 matches neither 19, 1990, nor a malformed "199x".
+_CARP_LINE = re.compile(r"carp:\s+(\S+)\s+vhid\s+(\d+)\b")
 _STATUS_ACTIVE = "status: active"    # carrier up
 _STATUS_ANY = "status: "             # a status line is present at all (up or down)
 
@@ -78,7 +80,7 @@ def iface_ipv4(ifconfig_text):
                 return None            # not the -f inet:cidr form -> no prefix length
             try:
                 prefixlen = int(bits)
-                ipaddress.ip_address(addr)
+                ipaddress.IPv4Address(addr)   # IPv4 only: reject an inet6 slipping through
             except ValueError:
                 return None
             return (addr, prefixlen) if 0 <= prefixlen <= 32 else None

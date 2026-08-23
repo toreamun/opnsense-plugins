@@ -23,6 +23,12 @@ def test_carp_roles_empty_on_none_blank_or_no_carp():
     assert not ifprobe.carp_roles("em0: flags\n\tstatus: active\n")   # no carp lines
 
 
+def test_carp_roles_keeps_a_non_word_role_token_whole():
+    # The lossless contract holds for a token with non-word characters too: \S+ keeps
+    # it whole rather than truncating (\w+ would stop at the '-' and drop the line).
+    assert ifprobe.carp_roles("\tcarp: PRE-INIT vhid 9 advbase 1\n") == {"9": "PRE-INIT"}
+
+
 def test_carp_roles_keeps_unrecognised_role():
     # An unknown role token is kept verbatim, not dropped, so a VIP never vanishes
     # from the status view (carp(4) only emits INIT/BACKUP/MASTER, but be lossless).
@@ -47,9 +53,11 @@ def test_is_carp_master():
 
 
 def test_is_carp_master_matches_vhid_exactly():
-    # 199 must never read as 19 or 1990 (the whole number is captured, not a prefix).
+    # 199 must never read as 19 or 1990 (the whole number is captured, not a prefix),
+    # and a trailing non-digit must not let "199x" read as vhid 199 (\b bounds it).
     assert ifprobe.is_carp_master("carp: MASTER vhid 19 advbase 1\n", "199") is False
     assert ifprobe.is_carp_master("carp: MASTER vhid 1990 advbase 1\n", "199") is False
+    assert ifprobe.is_carp_master("carp: MASTER vhid 199x advbase 1\n", "199") is False
 
 
 def test_carrier_up():
@@ -76,6 +84,7 @@ def test_iface_ipv4_none_cases():
     assert ifprobe.iface_ipv4("\tinet nope/24\n") is None                      # bad address
     assert ifprobe.iface_ipv4("\tinet 100.64.4.7/33\n") is None                # prefix out of range
     assert ifprobe.iface_ipv4("\tinet 100.64.4.7/xx\n") is None                # bad prefix
+    assert ifprobe.iface_ipv4("\tinet 2001:db8::1/32\n") is None               # IPv6 rejected
 
 
 def test_carp_role_values_are_the_ifconfig_tokens():

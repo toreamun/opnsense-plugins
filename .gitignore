@@ -7,6 +7,12 @@ build/
 work/
 dist/
 
+# test / coverage artifacts
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
 # release signing: never commit a private key
 *.key
 *.sec

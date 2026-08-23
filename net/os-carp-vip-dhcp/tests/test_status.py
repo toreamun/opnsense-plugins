@@ -1,5 +1,6 @@
 """Unit tests for status.py heartbeat / keeper-id parsing (comments over docstrings)."""
 # pylint: disable=missing-function-docstring
+import json
 import time
 import types
 
@@ -165,3 +166,87 @@ def test_carp_states_empty_when_no_carp_interfaces(monkeypatch):
     monkeypatch.setattr(syscmd.subprocess, "run",
                         lambda *a, **k: types.SimpleNamespace(returncode=0, stdout="em0: flags\n\tstatus: active\n"))
     assert not status.carp_states()
+
+
+# ---- iface_names: device -> friendly OPNsense name, parsed from config.xml.
+
+def test_iface_names_maps_device_to_descr(tmp_path, monkeypatch):
+    xml = tmp_path / "config.xml"
+    xml.write_text(
+        "<opnsense><interfaces>"
+        "<wan><if>igb0</if><descr>WAN</descr></wan>"
+        "<lan><if>igb1</if><descr></descr></lan>"      # blank descr -> the tag, upper-cased
+        "<opt1><descr>no if element</descr></opt1>"    # no <if> -> skipped
+        "</interfaces></opnsense>")
+    monkeypatch.setattr(status, "CONFIG_XML", str(xml))
+    assert status.iface_names() == {"igb0": "WAN", "igb1": "LAN"}
+
+
+def test_iface_names_empty_on_malformed_xml(tmp_path, monkeypatch):
+    bad = tmp_path / "config.xml"
+    bad.write_text("<opnsense><interfaces>")           # unclosed -> ParseError
+    monkeypatch.setattr(status, "CONFIG_XML", str(bad))
+    assert not status.iface_names()
+
+
+def test_iface_names_empty_when_file_missing(tmp_path, monkeypatch):
+    monkeypatch.setattr(status, "CONFIG_XML", str(tmp_path / "nope.xml"))   # OSError
+    assert not status.iface_names()
+
+
+def test_iface_names_empty_without_interfaces_section(tmp_path, monkeypatch):
+    xml = tmp_path / "config.xml"
+    xml.write_text("<opnsense></opnsense>")            # find('interfaces') -> None
+    monkeypatch.setattr(status, "CONFIG_XML", str(xml))
+    assert not status.iface_names()
+
+
+# ---- pid_alive: the live pid in a pidfile, or None. os.kill(pid, 0) is stubbed
+# where it must succeed (signal 0 checks liveness on FreeBSD but terminates the
+# process on Windows, where the tests also run).
+
+def test_pid_alive_returns_live_pid(tmp_path, monkeypatch):
+    monkeypatch.setattr(status.os, "kill", lambda pid, sig: None)   # pid is alive
+    pidf = tmp_path / "live.pid"
+    pidf.write_text("4242")
+    assert status.pid_alive(str(pidf)) == 4242
+
+
+def test_pid_alive_none_when_process_gone(tmp_path, monkeypatch):
+    def boom(pid, sig):
+        raise ProcessLookupError                       # OSError: stale/foreign pid
+    monkeypatch.setattr(status.os, "kill", boom)
+    pidf = tmp_path / "stale.pid"
+    pidf.write_text("999999")
+    assert status.pid_alive(str(pidf)) is None
+
+
+def test_pid_alive_none_on_missing_file(tmp_path):
+    assert status.pid_alive(str(tmp_path / "absent.pid")) is None   # open -> OSError
+
+
+def test_pid_alive_none_on_garbled_pidfile(tmp_path):
+    bad = tmp_path / "bad.pid"
+    bad.write_text("not-a-pid")
+    assert status.pid_alive(str(bad)) is None                       # int() -> ValueError
+
+
+# ---- main(): wire carp_states()/iface_names() into read_keepers, in that order.
+
+def test_main_maps_carp_state_and_iface_name_onto_keeper(monkeypatch, capsys):
+    # main() must pass carp_states() and iface_names() to read_keepers in THAT
+    # order, and read_keepers must key them onto the keeper by vhid / iface. A
+    # swapped arg order or a broken .get would misassign the GUI feed.
+    rec = {"request": "100.64.4.7", "iface": "igb0", "chaddr": "aa",
+           "vhid": "149", "follow": "1", "arpnudge": "240"}
+    monkeypatch.setattr(status, "keeper_records", lambda conffile: [rec])
+    monkeypatch.setattr(status, "carp_states", lambda: {"149": "MASTER"})
+    monkeypatch.setattr(status, "iface_names", lambda: {"igb0": "WAN"})
+    monkeypatch.setattr(status, "carp_demotion", lambda: 0)
+    status.main()
+    doc = json.loads(capsys.readouterr().out)
+    assert doc["carp_demotion"] == 0
+    keeper = doc["keepers"][0]
+    assert keeper["request"] == "100.64.4.7" and keeper["vhid"] == "149"
+    assert keeper["carp_state"] == "MASTER"    # from carp_states(), keyed by vhid
+    assert keeper["iface_name"] == "WAN"       # from iface_names(), keyed by iface

@@ -13,11 +13,11 @@ The heartbeat file is written by lease_keeper.py in one of two forms:
 """
 import json
 import os
-import re
 import time
 import xml.etree.ElementTree as ET
 
 from keeperconf import CONFFILE, keeper_id, keeper_records
+from leasekeeper.ifprobe import carp_roles
 from leasekeeper.syscmd import ifconfig, run
 
 CONFIG_XML = "/conf/config.xml"
@@ -123,14 +123,10 @@ def parse_heartbeat(path):
 
 
 def carp_states():
-    """Map vhid -> live CARP role (MASTER/BACKUP/INIT) from ifconfig."""
-    states = {}
-    out = ifconfig()
-    if out is None:
-        return states
-    for match in re.finditer(r"carp:\s+(\w+)\s+vhid\s+(\d+)", out):
-        states[match.group(2)] = match.group(1)
-    return states
+    """Map vhid -> live CARP role token (MASTER/BACKUP/INIT) from ifconfig, for
+    the status JSON. Shares the CARP-line parser with the keeper (ifprobe); the
+    token is passed through verbatim (any unrecognised state stays visible)."""
+    return carp_roles(ifconfig())
 
 
 def iface_names():

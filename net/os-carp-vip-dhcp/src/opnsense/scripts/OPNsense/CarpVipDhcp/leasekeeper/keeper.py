@@ -18,6 +18,7 @@ from .constants import (
     LINK_POLL_STEP, LOOP_ERROR_BACKOFF, Phase, REBIND_POLL_STEP, REDORA_MAX, REDORA_MIN,
     SNIFFER_RETRY, SNIFFER_WARMUP)
 from .dhcpclient import DhcpClient, DhcpHooks
+from .ifprobe import carrier_up, is_carp_master
 from .policy import ArpNudge, FollowHooks, FollowPolicy
 from .route import (BackupEgressReconciler, DefaultRouteMode, DefaultRouteReconciler,
                     withdraw_unless_master)
@@ -27,13 +28,6 @@ from .wire import _parse_reply
 
 LOG = logging.getLogger(LOGGER_NAME)
 
-# The keeper's dependency on ifconfig(8) output text, named in one place. The
-# trailing space in the CARP format is load-bearing: it stops vhid 1 matching
-# "vhid 11".
-CARP_MASTER_FMT = "carp: MASTER vhid {vhid} "
-IFCONFIG_STATUS_ACTIVE = "status: active"    # carrier up
-IFCONFIG_STATUS = "status: "                 # any status line present (up or down)
-
 # _UNSET (shared, from util) marks "CARP-master value not supplied": the maintain
 # loop probes the role once per tick and shares it, but None is a valid probe
 # result, so the sentinel means "probe it now".
@@ -41,20 +35,20 @@ IFCONFIG_STATUS = "status: "                 # any status line present (up or do
 
 def _carp_master(ifconfig_text, vhid):
     """CARP-master decision from ifconfig text: True/False for the vhid, None when
-    the text is missing (probe failed), True when no vhid (nothing to gate on)."""
+    the text is missing (probe failed), True when no vhid (nothing to gate on).
+    Parsing lives in ifprobe.is_carp_master; this adds only the keeper policy that
+    a keeper with no vhid has nothing to gate on."""
     if not vhid:
         return True
-    if ifconfig_text is None:
-        return None
-    return CARP_MASTER_FMT.format(vhid=vhid) in ifconfig_text
+    return is_carp_master(ifconfig_text, vhid)
 
 
 def carp_master(iface, vhid):
     """CARP-master role for `vhid` on `iface` (True/False, None on probe failure).
     Standalone -- no Keeper -- so the daemon entry point can gate its startup
     fail-stop default withdraw on the role before the Keeper / capture backend
-    exist; the Keeper's per-tick probe (_probe_carp_master) shares CARP_MASTER_FMT
-    through _carp_master."""
+    exist; the Keeper's per-tick probe (_probe_carp_master) shares the same
+    ifprobe parse through _carp_master."""
     return _carp_master(ifconfig(iface), vhid)
 
 
@@ -193,8 +187,8 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
 
         # ARP nudge component: owns the pacing and reachability state; the
         # keeper supplies the lease binding per nudge (_arp_nudge) and the
-        # CARP-role probe (via the _carp_master_probe shim).
-        self._nudge = ArpNudge(self._capture, self._cfg.chaddr, arp_nudge, self._carp_master_probe)
+        # CARP-role probe (via the _nudge_is_master shim).
+        self._nudge = ArpNudge(self._capture, self._cfg.chaddr, arp_nudge, self._nudge_is_master)
 
         self._was_master = None        # CARP role at the last nudge check (None = unknown yet)
 
@@ -244,7 +238,7 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         self._link = _LinkState()
 
         # Wake pipe for the maintain-loop sleep: _sleep_interruptible selects on
-        # the read end, and _signal_wake() writes one byte to make it return at
+        # the read end, and _wake_loop() writes one byte to make it return at
         # once instead of waiting out the 1s tick. Woken from two places: the
         # capture thread on an observed peer ACK (so the follow fires in
         # milliseconds), and the operator signal handlers (SIGTERM/USR1/USR2) so
@@ -315,7 +309,7 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         if (rx.mtype == ACK and rx.yiaddr and rx.yiaddr != self._dhcp.binding.yiaddr
                 and _sane_ipv4(rx.yiaddr)):
             self._follow.observe(rx)
-            self._signal_wake()   # wake the maintain-loop sleep now, don't wait for the tick
+            self._wake_loop()   # wake the maintain-loop sleep now, don't wait for the tick
 
     # ---- heartbeat / status file ----
 
@@ -397,7 +391,7 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         Uses the warn-once _ifconfig(), unlike the standalone carp_master()."""
         return _carp_master(self._ifconfig(), self._cfg.vhid)
 
-    def _carp_master_probe(self) -> "bool | None":
+    def _nudge_is_master(self) -> "bool | None":
         """ArpNudge's is_master hook -> the CARP probe (late-bound through the
         attribute so tests can stub _probe_carp_master)."""
         return self._probe_carp_master()
@@ -407,15 +401,9 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         present-but-inactive status (no carrier / no link), None when it cannot be
         read (probe failed, or the NIC reports no status line). Used by the
         unbound link-return fast path and the acquire carrier gate; a None
-        result never disturbs the backoff and never holds an acquire."""
-        out = self._ifconfig()
-        if out is None:
-            return None
-        if IFCONFIG_STATUS_ACTIVE in out:
-            return True
-        if IFCONFIG_STATUS in out:
-            return False
-        return None
+        result never disturbs the backoff and never holds an acquire. Parsing
+        lives in ifprobe.carrier_up; _ifconfig supplies the warn-once text."""
+        return carrier_up(self._ifconfig())
 
     def _check_link_returned(self):
         """While UNBOUND, detect a carrier down->up edge so the keeper re-DORAs at
@@ -502,8 +490,8 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
             return
         if master is _UNSET:
             master = self._probe_carp_master()
-        b = self._dhcp.binding
-        self._defroute.reconcile(master, b.yiaddr is not None, b.lease_router)
+        binding = self._dhcp.binding
+        self._defroute.reconcile(master, binding.yiaddr is not None, binding.lease_router)
         # Backup egress needs the REAL CARP role: the unbound path drives the 0/0
         # withdraw with a fictional master=False (role-independent for 0/0), which would
         # wrongly install a backup route on a master-without-lease. probe_for_backup
@@ -529,8 +517,8 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         server T1/T2. The lease length is deliberately excluded -- many servers
         jitter option 51 by a second or two each renew, which is not an operationally
         meaningful change and would otherwise force every renew to INFO."""
-        b = self._dhcp.binding
-        return (b.lease_router, b.t1_server, b.t2_server)
+        binding = self._dhcp.binding
+        return (binding.lease_router, binding.t1_server, binding.t2_server)
 
     def _lease_changes(self, prior):
         """A short 'what changed' summary of the current binding against `prior`, or
@@ -539,11 +527,11 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         lease length; see _lease_facts. The current lease length is still shown in
         the renew line itself, just not treated as a change."""
         old_gw, old_t1, old_t2 = prior
-        b = self._dhcp.binding
+        binding = self._dhcp.binding
         parts = []
-        if b.lease_router != old_gw:
-            parts.append(f"gw {old_gw or 'none'}->{b.lease_router or 'none'}")
-        if (b.t1_server, b.t2_server) != (old_t1, old_t2):
+        if binding.lease_router != old_gw:
+            parts.append(f"gw {old_gw or 'none'}->{binding.lease_router or 'none'}")
+        if (binding.t1_server, binding.t2_server) != (old_t1, old_t2):
             parts.append("renew timers changed")
         return ", ".join(parts)
 
@@ -555,15 +543,15 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         notable) -- logs at INFO stating what changed. The default route is
         reconciled by the loop-head reconcile on the next _maintain_step entry (a
         renewed lease can carry a new option-3 gateway), so it is not repeated here."""
-        b = self._dhcp.binding
+        binding = self._dhcp.binding
         changes = self._lease_changes(prior)
         if phase == Phase.RENEW and not changes:
-            LOG.debug("DHCP RENEW ok %s (lease=%ss, expires ~%s)", b.yiaddr, b.lease_secs,
-                      _clock_at(b.lease_secs))
+            LOG.debug("DHCP RENEW ok %s (lease=%ss, expires ~%s)", binding.yiaddr, binding.lease_secs,
+                      _clock_at(binding.lease_secs))
         else:
             suffix = f" [{changes}]" if changes else ""
-            LOG.info("DHCP %s ok %s (lease=%ss, expires ~%s)%s", phase, b.yiaddr, b.lease_secs,
-                     _clock_at(b.lease_secs), suffix)
+            LOG.info("DHCP %s ok %s (lease=%ss, expires ~%s)%s", phase, binding.yiaddr, binding.lease_secs,
+                     _clock_at(binding.lease_secs), suffix)
         self._hb()
         self._arp_nudge(force=True)
 
@@ -596,7 +584,7 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
     # ---- operator/signal API (signal handlers set a flag only -- see the
     # _SignalFlags invariant for why that rule is load-bearing; the
     # loop wakes via the wake socket -- from the capture thread through
-    # _signal_wake, and from signal delivery through signal.set_wakeup_fd(
+    # _wake_loop, and from signal delivery through signal.set_wakeup_fd(
     # wake_fileno) wired in main(), which is async-signal-safe C-level machinery) ----
 
     def wake_fileno(self):
@@ -604,7 +592,15 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         delivered signal wakes the maintain-loop sleep at once."""
         return self._wake_w.fileno()
 
-    def _signal_wake(self):
+    def close(self):
+        """Release the wake socketpair. The entry point calls this in its finally
+        AFTER signal.set_wakeup_fd(-1), so the C-level signal writer can never
+        target this fd once it is closed -- a signal in the shutdown window would
+        otherwise write to a closed (or, astronomically, a reused) fd."""
+        self._wake_r.close()
+        self._wake_w.close()
+
+    def _wake_loop(self):
         """Wake the maintain-loop sleep by sending one byte to the wake socket.
         Called from the capture thread (a normal thread) on a peer-ACK
         observation; socket.send works on every platform. The operator SIGNAL
@@ -717,12 +713,12 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         logs nothing at INFO between renews (routine renews are DEBUG), so this
         periodic line shows it is alive without per-tick spam. Not master-gated: a
         backup holds the same lease and is just as 'healthy'."""
-        b = self._dhcp.binding
-        if not b.yiaddr:
+        binding = self._dhcp.binding
+        if not binding.yiaddr:
             return
         ok, _ = self._pulse.ready()
         if ok:
-            LOG.info("lease healthy: %s on %s (lease %ss)", b.yiaddr, self._cfg.iface, b.lease_secs)
+            LOG.info("lease healthy: %s on %s (lease %ss)", binding.yiaddr, self._cfg.iface, binding.lease_secs)
 
     def run(self):
         """The daemon main loop: capture up, then maintain the lease until
@@ -769,8 +765,6 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         if self._cfg.release_on_exit:
             self._dhcp.release()
         self._capture.stop()
-        self._wake_r.close()
-        self._wake_w.close()
         LOG.info("stopped (lease-keeper %s)", __version__)
         return 0
 
@@ -792,8 +786,8 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         """One iteration of the maintain loop. Returns to run() (which loops again)
         on every state transition; any exception it raises is caught by run() and
         retried, so a transient fault can never terminate the keeper."""
-        b = self._dhcp.binding
-        if not b.yiaddr:
+        binding = self._dhcp.binding
+        if not binding.yiaddr:
             # Unbound: (re)acquire FIRST, then withdraw only if that did not bind. A
             # keeper restart re-adopts its still-valid lease here (INIT-REBOOT, a few
             # ms), so a master keeps its inherited default -- no 0/0 flap -- instead of
@@ -810,7 +804,7 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
             if self._backup.enabled:
                 self._backup.reconcile_backup_egress(self._probe_carp_master())
             self._acquire_step()
-            if not b.yiaddr:
+            if not binding.yiaddr:
                 # master=False is the fictional role for the role-independent 0/0
                 # withdraw; backup egress needs the true role (a master-without-lease
                 # must not get a backup route), so probe when the feature is enabled.
@@ -831,14 +825,14 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         # "RENEW ok" already carries the lease + expiry. Raise the keeper's log
         # level to see it.
         LOG.debug("DHCP lease %ds; renew at T1=%ds (~%s), rebind by T2=%ds (~%s) (timing source: %s)",
-                  b.lease_secs, t1, _clock_at(t1), t2, _clock_at(t2), src)
+                  binding.lease_secs, t1, _clock_at(t1), t2, _clock_at(t2), src)
         if not self._hold_lease(t1):
             return
         prior = self._lease_facts()   # snapshot to report what a renew changed
         if self._dhcp.renew():
             self._on_lease_extended(Phase.RENEW, prior)
             return
-        if not b.yiaddr:            # renew() drew a NAK and forgot the binding
+        if not binding.yiaddr:            # renew() drew a NAK and forgot the binding
             self._on_lease_revoked(Phase.RENEW)
             return
         LOG.warning("DHCP %s failed at T1 -- trying %s until T2", Phase.RENEW, Phase.REBIND)
@@ -864,7 +858,7 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
             if self._dhcp.renew(rebind=True):
                 ok = True
                 break
-            if not b.yiaddr:            # a NAK during REBIND likewise revoked the lease
+            if not binding.yiaddr:            # a NAK during REBIND likewise revoked the lease
                 self._on_lease_revoked(Phase.REBIND)
                 return
         if ok:
@@ -910,13 +904,13 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
             self._wait_unbound(REDORA_MIN)
             return
 
-        b = self._dhcp.binding
+        binding = self._dhcp.binding
         if self._dhcp.acquire(self._follow.target):
             self._link.up = True   # a completed DORA proves carrier
             LOG.info("DHCP BOUND %s (lease=%ss, expires ~%s, server=%s, gw=%s, mask=%s)",
-                     b.yiaddr, b.lease_secs, _clock_at(b.lease_secs),
-                     b.server, b.router or "?",
-                     f"/{b.mask_bits}" if b.mask_bits else "none")
+                     binding.yiaddr, binding.lease_secs, _clock_at(binding.lease_secs),
+                     binding.server, binding.router or "?",
+                     f"/{binding.mask_bits}" if binding.mask_bits else "none")
             self._hb()
             self._arp_nudge(force=True)
             self.redora_wait = REDORA_MIN

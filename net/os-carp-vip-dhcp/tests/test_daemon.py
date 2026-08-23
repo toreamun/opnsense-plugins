@@ -57,7 +57,7 @@ def _client(lk, id_opts=None, on_changed=None):
 def test_timing_derived(lk):
     c = _client(lk)
     c.binding.lease_secs = 1800
-    assert c.timing() == (900, 1575, "derived")
+    assert c.timing() == (900, 1575, lk.TimingSource.DERIVED)
 
 
 def test_timing_honours_server(lk):
@@ -65,7 +65,14 @@ def test_timing_honours_server(lk):
     c.binding.lease_secs = 1800
     c.binding.t1_server = 600
     c.binding.t2_server = 1200
-    assert c.timing() == (600, 1200, "server")
+    assert c.timing() == (600, 1200, lk.TimingSource.SERVER)
+
+
+def test_timing_source_tokens_are_wire_stable(lk):
+    # The heartbeat 'src=' token and log label: the StrEnum must format to the
+    # exact wire strings status.py parses (server/derived), not "TimingSource.X".
+    assert f"{lk.TimingSource.SERVER}" == "server"
+    assert f"{lk.TimingSource.DERIVED}" == "derived"
 
 
 def test_redora_max_bounded(lk):
@@ -164,7 +171,7 @@ def test_feed_wakes_the_waiting_sequence(lk):
     rx = _reply(lk, lk.ACK, "100.64.4.7")
     c.feed(rx)
     assert c._rx is rx
-    assert c._ev.is_set()        # the waiting _wait_for_dhcp_reply returns at once
+    assert c._reply_ready.is_set()        # the waiting _wait_for_dhcp_reply returns at once
 
 
 def test_fmt_reply_readable(lk):
@@ -518,7 +525,7 @@ def test_check_observed_rejects_wrong_server(lk, tmp_path):
 def test_observed_serviced_by_maintain_loop(lk, tmp_path):
     keeper = _observe_keeper(lk, tmp_path)
     keeper._follow._observed = _ack(lk, "100.64.4.60")
-    keeper._signal_wake()   # as the sniffer would -> loop returns at once
+    keeper._wake_loop()   # as the sniffer would -> loop returns at once
     keeper._sleep_interruptible(1)
     assert keeper.fired == ["100.64.4.60"]
     assert not _woken(keeper)   # the wake byte was drained -> the loop paces at 1s again
@@ -531,7 +538,7 @@ def test_peer_ack_wakes_and_is_serviced_end_to_end(lk, tmp_path):
     the loop does not then busy-spin (a leftover byte would make every
     subsequent select return at once)."""
     keeper = _observe_keeper(lk, tmp_path)
-    keeper._on_dhcp_reply(_peer_ack(lk, "100.64.4.60"))   # real observe + real _signal_wake
+    keeper._on_dhcp_reply(_peer_ack(lk, "100.64.4.60"))   # real observe + real _wake_loop
     assert _woken(keeper)                    # the capture thread woke the loop
     keeper._sleep_interruptible(1)
     assert keeper.fired == ["100.64.4.60"]   # ...and the loop serviced the follow
@@ -545,6 +552,102 @@ def test_wake_fileno_is_the_nonblocking_write_end(lk):
     keeper = _keeper(lk)
     assert keeper.wake_fileno() == keeper._wake_w.fileno()
     assert keeper._wake_w.getblocking() is False
+
+
+def test_close_releases_the_wake_socket(lk):
+    # run() no longer closes the wake socket; the entry point calls close() AFTER
+    # set_wakeup_fd(-1) so a shutdown-window signal can never hit a closed fd.
+    keeper = _keeper(lk)
+    keeper.close()
+    with pytest.raises(OSError):
+        keeper._wake_w.send(b"\x00")   # write end is closed
+
+
+def _stub_main(monkeypatch, keeper_cls, *argv_extra):
+    """Wire lease_keeper.main() for a spy test on a non-FreeBSD host: a fake Keeper,
+    a runnable capture backend, no-op signal wiring (with the POSIX-only SIGUSR
+    numbers faked in), and a synthetic argv. Returns the module so the caller can
+    also spy set_wakeup_fd."""
+    import lease_keeper  # noqa: E402  # pylint: disable=import-outside-toplevel
+    monkeypatch.setattr(lease_keeper, "_setup_logging", lambda _logfile: None)
+    monkeypatch.setattr(lease_keeper, "Keeper", keeper_cls)
+    monkeypatch.setattr(lease_keeper.BpfCapture, "unavailable_reason", staticmethod(lambda: None))
+    monkeypatch.setattr(lease_keeper.signal, "signal", lambda *_a: None)
+    monkeypatch.setattr(lease_keeper.signal, "SIGUSR1", 30, raising=False)
+    monkeypatch.setattr(lease_keeper.signal, "SIGUSR2", 31, raising=False)
+    monkeypatch.setattr("sys.argv", [
+        "lease_keeper", "--iface", "eth0", "--chaddr", CHADDR_STR,
+        "--pidfile", "", "--hbfile", "", "--logfile", "", *argv_extra])
+    return lease_keeper
+
+
+def test_main_run_unregisters_wakeup_fd_before_close(monkeypatch):
+    # The shutdown ordering (set_wakeup_fd(-1) BEFORE keeper.close()) must hold, or a
+    # signal in the window would hit a closed wake fd. Pin the whole sequence so a
+    # future move of either finally cannot silently reintroduce that race.
+    events = []
+
+    class _FakeKeeper:
+        def __init__(self, *_a, **_k):
+            pass
+
+        def wake_fileno(self):
+            return 7
+
+        def run(self):
+            events.append("run")
+            return 0
+
+        def close(self):
+            events.append("close")
+
+    lease_keeper = _stub_main(monkeypatch, _FakeKeeper)
+    monkeypatch.setattr(lease_keeper.signal, "set_wakeup_fd", lambda fd: events.append(f"wakeupfd={fd}"))
+    assert lease_keeper.main() == 0
+    assert events == ["wakeupfd=7", "run", "wakeupfd=-1", "close"]
+
+
+def test_main_once_closes_keeper_without_arming_wakeup_fd(monkeypatch):
+    # --once must also close the keeper (its wake socketpair opened in __init__),
+    # even though it never arms set_wakeup_fd -- else a repeated in-process
+    # main(--once) leaks two fds per call.
+    events = []
+    armed = []
+
+    class _FakeKeeper:
+        def __init__(self, *_a, **_k):
+            pass
+
+        def claim_once(self):
+            events.append("claim_once")
+            return 0
+
+        def close(self):
+            events.append("close")
+
+    lease_keeper = _stub_main(monkeypatch, _FakeKeeper, "--once")
+    monkeypatch.setattr(lease_keeper.signal, "set_wakeup_fd", armed.append)
+    assert lease_keeper.main() == 0
+    assert events == ["claim_once", "close"]   # closed after the one-shot claim
+    assert not armed                           # --once never armed the signal wakeup fd
+
+
+def test_read_loop_uses_its_own_buflen_arg(lk, monkeypatch):
+    # The bpf read size is the reader thread's own arg, not shared instance state, so
+    # a concurrent restart cannot rebind it under an old reader. Guard it: os.read is
+    # called with the arg buflen (reintroducing self._buflen would fail this).
+    cap = lk.BpfCapture("eth0", False, lambda _f: None, lambda _f: None)
+    reads = []
+    monkeypatch.setattr(select, "select", lambda r, _w, _x: ([r[0]], [], []))   # bpf fd readable
+
+    def _fake_read(_fd, n):
+        reads.append(n)
+        raise OSError("stop the loop after one read")
+    monkeypatch.setattr(os, "read", _fake_read)
+    monkeypatch.setattr(os, "close", lambda _fd: None)   # fd / wake_reader are fakes here
+    stop = types.SimpleNamespace(is_set=lambda: False)
+    cap._read_loop(fd=11, wake_reader=12, stop_event=stop, buflen=9000)
+    assert reads == [9000]
 
 
 def test_id_opts_empty_by_default(lk):
@@ -1389,6 +1492,7 @@ def _run_to_shutdown(lk, monkeypatch, *, master, initial):
     k._capture.stop = lambda: None
     k._signals.request_stop()          # exit at once -> straight to the shutdown path
     assert k.run() == 0
+    k.close()                          # mirror the entry point: close the wake socket after run()
     return fake
 
 
@@ -1453,7 +1557,7 @@ def test_carp_master_decision_from_ifconfig_text(lk):
 
 
 def test_carp_master_vhid_is_word_bounded(lk):
-    # The trailing space in CARP_MASTER_FMT stops vhid 199 matching 19 or 1990.
+    # ifprobe captures the whole vhid number, so 199 never reads as 19 or 1990.
     assert lk._carp_master("carp: MASTER vhid 19 advbase 1\n", "199") is False
     assert lk._carp_master("carp: MASTER vhid 1990 advbase 1\n", "199") is False
 

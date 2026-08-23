@@ -43,7 +43,7 @@ class ArpNudge:  # pylint: disable=too-many-instance-attributes
         # Reachability: the sniffer stamps last_reply when the gateway answers
         # a nudge (a lone atomic float write); the status page surfaces its age.
         self.last_reply = 0.0          # epoch of the gateway's last ARP reply (0 = none)
-        self._gw = None                # last nudge target we logged (log again on change)
+        self._logged_gw = None                # last nudge target we logged (log again on change)
         self._warned = False           # warned once about a missing nudge target
         # Throttle a failing send so a persistent fault stays periodically visible
         # (with a suppressed count) instead of spamming or latching fully silent.
@@ -90,10 +90,10 @@ class ArpNudge:  # pylint: disable=too-many-instance-attributes
             # shows the nudge is active; routine repeats at DEBUG (they fire oftener
             # than DHCP renews). Whether the gateway actually answered is surfaced by
             # age on the status page (via last_reply -> the heartbeat's arpok=).
-            if gateway != self._gw:
+            if gateway != self._logged_gw:
                 LOG.info("ARP nudge active: who-has %s tell %s (src %s) every %ds",
                          gateway, yiaddr, self.chaddr, self.interval)
-                self._gw = gateway
+                self._logged_gw = gateway
             else:
                 LOG.debug("ARP nudge sent: who-has %s tell %s", gateway, yiaddr)
         except Exception as e:  # pylint: disable=broad-exception-caught

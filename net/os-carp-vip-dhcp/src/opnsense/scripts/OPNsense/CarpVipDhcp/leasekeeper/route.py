@@ -31,6 +31,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 from .constants import LOGGER_NAME, RECONCILE_HEARTBEAT_INTERVAL
+from .ifprobe import iface_ipv4
 from .syscmd import run
 from .util import _UNSET, _RateLimit, _sane_ipv4
 
@@ -38,7 +39,7 @@ LOG = logging.getLogger(LOGGER_NAME)
 
 
 def _drop(*_args, **_kwargs):
-    """A log-callable that discards its call: what _at returns for a throttled
+    """A log-callable that discards its call: what _log_at returns for a throttled
     steady-state repeat, so a suppressed heartbeat is a no-op with the same
     call shape as LOG.debug/LOG.info."""
 
@@ -183,7 +184,7 @@ def _route(command, dest, gateway=None):
                   (res.stderr or "").strip())
 
 
-def _at(changed, heartbeat):
+def _log_at(changed, heartbeat):
     """Pick the log callable for a desired-state confirmation. A state change
     logs at INFO the first time the state is entered, and re-arms the heartbeat
     so the identical DEBUG repeat does not fire on the very next tick. An
@@ -263,11 +264,11 @@ class DefaultRouteReconciler:
         self._strikes = 0
         self._unreadable_warned = False   # rising-edge gate for the fail-closed warning
         # Last (want, gateway) we logged, so a steady desired state is confirmed
-        # once at INFO then repeats at DEBUG (see _at / _UNSET).
+        # once at INFO then repeats at DEBUG (see _log_at / _UNSET).
         self._last_desired = _UNSET
         # Throttle for the unchanged steady-state DEBUG heartbeat, so a quiet
         # backup/master does not log its (identical) decision every tick and churn
-        # the log rotation. A change re-arms it (see _at).
+        # the log rotation. A change re-arms it (see _log_at).
         self._heartbeat = _RateLimit(RECONCILE_HEARTBEAT_INTERVAL)
 
     @property
@@ -340,7 +341,7 @@ class DefaultRouteReconciler:
             else:
                 self._install(changed, gateway, replacing=have)
         else:
-            reason = self._no_default_reason(blocked, is_master, holds_lease)
+            reason = self._no_default_reason(blocked, is_master, holds_lease, bound)
             # A route-get failure (for any reason) also reads as None here, so we
             # skip the withdraw. Treating an unreadable table as "absent" is a
             # deliberate trade-off: an empty table -- the common quiet state on a
@@ -357,13 +358,16 @@ class DefaultRouteReconciler:
                 self._withdraw(changed, have, reason)
 
     @staticmethod
-    def _no_default_reason(blocked, is_master, holds_lease):
+    def _no_default_reason(blocked, is_master, holds_lease, bound):
         """Why the desired state is 'no default' -- the informative half of the
         backup/no-lease/liveness heartbeat and of a withdraw."""
         if blocked:
             return "liveness not confirmed (possible split-brain / dead WAN)"
         if not holds_lease:
-            return "no usable lease"
+            # `bound` separates a genuinely absent lease from a held lease whose ACK
+            # carried no usable option-3 gateway: both yield no default, but the log
+            # must not tell an operator holding a lease that there is none.
+            return "lease has no usable gateway" if bound else "no lease held"
         if is_master is not True:
             return "CARP backup"
         return "not owned"
@@ -373,17 +377,17 @@ class DefaultRouteReconciler:
         gateway, so there is nothing to install -- state ownership positively
         instead of returning silently."""
         if self._mode == DefaultRouteMode.OBSERVE:
-            _at(changed, self._heartbeat)("[observe] default already via %s -- would own", gateway)
+            _log_at(changed, self._heartbeat)("[observe] default already via %s -- would own", gateway)
         else:
-            _at(changed, self._heartbeat)("owning default via %s", gateway)
+            _log_at(changed, self._heartbeat)("owning default via %s", gateway)
 
     def _confirm_no_default(self, changed, reason):
         """Steady-state no-default heartbeat: there is correctly no default to
         hold (backup / no lease / liveness-gated)."""
         if self._mode == DefaultRouteMode.OBSERVE:
-            _at(changed, self._heartbeat)("[observe] no default held (%s) -- as wanted", reason)
+            _log_at(changed, self._heartbeat)("[observe] no default held (%s) -- as wanted", reason)
         else:
-            _at(changed, self._heartbeat)("no default held (%s)", reason)
+            _log_at(changed, self._heartbeat)("no default held (%s)", reason)
 
     def _on_unknown_role(self):
         """An unreadable (is_master is None) probe: do not install when unsure,
@@ -419,8 +423,8 @@ class DefaultRouteReconciler:
 
     def _install(self, changed, gateway, replacing=None):
         if self._mode == DefaultRouteMode.OBSERVE:
-            _at(changed, self._heartbeat)("[observe] would install default via %s%s", gateway,
-                                          "" if replacing is None else f" (replacing {replacing})")
+            _log_at(changed, self._heartbeat)("[observe] would install default via %s%s", gateway,
+                                              "" if replacing is None else f" (replacing {replacing})")
             return
         # Replace atomically with `route change`, not delete-then-add. A bench
         # check on FreeBSD 14.3 confirmed both halves: `route change` to an on-link
@@ -445,8 +449,8 @@ class DefaultRouteReconciler:
 
     def _withdraw(self, changed, current, reason):
         if self._mode == DefaultRouteMode.OBSERVE:
-            _at(changed, self._heartbeat)("[observe] would withdraw default (currently via %s) -- %s",
-                                          current, reason)
+            _log_at(changed, self._heartbeat)("[observe] would withdraw default (currently via %s) -- %s",
+                                              current, reason)
             return
         _route(RouteCommand.DELETE, _DEFAULT)
         # Confirm the FIB, not the exit code: a silently failed delete would leave
@@ -490,7 +494,7 @@ class BackupEgressReconciler:
         # mode is coerced (as in DefaultRouteReconciler) so an unrecognised value is
         # inert OFF; the backup set only acts under observe/enforce.
         self._mode = DefaultRouteMode.coerce(mode)
-        self._backup = backup_egress or BackupEgressConfig()
+        self._cfg = backup_egress or BackupEgressConfig()
         self._last_backup_desired = _UNSET
         self._backup_heartbeat = _RateLimit(RECONCILE_HEARTBEAT_INTERVAL)
         self._valid_prefixes = None            # cached validated prefixes (warn-once via the cache)
@@ -503,7 +507,7 @@ class BackupEgressReconciler:
         feature enabled). Lets the caller decide whether the unbound path must probe the
         real CARP role for backup egress (the 0/0 withdraw there uses a fictional role)."""
         return (self._mode in (DefaultRouteMode.OBSERVE, DefaultRouteMode.ENFORCE)
-                and self._backup.enabled)
+                and self._cfg.enabled)
 
     def withdraw_backup_egress(self):
         """Remove the backup-egress routes (the /1-split plus any configured prefixes) at a
@@ -559,7 +563,7 @@ class BackupEgressReconciler:
     def _backup_route_set(self):
         """The prefixes to install for the configured form. SPLIT (and any unrecognised
         form) is the leak-safe /1-split; PREFIXES is the validated configured list."""
-        if self._backup.form == BackupEgressForm.PREFIXES:
+        if self._cfg.form == BackupEgressForm.PREFIXES:
             return self._backup_prefixes()
         return _SPLIT_PREFIXES
 
@@ -578,7 +582,7 @@ class BackupEgressReconciler:
         prefix, 0.0.0.0/0 under enforce, empty prefixes list) each fire once."""
         if self._valid_prefixes is None:
             valid = []
-            for prefix in self._backup.prefixes:
+            for prefix in self._cfg.prefixes:
                 try:
                     net = ipaddress.ip_network(prefix, strict=False)
                 except ValueError:
@@ -592,7 +596,7 @@ class BackupEgressReconciler:
                                 "a backup-egress route -- ignoring it (use the /1-split)")
                     continue
                 valid.append(prefix)
-            if self._backup.form == BackupEgressForm.PREFIXES and not valid:
+            if self._cfg.form == BackupEgressForm.PREFIXES and not valid:
                 LOG.warning("backup egress: form is 'prefixes' but no valid prefixes are set")
             self._valid_prefixes = tuple(valid)
         return self._valid_prefixes
@@ -609,7 +613,7 @@ class BackupEgressReconciler:
         return gateway
 
     def _backup_gateway(self):
-        cfg = self._backup
+        cfg = self._cfg
         if cfg.gateway:
             own = self._gateway_is_own(cfg.gateway)   # True / False / None (could not check)
             if own is None:
@@ -670,26 +674,14 @@ class BackupEgressReconciler:
         return next((str(host) for host in net.hosts() if str(host) != own), None)
 
     def _iface_ipv4(self, iface):
-        """(address, prefixlen) of the first IPv4 on `iface`, or None. Parses
-        `ifconfig <iface> inet` ('inet A netmask 0xMMMMMMMM ...')."""
-        res = run([_IFCONFIG, iface, "inet"])
+        """(address, prefixlen) of the first IPv4 on `iface`, or None. Runs
+        `ifconfig -f inet:cidr <iface> inet` so the address prints as A.B.C.D/NN
+        (a direct prefix length) instead of the default hex netmask (0xffffff00),
+        which ifprobe.iface_ipv4 then parses."""
+        res = run([_IFCONFIG, "-f", "inet:cidr", iface, "inet"])
         if res is None or res.returncode != 0:
             return None
-        toks = res.stdout.split()
-        addr = mask = None
-        for i, tok in enumerate(toks):
-            if tok == "inet" and addr is None and i + 1 < len(toks):
-                addr = toks[i + 1]
-            elif tok == "netmask" and mask is None and i + 1 < len(toks):
-                mask = toks[i + 1]
-        if addr is None or mask is None:
-            return None
-        try:
-            bits = bin(int(mask, 16)).count("1")
-            ipaddress.ip_address(addr)
-        except ValueError:
-            return None
-        return addr, bits
+        return iface_ipv4(res.stdout)
 
     # ---- backup-egress FIB operations (idempotent, fail-safe on an unreadable table) ----
 
@@ -703,8 +695,8 @@ class BackupEgressReconciler:
         peer on a fresh master), which makes cleanup best-effort there rather than risk
         clobbering an unrelated route."""
         gateways = set(self._backup_installed_gws)
-        if self._backup.gateway:
-            gateways.add(self._backup.gateway)
+        if self._cfg.gateway:
+            gateways.add(self._cfg.gateway)
         return gateways
 
     def _note_backup_collisions(self, prefixes, gateway):
@@ -765,7 +757,7 @@ class BackupEgressReconciler:
         if not route_set:
             return
         if self._mode == DefaultRouteMode.OBSERVE:
-            _at(changed, self._backup_heartbeat)(
+            _log_at(changed, self._backup_heartbeat)(
                 "[observe] would route backup egress via %s (%s)", gateway, " ".join(route_set))
             return
         have = self._fib_routes()
@@ -786,7 +778,7 @@ class BackupEgressReconciler:
         self._record_backup_ownership(gateway, state, route_set)
         if not pending:
             if not collisions:
-                _at(changed, self._backup_heartbeat)(
+                _log_at(changed, self._backup_heartbeat)(
                     "backup egress via %s (%s)", gateway, " ".join(route_set))
             return
         missing = [p for p in pending if state.get(self._net(p)) != gateway]
@@ -800,7 +792,7 @@ class BackupEgressReconciler:
         # did not happen: the reconcile master path uses the default, the shutdown
         # boundary passes "keeper stopping".
         if self._mode == DefaultRouteMode.OBSERVE:
-            _at(changed, self._backup_heartbeat)(
+            _log_at(changed, self._backup_heartbeat)(
                 "[observe] would remove backup egress (%s)", " ".join(removal_set))
             return
         have = self._fib_routes()
@@ -822,7 +814,7 @@ class BackupEgressReconciler:
         self._note_backup_collisions(collisions, None)
         if not present:
             self._prune_backup_ownership(have, removal_set)   # nothing of ours here -> drop stale gws
-            _at(changed, self._backup_heartbeat)("no backup egress (%s)", reason)
+            _log_at(changed, self._backup_heartbeat)("no backup egress (%s)", reason)
             return
         for prefix in present:
             _route(RouteCommand.DELETE, prefix)
@@ -830,18 +822,23 @@ class BackupEgressReconciler:
         if now is None:
             return   # deletes issued but cannot confirm (already warned); re-check next tick
         self._prune_backup_ownership(now, removal_set)        # removed routes -> retire their gws
-        still = [p for p in present if now.get(self._net(p)) in owned]
-        if not still:
+        still_present = [p for p in present if now.get(self._net(p)) in owned]
+        if not still_present:
             LOG.info("removed backup egress -- %s", reason)
         else:
             LOG.error("backup egress: failed to remove %s -- this node would loop its egress",
-                      " ".join(still))
+                      " ".join(still_present))
 
     def _fib_routes(self):
         """{network: gateway} for the IPv4 FIB from one `netstat -rn` pass, or None when
         the table cannot be read -- callers must not mistake an unreadable table for 'no
         routes' and skip the master-side removal. A bare host address parses as /32;
-        header and default rows that are not a network are skipped."""
+        header and default rows that are not a network are skipped.
+
+        Parses the plain-text table on purpose: the destination/gateway column layout of
+        `netstat -rn` has been stable for decades, whereas netstat's libxo(3) JSON key
+        names are explicitly NOT a stable API across FreeBSD releases -- so the text is
+        the more robust substrate for this one parse, not the less."""
         res = run([_NETSTAT, "-rn", "-f", "inet"])
         if res is None or res.returncode != 0:
             if not self._warn.fib_unreadable:   # once per unreadable episode (re-armed below)

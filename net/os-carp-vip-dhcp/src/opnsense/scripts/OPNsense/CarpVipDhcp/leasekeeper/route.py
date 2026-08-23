@@ -817,12 +817,12 @@ class BackupEgressReconciler:
         if now is None:
             return   # deletes issued but cannot confirm (already warned); re-check next tick
         self._prune_backup_ownership(now, removal_set)        # removed routes -> retire their gws
-        still = [p for p in present if now.get(self._net(p)) in owned]
-        if not still:
+        still_present = [p for p in present if now.get(self._net(p)) in owned]
+        if not still_present:
             LOG.info("removed backup egress -- %s", reason)
         else:
             LOG.error("backup egress: failed to remove %s -- this node would loop its egress",
-                      " ".join(still))
+                      " ".join(still_present))
 
     def _fib_routes(self):
         """{network: gateway} for the IPv4 FIB from one `netstat -rn` pass, or None when

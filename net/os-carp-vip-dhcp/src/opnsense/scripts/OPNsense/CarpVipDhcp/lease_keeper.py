@@ -209,14 +209,14 @@ def _setup_logging(logfile):
 
 def main():
     """CLI entry point: parse args, wire up the Keeper and signals, run."""
-    a = _build_arg_parser().parse_args()
-    _setup_logging(a.logfile)
+    args = _build_arg_parser().parse_args()
+    _setup_logging(args.logfile)
 
     # Validate the two free-string enum args now that logging is up: an unknown
     # value (only reachable via a hand-edited config.xml) falls back to a safe
     # default with a warning instead of crash-looping under daemon(8) -r.
-    a.default_route_mode = DefaultRouteMode.coerce(a.default_route_mode)
-    a.backup_egress_form = BackupEgressForm.coerce(a.backup_egress_form)
+    args.default_route_mode = DefaultRouteMode.coerce(args.default_route_mode)
+    args.backup_egress_form = BackupEgressForm.coerce(args.backup_egress_form)
 
     # Single-instance guard BEFORE any FIB mutation: the startup fail-stop withdraw
     # below deletes a default, so a duplicate start (pidfile held by the live owner)
@@ -224,17 +224,17 @@ def main():
     # and only then discover it is the duplicate. Held across the withdraw and the
     # backend/arg checks; the finally releases it on every exit. --once is a wiring
     # test: no guard and no FIB mutation, so it takes neither (pf stays None).
-    pf = None if a.once else acquire_pidfile(a.pidfile)
+    pf = None if args.once else acquire_pidfile(args.pidfile)
     try:
         # Built before the fail-stop so the startup reconciler can clean the backup-egress
         # routes this feature manages when it is enabled (else a node coming up as master
         # with a stale /1 a crashed predecessor left would loop its egress).
         backup_egress = BackupEgressConfig(
-            enabled=a.backup_egress,
-            form=a.backup_egress_form,
-            gateway=a.backup_egress_gateway or None,
-            interface=a.backup_egress_interface or None,
-            prefixes=_split_prefixes(a.backup_egress_prefixes))
+            enabled=args.backup_egress,
+            form=args.backup_egress_form,
+            gateway=args.backup_egress_gateway or None,
+            interface=args.backup_egress_interface or None,
+            prefixes=_split_prefixes(args.backup_egress_prefixes))
 
         # Fail-stop: a crashed predecessor (backend now missing, or a bad arg) may
         # have left a default in the FIB, still redistributed by FRR. Drop it here --
@@ -242,14 +242,14 @@ def main():
         # arg checks, each of which can return before Keeper.run() would. The gate
         # (a master keeps its default, a backup withdraws; probe only when the mode
         # acts) lives in withdraw_unless_master. Skipped for --once and no vhid.
-        if not a.once and a.vhid:
-            # a.default_route_mode is already coerced (above), so both reconcilers take
+        if not args.once and args.vhid:
+            # args.default_route_mode is already coerced (above), so both reconcilers take
             # it verbatim; the backup set is cleaned before the 0/0 withdraw inside
             # withdraw_unless_master, the one sequence that spans the two reconcilers.
             withdraw_unless_master(
-                DefaultRouteReconciler(a.default_route_mode),
-                BackupEgressReconciler(a.default_route_mode, backup_egress=backup_egress),
-                lambda: carp_master(a.iface, a.vhid))
+                DefaultRouteReconciler(args.default_route_mode),
+                BackupEgressReconciler(args.default_route_mode, backup_egress=backup_egress),
+                lambda: carp_master(args.iface, args.vhid))
 
         # Fail fast (with a logged reason) if the raw /dev/bpf backend cannot run
         # on this host (e.g. fcntl missing off FreeBSD).
@@ -258,33 +258,33 @@ def main():
             LOG.critical("capture backend cannot run: %s -- the lease keeper cannot start", reason)
             return 3
 
-        for label, mac in (("chaddr", a.chaddr), ("eth-src", a.eth_src)):
+        for label, mac in (("chaddr", args.chaddr), ("eth-src", args.eth_src)):
             if mac and not MAC_RE.match(mac):
                 LOG.critical("invalid %s MAC address %r -- the lease keeper cannot start", label, mac)
                 return 2
 
-        k = Keeper(a.iface, a.chaddr, a.request, a.eth_src,
-                   hbfile=a.hbfile, release_on_exit=a.release_on_exit or a.once,
-                   vhid=a.vhid, follow=a.follow,
-                   vendor_class=a.vendor_class, client_id=a.client_id, hostname=a.hostname,
-                   arp_nudge=a.arp_nudge, arp_listen_promisc=a.arp_listen_promisc,
-                   default_route_mode=a.default_route_mode,
-                   backup_egress=backup_egress)
+        keeper = Keeper(args.iface, args.chaddr, args.request, args.eth_src,
+                        hbfile=args.hbfile, release_on_exit=args.release_on_exit or args.once,
+                        vhid=args.vhid, follow=args.follow,
+                        vendor_class=args.vendor_class, client_id=args.client_id, hostname=args.hostname,
+                        arp_nudge=args.arp_nudge, arp_listen_promisc=args.arp_listen_promisc,
+                        default_route_mode=args.default_route_mode,
+                        backup_egress=backup_egress)
 
         # Warn only when promiscuous capture is ACTUALLY in effect: it is gated on the ARP
         # nudge (see Keeper.__init__), so a stale flag with the nudge disabled is ignored,
         # not promiscuous -- warning off the raw flag would contradict that and misstate the
         # node's security posture.
-        if a.arp_listen_promisc and a.arp_nudge > 0:
+        if args.arp_listen_promisc and args.arp_nudge > 0:
             LOG.warning("ARP listen: PROMISCUOUS capture enabled on %s -- the daemon now "
                         "sees all traffic on the segment (opt-in fallback for NICs that "
-                        "drop the gateway's unicast ARP reply otherwise)", a.iface)
+                        "drop the gateway's unicast ARP reply otherwise)", args.iface)
 
         def _sig(*_):
             # Flag only -- no logging or other non-async-signal-safe work in the
             # handler (like the SIGUSR1/2 handlers below). set_wakeup_fd wakes the
             # loop at once; run() logs "stopped" when it exits.
-            k.request_stop()
+            keeper.request_stop()
         signal.signal(signal.SIGINT, _sig)
         signal.signal(signal.SIGTERM, _sig)
 
@@ -293,24 +293,24 @@ def main():
         # suppression that is then flagged as useless where the attributes do exist.
         def _sig_arp_nudge(*_):
             # Operator-requested immediate ARP nudge (configd action / kill -USR1).
-            k.trigger_nudge()
+            keeper.trigger_nudge()
         signal.signal(getattr(signal, "SIGUSR1"), _sig_arp_nudge)
 
         def _sig_carp(*_):
             # CARP transition (rc.syshook.d/carp/50-carpvipdhcp sends SIGUSR2).
-            k.recheck_carp_role()
+            keeper.recheck_carp_role()
         signal.signal(getattr(signal, "SIGUSR2"), _sig_carp)
 
-        if a.once:
-            return k.claim_once()
+        if args.once:
+            return keeper.claim_once()
 
         # Wake the maintain-loop sleep the instant a signal is delivered: Python's
         # C-level signal machinery writes the signal number to this fd, which is
         # async-signal-safe and needs no work in the handler (the _sig* handlers
         # above only set a flag). The loop selects on the read end and drains it.
-        signal.set_wakeup_fd(k.wake_fileno())
+        signal.set_wakeup_fd(keeper.wake_fileno())
         try:
-            return k.run()
+            return keeper.run()
         finally:
             # Stop the C-level signal machinery from writing to the wake socket
             # before run() closes it; otherwise a signal in the shutdown window

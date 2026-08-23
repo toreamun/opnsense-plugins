@@ -490,8 +490,8 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
             return
         if master is _UNSET:
             master = self._probe_carp_master()
-        b = self._dhcp.binding
-        self._defroute.reconcile(master, b.yiaddr is not None, b.lease_router)
+        binding = self._dhcp.binding
+        self._defroute.reconcile(master, binding.yiaddr is not None, binding.lease_router)
         # Backup egress needs the REAL CARP role: the unbound path drives the 0/0
         # withdraw with a fictional master=False (role-independent for 0/0), which would
         # wrongly install a backup route on a master-without-lease. probe_for_backup
@@ -517,8 +517,8 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         server T1/T2. The lease length is deliberately excluded -- many servers
         jitter option 51 by a second or two each renew, which is not an operationally
         meaningful change and would otherwise force every renew to INFO."""
-        b = self._dhcp.binding
-        return (b.lease_router, b.t1_server, b.t2_server)
+        binding = self._dhcp.binding
+        return (binding.lease_router, binding.t1_server, binding.t2_server)
 
     def _lease_changes(self, prior):
         """A short 'what changed' summary of the current binding against `prior`, or
@@ -527,11 +527,11 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         lease length; see _lease_facts. The current lease length is still shown in
         the renew line itself, just not treated as a change."""
         old_gw, old_t1, old_t2 = prior
-        b = self._dhcp.binding
+        binding = self._dhcp.binding
         parts = []
-        if b.lease_router != old_gw:
-            parts.append(f"gw {old_gw or 'none'}->{b.lease_router or 'none'}")
-        if (b.t1_server, b.t2_server) != (old_t1, old_t2):
+        if binding.lease_router != old_gw:
+            parts.append(f"gw {old_gw or 'none'}->{binding.lease_router or 'none'}")
+        if (binding.t1_server, binding.t2_server) != (old_t1, old_t2):
             parts.append("renew timers changed")
         return ", ".join(parts)
 
@@ -543,15 +543,15 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         notable) -- logs at INFO stating what changed. The default route is
         reconciled by the loop-head reconcile on the next _maintain_step entry (a
         renewed lease can carry a new option-3 gateway), so it is not repeated here."""
-        b = self._dhcp.binding
+        binding = self._dhcp.binding
         changes = self._lease_changes(prior)
         if phase == Phase.RENEW and not changes:
-            LOG.debug("DHCP RENEW ok %s (lease=%ss, expires ~%s)", b.yiaddr, b.lease_secs,
-                      _clock_at(b.lease_secs))
+            LOG.debug("DHCP RENEW ok %s (lease=%ss, expires ~%s)", binding.yiaddr, binding.lease_secs,
+                      _clock_at(binding.lease_secs))
         else:
             suffix = f" [{changes}]" if changes else ""
-            LOG.info("DHCP %s ok %s (lease=%ss, expires ~%s)%s", phase, b.yiaddr, b.lease_secs,
-                     _clock_at(b.lease_secs), suffix)
+            LOG.info("DHCP %s ok %s (lease=%ss, expires ~%s)%s", phase, binding.yiaddr, binding.lease_secs,
+                     _clock_at(binding.lease_secs), suffix)
         self._hb()
         self._arp_nudge(force=True)
 
@@ -705,12 +705,12 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         logs nothing at INFO between renews (routine renews are DEBUG), so this
         periodic line shows it is alive without per-tick spam. Not master-gated: a
         backup holds the same lease and is just as 'healthy'."""
-        b = self._dhcp.binding
-        if not b.yiaddr:
+        binding = self._dhcp.binding
+        if not binding.yiaddr:
             return
         ok, _ = self._pulse.ready()
         if ok:
-            LOG.info("lease healthy: %s on %s (lease %ss)", b.yiaddr, self._cfg.iface, b.lease_secs)
+            LOG.info("lease healthy: %s on %s (lease %ss)", binding.yiaddr, self._cfg.iface, binding.lease_secs)
 
     def run(self):
         """The daemon main loop: capture up, then maintain the lease until
@@ -780,8 +780,8 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         """One iteration of the maintain loop. Returns to run() (which loops again)
         on every state transition; any exception it raises is caught by run() and
         retried, so a transient fault can never terminate the keeper."""
-        b = self._dhcp.binding
-        if not b.yiaddr:
+        binding = self._dhcp.binding
+        if not binding.yiaddr:
             # Unbound: (re)acquire FIRST, then withdraw only if that did not bind. A
             # keeper restart re-adopts its still-valid lease here (INIT-REBOOT, a few
             # ms), so a master keeps its inherited default -- no 0/0 flap -- instead of
@@ -798,7 +798,7 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
             if self._backup.enabled:
                 self._backup.reconcile_backup_egress(self._probe_carp_master())
             self._acquire_step()
-            if not b.yiaddr:
+            if not binding.yiaddr:
                 # master=False is the fictional role for the role-independent 0/0
                 # withdraw; backup egress needs the true role (a master-without-lease
                 # must not get a backup route), so probe when the feature is enabled.
@@ -819,14 +819,14 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         # "RENEW ok" already carries the lease + expiry. Raise the keeper's log
         # level to see it.
         LOG.debug("DHCP lease %ds; renew at T1=%ds (~%s), rebind by T2=%ds (~%s) (timing source: %s)",
-                  b.lease_secs, t1, _clock_at(t1), t2, _clock_at(t2), src)
+                  binding.lease_secs, t1, _clock_at(t1), t2, _clock_at(t2), src)
         if not self._hold_lease(t1):
             return
         prior = self._lease_facts()   # snapshot to report what a renew changed
         if self._dhcp.renew():
             self._on_lease_extended(Phase.RENEW, prior)
             return
-        if not b.yiaddr:            # renew() drew a NAK and forgot the binding
+        if not binding.yiaddr:            # renew() drew a NAK and forgot the binding
             self._on_lease_revoked(Phase.RENEW)
             return
         LOG.warning("DHCP %s failed at T1 -- trying %s until T2", Phase.RENEW, Phase.REBIND)
@@ -852,7 +852,7 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
             if self._dhcp.renew(rebind=True):
                 ok = True
                 break
-            if not b.yiaddr:            # a NAK during REBIND likewise revoked the lease
+            if not binding.yiaddr:            # a NAK during REBIND likewise revoked the lease
                 self._on_lease_revoked(Phase.REBIND)
                 return
         if ok:
@@ -898,13 +898,13 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
             self._wait_unbound(REDORA_MIN)
             return
 
-        b = self._dhcp.binding
+        binding = self._dhcp.binding
         if self._dhcp.acquire(self._follow.target):
             self._link.up = True   # a completed DORA proves carrier
             LOG.info("DHCP BOUND %s (lease=%ss, expires ~%s, server=%s, gw=%s, mask=%s)",
-                     b.yiaddr, b.lease_secs, _clock_at(b.lease_secs),
-                     b.server, b.router or "?",
-                     f"/{b.mask_bits}" if b.mask_bits else "none")
+                     binding.yiaddr, binding.lease_secs, _clock_at(binding.lease_secs),
+                     binding.server, binding.router or "?",
+                     f"/{binding.mask_bits}" if binding.mask_bits else "none")
             self._hb()
             self._arp_nudge(force=True)
             self.redora_wait = REDORA_MIN

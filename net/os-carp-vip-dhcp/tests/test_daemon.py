@@ -563,6 +563,93 @@ def test_close_releases_the_wake_socket(lk):
         keeper._wake_w.send(b"\x00")   # write end is closed
 
 
+def _stub_main(monkeypatch, keeper_cls, *argv_extra):
+    """Wire lease_keeper.main() for a spy test on a non-FreeBSD host: a fake Keeper,
+    a runnable capture backend, no-op signal wiring (with the POSIX-only SIGUSR
+    numbers faked in), and a synthetic argv. Returns the module so the caller can
+    also spy set_wakeup_fd."""
+    import lease_keeper  # noqa: E402  # pylint: disable=import-outside-toplevel
+    monkeypatch.setattr(lease_keeper, "_setup_logging", lambda _logfile: None)
+    monkeypatch.setattr(lease_keeper, "Keeper", keeper_cls)
+    monkeypatch.setattr(lease_keeper.BpfCapture, "unavailable_reason", staticmethod(lambda: None))
+    monkeypatch.setattr(lease_keeper.signal, "signal", lambda *_a: None)
+    monkeypatch.setattr(lease_keeper.signal, "SIGUSR1", 30, raising=False)
+    monkeypatch.setattr(lease_keeper.signal, "SIGUSR2", 31, raising=False)
+    monkeypatch.setattr("sys.argv", [
+        "lease_keeper", "--iface", "eth0", "--chaddr", CHADDR_STR,
+        "--pidfile", "", "--hbfile", "", "--logfile", "", *argv_extra])
+    return lease_keeper
+
+
+def test_main_run_unregisters_wakeup_fd_before_close(monkeypatch):
+    # The shutdown ordering (set_wakeup_fd(-1) BEFORE keeper.close()) must hold, or a
+    # signal in the window would hit a closed wake fd. Pin the whole sequence so a
+    # future move of either finally cannot silently reintroduce that race.
+    events = []
+
+    class _FakeKeeper:
+        def __init__(self, *_a, **_k):
+            pass
+
+        def wake_fileno(self):
+            return 7
+
+        def run(self):
+            events.append("run")
+            return 0
+
+        def close(self):
+            events.append("close")
+
+    lease_keeper = _stub_main(monkeypatch, _FakeKeeper)
+    monkeypatch.setattr(lease_keeper.signal, "set_wakeup_fd", lambda fd: events.append(f"wakeupfd={fd}"))
+    assert lease_keeper.main() == 0
+    assert events == ["wakeupfd=7", "run", "wakeupfd=-1", "close"]
+
+
+def test_main_once_closes_keeper_without_arming_wakeup_fd(monkeypatch):
+    # --once must also close the keeper (its wake socketpair opened in __init__),
+    # even though it never arms set_wakeup_fd -- else a repeated in-process
+    # main(--once) leaks two fds per call.
+    events = []
+    armed = []
+
+    class _FakeKeeper:
+        def __init__(self, *_a, **_k):
+            pass
+
+        def claim_once(self):
+            events.append("claim_once")
+            return 0
+
+        def close(self):
+            events.append("close")
+
+    lease_keeper = _stub_main(monkeypatch, _FakeKeeper, "--once")
+    monkeypatch.setattr(lease_keeper.signal, "set_wakeup_fd", armed.append)
+    assert lease_keeper.main() == 0
+    assert events == ["claim_once", "close"]   # closed after the one-shot claim
+    assert not armed                           # --once never armed the signal wakeup fd
+
+
+def test_read_loop_uses_its_own_buflen_arg(lk, monkeypatch):
+    # The bpf read size is the reader thread's own arg, not shared instance state, so
+    # a concurrent restart cannot rebind it under an old reader. Guard it: os.read is
+    # called with the arg buflen (reintroducing self._buflen would fail this).
+    cap = lk.BpfCapture("eth0", False, lambda _f: None, lambda _f: None)
+    reads = []
+    monkeypatch.setattr(select, "select", lambda r, _w, _x: ([r[0]], [], []))   # bpf fd readable
+
+    def _fake_read(_fd, n):
+        reads.append(n)
+        raise OSError("stop the loop after one read")
+    monkeypatch.setattr(os, "read", _fake_read)
+    monkeypatch.setattr(os, "close", lambda _fd: None)   # fd / wake_reader are fakes here
+    stop = types.SimpleNamespace(is_set=lambda: False)
+    cap._read_loop(fd=11, wake_reader=12, stop_event=stop, buflen=9000)
+    assert reads == [9000]
+
+
 def test_id_opts_empty_by_default(lk):
     keeper = _keeper(lk)
     assert keeper._dhcp._id_opts == []

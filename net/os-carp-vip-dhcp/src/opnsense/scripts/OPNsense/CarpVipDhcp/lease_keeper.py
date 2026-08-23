@@ -271,59 +271,59 @@ def main():
                         default_route_mode=args.default_route_mode,
                         backup_egress=backup_egress)
 
-        # Warn only when promiscuous capture is ACTUALLY in effect: it is gated on the ARP
-        # nudge (see Keeper.__init__), so a stale flag with the nudge disabled is ignored,
-        # not promiscuous -- warning off the raw flag would contradict that and misstate the
-        # node's security posture.
-        if args.arp_listen_promisc and args.arp_nudge > 0:
-            LOG.warning("ARP listen: PROMISCUOUS capture enabled on %s -- the daemon now "
-                        "sees all traffic on the segment (opt-in fallback for NICs that "
-                        "drop the gateway's unicast ARP reply otherwise)", args.iface)
-
-        def _sig(*_):
-            # Flag only -- no logging or other non-async-signal-safe work in the
-            # handler (like the SIGUSR1/2 handlers below). set_wakeup_fd wakes the
-            # loop at once; run() logs "stopped" when it exits.
-            keeper.request_stop()
-        signal.signal(signal.SIGINT, _sig)
-        signal.signal(signal.SIGTERM, _sig)
-
-        # SIGUSR1/SIGUSR2 are POSIX-only (the daemon runs on FreeBSD); access them
-        # dynamically so a non-POSIX static-analysis host neither errors nor needs a
-        # suppression that is then flagged as useless where the attributes do exist.
-        def _sig_arp_nudge(*_):
-            # Operator-requested immediate ARP nudge (configd action / kill -USR1).
-            keeper.trigger_nudge()
-        signal.signal(getattr(signal, "SIGUSR1"), _sig_arp_nudge)
-
-        def _sig_carp(*_):
-            # CARP transition (rc.syshook.d/carp/50-carpvipdhcp sends SIGUSR2).
-            keeper.recheck_carp_role()
-        signal.signal(getattr(signal, "SIGUSR2"), _sig_carp)
-
-        if args.once:
-            # --once does not arm set_wakeup_fd, but the Keeper still opened its wake
-            # socketpair in __init__, so close it here too -- otherwise a repeated
-            # in-process main(--once) leaks two fds per call.
-            try:
-                return keeper.claim_once()
-            finally:
-                keeper.close()
-
-        # Wake the maintain-loop sleep the instant a signal is delivered: Python's
-        # C-level signal machinery writes the signal number to this fd, which is
-        # async-signal-safe and needs no work in the handler (the _sig* handlers
-        # above only set a flag). The loop selects on the read end and drains it.
-        signal.set_wakeup_fd(keeper.wake_fileno())
+        # The Keeper is constructed, so its wake socketpair is now open: guarantee
+        # keeper.close() on EVERY path from here -- the --once return, a normal run,
+        # or an exception during signal setup -- via one outer finally, not a
+        # per-path close. Otherwise a path that skips it leaks the socketpair (a
+        # repeated in-process main() would leak two fds per call).
         try:
-            return keeper.run()
+            # Warn only when promiscuous capture is ACTUALLY in effect: it is gated on the ARP
+            # nudge (see Keeper.__init__), so a stale flag with the nudge disabled is ignored,
+            # not promiscuous -- warning off the raw flag would contradict that and misstate the
+            # node's security posture.
+            if args.arp_listen_promisc and args.arp_nudge > 0:
+                LOG.warning("ARP listen: PROMISCUOUS capture enabled on %s -- the daemon now "
+                            "sees all traffic on the segment (opt-in fallback for NICs that "
+                            "drop the gateway's unicast ARP reply otherwise)", args.iface)
+
+            def _sig(*_):
+                # Flag only -- no logging or other non-async-signal-safe work in the
+                # handler (like the SIGUSR1/2 handlers below). set_wakeup_fd wakes the
+                # loop at once; run() logs "stopped" when it exits.
+                keeper.request_stop()
+            signal.signal(signal.SIGINT, _sig)
+            signal.signal(signal.SIGTERM, _sig)
+
+            # SIGUSR1/SIGUSR2 are POSIX-only (the daemon runs on FreeBSD); access them
+            # dynamically so a non-POSIX static-analysis host neither errors nor needs a
+            # suppression that is then flagged as useless where the attributes do exist.
+            def _sig_arp_nudge(*_):
+                # Operator-requested immediate ARP nudge (configd action / kill -USR1).
+                keeper.trigger_nudge()
+            signal.signal(getattr(signal, "SIGUSR1"), _sig_arp_nudge)
+
+            def _sig_carp(*_):
+                # CARP transition (rc.syshook.d/carp/50-carpvipdhcp sends SIGUSR2).
+                keeper.recheck_carp_role()
+            signal.signal(getattr(signal, "SIGUSR2"), _sig_carp)
+
+            if args.once:
+                return keeper.claim_once()   # --once never arms set_wakeup_fd; outer finally closes
+
+            # Wake the maintain-loop sleep the instant a signal is delivered: Python's
+            # C-level signal machinery writes the signal number to this fd, which is
+            # async-signal-safe and needs no work in the handler (the _sig* handlers
+            # above only set a flag). The loop selects on the read end and drains it.
+            signal.set_wakeup_fd(keeper.wake_fileno())
+            try:
+                return keeper.run()
+            finally:
+                # Order matters: unregister the C-level signal wakeup fd BEFORE the
+                # outer finally closes the wake socket it points at. Otherwise a signal
+                # in the shutdown window makes the C machinery write to a closed (or, in
+                # the worst case, a reused) fd. This inner finally runs first.
+                signal.set_wakeup_fd(-1)
         finally:
-            # Order matters: unregister the C-level signal wakeup fd BEFORE
-            # closing the wake socket it points at. Otherwise a signal in the
-            # shutdown window makes the C machinery write to a closed (or, in the
-            # worst case, a reused) fd. keeper.close() therefore runs only after
-            # set_wakeup_fd(-1).
-            signal.set_wakeup_fd(-1)
             keeper.close()
     finally:
         if pf and os.path.exists(pf):

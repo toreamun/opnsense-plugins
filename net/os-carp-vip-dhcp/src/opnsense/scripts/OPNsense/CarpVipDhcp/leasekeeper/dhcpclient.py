@@ -83,14 +83,14 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
         self._tried_reboot = False     # the first acquire tries INIT-REBOOT before a full DISCOVER
 
         self._rx = None                # latest DhcpReply snapshot (set via feed(), sniffer thread)
-        self._ev = threading.Event()
+        self._reply_ready = threading.Event()
 
     def feed(self, rx):
         """Hand a first-party (xid-matched) DhcpReply to the waiting sequence.
         Called on the sniffer thread; a lone ref-assign plus the event set."""
         self._rx = rx
         LOG.debug("DHCP reply: %s", _fmt_reply(rx))
-        self._ev.set()
+        self._reply_ready.set()
 
     def _send_dhcp(self, mtype, extra, ciaddr="0.0.0.0"):
         # ciaddr is set for RENEW/REBIND (the client already owns the address);
@@ -109,8 +109,8 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
         operator's actual context (which exchange, which address was refused)."""
         end = time.time() + timeout
         while time.time() < end and not self._should_stop():
-            self._ev.clear()
-            self._ev.wait(min(1.0, max(0.05, end - time.time())))
+            self._reply_ready.clear()
+            self._reply_ready.wait(min(1.0, max(0.05, end - time.time())))
 
             rx = self._rx
             if rx and rx.mtype == want:

@@ -491,7 +491,7 @@ class BackupEgressReconciler:
         # mode is coerced (as in DefaultRouteReconciler) so an unrecognised value is
         # inert OFF; the backup set only acts under observe/enforce.
         self._mode = DefaultRouteMode.coerce(mode)
-        self._backup = backup_egress or BackupEgressConfig()
+        self._cfg = backup_egress or BackupEgressConfig()
         self._last_backup_desired = _UNSET
         self._backup_heartbeat = _RateLimit(RECONCILE_HEARTBEAT_INTERVAL)
         self._valid_prefixes = None            # cached validated prefixes (warn-once via the cache)
@@ -504,7 +504,7 @@ class BackupEgressReconciler:
         feature enabled). Lets the caller decide whether the unbound path must probe the
         real CARP role for backup egress (the 0/0 withdraw there uses a fictional role)."""
         return (self._mode in (DefaultRouteMode.OBSERVE, DefaultRouteMode.ENFORCE)
-                and self._backup.enabled)
+                and self._cfg.enabled)
 
     def withdraw_backup_egress(self):
         """Remove the backup-egress routes (the /1-split plus any configured prefixes) at a
@@ -560,7 +560,7 @@ class BackupEgressReconciler:
     def _backup_route_set(self):
         """The prefixes to install for the configured form. SPLIT (and any unrecognised
         form) is the leak-safe /1-split; PREFIXES is the validated configured list."""
-        if self._backup.form == BackupEgressForm.PREFIXES:
+        if self._cfg.form == BackupEgressForm.PREFIXES:
             return self._backup_prefixes()
         return _SPLIT_PREFIXES
 
@@ -579,7 +579,7 @@ class BackupEgressReconciler:
         prefix, 0.0.0.0/0 under enforce, empty prefixes list) each fire once."""
         if self._valid_prefixes is None:
             valid = []
-            for prefix in self._backup.prefixes:
+            for prefix in self._cfg.prefixes:
                 try:
                     net = ipaddress.ip_network(prefix, strict=False)
                 except ValueError:
@@ -593,7 +593,7 @@ class BackupEgressReconciler:
                                 "a backup-egress route -- ignoring it (use the /1-split)")
                     continue
                 valid.append(prefix)
-            if self._backup.form == BackupEgressForm.PREFIXES and not valid:
+            if self._cfg.form == BackupEgressForm.PREFIXES and not valid:
                 LOG.warning("backup egress: form is 'prefixes' but no valid prefixes are set")
             self._valid_prefixes = tuple(valid)
         return self._valid_prefixes
@@ -610,7 +610,7 @@ class BackupEgressReconciler:
         return gateway
 
     def _backup_gateway(self):
-        cfg = self._backup
+        cfg = self._cfg
         if cfg.gateway:
             own = self._gateway_is_own(cfg.gateway)   # True / False / None (could not check)
             if own is None:
@@ -690,8 +690,8 @@ class BackupEgressReconciler:
         peer on a fresh master), which makes cleanup best-effort there rather than risk
         clobbering an unrelated route."""
         gateways = set(self._backup_installed_gws)
-        if self._backup.gateway:
-            gateways.add(self._backup.gateway)
+        if self._cfg.gateway:
+            gateways.add(self._cfg.gateway)
         return gateways
 
     def _note_backup_collisions(self, prefixes, gateway):

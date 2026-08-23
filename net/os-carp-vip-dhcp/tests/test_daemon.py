@@ -171,7 +171,7 @@ def test_feed_wakes_the_waiting_sequence(lk):
     rx = _reply(lk, lk.ACK, "100.64.4.7")
     c.feed(rx)
     assert c._rx is rx
-    assert c._ev.is_set()        # the waiting _wait_for_dhcp_reply returns at once
+    assert c._reply_ready.is_set()        # the waiting _wait_for_dhcp_reply returns at once
 
 
 def test_fmt_reply_readable(lk):

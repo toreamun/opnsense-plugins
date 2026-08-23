@@ -1,5 +1,6 @@
 """Unit tests for status.py heartbeat / keeper-id parsing (comments over docstrings)."""
 # pylint: disable=missing-function-docstring
+import json
 import time
 import types
 
@@ -228,3 +229,24 @@ def test_pid_alive_none_on_garbled_pidfile(tmp_path):
     bad = tmp_path / "bad.pid"
     bad.write_text("not-a-pid")
     assert status.pid_alive(str(bad)) is None                       # int() -> ValueError
+
+
+# ---- main(): wire carp_states()/iface_names() into read_keepers, in that order.
+
+def test_main_maps_carp_state_and_iface_name_onto_keeper(monkeypatch, capsys):
+    # main() must pass carp_states() and iface_names() to read_keepers in THAT
+    # order, and read_keepers must key them onto the keeper by vhid / iface. A
+    # swapped arg order or a broken .get would misassign the GUI feed.
+    rec = {"request": "100.64.4.7", "iface": "igb0", "chaddr": "aa",
+           "vhid": "149", "follow": "1", "arpnudge": "240"}
+    monkeypatch.setattr(status, "keeper_records", lambda conffile: [rec])
+    monkeypatch.setattr(status, "carp_states", lambda: {"149": "MASTER"})
+    monkeypatch.setattr(status, "iface_names", lambda: {"igb0": "WAN"})
+    monkeypatch.setattr(status, "carp_demotion", lambda: 0)
+    status.main()
+    doc = json.loads(capsys.readouterr().out)
+    assert doc["carp_demotion"] == 0
+    keeper = doc["keepers"][0]
+    assert keeper["request"] == "100.64.4.7" and keeper["vhid"] == "149"
+    assert keeper["carp_state"] == "MASTER"    # from carp_states(), keyed by vhid
+    assert keeper["iface_name"] == "WAN"       # from iface_names(), keyed by iface

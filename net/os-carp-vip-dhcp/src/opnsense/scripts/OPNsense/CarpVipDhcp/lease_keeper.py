@@ -302,7 +302,13 @@ def main():
         signal.signal(getattr(signal, "SIGUSR2"), _sig_carp)
 
         if args.once:
-            return keeper.claim_once()
+            # --once does not arm set_wakeup_fd, but the Keeper still opened its wake
+            # socketpair in __init__, so close it here too -- otherwise a repeated
+            # in-process main(--once) leaks two fds per call.
+            try:
+                return keeper.claim_once()
+            finally:
+                keeper.close()
 
         # Wake the maintain-loop sleep the instant a signal is delivered: Python's
         # C-level signal machinery writes the signal number to this fd, which is

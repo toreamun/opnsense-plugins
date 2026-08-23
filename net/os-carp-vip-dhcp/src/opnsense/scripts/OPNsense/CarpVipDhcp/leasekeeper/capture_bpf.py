@@ -41,7 +41,7 @@ except ImportError:
 
 
 @dataclass
-class _ReaderGen:
+class _ReaderGeneration:
     """One reader generation (one start()): the bpf fd, the reader thread, its
     stop signal, and the write end of its wake pipe. start() installs the whole
     generation and stop() clears it as a unit; a reader that outlives its stop()
@@ -71,7 +71,7 @@ class BpfCapture:
         self._on_bootp = on_bootp
         self._on_arp = on_arp
         self._buflen = 0               # kernel buffer size, from BIOCGBLEN in _configure
-        self._gen = None               # the current _ReaderGen, or None when stopped
+        self._gen = None               # the current _ReaderGeneration, or None when stopped
         # Throttle the untrusted-input parse-error line: a malformed/spoof storm
         # must not churn the log (DEBUG still hits disk regardless of the view).
         self._parse_errs = _RateLimit(PARSE_ERROR_LOG_INTERVAL)
@@ -114,7 +114,7 @@ class BpfCapture:
         thread = threading.Thread(
             target=self._read_loop, args=(fd, wake_reader, stop_event),
             name="bpf-capture", daemon=True)
-        self._gen = _ReaderGen(fd=fd, thread=thread, stop_event=stop_event, wake_writer=wake_writer)
+        self._gen = _ReaderGeneration(fd=fd, thread=thread, stop_event=stop_event, wake_writer=wake_writer)
         thread.start()
         return True
 

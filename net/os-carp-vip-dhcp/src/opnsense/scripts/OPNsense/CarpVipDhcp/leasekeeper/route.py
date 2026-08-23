@@ -341,7 +341,7 @@ class DefaultRouteReconciler:
             else:
                 self._install(changed, gateway, replacing=have)
         else:
-            reason = self._no_default_reason(blocked, is_master, holds_lease)
+            reason = self._no_default_reason(blocked, is_master, holds_lease, bound)
             # A route-get failure (for any reason) also reads as None here, so we
             # skip the withdraw. Treating an unreadable table as "absent" is a
             # deliberate trade-off: an empty table -- the common quiet state on a
@@ -358,13 +358,16 @@ class DefaultRouteReconciler:
                 self._withdraw(changed, have, reason)
 
     @staticmethod
-    def _no_default_reason(blocked, is_master, holds_lease):
+    def _no_default_reason(blocked, is_master, holds_lease, bound):
         """Why the desired state is 'no default' -- the informative half of the
         backup/no-lease/liveness heartbeat and of a withdraw."""
         if blocked:
             return "liveness not confirmed (possible split-brain / dead WAN)"
         if not holds_lease:
-            return "no usable lease"
+            # `bound` separates a genuinely absent lease from a held lease whose ACK
+            # carried no usable option-3 gateway: both yield no default, but the log
+            # must not tell an operator holding a lease that there is none.
+            return "lease has no usable gateway" if bound else "no lease held"
         if is_master is not True:
             return "CARP backup"
         return "not owned"

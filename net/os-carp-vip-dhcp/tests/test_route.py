@@ -415,13 +415,24 @@ def test_liveness_withdraw_names_the_reason(lk, monkeypatch, caplog):
                for r in caplog.records)
 
 
-def test_no_default_reason_no_usable_lease(lk, monkeypatch, caplog):
-    # master but holding no lease: the no-default heartbeat names "no usable lease"
-    # (not "CARP backup"), so the operator sees WHY there is no default.
+def test_no_default_reason_no_lease_held(lk, monkeypatch, caplog):
+    # master but holding no lease at all: the no-default heartbeat names "no lease
+    # held" (not "CARP backup"), so the operator sees WHY there is no default.
     rec, _ = _rec(lk, monkeypatch, "enforce")
     with caplog.at_level("INFO", logger="lease-keeper"):
         rec.reconcile(True, False, None)
-    assert any("no default held (no usable lease)" in r.getMessage() for r in caplog.records)
+    assert any("no default held (no lease held)" in r.getMessage() for r in caplog.records)
+
+
+def test_no_default_reason_lease_without_gateway(lk, monkeypatch, caplog):
+    # master, a lease IS held (bound), but the ACK carried no usable option-3
+    # gateway: distinct from "no lease held" so the log does not tell an operator
+    # who has a lease that there is none.
+    rec, _ = _rec(lk, monkeypatch, "enforce")
+    with caplog.at_level("INFO", logger="lease-keeper"):
+        rec.reconcile(True, True, None)
+    assert any("no default held (lease has no usable gateway)" in r.getMessage()
+               for r in caplog.records)
 
 
 def test_gateway_change_relogs_ownership_at_info(lk, monkeypatch, caplog):

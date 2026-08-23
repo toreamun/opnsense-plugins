@@ -1453,7 +1453,7 @@ def test_carp_master_decision_from_ifconfig_text(lk):
 
 
 def test_carp_master_vhid_is_word_bounded(lk):
-    # The trailing space in CARP_MASTER_FMT stops vhid 199 matching 19 or 1990.
+    # ifprobe captures the whole vhid number, so 199 never reads as 19 or 1990.
     assert lk._carp_master("carp: MASTER vhid 19 advbase 1\n", "199") is False
     assert lk._carp_master("carp: MASTER vhid 1990 advbase 1\n", "199") is False
 

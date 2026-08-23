@@ -18,6 +18,7 @@ from .constants import (
     LINK_POLL_STEP, LOOP_ERROR_BACKOFF, Phase, REBIND_POLL_STEP, REDORA_MAX, REDORA_MIN,
     SNIFFER_RETRY, SNIFFER_WARMUP)
 from .dhcpclient import DhcpClient, DhcpHooks
+from .ifprobe import carrier_up, is_carp_master
 from .policy import ArpNudge, FollowHooks, FollowPolicy
 from .route import (BackupEgressReconciler, DefaultRouteMode, DefaultRouteReconciler,
                     withdraw_unless_master)
@@ -27,13 +28,6 @@ from .wire import _parse_reply
 
 LOG = logging.getLogger(LOGGER_NAME)
 
-# The keeper's dependency on ifconfig(8) output text, named in one place. The
-# trailing space in the CARP format is load-bearing: it stops vhid 1 matching
-# "vhid 11".
-CARP_MASTER_FMT = "carp: MASTER vhid {vhid} "
-IFCONFIG_STATUS_ACTIVE = "status: active"    # carrier up
-IFCONFIG_STATUS = "status: "                 # any status line present (up or down)
-
 # _UNSET (shared, from util) marks "CARP-master value not supplied": the maintain
 # loop probes the role once per tick and shares it, but None is a valid probe
 # result, so the sentinel means "probe it now".
@@ -41,20 +35,20 @@ IFCONFIG_STATUS = "status: "                 # any status line present (up or do
 
 def _carp_master(ifconfig_text, vhid):
     """CARP-master decision from ifconfig text: True/False for the vhid, None when
-    the text is missing (probe failed), True when no vhid (nothing to gate on)."""
+    the text is missing (probe failed), True when no vhid (nothing to gate on).
+    Parsing lives in ifprobe.is_carp_master; this adds only the keeper policy that
+    a keeper with no vhid has nothing to gate on."""
     if not vhid:
         return True
-    if ifconfig_text is None:
-        return None
-    return CARP_MASTER_FMT.format(vhid=vhid) in ifconfig_text
+    return is_carp_master(ifconfig_text, vhid)
 
 
 def carp_master(iface, vhid):
     """CARP-master role for `vhid` on `iface` (True/False, None on probe failure).
     Standalone -- no Keeper -- so the daemon entry point can gate its startup
     fail-stop default withdraw on the role before the Keeper / capture backend
-    exist; the Keeper's per-tick probe (_probe_carp_master) shares CARP_MASTER_FMT
-    through _carp_master."""
+    exist; the Keeper's per-tick probe (_probe_carp_master) shares the same
+    ifprobe parse through _carp_master."""
     return _carp_master(ifconfig(iface), vhid)
 
 
@@ -407,15 +401,9 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         present-but-inactive status (no carrier / no link), None when it cannot be
         read (probe failed, or the NIC reports no status line). Used by the
         unbound link-return fast path and the acquire carrier gate; a None
-        result never disturbs the backoff and never holds an acquire."""
-        out = self._ifconfig()
-        if out is None:
-            return None
-        if IFCONFIG_STATUS_ACTIVE in out:
-            return True
-        if IFCONFIG_STATUS in out:
-            return False
-        return None
+        result never disturbs the backoff and never holds an acquire. Parsing
+        lives in ifprobe.carrier_up; _ifconfig supplies the warn-once text."""
+        return carrier_up(self._ifconfig())
 
     def _check_link_returned(self):
         """While UNBOUND, detect a carrier down->up edge so the keeper re-DORAs at

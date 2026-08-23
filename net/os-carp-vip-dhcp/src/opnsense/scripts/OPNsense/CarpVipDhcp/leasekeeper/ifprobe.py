@@ -1,0 +1,59 @@
+"""Parse ifconfig(8) output text.
+
+The counterpart to syscmd, which *runs* ifconfig: this module *reads* its text,
+so keeper.py and status.py agree on exactly how a CARP line and a status line
+are interpreted instead of each carrying its own parser (they used to -- keeper
+matched the CARP role by substring, status by a separate regex). Pure text in,
+values out; no IO.
+"""
+import re
+from enum import StrEnum
+
+# One regex owns the CARP line shape ("carp: <ROLE> vhid <N> ..."). Capturing the
+# whole vhid number (not a substring) is what keeps vhid 199 from matching 19/1990.
+_CARP_LINE = re.compile(r"carp:\s+(\w+)\s+vhid\s+(\d+)")
+_STATUS_ACTIVE = "status: active"    # carrier up
+_STATUS_ANY = "status: "             # a status line is present at all (up or down)
+
+
+class CarpRole(StrEnum):
+    """The CARP states ifconfig(8) reports. StrEnum (like constants.Phase) so a
+    member is its own ifconfig token; used as the typed MASTER constant below."""
+    MASTER = "MASTER"
+    BACKUP = "BACKUP"
+    INIT = "INIT"
+
+
+def carp_roles(ifconfig_text):
+    """Map vhid (str) -> role token (str) for every CARP line in `ifconfig_text`
+    (empty dict when the text is None/empty). The role token is passed through
+    verbatim -- an unrecognised state is kept, not dropped, so the status view
+    never loses a VIP (CarpRole names the three states carp(4) actually emits)."""
+    roles = {}
+    if not ifconfig_text:
+        return roles
+    for role, vhid in _CARP_LINE.findall(ifconfig_text):
+        roles[vhid] = role
+    return roles
+
+
+def is_carp_master(ifconfig_text, vhid):
+    """True/False whether `vhid` is CARP MASTER in `ifconfig_text`, or None when
+    the text is missing (probe failed) -- distinct from present-but-not-master
+    (False). vhid is matched exactly, so 199 never reads as 19 or 1990."""
+    if ifconfig_text is None:
+        return None
+    return carp_roles(ifconfig_text).get(str(vhid)) == CarpRole.MASTER
+
+
+def carrier_up(ifconfig_text):
+    """Interface carrier from `ifconfig_text`: True on 'status: active', False on
+    a present-but-inactive status line, None when it cannot be read (text missing,
+    or the NIC reports no status line at all)."""
+    if ifconfig_text is None:
+        return None
+    if _STATUS_ACTIVE in ifconfig_text:
+        return True
+    if _STATUS_ANY in ifconfig_text:
+        return False
+    return None

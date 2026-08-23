@@ -60,18 +60,22 @@ def test_carrier_up():
 
 
 def test_iface_ipv4():
+    # `ifconfig -f inet:cidr` prints the prefix inline; /24 plus /30 and /31 (the
+    # backup-egress peer-derivation cases) all parse.
     assert ifprobe.iface_ipv4(
-        "\tinet 100.64.4.7 netmask 0xffffff00 broadcast 100.64.4.255\n") == ("100.64.4.7", 24)
-    assert ifprobe.iface_ipv4("\tinet 10.0.0.1 netmask 0xfffffe00\n") == ("10.0.0.1", 23)
+        "\tinet 100.64.4.7/24 broadcast 100.64.4.255\n") == ("100.64.4.7", 24)
+    assert ifprobe.iface_ipv4("\tinet 10.0.0.2/30\n") == ("10.0.0.2", 30)
+    assert ifprobe.iface_ipv4("\tinet 10.0.0.2/31\n") == ("10.0.0.2", 31)
 
 
 def test_iface_ipv4_none_cases():
     assert ifprobe.iface_ipv4(None) is None
     assert ifprobe.iface_ipv4("") is None
     assert ifprobe.iface_ipv4("igc0: flags\n\tstatus: active\n") is None       # no inet
-    assert ifprobe.iface_ipv4("\tinet 100.64.4.7\n") is None                   # no netmask
-    assert ifprobe.iface_ipv4("\tinet nope netmask 0xffffff00\n") is None      # bad address
-    assert ifprobe.iface_ipv4("\tinet 100.64.4.7 netmask zzz\n") is None       # bad mask
+    assert ifprobe.iface_ipv4("\tinet 100.64.4.7\n") is None                   # no /NN (not -f cidr)
+    assert ifprobe.iface_ipv4("\tinet nope/24\n") is None                      # bad address
+    assert ifprobe.iface_ipv4("\tinet 100.64.4.7/33\n") is None                # prefix out of range
+    assert ifprobe.iface_ipv4("\tinet 100.64.4.7/xx\n") is None                # bad prefix
 
 
 def test_carp_role_values_are_the_ifconfig_tokens():

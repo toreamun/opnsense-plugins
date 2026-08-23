@@ -52,7 +52,10 @@ class FakeRoute:
                 return self._reply(1, "", "netstat: routing table unavailable")
             return self._reply(0, self._netstat_body())
         if prog.endswith("ifconfig"):
-            return self._ifconfig(cmd[1])
+            # Only route._iface_ipv4 shells ifconfig here, always as
+            # `ifconfig -f inet:cidr <iface> inet` -> iface is the token before "inet".
+            iface = cmd[cmd.index("inet") - 1] if "inet" in cmd else cmd[-1]
+            return self._ifconfig(iface)
         return self._route(cmd)
 
     def _route(self, cmd):
@@ -94,12 +97,12 @@ class FakeRoute:
         return "\n".join(lines) + "\n"
 
     def _ifconfig(self, iface):
+        # Mirrors `ifconfig -f inet:cidr`: the address prints as A.B.C.D/NN.
         info = self.ifaces.get(iface)
         if info is None:
             return self._reply(1, "", f"ifconfig: interface {iface} does not exist")
         addr, prefixlen = info
-        mask = (0xffffffff << (32 - prefixlen)) & 0xffffffff if prefixlen else 0
-        body = f"{iface}: flags=8843<UP>\n\tinet {addr} netmask 0x{mask:08x} broadcast 0.0.0.0\n"
+        body = f"{iface}: flags=8843<UP>\n\tinet {addr}/{prefixlen} broadcast 0.0.0.0\n"
         return self._reply(0, body)
 
     @staticmethod

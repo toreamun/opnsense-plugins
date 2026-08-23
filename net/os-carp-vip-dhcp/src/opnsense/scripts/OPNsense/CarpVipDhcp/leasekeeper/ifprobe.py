@@ -61,23 +61,25 @@ def carrier_up(ifconfig_text):
 
 
 def iface_ipv4(ifconfig_text):
-    """(address, prefixlen) of the first IPv4 in `ifconfig <iface> inet` text
-    ('inet A netmask 0xMMMMMMMM ...'), or None when the text is missing or has no
-    valid inet+netmask pair."""
+    """(address, prefixlen) of the first IPv4 in `ifconfig -f inet:cidr <iface> inet`
+    text ('inet A.B.C.D/NN ...'), or None when the text is missing or has no valid inet
+    address with a prefix length.
+
+    The caller (route._iface_ipv4) always requests `-f inet:cidr`, so the address carries
+    its prefix length inline -- no hex netmask (0xMMMMMMMM) to convert. Text without a
+    /NN (an ifconfig that did not honour -f) returns None, and the caller defers."""
     if not ifconfig_text:
         return None
     toks = ifconfig_text.split()
-    addr = mask = None
     for i, tok in enumerate(toks):
-        if tok == "inet" and addr is None and i + 1 < len(toks):
-            addr = toks[i + 1]
-        elif tok == "netmask" and mask is None and i + 1 < len(toks):
-            mask = toks[i + 1]
-    if addr is None or mask is None:
-        return None
-    try:
-        bits = bin(int(mask, 16)).count("1")
-        ipaddress.ip_address(addr)
-    except ValueError:
-        return None
-    return addr, bits
+        if tok == "inet" and i + 1 < len(toks):
+            addr, slash, bits = toks[i + 1].partition("/")
+            if not slash:
+                return None            # not the -f inet:cidr form -> no prefix length
+            try:
+                prefixlen = int(bits)
+                ipaddress.ip_address(addr)
+            except ValueError:
+                return None
+            return (addr, prefixlen) if 0 <= prefixlen <= 32 else None
+    return None

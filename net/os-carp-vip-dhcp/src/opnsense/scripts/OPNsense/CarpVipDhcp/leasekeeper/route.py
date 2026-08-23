@@ -672,8 +672,10 @@ class BackupEgressReconciler:
 
     def _iface_ipv4(self, iface):
         """(address, prefixlen) of the first IPv4 on `iface`, or None. Runs
-        `ifconfig <iface> inet`; ifprobe.iface_ipv4 does the parse."""
-        res = run([_IFCONFIG, iface, "inet"])
+        `ifconfig -f inet:cidr <iface> inet` so the address prints as A.B.C.D/NN
+        (a direct prefix length) instead of the default hex netmask (0xffffff00),
+        which ifprobe.iface_ipv4 then parses."""
+        res = run([_IFCONFIG, "-f", "inet:cidr", iface, "inet"])
         if res is None or res.returncode != 0:
             return None
         return iface_ipv4(res.stdout)
@@ -828,7 +830,12 @@ class BackupEgressReconciler:
         """{network: gateway} for the IPv4 FIB from one `netstat -rn` pass, or None when
         the table cannot be read -- callers must not mistake an unreadable table for 'no
         routes' and skip the master-side removal. A bare host address parses as /32;
-        header and default rows that are not a network are skipped."""
+        header and default rows that are not a network are skipped.
+
+        Parses the plain-text table on purpose: the destination/gateway column layout of
+        `netstat -rn` has been stable for decades, whereas netstat's libxo(3) JSON key
+        names are explicitly NOT a stable API across FreeBSD releases -- so the text is
+        the more robust substrate for this one parse, not the less."""
         res = run([_NETSTAT, "-rn", "-f", "inet"])
         if res is None or res.returncode != 0:
             if not self._warn.fib_unreadable:   # once per unreadable episode (re-armed below)

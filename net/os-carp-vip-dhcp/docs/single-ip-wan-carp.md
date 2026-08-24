@@ -10,7 +10,7 @@ nodes: the classic "single-IP" obstacle to CARP on the WAN side.
 > correction came out of that run: giving the backup its own internet via an **automatic
 > gateway-group tier flip is failover-unsafe**, and is replaced by a fixed default route
 > (baseline), or the role-driven `defaultRouteMode = enforce` plus the built-in **backup-egress**
-> feature that gives the backup automatic internet via the master ([section 8](#s8), [section 9](#s9);
+> feature that gives the backup automatic internet via the master ([section 7](#s7), [section 8](#s8);
 > [backup-egress.md](backup-egress.md)). [section 10](#s10) has the piece-by-piece status.
 
 All addresses below are **examples, substitute your own.** The per-node WAN IPs are
@@ -65,7 +65,7 @@ public IP). That leaves you two short. This document works around that.
 > one simplification: a static public IP needs no lease-keeping, so you **skip the
 > DHCP/plugin part** ([section 3](#s3) step 2 / [section 6.3](#s6-3) step 4) and simply assign the public address to
 > the CARP VIP (or bind it as an IP-alias VIP to the CARP VIP). Everything else -
-> the per-node WAN IPs for CARP, and the backup's own-internet handling ([section 8](#s8)) - is
+> the per-node WAN IPs for CARP, and the backup's own-internet handling ([section 7](#s7)) - is
 > identical. The plugin is only needed when that single public address is
 > handed out by **DHCP**.
 
@@ -94,7 +94,7 @@ The facts that drive the design:
   on the interface, so the backup has no address in the VIP's subnet and **no
   connected route to the ISP gateway**. This, not source-address selection, is the
   real reason the backup's gateway monitor fails and why the backup has no internet of
-  its own ([section 8](#s8)). It is *not* a safe trigger for automatic gateway switching ([section 8.1](#s8-1)).
+  its own ([section 7](#s7)). It is *not* a safe trigger for automatic gateway switching ([section 7.1](#s7-1)).
 - **Important:** OpenBSD's warning that the carp device must share a subnet with
   the CARP VIP applies **only to `balancing` mode**. In ordinary master/backup,
   **a non-routable node IP (link-local or RFC 1918) plus a public VIP in a different subnet works fine** -
@@ -121,7 +121,7 @@ The facts that drive the design:
    that stays on the WAN segment. (The ISP's on-segment access gear does still see the
    *master's* physical MAC as source - CARP advertisements and egress both use it - plus
    the virtual MAC; the backup stays silent on the WAN until it takes over, when that
-   physical MAC flips to it. See [section 7](#s7) for the strict one-MAC-per-port case.)
+   physical MAC flips to it. See [section 9](#s9) for the strict one-MAC-per-port case.)
    Because that range is not RFC 1918, the outbound `internal to VIP` SNAT catch-all never
    matches the node IP as a *source*, so it needs no no-NAT-for-CARP carve-out - one rule
    fewer ([IP and CARP plan](#s6-1)). (Egress still leaves via the VIP: that SNAT's *target* is set
@@ -130,8 +130,8 @@ The facts that drive the design:
 4. **The default route stays pinned to the ISP gateway** (via the VIP) on both nodes,
    so a promoted backup routes out the instant it owns the VIP - failover needs no
    routing change. In backup state a node has no internet of its own; if it must
-   self-update, it borrows the master's path over [SYNC](#t-sync) **on demand** ([section 8](#s8)), never via
-   automatic gateway switching (failover-unsafe, [section 8.1](#s8-1)).
+   self-update, it borrows the master's path over [SYNC](#t-sync) **on demand** ([section 7](#s7)), never via
+   automatic gateway switching (failover-unsafe, [section 7.1](#s7-1)).
 
 <details>
 <summary><b>Direct VIP vs. IP-alias - why the public address sits straight on the CARP VIP</b></summary>
@@ -245,7 +245,7 @@ sequenceDiagram
 > both nodes, so the gateway's ARP entry stays valid and only the switch relearns the
 > port. A separate, steady-state hazard - the gateway letting the VIP's ARP entry
 > **expire** and never re-querying it - is independent of failover and is covered in
-> [section 7](#s7).
+> [section 9](#s9).
 >
 > **Lab-validated, and exercised on real ISPs.** The failover itself has run on real
 > WANs: the VIP followed the master on a CGNAT WAN, and on a live single-IP WAN a real
@@ -254,7 +254,7 @@ sequenceDiagram
 > data both **before and after** a mid-connection cable-pull (`pfsync` had synced the
 > state; outbound NAT to the VIP keeps it portable across nodes, so the promoted node
 > continued the same connection), and the switch relearns the virtual MAC from the new
-> master's gratuitous ARP with no special switch config ([section 7](#s7) has the lab caveat
+> master's gratuitous ARP with no special switch config ([section 9](#s9) has the lab caveat
 > on faithful failure injection).
 
 ---
@@ -278,21 +278,21 @@ are examples, substitute your own.*
 > the single lease to the first MAC they see and **NAK a `REQUEST` from any other MAC and
 > stay silent to its `DISCOVER`** - then this design cannot work as-is and you need a
 > fixed-MAC-plus-CARP-gated approach instead. Check it while the WAN is still on DHCP; it
-> needs no static cutover, so the reboot in [section 7](#s7) *First cutover* (a
+> needs no static cutover, so the reboot in [section 9](#s9) *First cutover* (a
 > DHCP-to-static issue) does not apply here. Two ways:
 >
 > - **Simplest (all GUI):** temporarily set the WAN interface's **MAC address** to the
 >   virtual MAC under _Interfaces ‣ [WAN]_, Apply, and see whether it pulls the public
 >   lease. The interface stays DHCP (no reboot trap), and this runs the full exchange on
 >   the virtual MAC - conclusive, but it *takes* a lease, so on a MAC-binding line expect
->   a brief WAN blip and a possible cooldown ([section 7](#s7) *First cutover*) on revert
+>   a brief WAN blip and a possible cooldown ([section 9](#s9) *First cutover*) on revert
 >   (clear the MAC field + Apply).
 > - **Non-disturbing:** send a `DISCOVER`-only probe on the virtual chaddr and watch
 >   the reply in _Interfaces ‣ Diagnostics ‣ Packet Capture_ (or
 >   `tcpdump -ni <wan> udp port 67 or udp port 68`): `OFFER`/`ACK` to the virtual MAC = good,
 >   NAK-then-silence = MAC-bound. A `DISCOVER` takes no lease, so it leaves the live line
 >   untouched. (OPNsense's `dhclient` has **no `-r`/release** flag; for a maximally clean
->   test free the current lease with a `DHCPRELEASE` sent another way.) See [section 7](#s7)
+>   test free the current lease with a `DHCPRELEASE` sent another way.) See [section 9](#s9)
 >   *DHCP behaviour* and [section 10](#s10).
 
 <a id="s6-1"></a>
@@ -312,7 +312,7 @@ are examples, substitute your own.*
 | `pass` | shared secret | Yes | Authenticates advertisements on the shared segment |
 
 > `vhid 9` gives virtual MAC `00:00:5e:00:01:09` (last MAC byte = vhid in hex). In
-> production pick an unusual vhid - see [vhid collision](#s7)
+> production pick an unusual vhid - see [vhid collision](#s9)
 > about shared ISP L2.
 
 > **The VIP is not a network you choose:** it is whatever address the ISP leases on the
@@ -425,8 +425,8 @@ the keeper) only need doing once.
    upstream gateway with the best **priority**
    ([Gateways manual](https://docs.opnsense.org/manual/gateways.html)). Leave **Allow
    default gateway switching** OFF and, for a single-uplink pair, gateway monitoring off
-   ([section 8.1](#s8-1), [section 7](#s7)) - there is nothing to switch to. You do **not** need a `PEER_SYNC` gateway
-   object; the optional backup path ([section 8.2](#s8-2)) routes straight to the peer's SYNC IP.
+   ([section 7.1](#s7-1), [section 9](#s9)) - there is nothing to switch to. You do **not** need a `PEER_SYNC` gateway
+   object; the optional backup path ([section 7.2](#s7-2)) routes straight to the peer's SYNC IP.
    > **Gotcha - the leftover DHCP gateway after a DHCP-to-static WAN.** This design turns the
    > WAN interface from DHCP to static (the public address lives on the VIP, not here). Two
    > things can then quietly leave the node with **no default route**, even while it is CARP
@@ -447,14 +447,14 @@ the keeper) only need doing once.
 7. **No gateway group for the default route.** The single upstream `WAN_ISP` from step 6
    *is* the system default; keeping it pinned there is what makes failover seamless. Do
    **not** point the default at a `[WAN_ISP, PEER_SYNC]` group with switching - it is
-   failover-unsafe ([section 8.1](#s8-1)). A gateway group still has its place for *policy-routed transit*
+   failover-unsafe ([section 7.1](#s7-1)). A gateway group still has its place for *policy-routed transit*
    traffic, just not for the firewall's own default route.
 8. **Source NAT** (_Firewall ‣ NAT ‣ Source NAT_, mode **Hybrid**, or **Manual** if you
    want to own every rule). This is ordinary OPNsense outbound NAT - nothing
    plugin-specific; the CARP how-to covers the same ground
    ([Setup outbound NAT](https://docs.opnsense.org/manual/how-tos/carp.html#setup-outbound-nat)).
    Bind the rules to the **WAN interface** (the rule's **Interface** field). If your two nodes number the WAN
-   under different config-keys (e.g. a physical+VM pair, [section 7](#s7)), bind instead to a `WAN`
+   under different config-keys (e.g. a physical+VM pair, [section 9](#s9)), bind instead to a `WAN`
    **interface group** whose members include both keys (e.g. `opt3,wan`), so the one
    synced rule resolves on both. Where a rule translates to the VIP, set the
    **Translation / target** address field (it otherwise defaults to *Interface address*)
@@ -463,7 +463,7 @@ the keeper) only need doing once.
       or simply the RFC 1918 ranges), destination any, **Translation / target**
       **`wan_carp_vip`**. One rule replaces per-subnet rules and follows the lease via the
       alias; if its source range covers the SYNC net it also NATs the backup's borrowed
-      traffic ([section 8.3](#s8-3)), so no separate backup-transit rule is needed.
+      traffic ([section 7.3](#s7-3)), so no separate backup-transit rule is needed.
    2. **backup transit** *(optional)*: only if the catch-all above does not cover the SYNC
       net - source the SYNC net to any, **Translation / target** `wan_carp_vip`.
    > **RFC 1918 node IPs only:** add a **no-NAT-for-CARP** rule *above* the catch-all -
@@ -479,7 +479,7 @@ the keeper) only need doing once.
 9. **Firewall (SYNC):** allow `SYNC net -> any`, kept tight (pkg/NTP/DNS).
 10. **Verify:**
     - `ifconfig -g WAN` on **both** nodes: it lists that node's real WAN device, so the
-      group-bound NAT resolves on each ([section 7](#s7)).
+      group-bound NAT resolves on each ([section 9](#s9)).
     - `pfctl -sn | grep -E 'no nat|nat on|wan_carp'`: the catch-all `-> <wan_carp_vip>`
       rule is bound to the WAN interface, and (with RFC 1918 node IPs) the
       `no nat … to 224.0.0.18` rule sits **above** it.
@@ -493,171 +493,7 @@ the keeper) only need doing once.
 
 <a id="s7"></a>
 
-## 7 Open questions and risks
-
-Most of these are edge cases - a WAN where the ISP isolates you per VLAN/port (the common fiber case) hits only a few. Skim for the ones your line actually has.
-
-### 7.1 Shared / untrusted WAN L2 (moot if the ISP isolates you per VLAN/port)
-
-- **`vhid` collision on a shared ISP L2:** if the ISP really shares L2 with other
-  customers, `00:00:5e:00:01:{vhid}` could collide with another customer's
-  VRRP/CARP. **Most fiber ISPs isolate customers per VLAN/port** (you only see gw
-  `.1`), so safe. **Verify** with `tcpdump -T carp` + `arp -an` on the WAN before
-  trusting it. Use an unusual `vhid` + a `pass` regardless.
-- **The CARP `pass` secures the *election*, not the *segment*.** The `pass` (a SHA-1
-  HMAC) stops a stranger from injecting CARP advertisements to hijack the VIP - but it
-  does nothing about a hostile on-segment neighbour **ARP-spoofing** the VIP or the
-  gateway directly - a **general untrusted-shared-L2 exposure** that a plain, non-CARP
-  firewall on the same segment shares equally. CARP does not *create* that risk; it only
-  *adds* the election as one more thing to authenticate. On a genuinely shared L2 you
-  can additionally set CARP to **unicast** (`ifconfig <if> vhid <n> … peer <peer-node-IP>`;
-  FreeBSD 14 [`carp(4)`](https://man.freebsd.org/cgi/man.cgi?query=carp&sektion=4)) so advertisements go only to the peer instead of flooding the
-  segment - hardening the election against on-segment observation/injection. Caveats: it
-  is a manual ifconfig-level setting (not exposed in the OPNsense VIP GUI, so not
-  persistent without a hook), it disables CARP's TTL verification, and it still does
-  **not** stop ARP-spoofing. So unicast hardens CARP; it does not make an untrusted shared
-  L2 safe - and most fiber ISPs isolate per VLAN/port anyway (previous bullet), where it
-  is moot.
-- **`blockpriv`/`blockbogons` vs. CARP advertisements - should be fine:** a peer's
-  advertisements arrive on the WAN with the node's non-routable link-local source IP
-  (`169.254.x`; not blocked here, see [section 6.1](#s6-1)). OPNsense installs a global `quick` rule (roughly the
-  form below) that lets CARP past all blocks:
-  ```
-  pass quick inet proto carp from any to 224.0.0.18
-  ```
-  `quick` is evaluated *before* `blockpriv`/`blockbogons`/default-deny, and it is
-  interface-independent (`from any`), so it covers the WAN. Confirm with
-  `pfctl -sr | grep carp` after the VIPs are set. (Observed on a working CGNAT
-  two-node setup; **not** yet confirmed in this exact single-IP topology.)
-- **Follow trusts the DHCP ACK, which a shared-L2 neighbour can forge:** on a genuinely
-  shared segment an attacker who reads the CARP adverts (to derive the virtual MAC) can
-  send a spoofed ACK and drive the VIP to an address of their choosing (throttled to one
-  move per 60 s). During a T2 **REBIND** the expected-server check is intentionally
-  relaxed (any server may answer - legitimate DHCP), widening the window. This is the
-  same untrusted-shared-L2 exposure as the ARP-spoofing bullet above, and moot where the
-  ISP isolates you per VLAN/port. On a shared L2, pin the address (follow off) or use a
-  strict upstream.
-
-### 7.2 DHCP, the lease, and the cutover
-
-- **DHCP behaviour (test before committing):** does the ISP hand a lease to the
-  virtual MAC, and does it restrict you to one active MAC? Some ISPs will happily
-  lease a second address to a second MAC (in which case you do **not** need this
-  single-IP design at all - just give each node its own lease). Others bind one lease
-  per line. **Test safely** with a DHCP `DISCOVER`-only probe before committing - a
-  `DISCOVER` does not take a lease, so it does not disturb the live line. (Verified on
-  a fiber ISP: a small crafted `DISCOVER` from a throwaway MAC drew a normal `OFFER`
-  with no effect on the live lease. Use a **throwaway** locally-administered MAC, not
-  the real virtual MAC, so a lease-binding ISP cannot associate the probe with your
-  VIP.)
-- **First cutover from a live DHCP WAN - two one-time traps** (a steady-state failover
-  hits neither). *(1)* Switching the WAN to static and pressing Apply does **not** stop
-  the running `dhclient` - it is [`daemon(8)`](https://man.freebsd.org/cgi/man.cgi?query=daemon&sektion=8)-supervised, so a plain `kill` is restarted
-  and it re-grabs the old lease; **reboot** into the static config to clear it. *(2)* A
-  MAC-binding ISP may hold the address on the *old* MAC for a few minutes and stay silent
-  to the virtual MAC's `DISCOVER` (**ISP-dependent** - check with the probe above), so
-  release the lease, wait the cooldown out, *then* start the keeper. Failover reuses the
-  *same* virtual MAC, so neither trap recurs.
-- **Follow tracks an ISP renumber, including cross-subnet:** the keeper rewrites the CARP
-  VIP to the new address (after checking it is sane, in the same routability class, and
-  from the expected server). A **same-subnet** change is seamless; on a **cross-subnet**
-  move it also updates the VIP prefix and the WAN gateway from the DHCP ACK and reapplies
-  routing, so outbound keeps working - parity with a plain DHCP interface. The one gap: if
-  the ACK carries **no subnet mask**, it can only move the address and logs a warning to
-  fix the prefix and gateway by hand. (`follow off` pins the address and does none of this.)
-- **Identical DHCP client-id across nodes:** the shared-lease premise assumes the server
-  keys on `chaddr`. If it keys on the client-id (option 61) and the two nodes present
-  different ones, they can get *different* addresses - set the same client-id on both
-  (config-sync makes this automatic).
-
-### 7.3 Failover and routing
-
-- **Gateway-monitor noise on the backup (dpinger):** if you leave monitoring enabled on
-  `WAN_ISP`, the backup logs it as DOWN - the VIP, and with it the on-link path to the
-  gateway, is suppressed in backup state ([section 2](#s2)). It is cosmetic; nothing in this design
-  depends on it (the default route is pinned, [section 8](#s8)). For a single shared uplink there is
-  nothing to fail over *to*, so you can **disable gateway monitoring on `WAN_ISP`** to
-  silence it.
-- **Do not drive the default route from an auto-switching gateway group.** It lags the
-  CARP event, so a promoted backup blackholes until dpinger catches up (field-observed).
-  Keep the default pinned to `WAN_ISP`; give the backup internet on-demand instead
-  ([section 8.1](#s8-1)).
-- **Failover transient:** connection states not covered by pfsync are lost across
-  the switch.
-- **Gateway that never re-ARPs the VIP (steady-state blackhole) - verify this:** some
-  ISP gateways ignore gratuitous ARP *and* never re-query an ARP entry once it
-  expires. A few minutes after the last refresh, return traffic to the VIP then
-  blackholes silently even with a stable master - outbound leaves, nothing comes
-  back, and the gateway stops answering pings sourced from the VIP. This is not
-  hypothetical; it bit a real deployment on this kind of fiber ISP. **Mitigation:**
-  the plugin's **ARP nudge** (on by default) periodically re-teaches the gateway the
-  VIP-to-virtual-MAC binding, keeping the entry fresh. Leave it enabled for this
-  topology; see the *ARP nudge* section in the [README](../README.md). Symptom to
-  recognize in the lab: everything works right after a CARP event or DHCP exchange,
-  then dies ~15–20 min later.
-- **Short gateway ARP timeout:** the 120 s ARP-nudge default suits most gateways,
-  including shorter-lived caches. A few CPE/BNG age ARP even faster - if the VIP
-  blackholes between nudges, lower the interval further (toward the 30 s floor) below
-  the gateway's ARP timeout.
-
-### 7.4 The HA pair (plumbing)
-
-- **Stopping the service is not the same as disabling a keeper:** disabling/removing a
-  keeper and pressing Apply drops it from `keeper.conf`, so the CARP eligibility hook
-  ignores it - no demotion. Stopping the whole *service*, by contrast, freezes the
-  heartbeats; a `demote_on_lease_loss` keeper then reads as failed and the node demotes,
-  handing the VIP to the peer. To take a node out of rotation on purpose that may be
-  what you want; to pause a keeper **without** a failover, disable the keeper - don't
-  stop the service.
-- **SYNC-link failure while both WAN ports stay up:** CARP advertisements still cross the
-  WAN segment, so **the master keeps its role - no spurious failover or ping-pong**
-  (lab-confirmed: `pfsync` demotion penalizes only the *out-of-sync* node - a backup
-  rejoining over the dead link went demotion 240 to 480 and stayed backup; the master was
-  untouched). What you lose is state replication (a *later* failover then drops the
-  unsynced connections) and, in this design, the backup's own internet (which rides the
-  SYNC path - a convenience, see [section 8](#s8)). Keep SYNC on a reliable dedicated link anyway.
-- **Match the interface assignments on both nodes.** The OPNsense CARP how-to warns to
-  keep assignments identical across the pair
-  ([HA setup notes](https://docs.opnsense.org/manual/how-tos/carp.html)); mismatched ones
-  give "mixed master/backup" VIPs and hurt state sync. (CARP VIPs here are **per-node**,
-  not config-synced, so each node's VIP stays bound to its own WAN interface - that alone
-  sidesteps the mixed-VIP trap.) A **physical master + VM backup** pair cannot be fully
-  identical: the WAN NIC differs (`igc…` vs `vtnet…`), which bites in two distinct ways -
-  - **State sync:** `pfsync` keys states on the **real device name**, so states anchored
-    on the differing WAN device do not sync. LAN/VLAN interfaces named identically on both
-    still do, and client sessions anchor on the LAN side, so failover survival holds for
-    LAN-originated flows. Confirm with `pfctl -ss | wc -l` on both (the backup should hold
-    a large fraction of the master's count).
-  - **NAT binding:** NAT rules and interface groups reference the interface by its
-    **config-key** (`opt3`, `wan`, …), which config-sync carries verbatim. If the two keys
-    differ, a rule bound to one node's key does **not** bind on the other, so the outbound
-    `internal to VIP` NAT is **silently dead on the backup once promoted** (the firewall's
-    own traffic still egresses, masking it). Bind that NAT to an **interface group** whose
-    members include both keys (e.g. `opt3,wan`), and verify `ifconfig -g WAN` lists the
-    real WAN device on **both** nodes.
-
-### 7.5 Scope and testing
-
-- **IPv6 does not fail over:** this is an IPv4-DHCP design. A DHCPv6-PD prefix will not
-  float with the VIP, so after an IPv4 failover expect broken/asymmetric IPv6 on the
-  surviving node until it re-acquires. Plan v6 HA separately (native IPv6 CARP: OPNsense
-  how-to, [Configuring CARP for IPv6](https://docs.opnsense.org/manual/how-tos/carp.html#configuring-carp-for-ipv6)).
-- **Lab failure modes to watch:** return-path routing for the backup's SYNC-sourced
-  traffic, dpinger flapping during role changes, and whether the ISP's DHCP server
-  tolerates the virtual MAC.
-- **Faithful failure injection (virtual labs):** to test failover, drop the **link** -
-  pull the cable, down the host-side tap, or stop the VM. Running `ifconfig down`
-  *inside* the guest is **not** equivalent: on a virtual switch the host tap stays up,
-  so the bridge never flushes its MAC table and traffic to the virtual MAC keeps going
-  to the dead node's port. That is a test artifact, not a design flaw - a real link/
-  node failure drops the port and the switch relearns immediately. Likewise, do not
-  pin the virtual MAC with a static FDB entry while testing; let the switch learn it.
-
----
-
-<a id="s8"></a>
-
-## 8 The backup's own internet (optional, and *not* via gateway switching)
+## 7 The backup's own internet (optional, and *not* via gateway switching)
 
 Giving the backup its own internet is a *convenience* (self-`pkg`/NTP), not an HA
 requirement. Both nodes share **one** physical WAN uplink, so a backup
@@ -679,10 +515,10 @@ route starts working - **no routing reconfiguration on role change.**
 > keeper's `defaultRouteMode` to `enforce`, that keeper owns the default per CARP role
 > (install as master, withdraw otherwise), for which you either mark the WAN gateway
 > down (`force_down`) or remove it, so OPNsense does not also manage the default. See
-> [section 9](#s9). In `off` this section applies unchanged. Under `enforce`, the built-in
+> [section 8](#s8). In `off` this section applies unchanged. Under `enforce`, the built-in
 > **backup-egress** feature then gives the backup automatic, seamless internet via the master
 > (a leak-safe `/1`-split, withdrawn on promotion), the productized version of the manual
-> toggle in [section 8.2](#s8-2); `observe` only previews it (logs the routes it would install,
+> toggle in [section 7.2](#s7-2); `observe` only previews it (logs the routes it would install,
 > no FIB change). See [backup-egress.md](backup-egress.md).
 
 ```mermaid
@@ -706,9 +542,9 @@ give it internet **on demand** or through a **role-change hook** - never through
 automatic gateway switching. See also OPNsense's CARP how-to,
 [Backup node cannot reach internet](https://docs.opnsense.org/manual/how-tos/carp.html#backup-node-cannot-reach-internet).
 
-<a id="s8-1"></a>
+<a id="s7-1"></a>
 
-### 8.1 Why not an automatic gateway-group tier-flip
+### 7.1 Why not an automatic gateway-group tier-flip
 
 The tempting design is a gateway group `WAN_HA = [WAN_ISP tier 1, PEER_SYNC tier 2]`
 set as the default with **Allow default gateway switching** on
@@ -719,7 +555,7 @@ master over SYNC), while the master uses tier 1. That part works.
 **It is failover-unsafe.** Switching is driven by *[dpinger](#t-dpinger) monitor transitions*, which
 lag (a detection interval plus an up-confirmation), and **OPNsense's native gateway switching
 has no CARP role-change hook** to re-evaluate routing on promotion (the plugin's keeper does,
-by CARP role, see [section 9](#s9); core gateway groups do not). When the backup is promoted, its default stays on
+by CARP role, see [section 8](#s8); core gateway groups do not). When the backup is promoted, its default stays on
 tier 2 - pointing over SYNC at the node that just died - until dpinger independently
 notices `WAN_ISP` has come UP. During that window the new master, and everything behind
 it, **blackholes.** Compounding it:
@@ -736,9 +572,9 @@ it, **blackholes.** Compounding it:
 
 This is not hypothetical - in testing, the site stayed dark until the monitor caught up.
 
-<a id="s8-2"></a>
+<a id="s7-2"></a>
 
-### 8.2 On-demand backup internet (manual)
+### 7.2 On-demand backup internet (manual)
 
 To bring the backup online for a maintenance window, temporarily point its default at
 the peer's SYNC IP, and revert **before** any failover:
@@ -752,7 +588,7 @@ configctl interface routes configure
 
 It is transient by design: a config reload re-installs the `WAN_ISP` default, so run it
 only for the window and revert first. Because it never touches gateway monitoring, it
-cannot blackhole a failover the way [section 8.1](#s8-1) does.
+cannot blackhole a failover the way [section 7.1](#s7-1) does.
 
 A **role-change hook** that flips routing on the CARP transition itself (not on
 dpinger) is the correct basis for a *seamless* always-on backup path. The plugin now ships
@@ -760,9 +596,9 @@ exactly that as the built-in **backup-egress** feature ([backup-egress.md](backu
 under `defaultRouteMode = enforce`; `observe` is a dry-run preview). The manual toggle above is its no-feature, one-shot
 equivalent (`ON` ≡ the backup branch, `OFF` ≡ the master branch).
 
-<a id="s8-3"></a>
+<a id="s7-3"></a>
 
-### 8.3 What the master needs to terminate the backup's borrowed traffic
+### 7.3 What the master needs to terminate the backup's borrowed traffic
 
 For either the on-demand toggle or a hook, the master forwards and NATs the backup's
 SYNC-sourced traffic out the VIP:
@@ -775,12 +611,12 @@ SYNC-sourced traffic out the VIP:
 
 ---
 
-<a id="s9"></a>
+<a id="s8"></a>
 
-## 9 Default-route ownership by CARP role (`defaultRouteMode`)
+## 8 Default-route ownership by CARP role (`defaultRouteMode`)
 
 The baseline above pins the default to `WAN_ISP` on both nodes and never moves it
-([section 8](#s8)): failover is seamless because the promoted node already holds the
+([section 7](#s7)): failover is seamless because the promoted node already holds the
 route and only its on-link path (the VIP) changes. That is the default
 (`defaultRouteMode = off`), and everything above applies unchanged.
 
@@ -856,6 +692,171 @@ Order matters, and the FIB-touching steps should be done on a node while it is t
 - A **faster reaction** to an OPNsense default reassert, to close the short window above
   without depending on `force_down`, if that independence is wanted.
 
+---
+
+<a id="s9"></a>
+
+## 9 Open questions and risks
+
+Most of these are edge cases - a WAN where the ISP isolates you per VLAN/port (the common fiber case) hits only a few. Skim for the ones your line actually has.
+
+### 9.1 Shared / untrusted WAN L2 (moot if the ISP isolates you per VLAN/port)
+
+- **`vhid` collision on a shared ISP L2:** if the ISP really shares L2 with other
+  customers, `00:00:5e:00:01:{vhid}` could collide with another customer's
+  VRRP/CARP. **Most fiber ISPs isolate customers per VLAN/port** (you only see gw
+  `.1`), so safe. **Verify** with `tcpdump -T carp` + `arp -an` on the WAN before
+  trusting it. Use an unusual `vhid` + a `pass` regardless.
+- **The CARP `pass` secures the *election*, not the *segment*.** The `pass` (a SHA-1
+  HMAC) stops a stranger from injecting CARP advertisements to hijack the VIP - but it
+  does nothing about a hostile on-segment neighbour **ARP-spoofing** the VIP or the
+  gateway directly - a **general untrusted-shared-L2 exposure** that a plain, non-CARP
+  firewall on the same segment shares equally. CARP does not *create* that risk; it only
+  *adds* the election as one more thing to authenticate. On a genuinely shared L2 you
+  can additionally set CARP to **unicast** (`ifconfig <if> vhid <n> … peer <peer-node-IP>`;
+  FreeBSD 14 [`carp(4)`](https://man.freebsd.org/cgi/man.cgi?query=carp&sektion=4)) so advertisements go only to the peer instead of flooding the
+  segment - hardening the election against on-segment observation/injection. Caveats: it
+  is a manual ifconfig-level setting (not exposed in the OPNsense VIP GUI, so not
+  persistent without a hook), it disables CARP's TTL verification, and it still does
+  **not** stop ARP-spoofing. So unicast hardens CARP; it does not make an untrusted shared
+  L2 safe - and most fiber ISPs isolate per VLAN/port anyway (previous bullet), where it
+  is moot.
+- **`blockpriv`/`blockbogons` vs. CARP advertisements - should be fine:** a peer's
+  advertisements arrive on the WAN with the node's non-routable link-local source IP
+  (`169.254.x`; not blocked here, see [section 6.1](#s6-1)). OPNsense installs a global `quick` rule (roughly the
+  form below) that lets CARP past all blocks:
+  ```
+  pass quick inet proto carp from any to 224.0.0.18
+  ```
+  `quick` is evaluated *before* `blockpriv`/`blockbogons`/default-deny, and it is
+  interface-independent (`from any`), so it covers the WAN. Confirm with
+  `pfctl -sr | grep carp` after the VIPs are set. (Observed on a working CGNAT
+  two-node setup; **not** yet confirmed in this exact single-IP topology.)
+- **Follow trusts the DHCP ACK, which a shared-L2 neighbour can forge:** on a genuinely
+  shared segment an attacker who reads the CARP adverts (to derive the virtual MAC) can
+  send a spoofed ACK and drive the VIP to an address of their choosing (throttled to one
+  move per 60 s). During a T2 **REBIND** the expected-server check is intentionally
+  relaxed (any server may answer - legitimate DHCP), widening the window. This is the
+  same untrusted-shared-L2 exposure as the ARP-spoofing bullet above, and moot where the
+  ISP isolates you per VLAN/port. On a shared L2, pin the address (follow off) or use a
+  strict upstream.
+
+### 9.2 DHCP, the lease, and the cutover
+
+- **DHCP behaviour (test before committing):** does the ISP hand a lease to the
+  virtual MAC, and does it restrict you to one active MAC? Some ISPs will happily
+  lease a second address to a second MAC (in which case you do **not** need this
+  single-IP design at all - just give each node its own lease). Others bind one lease
+  per line. **Test safely** with a DHCP `DISCOVER`-only probe before committing - a
+  `DISCOVER` does not take a lease, so it does not disturb the live line. (Verified on
+  a fiber ISP: a small crafted `DISCOVER` from a throwaway MAC drew a normal `OFFER`
+  with no effect on the live lease. Use a **throwaway** locally-administered MAC, not
+  the real virtual MAC, so a lease-binding ISP cannot associate the probe with your
+  VIP.)
+- **First cutover from a live DHCP WAN - two one-time traps** (a steady-state failover
+  hits neither). *(1)* Switching the WAN to static and pressing Apply does **not** stop
+  the running `dhclient` - it is [`daemon(8)`](https://man.freebsd.org/cgi/man.cgi?query=daemon&sektion=8)-supervised, so a plain `kill` is restarted
+  and it re-grabs the old lease; **reboot** into the static config to clear it. *(2)* A
+  MAC-binding ISP may hold the address on the *old* MAC for a few minutes and stay silent
+  to the virtual MAC's `DISCOVER` (**ISP-dependent** - check with the probe above), so
+  release the lease, wait the cooldown out, *then* start the keeper. Failover reuses the
+  *same* virtual MAC, so neither trap recurs.
+- **Follow tracks an ISP renumber, including cross-subnet:** the keeper rewrites the CARP
+  VIP to the new address (after checking it is sane, in the same routability class, and
+  from the expected server). A **same-subnet** change is seamless; on a **cross-subnet**
+  move it also updates the VIP prefix and the WAN gateway from the DHCP ACK and reapplies
+  routing, so outbound keeps working - parity with a plain DHCP interface. The one gap: if
+  the ACK carries **no subnet mask**, it can only move the address and logs a warning to
+  fix the prefix and gateway by hand. (`follow off` pins the address and does none of this.)
+- **Identical DHCP client-id across nodes:** the shared-lease premise assumes the server
+  keys on `chaddr`. If it keys on the client-id (option 61) and the two nodes present
+  different ones, they can get *different* addresses - set the same client-id on both
+  (config-sync makes this automatic).
+
+### 9.3 Failover and routing
+
+- **Gateway-monitor noise on the backup (dpinger):** if you leave monitoring enabled on
+  `WAN_ISP`, the backup logs it as DOWN - the VIP, and with it the on-link path to the
+  gateway, is suppressed in backup state ([section 2](#s2)). It is cosmetic; nothing in this design
+  depends on it (the default route is pinned, [section 7](#s7)). For a single shared uplink there is
+  nothing to fail over *to*, so you can **disable gateway monitoring on `WAN_ISP`** to
+  silence it.
+- **Do not drive the default route from an auto-switching gateway group.** It lags the
+  CARP event, so a promoted backup blackholes until dpinger catches up (field-observed).
+  Keep the default pinned to `WAN_ISP`; give the backup internet on-demand instead
+  ([section 7.1](#s7-1)).
+- **Failover transient:** connection states not covered by pfsync are lost across
+  the switch.
+- **Gateway that never re-ARPs the VIP (steady-state blackhole) - verify this:** some
+  ISP gateways ignore gratuitous ARP *and* never re-query an ARP entry once it
+  expires. A few minutes after the last refresh, return traffic to the VIP then
+  blackholes silently even with a stable master - outbound leaves, nothing comes
+  back, and the gateway stops answering pings sourced from the VIP. This is not
+  hypothetical; it bit a real deployment on this kind of fiber ISP. **Mitigation:**
+  the plugin's **ARP nudge** (on by default) periodically re-teaches the gateway the
+  VIP-to-virtual-MAC binding, keeping the entry fresh. Leave it enabled for this
+  topology; see the *ARP nudge* section in the [README](../README.md). Symptom to
+  recognize in the lab: everything works right after a CARP event or DHCP exchange,
+  then dies ~15–20 min later.
+- **Short gateway ARP timeout:** the 120 s ARP-nudge default suits most gateways,
+  including shorter-lived caches. A few CPE/BNG age ARP even faster - if the VIP
+  blackholes between nudges, lower the interval further (toward the 30 s floor) below
+  the gateway's ARP timeout.
+
+### 9.4 The HA pair (plumbing)
+
+- **Stopping the service is not the same as disabling a keeper:** disabling/removing a
+  keeper and pressing Apply drops it from `keeper.conf`, so the CARP eligibility hook
+  ignores it - no demotion. Stopping the whole *service*, by contrast, freezes the
+  heartbeats; a `demote_on_lease_loss` keeper then reads as failed and the node demotes,
+  handing the VIP to the peer. To take a node out of rotation on purpose that may be
+  what you want; to pause a keeper **without** a failover, disable the keeper - don't
+  stop the service.
+- **SYNC-link failure while both WAN ports stay up:** CARP advertisements still cross the
+  WAN segment, so **the master keeps its role - no spurious failover or ping-pong**
+  (lab-confirmed: `pfsync` demotion penalizes only the *out-of-sync* node - a backup
+  rejoining over the dead link went demotion 240 to 480 and stayed backup; the master was
+  untouched). What you lose is state replication (a *later* failover then drops the
+  unsynced connections) and, in this design, the backup's own internet (which rides the
+  SYNC path - a convenience, see [section 7](#s7)). Keep SYNC on a reliable dedicated link anyway.
+- **Match the interface assignments on both nodes.** The OPNsense CARP how-to warns to
+  keep assignments identical across the pair
+  ([HA setup notes](https://docs.opnsense.org/manual/how-tos/carp.html)); mismatched ones
+  give "mixed master/backup" VIPs and hurt state sync. (CARP VIPs here are **per-node**,
+  not config-synced, so each node's VIP stays bound to its own WAN interface - that alone
+  sidesteps the mixed-VIP trap.) A **physical master + VM backup** pair cannot be fully
+  identical: the WAN NIC differs (`igc…` vs `vtnet…`), which bites in two distinct ways -
+  - **State sync:** `pfsync` keys states on the **real device name**, so states anchored
+    on the differing WAN device do not sync. LAN/VLAN interfaces named identically on both
+    still do, and client sessions anchor on the LAN side, so failover survival holds for
+    LAN-originated flows. Confirm with `pfctl -ss | wc -l` on both (the backup should hold
+    a large fraction of the master's count).
+  - **NAT binding:** NAT rules and interface groups reference the interface by its
+    **config-key** (`opt3`, `wan`, …), which config-sync carries verbatim. If the two keys
+    differ, a rule bound to one node's key does **not** bind on the other, so the outbound
+    `internal to VIP` NAT is **silently dead on the backup once promoted** (the firewall's
+    own traffic still egresses, masking it). Bind that NAT to an **interface group** whose
+    members include both keys (e.g. `opt3,wan`), and verify `ifconfig -g WAN` lists the
+    real WAN device on **both** nodes.
+
+### 9.5 Scope and testing
+
+- **IPv6 does not fail over:** this is an IPv4-DHCP design. A DHCPv6-PD prefix will not
+  float with the VIP, so after an IPv4 failover expect broken/asymmetric IPv6 on the
+  surviving node until it re-acquires. Plan v6 HA separately (native IPv6 CARP: OPNsense
+  how-to, [Configuring CARP for IPv6](https://docs.opnsense.org/manual/how-tos/carp.html#configuring-carp-for-ipv6)).
+- **Lab failure modes to watch:** return-path routing for the backup's SYNC-sourced
+  traffic, dpinger flapping during role changes, and whether the ISP's DHCP server
+  tolerates the virtual MAC.
+- **Faithful failure injection (virtual labs):** to test failover, drop the **link** -
+  pull the cable, down the host-side tap, or stop the VM. Running `ifconfig down`
+  *inside* the guest is **not** equivalent: on a virtual switch the host tap stays up,
+  so the bridge never flushes its MAC table and traffic to the virtual MAC keeps going
+  to the dead node's port. That is a test artifact, not a design flaw - a real link/
+  node failure drops the port and the switch relearns immediately. Likewise, do not
+  pin the virtual MAC with a static FDB entry while testing; let the switch learn it.
+
+---
 
 <a id="s10"></a>
 
@@ -873,15 +874,15 @@ the integrated field run.
 | ARP nudge keeps a non-re-ARPing gateway from blackholing the VIP | **Confirmed on a real fiber ISP** - it was required there; on by default (see README) |
 | Link-local (`169.254.x`) per-node WAN IPs (the default here) as CARP source | **Validated on OPNsense 26.7** - `blockbogons` does not block link-local (negated in the bogons table), the GUI accepts a static link-local WAN IP, and CARP elected and failed over normally; no no-NAT-for-CARP rule needed ([section 6.1](#s6-1)) |
 | RFC 1918 per-node WAN IPs (the alternative, needs the extra no-NAT rule) | **Lab-validated** - CARP elected master/backup correctly with private `/30` node IPs and a public VIP in a different subnet |
-| Backup's gateway monitor = DOWN, master's = UP | **Lab-validated** - mechanism is CARP backup-state VIP suppression, **not** dpinger's source address. It explains why the backup has no internet of its own; it is **not** a safe trigger for an automatic default switch ([section 8.1](#s8-1)) |
-| A client's TCP connection survives a master failover (`pfsync` + NAT to VIP) | **Lab-validated** - bytes flowed on the same connection before *and* after a mid-connection cable-pull. Note the physical+VM caveat: WAN-device-anchored states do not sync, LAN-anchored ones do ([section 7](#s7)) |
+| Backup's gateway monitor = DOWN, master's = UP | **Lab-validated** - mechanism is CARP backup-state VIP suppression, **not** dpinger's source address. It explains why the backup has no internet of its own; it is **not** a safe trigger for an automatic default switch ([section 7.1](#s7-1)) |
+| A client's TCP connection survives a master failover (`pfsync` + NAT to VIP) | **Lab-validated** - bytes flowed on the same connection before *and* after a mid-connection cable-pull. Note the physical+VM caveat: WAN-device-anchored states do not sync, LAN-anchored ones do ([section 9](#s9)) |
 | The switch relearns the VIP's MAC on failover | **Lab-validated** - the bridge relearns from the new master's gratuitous ARP; no special switch config, extra bridge, or NIC driver needed |
-| Default pinned to `WAN_ISP`, giving seamless failover with no routing switch | **Field-validated** - the promoted node routed straight out the VIP the moment it took the VIP; no gateway switching involved ([section 8](#s8)) |
-| Default-route ownership by CARP role (`defaultRouteMode = enforce`), fail-stop | **Field-validated on a live single-IP pair** - both nodes made fail-stop (`force_down` + `enforce` + FIB-following origination), and a controlled failover moved the default in ~20-50 ms with the WAN up throughout ([section 9](#s9)) |
+| Default pinned to `WAN_ISP`, giving seamless failover with no routing switch | **Field-validated** - the promoted node routed straight out the VIP the moment it took the VIP; no gateway switching involved ([section 7](#s7)) |
+| Default-route ownership by CARP role (`defaultRouteMode = enforce`), fail-stop | **Field-validated on a live single-IP pair** - both nodes made fail-stop (`force_down` + `enforce` + FIB-following origination), and a controlled failover moved the default in ~20-50 ms with the WAN up throughout ([section 8](#s8)) |
 | Built-in backup egress (backup routes its own internet via the master, role-driven `/1`-split) | **Field-deployed on a live single-IP pair** - running with `defaultRouteMode = enforce` + `/1`-split; the role-driven install/withdraw (and no egress loop on promotion) was validated on a two-node bench ([backup-egress.md](backup-egress.md)) |
-| ~~Automatic gateway-group tier flip for the backup's default route~~ | **Rejected - failover-unsafe ([section 8.1](#s8-1)).** Switching lags the CARP event, so a promoted backup blackholes until dpinger catches up (field-observed). Default stays pinned to `WAN_ISP`; give the backup internet via the built-in backup-egress feature ([backup-egress.md](backup-egress.md)) or the on-demand toggle ([section 8.2](#s8-2)) instead |
-| Outbound NAT on an interface group across a physical/VM pair's divergent WAN keys | **Field-validated failure + fix** - a group bound to only one node's key left the backup's outbound NAT silently dead once promoted; setting the group members to *both* keys (`opt3,wan`) fixed it, and `ifconfig -g WAN` then lists the real device on both ([section 7](#s7)) |
-| `pfsync` state sync across a physical (`igc`) + VM (`vtnet`) pair | **Field-observed working** - the backup held ~60% of the master's state count; states on identically-named LAN/VLAN interfaces sync, WAN-device-anchored states do not ([section 7](#s7)). A mid-connection failover on this exact pair has not been separately retested |
+| ~~Automatic gateway-group tier flip for the backup's default route~~ | **Rejected - failover-unsafe ([section 7.1](#s7-1)).** Switching lags the CARP event, so a promoted backup blackholes until dpinger catches up (field-observed). Default stays pinned to `WAN_ISP`; give the backup internet via the built-in backup-egress feature ([backup-egress.md](backup-egress.md)) or the on-demand toggle ([section 7.2](#s7-2)) instead |
+| Outbound NAT on an interface group across a physical/VM pair's divergent WAN keys | **Field-validated failure + fix** - a group bound to only one node's key left the backup's outbound NAT silently dead once promoted; setting the group members to *both* keys (`opt3,wan`) fixed it, and `ifconfig -g WAN` then lists the real device on both ([section 9](#s9)) |
+| `pfsync` state sync across a physical (`igc`) + VM (`vtnet`) pair | **Field-observed working** - the backup held ~60% of the master's state count; states on identically-named LAN/VLAN interfaces sync, WAN-device-anchored states do not ([section 9](#s9)). A mid-connection failover on this exact pair has not been separately retested |
 | The full single-IP topology as one integrated system, on a live one-IP line | **Field-run** on a live single-IP DHCP WAN, including a real CARP failover - a single deployment, not yet exercised long-haul across many ISP/CPE combinations |
 
 If you run the full topology - especially the backup's own-internet path - please open

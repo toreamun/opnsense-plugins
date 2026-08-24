@@ -781,27 +781,19 @@ Most of these are edge cases - a WAN where the ISP isolates you per VLAN/port (t
   depends on it (the default route is pinned, [section 7](#s7)). For a single shared uplink there is
   nothing to fail over *to*, so you can **disable gateway monitoring on `WAN_ISP`** to
   silence it.
-- **Do not drive the default route from an auto-switching gateway group.** It lags the
-  CARP event, so a promoted backup blackholes until dpinger catches up (field-observed).
-  Keep the default pinned to `WAN_ISP`; give the backup internet on-demand instead
-  ([section 7.1](#s7-1)).
+- **Do not drive the default route from an auto-switching gateway group** - it lags the
+  CARP event and blackholes a promoted backup until dpinger catches up (field-observed);
+  full reasoning in [section 7.1](#s7-1).
 - **Failover transient:** connection states not covered by pfsync are lost across
   the switch.
-- **Gateway that never re-ARPs the VIP (steady-state blackhole) - verify this:** some
-  ISP gateways ignore gratuitous ARP *and* never re-query an ARP entry once it
-  expires. A few minutes after the last refresh, return traffic to the VIP then
-  blackholes silently even with a stable master - outbound leaves, nothing comes
-  back, and the gateway stops answering pings sourced from the VIP. This is not
-  hypothetical; it bit a real deployment on this kind of fiber ISP. **Mitigation:**
-  the plugin's **ARP nudge** (on by default) periodically re-teaches the gateway the
-  VIP-to-virtual-MAC binding, keeping the entry fresh. Leave it enabled for this
-  topology; see the *ARP nudge* section in the [README](../README.md). Symptom to
-  recognize in the lab: everything works right after a CARP event or DHCP exchange,
-  then dies ~15–20 min later.
-- **Short gateway ARP timeout:** the 120 s ARP-nudge default suits most gateways,
-  including shorter-lived caches. A few CPE/BNG age ARP even faster - if the VIP
-  blackholes between nudges, lower the interval further (toward the 30 s floor) below
-  the gateway's ARP timeout.
+- **Gateway that never re-ARPs the VIP (steady-state blackhole) - verify this:** some ISP
+  gateways ignore gratuitous ARP and never re-query an expired ARP entry, so return
+  traffic to the VIP blackholes minutes after the last refresh even with a stable master
+  (it bit a real fiber deployment; the tell is that everything works right after a CARP or
+  DHCP event, then dies ~15–20 min later). The plugin's **ARP nudge** (on by default) keeps
+  the entry fresh - leave it enabled for this topology, and lower its interval toward the
+  30 s floor for gear with a very short ARP timeout. Full detail in the README's *ARP
+  nudge* section.
 
 ### 9.4 The HA pair (plumbing)
 
@@ -841,10 +833,10 @@ Most of these are edge cases - a WAN where the ISP isolates you per VLAN/port (t
 
 ### 9.5 Scope and testing
 
-- **IPv6 does not fail over:** this is an IPv4-DHCP design. A DHCPv6-PD prefix will not
-  float with the VIP, so after an IPv4 failover expect broken/asymmetric IPv6 on the
-  surviving node until it re-acquires. Plan v6 HA separately (native IPv6 CARP: OPNsense
-  how-to, [Configuring CARP for IPv6](https://docs.opnsense.org/manual/how-tos/carp.html#configuring-carp-for-ipv6)).
+- **IPv6 does not fail over** (IPv4-DHCP design; a DHCPv6-PD prefix will not float with the
+  VIP, so IPv6 on the surviving node breaks until it re-acquires) - plan v6 HA separately;
+  see the README's scope notes and OPNsense's
+  [Configuring CARP for IPv6](https://docs.opnsense.org/manual/how-tos/carp.html#configuring-carp-for-ipv6).
 - **Lab failure modes to watch:** return-path routing for the backup's SYNC-sourced
   traffic, dpinger flapping during role changes, and whether the ISP's DHCP server
   tolerates the virtual MAC.

@@ -15,7 +15,7 @@ An independent OPNsense plugin by [@toreamun](https://github.com/toreamun). *(So
 
 On a **DHCP-assigned WAN**, the ISP only routes an address while it holds a **live DHCP lease** bound to a MAC. A plain CARP virtual IP is *static* - it never gets a lease, so it never receives traffic.
 
-This plugin runs a small daemon that keeps a DHCP lease alive **for the CARP VIP's virtual MAC**. The ISP then routes the VIP to that MAC, native OPNsense CARP handles ARP and failover as usual, and the shared IP works - and fails over between two nodes - on a dynamic line. It works whether the ISP hands out several addresses or, via a **lab-validated** single-IP design, [only one](net/os-carp-vip-dhcp/docs/single-ip-wan-carp.md).
+This plugin runs a small daemon that keeps a DHCP lease alive **for the CARP VIP's virtual MAC**. The ISP then routes the VIP to that MAC, native OPNsense CARP handles ARP and failover as usual, and the shared IP works - and fails over between two nodes - on a dynamic line. It works whether the ISP hands out several addresses or, via a **field-validated** single-IP design, [only one](net/os-carp-vip-dhcp/docs/single-ip-wan-carp.md).
 
 <p align="center">
   <img src="net/os-carp-vip-dhcp/docs/img/status.png" alt="Status page: the CARP VIP holding its DHCP lease as CARP master, with the ARP nudge confirmed by the gateway" width="900"><br>
@@ -34,7 +34,7 @@ You need it if **both** of these are true:
 **The plugin supports both DHCP shapes** - however many addresses your line hands out:
 
 - **Several concurrent leases** (one per node's WAN + one for the VIP) - the straightforward setup. Any such line works; tested on a plain public-DHCP WAN and behind CGNAT (the CGNAT line under test leased several addresses - behaviour varies by carrier).
-- **Only one ISP address** - supported too. A single floating VIP holds the lease while each node uses a private WAN IP for CARP; the backup reaches the internet through the master. **Lab-validated** (not yet field-run on a live one-IP line) - full design in [net/os-carp-vip-dhcp/docs/single-ip-wan-carp.md](net/os-carp-vip-dhcp/docs/single-ip-wan-carp.md).
+- **Only one ISP address** - supported too. A single floating VIP holds the lease while each node uses a private WAN IP for CARP; the backup reaches the internet through the master. **Field-validated** on a live single-IP DHCP WAN, including a real CARP failover (a single deployment - not yet exercised long-haul across many ISP/CPE combinations) - full design in [net/os-carp-vip-dhcp/docs/single-ip-wan-carp.md](net/os-carp-vip-dhcp/docs/single-ip-wan-carp.md).
 
 If your WAN is static or PPPoE, you don't need this plugin.
 
@@ -95,7 +95,7 @@ Only *one* public IP on the WAN? You still get CARP failover. The shape:
 - **one floating CARP VIP** holds the single public lease - this plugin keeps it alive on the virtual MAC;
 - the **master owns the default route** (*Own default route by CARP role*, enforce) and the backup reaches the internet through the master via the built-in **backup egress** feature - not an auto-switching gateway group, which lags failover.
 
-This is the **mental model, not a setup checklist** - single-IP needs the private node IPs, default-route-by-role, backup egress, and the SYNC link wired correctly, and each mechanism is lab-validated individually but the whole stack has not yet been field-run on a live one-IP line. Don't build it from these three bullets alone: the full recipe (IP plan, failover flow, GUI steps, lab-validation status) is in **➜ [Single-IP WAN failover](net/os-carp-vip-dhcp/docs/single-ip-wan-carp.md)**.
+This is the **mental model, not a setup checklist** - single-IP needs the private node IPs, default-route-by-role, backup egress, and the SYNC link wired correctly. The integrated stack has now been field-run on a live one-IP line (a single deployment - not yet exercised long-haul across many ISP/CPE combinations). Don't build it from these three bullets alone: the full recipe (IP plan, failover flow, GUI steps, validation status) is in **➜ [Single-IP WAN failover](net/os-carp-vip-dhcp/docs/single-ip-wan-carp.md)**.
 
 ---
 

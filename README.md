@@ -59,7 +59,7 @@ That's it - the VIP now holds a live lease. The defaults are sensible: it follow
 
 **You'll know it's working when**, on the **Status** page (or the dashboard widget): the keeper shows **bound** to the VIP's address, the node it runs on is CARP **master**, and gateway reachability shows a **green check** (the gateway is answering the ARP nudge). On the backup you'll instead see it **standing by** (or holding its own lease, depending on mode) - that's expected. A persistent problem raises a **dashboard banner**.
 
-- **Update:** re-run the exact same command (it always fetches the latest signed release and reinstalls in place; settings are preserved). Pin a version by appending its tag, e.g. `… | sh -s -- os-carp-vip-dhcp v1.4.0`.
+- **Update:** re-run the exact same command (it always fetches the latest signed release and reinstalls in place; settings are preserved). Pin a version by appending its tag, e.g. `… | sh -s -- os-carp-vip-dhcp v1.13.5`.
 - **Uninstall:** `pkg delete os-carp-vip-dhcp` - stops the daemons and cleans up. *(A manual, no-script install is documented below.)*
 
 ## Where it lives in the GUI
@@ -93,9 +93,9 @@ Only *one* public IP on the WAN? You still get CARP failover. The shape:
 
 - each node takes a small **private** static WAN IP (used only for CARP advertisements + node identity);
 - **one floating CARP VIP** holds the single public lease - this plugin keeps it alive on the virtual MAC;
-- a **gateway group** routes the backup's own traffic out through the master over the SYNC link.
+- the **master owns the default route** (*Own default route by CARP role*, enforce) and the backup reaches the internet through the master via the built-in **backup egress** feature - not an auto-switching gateway group, which lags failover.
 
-This is the **mental model, not a setup checklist** - single-IP needs the private node IPs, a gateway group, and the SYNC link wired correctly, and each mechanism is lab-validated individually but the whole stack has not yet been field-run on a live one-IP line. Don't build it from these three bullets alone: the full recipe (IP plan, failover flow, GUI steps, lab-validation status) is in **➜ [Single-IP WAN failover](net/os-carp-vip-dhcp/docs/single-ip-wan-carp.md)**.
+This is the **mental model, not a setup checklist** - single-IP needs the private node IPs, default-route-by-role, backup egress, and the SYNC link wired correctly, and each mechanism is lab-validated individually but the whole stack has not yet been field-run on a live one-IP line. Don't build it from these three bullets alone: the full recipe (IP plan, failover flow, GUI steps, lab-validation status) is in **➜ [Single-IP WAN failover](net/os-carp-vip-dhcp/docs/single-ip-wan-carp.md)**.
 
 ---
 
@@ -110,6 +110,7 @@ All per-keeper; sensible defaults mean most setups only pick a CARP VIP and enab
 - **CARP failover on lease loss** *(optional)*: demote this node (hand the VIP to the peer) if the keeper stops holding the correct lease.
 - **DHCP identity options** *(advanced)*: set a vendor-class (opt 60), client-id (61) or hostname (12) for servers that only lease to a known value. On a server that keys the lease on the **client-id** (not the chaddr), **both HA nodes must present the *same* client-id** - a divergent one gets them different addresses and breaks the shared VIP. HA config-sync keeps it identical.
 - **Own the default route by CARP role** *(advanced, default off)*: make one keeper own the IPv4 default route as a function of CARP role and lease - only the master node holding the lease keeps a default (via the lease gateway), every other state has none, so a failover moves the default with the role instead of leaving a backup black-holing traffic. **observe** logs what it would do without touching the routing table; **enforce** installs and withdraws it. Pairs with marking the WAN gateway down (`force_down`) so OPNsense does not install a competing default. See *Owning the default route by CARP role*.
+- **Backup egress for the backup node** *(advanced, default off; needs default-route mode observe/enforce)*: once the master owns the default route, the backup has no WAN route of its own, so its own traffic (updates, NTP, DNS, remote access) has nowhere to go. This routes the backup's egress to the master via a leak-safe /1-split (or a configured prefix list) and withdraws it on promotion to master. See the [backup egress guide](net/os-carp-vip-dhcp/docs/backup-egress.md).
 - **HA config sync** *(optional)*: replicate the keeper config to the peer (System ‣ High Availability ‣ Settings), so you configure once on the master. Safe: the config is node-agnostic.
 - **Self-healing & health banner:** the daemon never exits on a transient fault (it keeps its heartbeat fresh so CARP doesn't falsely demote the node), and a GUI banner warns if any enabled keeper stops holding its lease - closing the silent-failure gap on a redundant spare.
 

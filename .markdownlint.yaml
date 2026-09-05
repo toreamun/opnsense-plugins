@@ -1,0 +1,9 @@
+# markdownlint rules for the docs (README, docs/*.md, RELEASE.md).
+# Run locally via pre-commit; CI runs the same check (.github/workflows/lint.yml).
+default: true
+MD013: false   # line length: prose wraps in the renderer; tables and long links are intentional
+MD033: false   # inline HTML: <details>, <img>, <p align> and <a id> anchors are used on purpose
+MD049: false   # emphasis style: _GUI ‣ menu paths_ and *emphasis* are both used deliberately
+MD028: false   # blank line between blockquotes: separate callouts are intended
+MD031:
+  list_items: false   # a fenced block directly inside a list item renders fine on GitHub

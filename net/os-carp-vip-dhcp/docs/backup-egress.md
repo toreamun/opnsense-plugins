@@ -2,7 +2,7 @@
 
 Companion to the default-route-by-CARP-role feature (`Own default route by CARP
 role` = observe/enforce; see also the [single-IP WAN CARP guide](single-ip-wan-carp.md),
-sections 8-9, for how this fits the overall failover topology). That feature makes the keeper own the WAN default as a
+sections 7-8, for how this fits the overall failover topology). That feature makes the keeper own the WAN default as a
 function of CARP role: the master installs `0.0.0.0/0`, every other state has
 none (fail-stop). A direct consequence is that **the CARP backup node has no
 route to the internet for its own traffic** (pkg/firmware updates, NTP, DNS,
@@ -179,6 +179,9 @@ active locally, so the recommended VIP gateway is not caught by this guard.
   the lease-less master. Self-correcting.
 
 ## Config fields
+
+<p align="center"><img src="img/settings-enforce.png" alt="Keeper dialog in advanced mode: Own default route by CARP role set to Enforce, Backup egress on, route form /1-split, gateway = an internal CARP VIP" width="700"><br>
+<sub><i>The WAN keeper in the role-driven design: <b>Own default route by CARP role</b> = Enforce, <b>Backup egress</b> on with the <code>/1</code>-split form and an internal CARP VIP as the gateway.</i></sub></p>
 
 | Field (GUI label) | Meaning |
 |---|---|

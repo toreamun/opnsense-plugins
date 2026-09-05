@@ -6,8 +6,10 @@ small daemon that keeps a DHCP lease alive for a chosen chaddr (normally the CAR
 virtual MAC of an existing CARP VirtualIP), so the VIP address is routed and can
 fail over between two OPNsense nodes.
 
-An HA CARP setup needs several concurrent DHCP addresses on the line (one per node
-plus the shared VIP). That is typically feasible on CGNAT links (abundant RFC 6598
-shared space) but rare on public IPv4.
+Works whether the line leases several addresses (one per node plus the shared VIP,
+common on CGNAT) or only one: on a single-IP WAN the VIP holds the one public lease
+while each node uses a private WAN address for CARP, with optional default-route
+ownership by CARP role and backup egress via the master. Requires an existing CARP
+virtual IP; configured under Interfaces > Virtual IPs DHCP.
 
 WWW: https://github.com/toreamun/opnsense-plugins

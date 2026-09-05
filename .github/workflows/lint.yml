@@ -91,6 +91,17 @@ jobs:
           echo "$files"
           shellcheck -s sh -e SC1091,SC2034 $files
 
+  markdown:
+    name: Markdown (markdownlint)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      # Same rules as the pre-commit hook (.markdownlint.yaml); only tracked files.
+      - run: npx --yes markdownlint-cli@0.45.0 $(git ls-files '*.md')
+
   xml:
     name: XML well-formedness
     runs-on: ubuntu-latest

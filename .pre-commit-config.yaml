@@ -11,6 +11,10 @@ repos:
     rev: 7.1.1
     hooks:
       - id: flake8            # PEP 8 + pyflakes (F-codes) via setup.cfg
+  - repo: https://github.com/igorshubovych/markdownlint-cli
+    rev: v0.45.0
+    hooks:
+      - id: markdownlint      # docs style, rules in .markdownlint.yaml
   # PHP PSR-12 (requires phpcs available on PATH):
   - repo: local
     hooks:

@@ -276,7 +276,7 @@ are examples, substitute your own.*
 | # | Do | Where |
 |---|----|-------|
 | 0 | Confirm the ISP leases to the CARP virtual MAC (pre-flight below) | Interfaces ‣ [WAN] or a `DISCOVER` probe |
-| A | Define the aliases `wan_carp_vip` and `internal_nets` ([6.2](#s6-2)) | Firewall ‣ Aliases |
+| A | Define the aliases `wan_carp_vip` and `snat_internal` ([6.2](#s6-2)) | Firewall ‣ Aliases |
 | 1 | Put a switch between the ISP hand-off and both nodes' WAN ports | hardware |
 | 2 | Give each node's WAN a static **link-local** IP (`169.254.255.1/29`, `.2/29`) | Interfaces ‣ [WAN] |
 | 3 | Create the CARP VIP (vhid, password, advskew 0 / 100) | Interfaces ‣ Virtual IPs |
@@ -382,7 +382,7 @@ address change without touching a single rule.
 | Alias | Type | Content | Used by |
 |-------|------|---------|---------|
 | `wan_carp_vip` | Host | *(plugin-managed, the live public VIP)* | Source-NAT target; any rule that must follow the WAN address |
-| `internal_nets` | Network | your LAN/VLAN subnets (or the RFC 1918 ranges) | The single "internal to VIP" source-NAT rule |
+| `snat_internal` | Network | your LAN/VLAN subnets (or the RFC 1918 ranges) | The single "internal to VIP" source-NAT rule |
 
 > **`wan_carp_vip` is created and owned by the plugin:** give the keeper a **Sync firewall alias** name
 > and it ensures a Host alias of that name exists and keeps its content equal to the live
@@ -438,6 +438,9 @@ the keeper) only need doing once.
    Only set it for an ISP reservation on a fixed *different* MAC, and never to this node's own
    NIC MAC (that binds the lease to one MAC while the VIP still sends from the CARP MAC, so an
    IP-source-guard ISP blackholes the gateway).
+
+   <p align="center"><img src="img/settings-advanced.png" alt="Keeper dialog in advanced mode: Follow on, Sync firewall alias wan_carp_vip, Own default route by CARP role off, Client MAC override blank" width="700"><br>
+   <sub><i>The keeper, advanced mode on: Follow on, alias <code>wan_carp_vip</code>, Client MAC override blank. <b>Own default route by CARP role</b> stays off in the baseline design (<a href="#s7">section 7</a>).</i></sub></p>
 5. **SYNC interface:** `10.2.2.1/30` / `.2/30`; pfsync + XMLRPC config-sync, under
    _System ‣ High Availability_ (OPNsense how-to:
    [Setup pfSync and HA sync](https://docs.opnsense.org/manual/how-tos/carp.html#setup-pfsync-and-ha-sync-xmlrpc)).
@@ -451,6 +454,9 @@ the keeper) only need doing once.
    default gateway switching** OFF and, for a single-uplink pair, gateway monitoring off
    ([section 7.1](#s7-1), [section 9](#s9)) - there is nothing to switch to. You do **not** need a `PEER_SYNC` gateway
    object; the optional backup path ([section 7.2](#s7-2)) routes straight to the peer's SYNC IP.
+   <p align="center"><img src="img/gateway-far-down.png" alt="Edit Gateway: Upstream Gateway, Far Gateway, Disable Gateway Monitoring and Mark Gateway as Down ticked" width="700"><br>
+   <sub><i>The WAN gateway (named <code>WAN_TN_GW</code> here, <code>WAN_ISP</code> in the text): Upstream, Far Gateway, monitoring off. <b>Mark Gateway as Down</b> is ticked because this pair runs the role-driven design (<a href="#s8">section 8</a>); leave it unticked in the baseline design.</i></sub></p>
+
    > **Gotcha - the leftover DHCP gateway after a DHCP-to-static WAN.** This design turns the
    > WAN interface from DHCP to static (the public address lives on the VIP, not here). Two
    > things can then quietly leave the node with **no default route**, even while it is CARP
@@ -481,15 +487,15 @@ the keeper) only need doing once.
    under different config-keys (e.g. a physical+VM pair, [section 9](#s9)), bind instead to a `WAN`
    **interface group** whose members include both keys (e.g. `opt3,wan`), so the one
    synced rule resolves on both. Where a rule translates to the VIP, set the
-   **Translation / target** address field (it otherwise defaults to *Interface address*)
-   to the `wan_carp_vip` alias.
-   1. **internal to VIP** (the catch-all): source `internal_nets` (your LAN/VLAN subnets,
-      or simply the RFC 1918 ranges), destination any, **Translation / target**
+   **Translate Source IP** field (*Translation / target* on the legacy Outbound page; it
+   otherwise defaults to *Interface address*) to the `wan_carp_vip` alias.
+   1. **internal to VIP** (the catch-all): source `snat_internal` (your LAN/VLAN subnets,
+      or simply the RFC 1918 ranges), destination any, **Translate Source IP**
       **`wan_carp_vip`**. One rule replaces per-subnet rules and follows the lease via the
       alias; if its source range covers the SYNC net it also NATs the backup's borrowed
       traffic ([section 7.3](#s7-3)), so no separate backup-transit rule is needed.
    2. **backup transit** *(optional)*: only if the catch-all above does not cover the SYNC
-      net - source the SYNC net to any, **Translation / target** `wan_carp_vip`.
+      net - source the SYNC net to any, **Translate Source IP** `wan_carp_vip`.
    > **RFC 1918 node IPs only:** add a **no-NAT-for-CARP** rule *above* the catch-all -
    > source the node range (`wan_carp_nodes`), destination `224.0.0.18`, **Do not NAT** -
    > else the catch-all rewrites your CARP advertisements' source and breaks the election.
@@ -500,6 +506,10 @@ the keeper) only need doing once.
    > unroutable. `wan_carp_vip` is the public address. (Cosmetic GUI quirk: a Do-not-NAT
    > rule still shows "Interface address" in the *Translate* column; that field is
    > ignored when Do-not-NAT is ticked; it renders as `no nat` in pf.)
+
+   <p align="center"><img src="img/snat-rule.png" alt="Source NAT rule: interface WAN, source alias snat_internal, Translate Source IP wan_carp_vip" width="700"><br>
+   <sub><i>The catch-all Source NAT rule: source <code>snat_internal</code>, <b>Translate Source IP</b> = the plugin-managed <code>wan_carp_vip</code> alias.</i></sub></p>
+
 9. **Firewall (SYNC):** allow `SYNC net -> any`, kept tight (pkg/NTP/DNS).
 10. **Verify:**
     - `ifconfig -g WAN` on **both** nodes: it lists that node's real WAN device, so the

@@ -688,6 +688,9 @@ wiring. FRR is not required by the plugin.
 Only one keeper may run `enforce` (a model validation enforces this): two keepers both
 trying to own the single `0.0.0.0/0` would fight over it.
 
+<p align="center"><img src="img/settings-enforce.png" alt="Keeper dialog in advanced mode: Own default route by CARP role set to Enforce, Backup egress on, route form /1-split, gateway = an internal CARP VIP" width="700"><br>
+<sub><i>The WAN keeper in the role-driven design: <b>Own default route by CARP role</b> = Enforce, <b>Backup egress</b> on with the <code>/1</code>-split form and an internal CARP VIP as the gateway.</i></sub></p>
+
 ### The gateway, and `force_down`
 
 `enforce` raises a choice about the OPNsense WAN gateway object, because OPNsense has its

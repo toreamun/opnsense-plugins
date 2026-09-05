@@ -180,6 +180,9 @@ active locally, so the recommended VIP gateway is not caught by this guard.
 
 ## Config fields
 
+<p align="center"><img src="img/settings-enforce.png" alt="Keeper dialog in advanced mode: Own default route by CARP role set to Enforce, Backup egress on, route form /1-split, gateway = an internal CARP VIP" width="700"><br>
+<sub><i>The WAN keeper in the role-driven design: <b>Own default route by CARP role</b> = Enforce, <b>Backup egress</b> on with the <code>/1</code>-split form and an internal CARP VIP as the gateway.</i></sub></p>
+
 | Field (GUI label) | Meaning |
 |---|---|
 | Backup egress (internet while not master) | Off by default. Turn on to give the backup node egress via the master. |

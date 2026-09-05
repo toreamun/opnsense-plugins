@@ -1,7 +1,7 @@
 # Release signing keys
 
 `release.pub` is the RSA **public** key used to verify GitHub-release packages
-(see the repository README, "Verifying releases"). It is safe to publish.
+(see the repository README, "Manual install"). It is safe to publish.
 
 ## Generate the keypair (maintainer, once)
 

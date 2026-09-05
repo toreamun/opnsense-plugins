@@ -7,60 +7,53 @@
 [![GitHub stars](https://img.shields.io/github/stars/toreamun/opnsense-plugins?style=flat&logo=github&label=Star)](https://github.com/toreamun/opnsense-plugins)
 [![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-donate-ffdd00?logo=buymeacoffee&logoColor=black)](https://buymeacoffee.com/toreamun)
 
-An independent OPNsense plugin by [@toreamun](https://github.com/toreamun). *(Sources live in [`net/os-carp-vip-dhcp/`](net/os-carp-vip-dhcp/); the repo mirrors the [opnsense/plugins](https://github.com/opnsense/plugins) ports-tree layout so it builds with the standard tooling.)*
+On a **DHCP-assigned WAN**, the ISP only routes an address while it holds a **live DHCP lease** bound to a MAC. A plain CARP virtual IP is *static* - it never gets a lease, so it never receives traffic. That is why OPNsense HA "just works" on a static WAN and falls apart on a DHCP one.
 
----
-
-## What it does
-
-On a **DHCP-assigned WAN**, the ISP only routes an address while it holds a **live DHCP lease** bound to a MAC. A plain CARP virtual IP is *static* - it never gets a lease, so it never receives traffic.
-
-This plugin runs a small daemon that keeps a DHCP lease alive **for the CARP VIP's virtual MAC**. The ISP then routes the VIP to that MAC, native OPNsense CARP handles ARP and failover as usual, and the shared IP works - and fails over between two nodes - on a dynamic line. It works whether the ISP hands out several addresses or, via a **field-validated** single-IP design, [only one](net/os-carp-vip-dhcp/docs/single-ip-wan-carp.md).
+This plugin closes that gap. A small daemon keeps a DHCP lease alive **for the CARP VIP's virtual MAC**, so the ISP routes the VIP to that MAC, native OPNsense CARP handles ARP and failover as usual, and the shared IP works - and fails over between two nodes - on a dynamic line. It works whether the ISP hands out several addresses or [only one](net/os-carp-vip-dhcp/docs/single-ip-wan-carp.md).
 
 <p align="center">
   <img src="net/os-carp-vip-dhcp/docs/img/status.png" alt="Status page: the CARP VIP holding its DHCP lease as CARP master, with the ARP nudge confirmed by the gateway" width="900"><br>
   <sub><i>The Status page - the VIP holding its lease as CARP <b>master</b>, with gateway reachability confirmed (green check).</i></sub>
 </p>
 
-> **Status: independent plugin, aiming for the official tree.** This is a standalone plugin, not (yet) part of OPNsense. **If enough people find it useful, I intend to propose it for the official OPNsense community plugins** - ⭐ [star the repo](https://github.com/toreamun/opnsense-plugins) if you'd like to see that happen.
-
 ## Is this for you?
 
-You need it if **both** of these are true:
+You need it if **both** are true:
 
-- ✅ An **HA pair** (two OPNsense nodes) sharing an IP via **CARP**.
+- ✅ You run (or want to run) an **HA pair** - two OPNsense nodes sharing an IP via **CARP**.
 - ✅ The WAN is addressed by the **ISP's DHCP** (not static, not PPPoE).
 
-**The plugin supports both DHCP shapes** - however many addresses your line hands out:
+And, as for any CARP setup, both nodes' WAN ports must share one L2 segment with the ISP hand-off (a switch in front of the pair).
 
-- **Several concurrent leases** (one per node's WAN + one for the VIP) - the straightforward setup. Any such line works; tested on a plain public-DHCP WAN and behind CGNAT (the CGNAT line under test leased several addresses - behaviour varies by carrier).
-- **Only one ISP address** - supported too. A single floating VIP holds the lease while each node uses a private WAN IP for CARP; the backup reaches the internet through the master. **Field-validated** on a live single-IP DHCP WAN, including a real CARP failover (a single deployment - not yet exercised long-haul across many ISP/CPE combinations) - full design in [net/os-carp-vip-dhcp/docs/single-ip-wan-carp.md](net/os-carp-vip-dhcp/docs/single-ip-wan-carp.md).
+Both DHCP shapes are supported:
 
-If your WAN is static or PPPoE, you don't need this plugin.
+- **Several concurrent leases** (one per node's WAN + one for the VIP): the straightforward setup. Tested on a plain public-DHCP WAN and behind CGNAT.
+- **Only one ISP address**: a single floating VIP holds the lease while each node uses a private WAN IP for CARP. Field-validated on a live single-IP line, including a real failover. Full design in the [Single-IP WAN guide](net/os-carp-vip-dhcp/docs/single-ip-wan-carp.md).
+
+If your WAN is static or PPPoE, you don't need this plugin. It targets current OPNsense releases (26.x) and is pure Python over the standard library, so there is nothing else to install.
 
 ## Getting started
 
-On the OPNsense box, as **root**:
+Five steps; only the install command needs a root shell, the rest is GUI. Start with one node; add the peer when the first one holds its lease.
 
-1. **Create a CARP VirtualIP** on the WAN (Interfaces ‣ Virtual IPs).
-2. **Install:** resolves the latest signed release, verifies its maintainer signature, and installs the plugin:
+1. **Create a CARP VirtualIP** on the WAN under **Interfaces ‣ Virtual IPs** (OPNsense's [CARP how-to: Setup Virtual IPs](https://docs.opnsense.org/manual/how-tos/carp.html#setup-virtual-ips)). IPv4 only. You don't need to know the leased address yet: enter your current public WAN address, or any IPv4 placeholder; with Follow on (the default) the keeper rewrites it to whatever the ISP leases. The plugin points at an existing CARP VIP, so the keeper's VIP dropdown is empty until you do this.
+2. **Install** the latest signed release:
    ```sh
    fetch -o - https://raw.githubusercontent.com/toreamun/opnsense-plugins/main/install.sh | sh
    ```
-   *(Trust note: this bootstrap runs as **root before it can verify itself** - trust-on-first-use over GitHub TLS, since the signature check it performs lives inside the as-yet-unverified script. To establish trust yourself instead, use the verified **Manual install** or **Build from source** paths below.)*
-3. Open **Interfaces ‣ Virtual IPs DHCP**, add a **keeper** (a per-VIP lease-holder) pointing at that CARP VIP, and **enable** it. *(The VIP dropdown lists your CARP VIPs - if it's empty you skipped step 1; a keeper needs an existing CARP VIP to point at. And a keeper does nothing until its **Enabled** box is ticked.)*
+   The script resolves the latest release, verifies the maintainer signature on its checksum manifest, and installs the package. Prefer to establish trust yourself? Use the verified [manual install](#manual-install) or [build from source](#build-from-source) below.
+3. **Add a keeper** under **Interfaces ‣ Virtual IPs DHCP**: pick the CARP VIP, tick **Enabled**, save and apply. The defaults are right for most lines: it follows a dynamic address, keeps the gateway's ARP fresh, and runs on both nodes for seamless failover.
+4. **Point your traffic at the VIP.** Keeping the lease alive is half the job; your NAT must *use* the failover-capable address. Under **Firewall ‣ NAT ‣ Source NAT**, translate outbound traffic to the **CARP VIP** (a rule left on the node's own WAN address does not fail over). On a **dynamic** address, set **Sync firewall alias** on the keeper and translate to that alias instead of a literal IP, so NAT follows the address automatically. See OPNsense's [CARP how-to: Setup outbound NAT](https://docs.opnsense.org/manual/how-tos/carp.html#setup-outbound-nat) and *Following a dynamic address* below.
+5. **Check the Status page** (or the dashboard widget). Working looks like the screenshot above: **Lease** says **held**, **CARP status** is **MASTER**, and the **ARP nudge** column shows a **green check** (the gateway answers the nudge). On the backup node, Lease is also **held** (both nodes keep the same lease warm), CARP status is **BACKUP**, and ARP nudge shows **never** (or the age of its last nudge as master) with no check mark, since only the master nudges - that's expected. A persistent problem raises a **dashboard banner**, so a silent failure on the spare cannot go unnoticed.
 
-That's it - the VIP now holds a live lease. The defaults are sensible: it follows a dynamic address, keeps the gateway's ARP fresh, and runs on both nodes for seamless failover.
+- **Update:** re-run the same install command. It always fetches the latest signed release and reinstalls in place; settings are preserved. To pin a release, append its tag from the [releases page](https://github.com/toreamun/opnsense-plugins/releases):
+  ```sh
+  fetch -o - https://raw.githubusercontent.com/toreamun/opnsense-plugins/main/install.sh | sh -s -- os-carp-vip-dhcp vX.Y.Z
+  ```
+- **Uninstall:** `pkg delete os-carp-vip-dhcp` stops the daemons and removes the package and its runtime files. The keeper settings stay in `config.xml` (so a reinstall finds them again) and the keeper logs are kept.
+- **Help:** [open an issue](https://github.com/toreamun/opnsense-plugins/issues) with the keeper log (**Interfaces ‣ Virtual IPs DHCP ‣ Log**) and your ISP/line type. Report security issues privately as described in [SECURITY.md](SECURITY.md).
 
-**Point your traffic at the VIP.** Keeping the lease alive is only half the job: to actually *use* the failover-capable VIP, your NAT and rules must reference **it**, not a single node's own WAN address:
-
-- **Source NAT** *(recommended for HA; required for a single-IP WAN)*: set **Firewall ‣ NAT ‣ Source NAT** to translate to the **CARP VIP**, so outbound connections source from the VIP and keep working after a failover (a rule left translating to the node's own WAN IP does not fail over). *(Set this on the **Source NAT** page. The same menu also has a legacy **Outbound** page - both are present on 26.1 and 26.7 and either works.)* See OPNsense's [CARP how-to: Setup outbound NAT](https://docs.opnsense.org/manual/how-tos/carp.html#setup-outbound-nat).
-- **Dynamic address?** Set **Sync firewall alias** on the keeper and point Source NAT - and any rule that must follow - at that **alias** instead of a literal IP, so it tracks the address automatically on a follow. See *Following a dynamic address* below.
-
-**You'll know it's working when**, on the **Status** page (or the dashboard widget): the keeper shows **bound** to the VIP's address, the node it runs on is CARP **master**, and gateway reachability shows a **green check** (the gateway is answering the ARP nudge). On the backup you'll instead see it **standing by** (or holding its own lease, depending on mode) - that's expected. A persistent problem raises a **dashboard banner**.
-
-- **Update:** re-run the exact same command (it always fetches the latest signed release and reinstalls in place; settings are preserved). Pin a version by appending its tag, e.g. `… | sh -s -- os-carp-vip-dhcp v1.13.5`.
-- **Uninstall:** `pkg delete os-carp-vip-dhcp` - stops the daemons and cleans up. *(A manual, no-script install is documented below.)*
+> **Trust note on the one-liner.** The bootstrap script runs as root before it can verify itself (trust-on-first-use over GitHub TLS; the signature check it performs lives inside the as-yet-unverified script). The [manual install](#manual-install) path verifies everything before anything runs.
 
 ## Where it lives in the GUI
 
@@ -72,7 +65,7 @@ Everything is under **Interfaces ‣ Virtual IPs DHCP**:
 | **Status** | live per-keeper state - lease, CARP role, heartbeat, ARP-nudge age + gateway reachability |
 | **Log** | the keeper log (searchable, with a level filter) |
 
-A **“CARP-VIP DHCP” dashboard widget** shows one row per keeper for an at-a-glance view. Access is granted by the **“Interfaces: Virtual IPs DHCP”** privilege.
+A **"CARP-VIP DHCP" dashboard widget** shows one row per keeper for an at-a-glance view. Access is granted by the **"WebCfg - Interfaces: Virtual IPs DHCP"** privilege.
 
 <p align="center">
   <img src="net/os-carp-vip-dhcp/docs/img/settings.png" alt="Add or edit a keeper: pick a CARP VIP, follow-mode, and an optional firewall alias" width="560">
@@ -83,34 +76,36 @@ A **“CARP-VIP DHCP” dashboard widget** shows one row per keeper for an at-a-
 
 ## How it works
 
-A small root daemon keeps a DHCP lease alive for a chosen `chaddr` - the CARP virtual MAC (`00:00:5e:00:01:<vhid>`, last octet = the vhid in hex) of an existing CARP VIP. Standard `dhclient` can't do this because it ties the DHCP `chaddr` to the interface's hardware MAC; the daemon decouples them via a raw `/dev/bpf` socket (pure Python stdlib, no third-party dependency).
+A small root daemon keeps a DHCP lease alive for a chosen `chaddr` - the CARP virtual MAC (`00:00:5e:00:01:<vhid>`, last octet = the vhid in hex) of an existing CARP VIP. Standard `dhclient` can't do this because it ties the DHCP `chaddr` to the interface's hardware MAC; the daemon decouples them via a raw `/dev/bpf` socket.
 
 Once the ISP routes the VIP address to that MAC, native OPNsense CARP answers ARP and egresses data as usual - so the VIP becomes failover-capable on a DHCP interface. The daemon references an existing CARP VirtualIP (deriving interface, vhid-to-chaddr and IP), follows the lease (RENEW at T1, REBIND at T2, re-DORA - a full Discover-Offer-Request-Ack - at expiry), and by default runs on **both** nodes redundantly - same lease, seamless failover, no split-brain. Because the lease lives on the CARP **virtual** MAC, a failover invalidates nothing upstream: the same MAC simply starts answering from the new master.
 
 ## Single-IP WAN (only one public IP)
 
-Only *one* public IP on the WAN? You still get CARP failover. The shape:
+Only *one* public IP on the WAN? You still get CARP failover:
 
 - each node takes a small **private** static WAN IP (used only for CARP advertisements + node identity);
 - **one floating CARP VIP** holds the single public lease - this plugin keeps it alive on the virtual MAC;
-- the **master owns the default route** (*Own default route by CARP role*, enforce) and the backup reaches the internet through the master via the built-in **backup egress** feature - not an auto-switching gateway group, which lags failover.
+- outbound NAT translates to the VIP, so failover needs no routing change.
 
-This is the **mental model, not a setup checklist** - single-IP needs the private node IPs, default-route-by-role, backup egress, and the SYNC link wired correctly. The integrated stack has now been field-run on a live one-IP line (a single deployment - not yet exercised long-haul across many ISP/CPE combinations). Don't build it from these three bullets alone: the full recipe (IP plan, failover flow, GUI steps, validation status) is in **➜ [Single-IP WAN failover](net/os-carp-vip-dhcp/docs/single-ip-wan-carp.md)**.
+For the default route there are two designs, both documented. The **baseline** keeps the default pinned to the ISP gateway on both nodes; the backup has no internet of its own until it is promoted, and borrows the master's path on demand when it needs updates. The **role-driven** design lets the master **own the default route by CARP role** (enforce) and gives the backup automatic internet through the master via the built-in **backup egress** feature; pick it when you want the backup online, or when a dynamic router redistributes your default. Neither uses an auto-switching gateway group, which lags failover and blackholes a promoted node.
 
----
+This is the mental model, not a setup checklist: single-IP needs the private node IPs, the SYNC link and the NAT wired correctly, and the ISP has to lease to the virtual MAC (there is a safe pre-flight test). The click-by-click recipe, IP plan, failover flow and validation status are in **➜ [Single-IP WAN failover](net/os-carp-vip-dhcp/docs/single-ip-wan-carp.md)**.
+
+## Going further
 
 <details>
 <summary><b>Options &amp; behaviour</b></summary>
 
 All per-keeper; sensible defaults mean most setups only pick a CARP VIP and enable.
 
-- **Follow a dynamic address** *(default on)*: if the server assigns a different address than the configured VIP, the keeper adopts it and rewrites the CARP VIP to match, so the VIP stays online on a dynamic line. Turn **off** to *enforce* a fixed reservation (a mismatch then alarms).
-- **Sync a firewall alias** *(optional)*: name a Host alias and the plugin keeps it set to the VIP's current address, so Source NAT and rules pointed at the alias follow a dynamic address. See *Following a dynamic address*.
+- **Follow dynamic DHCP address** *(default on)*: if the server assigns a different address than the configured VIP, the keeper adopts it and rewrites the CARP VIP to match, so the VIP stays online on a dynamic line. Turn **off** to *enforce* a fixed reservation (a mismatch then alarms).
+- **Sync firewall alias** *(optional)*: name a Host alias and the plugin keeps it set to the VIP's current address, so Source NAT and rules pointed at the alias follow a dynamic address. See *Following a dynamic address*.
 - **ARP nudge** *(default on)*: keeps the upstream gateway's ARP entry for the VIP fresh and listens for the reply as a reachability signal. See *ARP nudge &amp; reachability*.
-- **CARP failover on lease loss** *(optional)*: demote this node (hand the VIP to the peer) if the keeper stops holding the correct lease.
-- **DHCP identity options** *(advanced)*: set a vendor-class (opt 60), client-id (61) or hostname (12) for servers that only lease to a known value. On a server that keys the lease on the **client-id** (not the chaddr), **both HA nodes must present the *same* client-id** - a divergent one gets them different addresses and breaks the shared VIP. HA config-sync keeps it identical.
-- **Own the default route by CARP role** *(advanced, default off)*: make one keeper own the IPv4 default route as a function of CARP role and lease - only the master node holding the lease keeps a default (via the lease gateway), every other state has none, so a failover moves the default with the role instead of leaving a backup black-holing traffic. **observe** logs what it would do without touching the routing table; **enforce** installs and withdraws it. Pairs with marking the WAN gateway down (`force_down`) so OPNsense does not install a competing default. See *Owning the default route by CARP role*.
-- **Backup egress for the backup node** *(advanced, default off; needs default-route mode observe/enforce)*: once the master owns the default route, the backup has no WAN route of its own, so its own traffic (updates, NTP, DNS, remote access) has nowhere to go. This routes the backup's egress to the master via a leak-safe /1-split (or a configured prefix list) and withdraws it on promotion to master. See the [backup egress guide](net/os-carp-vip-dhcp/docs/backup-egress.md).
+- **CARP failover on lease loss** *(optional, only with Follow off)*: demote this node (hand the VIP to the peer) if the keeper stops holding the correct lease. A following keeper adopts a new address instead of losing its lease, so the two are mutually exclusive.
+- **DHCP vendor class / DHCP client-id / DHCP hostname** *(advanced)*: set option 60, 61 or 12 for servers that only lease to a known value. On a server that keys the lease on the **client-id** (not the chaddr), **both HA nodes must present the *same* client-id** - a divergent one gets them different addresses and breaks the shared VIP. HA config-sync keeps it identical.
+- **Own default route by CARP role** *(advanced, default off)*: one keeper owns the IPv4 default route as a function of CARP role and lease, so a failover moves the default with the role instead of leaving a backup black-holing traffic. Modes **observe** (log only) and **enforce**. See *Owning the default route by CARP role* below.
+- **Backup egress (internet while not master)** *(advanced, default off; needs the default-route mode above set to observe/enforce)*: once the master owns the default route, the backup has no WAN route of its own, so its own traffic (updates, NTP, DNS, remote access) has nowhere to go. This routes the backup's egress to the master via a leak-safe /1-split (or a configured prefix list) and withdraws it on promotion to master. See the [backup egress guide](net/os-carp-vip-dhcp/docs/backup-egress.md).
 - **HA config sync** *(optional)*: replicate the keeper config to the peer (System ‣ High Availability ‣ Settings), so you configure once on the master. Safe: the config is node-agnostic.
 - **Self-healing & health banner:** the daemon never exits on a transient fault (it keeps its heartbeat fresh so CARP doesn't falsely demote the node), and a GUI banner warns if any enabled keeper stops holding its lease - closing the silent-failure gap on a redundant spare.
 
@@ -124,7 +119,7 @@ Some ISP gateways/BNGs ignore gratuitous ARP and **never re-ARP an expired entry
 - **The nudge:** a periodic ARP *request* from the VIP (source = leased IP + CARP MAC) for the gateway. Default 120 s - comfortably under the ARP timeout of typical *and* shorter-lived gateway caches, at one negligible broadcast per interval. Lower it toward the 30 s floor for gear with a very short ARP timeout. Sent **only while CARP master** (never from a backup). Set 0 to disable.
 - **On becoming master** (failover or a link flap re-electing CARP): an immediate nudge **and** an early lease RENEW, within ~1 s of the kernel CARP transition - neither waits for its timer.
 - **Manual nudge:** the ⚡ button on the Status page (shown on the master), or `kill -USR1` on the daemon.
-- **Reachability:** the keeper watches for the gateway's ARP **reply**; the Status page/widget show a green check when confirmed. If the gateway stops answering **while the lease is held** - the silent return-path blackhole this whole feature guards against - a **dashboard banner** is raised (it is otherwise invisible: CARP still masters and the lease is still held). No promiscuous mode is needed - the master already accepts the VIP MAC. A NIC that filters non-primary unicast can enable the advanced **“ARP listen in promiscuous mode”** fallback *(default off; it warns when on)*.
+- **Reachability:** the keeper watches for the gateway's ARP **reply**; the Status page/widget show a green check when confirmed. If the gateway stops answering **while the lease is held** - the silent return-path blackhole this whole feature guards against - a **dashboard banner** is raised (it is otherwise invisible: CARP still masters and the lease is still held). No promiscuous mode is needed - the master already accepts the VIP MAC. A NIC that filters non-primary unicast can enable the advanced **"ARP listen in promiscuous mode"** fallback *(default off; it warns when on)*.
 
 </details>
 
@@ -137,7 +132,6 @@ When **Follow dynamic DHCP address** is on (default) and the server assigns a di
 
 1. In the keeper, set **Sync firewall alias** to a name (e.g. `wan_carp_vip`). The plugin creates a Host alias of that name (or adopts a Host alias of that name you pre-created) and keeps it equal to the VIP's current address.
 2. Point your **Source NAT** translation address - and any rule that must follow - at that **alias** instead of a literal IP. On a follow, the plugin updates the alias and reapplies the filter (state-preserving), so rules track the new address.
-
 
 The alias is created/updated automatically and never deleted (it may be referenced elsewhere).
 
@@ -199,10 +193,14 @@ Carrier access gear (BNG / access switches / OLTs) polices subscribers with mech
 
 </details>
 
-<details>
-<summary><b>Manual install (step by step, no script)</b></summary>
+## Installing without the one-liner
 
-As **root**, download the plugin `.pkg`, `SHA256SUMS` and `SHA256SUMS.sig` from the [latest release](https://github.com/toreamun/opnsense-plugins/releases/latest) into an empty directory, then:
+<a id="manual-install"></a>
+
+<details>
+<summary><b>Manual install (verified, step by step)</b></summary>
+
+`pkg add` does not verify a standalone package, so each release also ships a signed checksum manifest (`SHA256SUMS` + `SHA256SUMS.sig`). As **root**, download the plugin `.pkg`, `SHA256SUMS` and `SHA256SUMS.sig` from the [latest release](https://github.com/toreamun/opnsense-plugins/releases/latest) into an empty directory, then:
 
 ```sh
 # 1. Fetch the maintainer's public key (one-time).
@@ -212,14 +210,18 @@ fetch -o release.pub https://raw.githubusercontent.com/toreamun/opnsense-plugins
 openssl base64 -d -in SHA256SUMS.sig -out SHA256SUMS.sig.bin
 openssl dgst -sha256 -verify release.pub -signature SHA256SUMS.sig.bin SHA256SUMS   # -> Verified OK
 
-# 3. Verify the package matches the signed manifest.
-h=$(sha256 -q os-carp-vip-dhcp-*.pkg); grep -q "$h" SHA256SUMS && echo "package OK"
+# 3. Verify the package matches the signed manifest (format-agnostic: match by hash).
+for p in *.pkg; do grep -q "$(sha256 -q "$p")" SHA256SUMS && echo "$p: OK" || echo "$p: MISMATCH"; done
 
 # 4. Install the plugin.
 pkg add ./os-carp-vip-dhcp-*.pkg
 ```
 
+`Verified OK` proves the manifest was signed with the maintainer key, and the hash match proves each `.pkg` is the one in the signed manifest. OPNsense packages use a wildcard ABI, so one build works across OPNsense versions.
+
 </details>
+
+<a id="build-from-source"></a>
 
 <details>
 <summary><b>Build from source (run the latest, or don't rely on a release)</b></summary>
@@ -237,30 +239,17 @@ cd opnsense-plugins            # inspect the source you're about to run
 ```
 
 `./build.sh` on its own only builds `./dist/<pkg>.pkg` (no install) - use that to build on a separate box and copy just the `.pkg` to a hardened firewall (keeping the build toolchain off it). Settings survive a reinstall; re-run the one-line `install.sh` any time to return to signed releases.
+
 </details>
 
-## Verifying releases
+## Project status
 
-`pkg add` does not verify a standalone package, so each release also ships a signed checksum manifest (`SHA256SUMS` + `SHA256SUMS.sig`). Verify it on the OPNsense box before installing:
-
-```sh
-# one-time: fetch the maintainer public key
-fetch -o release.pub https://raw.githubusercontent.com/toreamun/opnsense-plugins/main/keys/release.pub
-
-# with the release's *.pkg, SHA256SUMS and SHA256SUMS.sig in the current dir:
-openssl base64 -d -in SHA256SUMS.sig -out SHA256SUMS.sig.bin
-openssl dgst -sha256 -verify release.pub -signature SHA256SUMS.sig.bin SHA256SUMS   # -> Verified OK
-
-# check each package against the signed manifest (format-agnostic: match by hash)
-for p in *.pkg; do grep -q "$(sha256 -q "$p")" SHA256SUMS && echo "$p: OK" || echo "$p: MISMATCH"; done
-```
-
-`Verified OK` proves the manifest was signed with the maintainer key; the diff proves each `.pkg` matches the signed manifest. OPNsense packages use a wildcard ABI, so one build works across OPNsense versions.
+This is an independent plugin by [@toreamun](https://github.com/toreamun), not (yet) part of OPNsense. **If enough people find it useful, I intend to propose it for the official OPNsense community plugins** - ⭐ [star the repo](https://github.com/toreamun/opnsense-plugins) if you'd like to see that happen, and open an issue with what worked and what did not on your ISP. Sources live in [`net/os-carp-vip-dhcp/`](net/os-carp-vip-dhcp/); the repo mirrors the [opnsense/plugins](https://github.com/opnsense/plugins) ports-tree layout so it builds with the standard tooling.
 
 ## For maintainers
 
 - **Building & releasing:** see **[RELEASE.md](RELEASE.md)** for the build, sign, tag and publish process and the review gates each release passes. Packages must be built **on an OPNsense box** - GitHub Actions has no OPNsense/FreeBSD runner.
-- **Linting:** Python is PEP 8, max line length 120 (`flake8`, config in [setup.cfg](setup.cfg)); PHP is PSR-12 (`phpcs`). Run everything locally with [pre-commit](.pre-commit-config.yaml) (`pre-commit install && pre-commit run --all-files`); CI ([.github/workflows/lint.yml](.github/workflows/lint.yml)) runs the same checks on every push and PR.
+- **Linting:** Python is PEP 8, max line length 120 (`flake8`, config in [setup.cfg](setup.cfg)); PHP is PSR-12 (`phpcs`); Markdown is checked with `markdownlint` (rules in [.markdownlint.yaml](.markdownlint.yaml)). Run everything locally with [pre-commit](.pre-commit-config.yaml) (`pre-commit install && pre-commit run --all-files`); CI ([.github/workflows/lint.yml](.github/workflows/lint.yml)) runs those plus pylint, pyright, pytest, shellcheck and xmllint on every push and PR.
 
 ## License
 

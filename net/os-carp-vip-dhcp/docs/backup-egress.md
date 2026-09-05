@@ -2,7 +2,7 @@
 
 Companion to the default-route-by-CARP-role feature (`Own default route by CARP
 role` = observe/enforce; see also the [single-IP WAN CARP guide](single-ip-wan-carp.md),
-sections 8-9, for how this fits the overall failover topology). That feature makes the keeper own the WAN default as a
+sections 7-8, for how this fits the overall failover topology). That feature makes the keeper own the WAN default as a
 function of CARP role: the master installs `0.0.0.0/0`, every other state has
 none (fail-stop). A direct consequence is that **the CARP backup node has no
 route to the internet for its own traffic** (pkg/firmware updates, NTP, DNS,

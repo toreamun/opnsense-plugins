@@ -44,7 +44,23 @@ function carpvipdhcp_services()
  * and therefore safe to replicate: carpVip stores the VIP's ADDRESS (not a
  * per-node UUID), and interface / VHID-chaddr / request-IP are DERIVED from that
  * address at render time, so the same keeper row renders correctly on both nodes.
- * After a sync the backup restarts the keepers to pick up the config.
+ *
+ * Nothing syncs by itself. Saving on the master changes nothing on the backup;
+ * OPNsense pushes config only from System > High Availability > Status (the
+ * per-service "Synchronize and Restart" button, or "Synchronize and reconfigure
+ * all") and from the cron job "HA update and reconfigure backup". The
+ * 'services' list below is inert: core normalises it and pluginctl -x prints
+ * it, but no sync path acts on it. Whether the backup's keepers pick up the
+ * new config depends on the path:
+ *  - per-service "Synchronize and Restart": syncs, reloads the templates and
+ *    restarts that keeper by id. The right button after a keeper change.
+ *  - "Synchronize and reconfigure all": same, but restarts every service on
+ *    the backup, and it reads the backup's service list BEFORE syncing, so a
+ *    keeper added or enabled on the master is not started; start it from its
+ *    own row afterwards.
+ *  - the cron job: syncs and reloads the templates, but restarts services with
+ *    the service NAME passed as the id, which never matches a keeper's id, so
+ *    the keepers keep running their previous settings until restarted.
  *
  * The CARP virtual IPs themselves are intentionally NOT synced (advskew differs
  * per node); with follow mode each node also updates its own VIP independently

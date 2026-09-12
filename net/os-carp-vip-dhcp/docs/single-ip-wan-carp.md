@@ -445,11 +445,15 @@ the keeper) only need doing once.
    _System ‣ High Availability_ (OPNsense how-to:
    [Setup pfSync and HA sync](https://docs.opnsense.org/manual/how-tos/carp.html#setup-pfsync-and-ha-sync-xmlrpc)).
    Include **`carpvipdhcp`** in the synchronized services so the keeper config replicates;
-   the CARP VIPs stay per-node (advskew differs). The sync only copies the settings, it
-   does not restart anything on the backup: after every later keeper change on the master,
-   go to _System ‣ High Availability ‣ Status_ and press **Synchronize and reconfigure
-   all** (or the per-service **Synchronize and Restart** button), otherwise the backup
-   keeps running its previous settings (for example a stale client MAC override).
+   the CARP VIPs stay per-node (advskew differs). OPNsense syncs on demand, not on save:
+   after every later keeper change on the master, go to _System ‣ High Availability ‣
+   Status_ and press the keeper's **Synchronize and Restart** button, which copies the
+   config to the backup and restarts that keeper with it. **Synchronize and reconfigure
+   all** also works but restarts every service on the backup, and it does not start a
+   keeper you have just added (start it from its own row after the sync). The cron job
+   **HA update and reconfigure backup** copies the config but does not restart the
+   keepers, so the backup keeps running its previous settings (for example a stale
+   client MAC override) until you restart them.
 6. **Gateway:** add `WAN_ISP` (`123.123.123.1`, on the WAN interface, **Far Gateway**,
    see step 2) under _System ‣ Gateways_ and mark it **Upstream Gateway** so it is the
    system default. There is no "pick the default" dropdown on 26.7: the default is the

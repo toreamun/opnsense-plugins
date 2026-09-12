@@ -44,7 +44,15 @@ function carpvipdhcp_services()
  * and therefore safe to replicate: carpVip stores the VIP's ADDRESS (not a
  * per-node UUID), and interface / VHID-chaddr / request-IP are DERIVED from that
  * address at render time, so the same keeper row renders correctly on both nodes.
- * After a sync the backup restarts the keepers to pick up the config.
+ *
+ * A sync does NOT restart anything on the backup: OPNsense's automatic
+ * sync-on-save copies the config section and reloads the firewall rules there,
+ * but neither re-renders keeper.conf nor restarts a service (core does not act
+ * on the 'services' list below during that sync). The backup keeps running its
+ * previous settings until its keepers are restarted from System > High
+ * Availability > Status ("Synchronize and reconfigure all", or the per-service
+ * "Synchronize and Restart" button): those re-sync, reload the templates and
+ * restart each keeper by id.
  *
  * The CARP virtual IPs themselves are intentionally NOT synced (advskew differs
  * per node); with follow mode each node also updates its own VIP independently

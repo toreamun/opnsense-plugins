@@ -75,7 +75,12 @@ class DhcpSend(NamedTuple):
 # Static BPF capture filter: DHCP (broadcast OFFER/ACK) + ARP replies to our nudge
 # (arp[6:2]=2). A boundary, not an optimization -- it keeps everything else (incl. the
 # segment's broadcast who-has flood) out of the Python parser.
-SNIFFER_FILTER = f"(udp and (port {DHCP_SERVER_PORT} or port {DHCP_CLIENT_PORT})) or (arp and arp[6:2] = 2)"
+_DHCP_ARP_CLAUSE = f"(udp and (port {DHCP_SERVER_PORT} or port {DHCP_CLIENT_PORT})) or (arp and arp[6:2] = 2)"
+# The same clauses are repeated under `vlan 0` so an 802.1Q priority-tagged frame
+# (VID 0, see codec._ether_payload) is accepted like its untagged twin. libpcap's
+# `vlan` keyword shifts the offsets of everything after it by the 4-byte tag, so
+# the untagged clauses must come first.
+SNIFFER_FILTER = f"{_DHCP_ARP_CLAUSE} or (vlan 0 and ({_DHCP_ARP_CLAUSE}))"
 
 
 def _msg_text(msg) -> str:

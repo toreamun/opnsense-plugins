@@ -303,12 +303,17 @@ DLT_EN10MB = 1               # Ethernet: the only link type this codec's offsets
 BPF_ALIGNMENT = 8            # capture records align to sizeof(long)
 BPF_HDR_FIXED = 26           # bh_tstamp(16) + bh_caplen(4) + bh_datalen(4) + bh_hdrlen(2)
 
-# SNIFFER_FILTER compiled to classic-BPF opcodes, embedded so the daemon needs
-# no runtime filter compiler. MUST stay in lockstep with SNIFFER_FILTER;
-# regenerate on any FreeBSD/OPNsense host with:
-#   tcpdump -i <ethernet-iface> -dd "$SNIFFER_FILTER"
-# (or, without touching an interface, `tcpdump -r <any EN10MB pcap> -dd ...` and
-# put the live default snap length 262144 back into the accept return).
+# SNIFFER_FILTER (wire.py) compiled to classic-BPF opcodes, embedded so the
+# daemon needs no runtime filter compiler. MUST stay in lockstep with that
+# constant; regenerate on any FreeBSD/OPNsense host, from this package's parent
+# directory, with the filter string read out of the module:
+#   tcpdump -i <ethernet-iface> -dd "$(python3 -c 'from leasekeeper.wire import SNIFFER_FILTER as f; print(f)')"
+# which today is
+#   (udp and (port 67 or port 68)) or (arp and arp[6:2] = 2)
+#     or (vlan 0 and ((udp and (port 67 or port 68)) or (arp and arp[6:2] = 2)))
+# Without touching an interface, `tcpdump -r <any EN10MB pcap> -dd '<filter>'`
+# gives the same program with the file's snap length in the accept return; put
+# the live default 262144 back.
 # The trailing comment on each row is the `tcpdump -d` mnemonic so the table can
 # be audited by eye against the filter string without a FreeBSD box; jump
 # targets are absolute instruction indices (tcpdump's relative jt/jf + here+1).

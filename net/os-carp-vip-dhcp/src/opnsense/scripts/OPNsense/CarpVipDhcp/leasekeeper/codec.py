@@ -21,8 +21,12 @@ from .wire import ArpFrame, BootpFrame
 
 ETHERTYPE_IPV4 = 0x0800
 ETHERTYPE_ARP = 0x0806
+ETHERTYPE_VLAN = 0x8100      # IEEE 802.1Q tag (TPID); VID 0 = priority-tagged, no VLAN membership
+QINQ_TPIDS = frozenset((0x88A8, 0x9100))   # 802.1ad / legacy QinQ: stacked tags, never priority-only
 ETHER_HDR_LEN = 14           # Ethernet II header: 6 dst + 6 src + 2 ethertype
 ETHERTYPE_OFF = 12           # the ethertype field sits at bytes 12-13 (end of the header)
+VLAN_TAG_LEN = 4             # an 802.1Q tag: TPID (2) + TCI (2), inserted after the source MAC
+VLAN_VID_MASK = 0x0FFF       # the VID bits of the TCI (the upper 4 are PCP priority + DEI)
 ETHER_MIN_FRAME = 60         # minimum Ethernet frame (without FCS); short ARP frames are padded
 DHCP_MAGIC = b"\x63\x82\x53\x63"   # RFC 2131 options magic cookie
 BOOTP_HDR_LEN = 236          # fixed BOOTP header before the magic cookie
@@ -259,6 +263,32 @@ def _decode_ipv4_bootp(pkt) -> "BootpFrame | None":
                                if op == BootpOp.REPLY else []))
 
 
+def _ether_payload(frame) -> "tuple[int, bytes] | None":
+    """Split a captured Ethernet frame into (ethertype, payload), or None for
+    a runt frame or a rejected tag.
+
+    An 802.1Q priority tag -- TPID 0x8100 with VID 0, priority-only with no
+    VLAN membership -- is stripped so the frame decodes exactly like its
+    untagged twin (some access networks send DHCP replies that way, and the
+    kernel's own IP stack treats VID 0 as untagged too). Every other tag is
+    rejected: a non-zero VID is another VLAN's traffic, a QinQ TPID a stacked
+    tag. The capture filter excludes most of these already; the decoder
+    re-checks rather than trusting it, as everywhere else."""
+    if len(frame) < ETHER_HDR_LEN:
+        return None
+    ethertype = int.from_bytes(frame[ETHERTYPE_OFF:ETHER_HDR_LEN], "big")
+    if ethertype in QINQ_TPIDS:
+        return None
+    if ethertype != ETHERTYPE_VLAN:
+        return ethertype, frame[ETHER_HDR_LEN:]
+    if len(frame) < ETHER_HDR_LEN + VLAN_TAG_LEN:
+        return None
+    tci, inner_ethertype = struct.unpack_from("!HH", frame, ETHER_HDR_LEN)   # the TPID sat in the ethertype slot
+    if tci & VLAN_VID_MASK:
+        return None
+    return inner_ethertype, frame[ETHER_HDR_LEN + VLAN_TAG_LEN:]
+
+
 # ---- /dev/bpf plumbing (bpf backend) ----
 # FreeBSD ioctl codes for the LP64 platforms OPNsense ships on (amd64/aarch64),
 # precomputed from net/bpf.h so no C headers are needed at runtime.
@@ -273,42 +303,84 @@ DLT_EN10MB = 1               # Ethernet: the only link type this codec's offsets
 BPF_ALIGNMENT = 8            # capture records align to sizeof(long)
 BPF_HDR_FIXED = 26           # bh_tstamp(16) + bh_caplen(4) + bh_datalen(4) + bh_hdrlen(2)
 
-# SNIFFER_FILTER compiled to classic-BPF opcodes, embedded so the daemon needs
-# no runtime filter compiler. MUST stay in lockstep with SNIFFER_FILTER;
-# regenerate on any FreeBSD/OPNsense host with:
-#   tcpdump -i <ethernet-iface> -dd '(udp and (port 67 or port 68)) or (arp and arp[6:2] = 2)'
+# SNIFFER_FILTER (wire.py) compiled to classic-BPF opcodes, embedded so the
+# daemon needs no runtime filter compiler. MUST stay in lockstep with that
+# constant; regenerate on any FreeBSD/OPNsense host, from this package's parent
+# directory, with the filter string read out of the module:
+#   tcpdump -i <ethernet-iface> -dd "$(python3 -c 'from leasekeeper.wire import SNIFFER_FILTER as f; print(f)')"
+# which today is
+#   (udp and (port 67 or port 68)) or (arp and arp[6:2] = 2)
+#     or (vlan 0 and ((udp and (port 67 or port 68)) or (arp and arp[6:2] = 2)))
+# Without touching an interface, `tcpdump -r <any EN10MB pcap> -dd '<filter>'`
+# gives the same program with the file's snap length in the accept return; put
+# the live default 262144 back.
 # The trailing comment on each row is the `tcpdump -d` mnemonic so the table can
 # be audited by eye against the filter string without a FreeBSD box; jump
 # targets are absolute instruction indices (tcpdump's relative jt/jf + here+1).
 # A bench test (testbench repo) asserts `tcpdump -ddd SNIFFER_FILTER` still
 # equals this table, turning the lockstep requirement into an enforced invariant.
+#
+# Rows 00-22 are the untagged frame (ethertype at [12], payload from [14]);
+# rows 23-51 repeat the same tests for an 802.1Q-tagged frame with VID 0
+# (TCI at [14], inner ethertype at [16], payload from [18]) -- libpcap's
+# `vlan` primitive accepts the 802.1Q, 802.1ad and QinQ TPIDs, and `vlan 0`
+# drops any frame with VID bits set, so only priority tags get through
+# (_ether_payload then narrows the decoder to the 0x8100 TPID).
 _BPF_FILTER = (
     (0x28, 0, 0, 0x0000000C),   # 00 ldh  [12]                 ; ethertype
     (0x15, 0, 10, 0x00000800),  # 01 jeq  #0x800  -> 02, ->12  ; IPv4?
     (0x30, 0, 0, 0x00000017),   # 02 ldb  [23]                 ; IPv4 proto
-    (0x15, 0, 21, 0x00000011),  # 03 jeq  #17     -> 04, ->25  ; UDP?
+    (0x15, 0, 49, 0x00000011),  # 03 jeq  #17     -> 04, ->53  ; UDP?
     (0x28, 0, 0, 0x00000014),   # 04 ldh  [20]                 ; flags+frag
-    (0x45, 19, 0, 0x00001FFF),  # 05 jset #0x1fff ->25, -> 06  ; fragment? drop
+    (0x45, 47, 0, 0x00001FFF),  # 05 jset #0x1fff ->53, -> 06  ; fragment? drop
     (0xB1, 0, 0, 0x0000000E),   # 06 ldxb 4*([14]&0xf)         ; X = IP hdr len
     (0x48, 0, 0, 0x0000000E),   # 07 ldh  [x+14]               ; UDP src port
-    (0x15, 15, 0, 0x00000043),  # 08 jeq  #67     ->24, -> 09  ; sport 67? accept
-    (0x15, 14, 0, 0x00000044),  # 09 jeq  #68     ->24, -> 10  ; sport 68? accept
+    (0x15, 43, 0, 0x00000043),  # 08 jeq  #67     ->52, -> 09  ; sport 67? accept
+    (0x15, 42, 0, 0x00000044),  # 09 jeq  #68     ->52, -> 10  ; sport 68? accept
     (0x48, 0, 0, 0x00000010),   # 10 ldh  [x+16]               ; UDP dst port
-    (0x15, 12, 8, 0x00000043),  # 11 jeq  #67     ->24, ->20   ; dport 67? accept
-    (0x15, 0, 8, 0x000086DD),   # 12 jeq  #0x86dd -> 13, ->21  ; IPv6? (else ARP)
+    (0x15, 40, 36, 0x00000043),  # 11 jeq  #67     ->52, ->48   ; dport 67? accept
+    (0x15, 0, 7, 0x000086DD),   # 12 jeq  #0x86dd -> 13, ->20  ; IPv6? (else ARP / tag)
     (0x30, 0, 0, 0x00000014),   # 13 ldb  [20]                 ; IPv6 next header
-    (0x15, 0, 10, 0x00000011),  # 14 jeq  #17     -> 15, ->25  ; UDP?
+    (0x15, 0, 38, 0x00000011),  # 14 jeq  #17     -> 15, ->53  ; UDP?
     (0x28, 0, 0, 0x00000036),   # 15 ldh  [54]                 ; UDP src port (14+40)
-    (0x15, 7, 0, 0x00000043),   # 16 jeq  #67     ->24, -> 17  ; sport 67? accept
-    (0x15, 6, 0, 0x00000044),   # 17 jeq  #68     ->24, -> 18  ; sport 68? accept
+    (0x15, 35, 0, 0x00000043),  # 16 jeq  #67     ->52, -> 17  ; sport 67? accept
+    (0x15, 34, 0, 0x00000044),  # 17 jeq  #68     ->52, -> 18  ; sport 68? accept
     (0x28, 0, 0, 0x00000038),   # 18 ldh  [56]                 ; UDP dst port
-    (0x15, 4, 0, 0x00000043),   # 19 jeq  #67     ->24, ->20   ; dport 67? accept
-    (0x15, 3, 4, 0x00000044),   # 20 jeq  #68     ->24, ->25   ; dport 68? accept
-    (0x15, 0, 3, 0x00000806),   # 21 jeq  #0x806  -> 22, ->25  ; ARP?
-    (0x28, 0, 0, 0x00000014),   # 22 ldh  [20]                 ; ARP opcode
-    (0x15, 0, 1, 0x00000002),   # 23 jeq  #2      ->24, ->25   ; is-at reply?
-    (0x6, 0, 0, 0x00040000),    # 24 ret  #262144              ; ACCEPT (snap len)
-    (0x6, 0, 0, 0x00000000),    # 25 ret  #0                   ; DROP
+    (0x15, 32, 28, 0x00000043),  # 19 jeq  #67     ->52, ->48   ; dport 67? accept
+    (0x15, 0, 2, 0x00000806),   # 20 jeq  #0x806  -> 21, ->23  ; ARP? (else tag)
+    (0x28, 0, 0, 0x00000014),   # 21 ldh  [20]                 ; ARP opcode
+    (0x15, 29, 30, 0x00000002),  # 22 jeq  #2      ->52, ->53   ; is-at reply?
+    (0x15, 2, 0, 0x00008100),   # 23 jeq  #0x8100 ->26, -> 24  ; 802.1Q TPID?
+    (0x15, 1, 0, 0x000088A8),   # 24 jeq  #0x88a8 ->26, -> 25  ; 802.1ad TPID?
+    (0x15, 0, 27, 0x00009100),  # 25 jeq  #0x9100 ->26, ->53   ; QinQ TPID? else drop
+    (0x28, 0, 0, 0x0000000E),   # 26 ldh  [14]                 ; TCI (PCP/DEI/VID)
+    (0x45, 25, 0, 0x00000FFF),  # 27 jset #0xfff  ->53, -> 28  ; VID != 0? drop
+    (0x28, 0, 0, 0x00000010),   # 28 ldh  [16]                 ; inner ethertype
+    (0x15, 0, 10, 0x00000800),  # 29 jeq  #0x800  -> 30, ->40  ; IPv4?
+    (0x30, 0, 0, 0x0000001B),   # 30 ldb  [27]                 ; IPv4 proto
+    (0x15, 0, 21, 0x00000011),  # 31 jeq  #17     -> 32, ->53  ; UDP?
+    (0x28, 0, 0, 0x00000018),   # 32 ldh  [24]                 ; flags+frag
+    (0x45, 19, 0, 0x00001FFF),  # 33 jset #0x1fff ->53, -> 34  ; fragment? drop
+    (0xB1, 0, 0, 0x00000012),   # 34 ldxb 4*([18]&0xf)         ; X = IP hdr len
+    (0x48, 0, 0, 0x00000012),   # 35 ldh  [x+18]               ; UDP src port
+    (0x15, 15, 0, 0x00000043),  # 36 jeq  #67     ->52, -> 37  ; sport 67? accept
+    (0x15, 14, 0, 0x00000044),  # 37 jeq  #68     ->52, -> 38  ; sport 68? accept
+    (0x48, 0, 0, 0x00000014),   # 38 ldh  [x+20]               ; UDP dst port
+    (0x15, 12, 8, 0x00000043),  # 39 jeq  #67     ->52, ->48   ; dport 67? accept
+    (0x15, 0, 8, 0x000086DD),   # 40 jeq  #0x86dd -> 41, ->49  ; IPv6? (else ARP)
+    (0x30, 0, 0, 0x00000018),   # 41 ldb  [24]                 ; IPv6 next header
+    (0x15, 0, 10, 0x00000011),  # 42 jeq  #17     -> 43, ->53  ; UDP?
+    (0x28, 0, 0, 0x0000003A),   # 43 ldh  [58]                 ; UDP src port (18+40)
+    (0x15, 7, 0, 0x00000043),   # 44 jeq  #67     ->52, -> 45  ; sport 67? accept
+    (0x15, 6, 0, 0x00000044),   # 45 jeq  #68     ->52, -> 46  ; sport 68? accept
+    (0x28, 0, 0, 0x0000003C),   # 46 ldh  [60]                 ; UDP dst port
+    (0x15, 4, 0, 0x00000043),   # 47 jeq  #67     ->52, ->48   ; dport 67? accept
+    (0x15, 3, 4, 0x00000044),   # 48 jeq  #68     ->52, ->53   ; dport 68? accept (shared tail)
+    (0x15, 0, 3, 0x00000806),   # 49 jeq  #0x806  -> 50, ->53  ; ARP?
+    (0x28, 0, 0, 0x00000018),   # 50 ldh  [24]                 ; ARP opcode
+    (0x15, 0, 1, 0x00000002),   # 51 jeq  #2      ->52, ->53   ; is-at reply?
+    (0x6, 0, 0, 0x00040000),    # 52 ret  #262144              ; ACCEPT (snap len)
+    (0x6, 0, 0, 0x00000000),    # 53 ret  #0                   ; DROP
 )
 
 

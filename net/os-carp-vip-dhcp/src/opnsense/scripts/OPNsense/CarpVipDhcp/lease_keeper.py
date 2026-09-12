@@ -28,8 +28,11 @@ Security posture (this daemon parses untrusted WAN traffic as root):
     already accepts the VIP's virtual MAC. --arp-listen-promisc is an opt-in
     fallback (warned when enabled) for NICs that drop non-primary unicast.
   * The BPF filter is the next boundary: only DHCP (udp 67/68) and ARP replies
-    reach Python; everything else -- including the who-has flood -- is dropped
-    in the kernel.
+    reach Python -- untagged or 802.1Q priority-tagged (VID 0, treated as
+    untagged); everything else -- including the who-has flood and frames of
+    any real VLAN -- is dropped in the kernel. The few frame kinds the filter
+    admits but the decoder does not route (IPv6, 802.1ad/QinQ tags) are
+    dropped unparsed in Python.
   * A reply must carry BOOTREPLY; our own xid gates the first-party path, and in
     follow mode a reply on our shared chaddr (the peer's ACK) is read only to
     RECORD an observed address change (see _on_dhcp_reply). Only the DHCP options

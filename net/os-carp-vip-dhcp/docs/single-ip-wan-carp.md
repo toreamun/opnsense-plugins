@@ -313,8 +313,10 @@ are examples, substitute your own.*
 >   MAC (not the real virtual MAC, so a lease-binding ISP cannot associate the probe with
 >   your VIP; the question it answers is "does this line lease to a second MAC at all") and
 >   watch the reply in _Interfaces ‣ Diagnostics ‣ Packet Capture_ (or
->   `tcpdump -ni <wan> udp port 67 or udp port 68`): an `OFFER` to the probe MAC = good,
->   silence = MAC-bound. A `DISCOVER` takes no lease, so it leaves the live line
+>   `tcpdump -ni <wan> 'udp port 67 or udp port 68 or (vlan 0 and (udp port 67 or udp port 68))'`):
+>   an `OFFER` to the probe MAC = good, silence = MAC-bound. Keep the `vlan 0` half of
+>   the filter: some upstreams send replies 802.1Q priority-tagged, and a bare port
+>   filter silently misses those. A `DISCOVER` takes no lease, so it leaves the live line
 >   untouched. (OPNsense's `dhclient` has **no `-r`/release** flag; for a maximally clean
 >   test free the current lease with a `DHCPRELEASE` sent another way.) See [section 9](#s9)
 >   *DHCP behaviour* and [section 10](#s10).

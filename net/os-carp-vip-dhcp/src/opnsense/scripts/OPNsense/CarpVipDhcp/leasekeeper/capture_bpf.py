@@ -17,11 +17,11 @@ from .constants import (
     DHCP_CLIENT_PORT, DHCP_SERVER_PORT, ETHER_BROADCAST, PARSE_ERROR_LOG_INTERVAL,
     THREAD_JOIN_TIMEOUT)
 from .codec import (BIOCGBLEN, BIOCGDLT, BIOCIMMEDIATE, BIOCPROMISC, BIOCSETF,
-                    BIOCSETIF, BIOCSHDRCMPLT, DLT_EN10MB, ETHER_HDR_LEN,
-                    ETHER_MIN_FRAME, ETHERTYPE_ARP, ETHERTYPE_IPV4, ETHERTYPE_OFF,
+                    BIOCSETIF, BIOCSHDRCMPLT, DLT_EN10MB,
+                    ETHER_MIN_FRAME, ETHERTYPE_ARP, ETHERTYPE_IPV4,
                     _BPF_FILTER, _bpf_frames, _decode_arp, _decode_ipv4_bootp,
                     _encode_arp_request, _encode_bootp_request, _encode_ether,
-                    _encode_ipv4_udp)
+                    _encode_ipv4_udp, _ether_payload)
 from .util import _RateLimit
 from .wire import _deliver
 
@@ -223,16 +223,18 @@ class BpfCapture:
     def _dispatch(self, frame):
         """Decode one captured Ethernet frame and route it by ethertype to the
         keeper callback (via _deliver, so a handler failure is labelled as
-        such). A parse error in the untrusted input is dropped (debug-logged)."""
+        such); an 802.1Q priority tag is stripped first (see _ether_payload).
+        A parse error in the untrusted input is dropped (debug-logged)."""
         decoded = None
         handler = None
         try:
-            if len(frame) >= ETHER_HDR_LEN:
-                ethertype = int.from_bytes(frame[ETHERTYPE_OFF:ETHER_HDR_LEN], "big")
+            split = _ether_payload(frame)
+            if split is not None:
+                ethertype, payload = split
                 if ethertype == ETHERTYPE_ARP:
-                    decoded, handler = _decode_arp(frame[ETHER_HDR_LEN:]), self._on_arp
+                    decoded, handler = _decode_arp(payload), self._on_arp
                 elif ethertype == ETHERTYPE_IPV4:
-                    decoded, handler = _decode_ipv4_bootp(frame[ETHER_HDR_LEN:]), self._on_bootp
+                    decoded, handler = _decode_ipv4_bootp(payload), self._on_bootp
         except Exception as e:  # pylint: disable=broad-exception-caught
             # Untrusted wire bytes: any decode failure is malformed input, not a bug.
             self._parse_errs.emit(LOG.debug, "bpf frame parse error: %s", e)

@@ -7,7 +7,7 @@ per-test docstrings."""
 # pylint: disable=protected-access, missing-function-docstring
 import struct
 
-from conftest import CHADDR
+from conftest import CHADDR, CHADDR_STR
 
 
 # ---- helpers: hand-built server replies (the encoder only builds requests) ----
@@ -245,19 +245,66 @@ def _bpf_capture(lk):
     return cap, frames
 
 
-def test_bpf_dispatch_routes_by_ethertype(lk):
-    cap, frames = _bpf_capture(lk)
-    arp = lk._encode_ether(lk.ETHER_BROADCAST, "00:00:5e:00:01:fe", lk.ETHERTYPE_ARP,
-                           b"\x00\x01\x08\x00\x06\x04\x00\x02" + CHADDR
-                           + bytes([100, 64, 4, 1]) + b"\x00" * 6 + bytes([100, 64, 4, 7]))
-    cap._dispatch(arp)
-    dhcp = lk._encode_ether(lk.ETHER_BROADCAST, "00:00:5e:00:01:fe", lk.ETHERTYPE_IPV4,
-                            lk._encode_ipv4_udp("100.64.4.1", "255.255.255.255", 67, 68,
+def _arp_reply_frame(lk):
+    """A gateway's untagged is-at reply (100.64.4.1 -> our 100.64.4.7)."""
+    return lk._encode_ether(lk.ETHER_BROADCAST, CHADDR_STR, lk.ETHERTYPE_ARP,
+                            lk._ARP_ETH_IPV4 + struct.pack("!H", lk.ArpOp.REPLY) + CHADDR
+                            + bytes([100, 64, 4, 1]) + b"\x00" * 6 + bytes([100, 64, 4, 7]))
+
+
+def _dhcp_reply_frame(lk, sport=67, dport=68):
+    """An untagged broadcast DHCP ACK from the server (67 -> 68 by default)."""
+    return lk._encode_ether(lk.ETHER_BROADCAST, CHADDR_STR, lk.ETHERTYPE_IPV4,
+                            lk._encode_ipv4_udp("100.64.4.1", "255.255.255.255", sport, dport,
                                                 _bootp_reply(lk, options=_ack_options(lk))))
-    cap._dispatch(dhcp)
+
+
+def _tagged(frame, vid=0, pcp=0, tpid=0x8100):
+    """Insert an 802.1Q tag (TPID + TCI) after the source MAC of an untagged frame."""
+    tci = (pcp << 13) | vid
+    return frame[:12] + tpid.to_bytes(2, "big") + tci.to_bytes(2, "big") + frame[12:]
+
+
+def test_bpf_dispatch_routes_by_ethertype(lk):
+    # Untagged and 802.1Q priority-tagged (VID 0) twins decode identically.
+    cap, frames = _bpf_capture(lk)
+    cap._dispatch(_arp_reply_frame(lk))
+    cap._dispatch(_tagged(_arp_reply_frame(lk), vid=0, pcp=6))
+    cap._dispatch(_dhcp_reply_frame(lk))
+    cap._dispatch(_tagged(_dhcp_reply_frame(lk), vid=0, pcp=7))
     cap._dispatch(b"\x00" * 5)          # runt garbage is dropped quietly
-    assert frames["arp"] == [lk.ArpFrame(2, "100.64.4.1", "100.64.4.7")]
-    assert len(frames["bootp"]) == 1 and frames["bootp"][0].yiaddr == "100.64.4.7"
+    assert frames["arp"] == [lk.ArpFrame(2, "100.64.4.1", "100.64.4.7")] * 2
+    assert len(frames["bootp"]) == 2 and frames["bootp"][0] == frames["bootp"][1]
+    assert frames["bootp"][0].yiaddr == "100.64.4.7" and frames["bootp"][0].op == 2
+
+
+def test_ether_payload_strips_only_a_priority_tag(lk):
+    dhcp = _dhcp_reply_frame(lk)
+    untagged = lk._ether_payload(dhcp)
+    assert untagged == (lk.ETHERTYPE_IPV4, dhcp[14:])
+    # VID 0 with any priority (PCP) is priority-only per 802.1Q: strip, same result.
+    assert lk._ether_payload(_tagged(dhcp, vid=0, pcp=5)) == untagged
+    assert lk._ether_payload(_tagged(dhcp, vid=0, pcp=0)) == untagged
+    # A real VLAN membership is not ours (even VID 1, and the top of the range).
+    assert lk._ether_payload(_tagged(dhcp, vid=1)) is None
+    assert lk._ether_payload(_tagged(dhcp, vid=4095, pcp=7)) is None
+    # Truncated inside the tag / runt: dropped, not raised.
+    assert lk._ether_payload(_tagged(dhcp)[:17]) is None
+    assert lk._ether_payload(dhcp[:13]) is None
+    # QinQ TPIDs are stacked tags, never a priority tag: rejected even with VID 0.
+    assert lk._ether_payload(_tagged(dhcp, tpid=0x88A8)) is None
+    assert lk._ether_payload(_tagged(dhcp, tpid=0x9100)) is None
+
+
+def test_bpf_dispatch_drops_rejected_tags_quietly(lk, caplog):
+    # Another VLAN's frame or a tag cut short is not-ours / runt input: dropped
+    # without a parse-error line (which would throttle-log a spoof storm).
+    cap, frames = _bpf_capture(lk)
+    with caplog.at_level("DEBUG", logger="lease-keeper"):
+        cap._dispatch(_tagged(_dhcp_reply_frame(lk), vid=1))
+        cap._dispatch(_tagged(_dhcp_reply_frame(lk))[:17])
+    assert not frames["bootp"] and not frames["arp"]
+    assert not [r for r in caplog.records if "parse error" in r.getMessage()]
 
 
 def test_bpf_send_dhcp_round_trips(lk):
@@ -287,7 +334,68 @@ def test_bpf_send_arp_pads_to_min_frame(lk):
 
 def test_bpf_filter_program_shape(lk):
     # The embedded opcode table must be a plausible classic-BPF program:
-    # 4-field instructions ending in the two return statements tcpdump emits.
-    assert all(len(insn) == 4 for insn in lk._BPF_FILTER)
-    assert lk._BPF_FILTER[-2][0] == 0x6 and lk._BPF_FILTER[-1][0] == 0x6
-    assert lk._BPF_FILTER[-1][3] == 0                    # default: drop
+    # 4-field instructions ending in the two return statements tcpdump emits,
+    # and every conditional jump landing inside the program.
+    prog = lk._BPF_FILTER
+    assert all(len(insn) == 4 for insn in prog)
+    assert prog[-2][0] == 0x6 and prog[-1][0] == 0x6
+    assert prog[-2][3] == 262144                          # accept: tcpdump's default snap length
+    assert prog[-1][3] == 0                               # default: drop
+    for i, (code, jt, jf, _k) in enumerate(prog[:-2]):
+        if code & 0x07 == 0x05:                           # BPF_JMP class
+            assert i + 1 + jt < len(prog) and i + 1 + jf < len(prog)
+
+
+def _run_bpf(program, pkt):
+    """A minimal classic-BPF interpreter for the opcodes the embedded filter
+    uses, with kernel semantics (an out-of-range load returns 0 = drop). Runs
+    the real table against real frames, so the filter's accept/drop outcome is
+    tested rather than only its shape. An unmodelled opcode (KeyError) or a
+    program that never returns fails loudly, as a regenerated table should."""
+    acc = idx = pc = 0
+    for _ in range(len(program)):                         # classic BPF has no backward jumps
+        code, jt, jf, k = program[pc]
+        pc += 1
+        if code == 0x06:                                  # ret #k
+            return k
+        if code in (0x15, 0x45):                          # jeq #k / jset #k, then jt or jf
+            pc += jt if (acc == k if code == 0x15 else acc & k) else jf
+            continue
+        # Loads: (offset, width) for ldh [k], ldb [k], ldh [x + k], ldxb 4*([k]&0xf).
+        off, width = {0x28: (k, 2), 0x30: (k, 1), 0x48: (idx + k, 2), 0xB1: (k, 1)}[code]
+        if off + width > len(pkt):
+            return 0
+        value = int.from_bytes(pkt[off:off + width], "big")
+        if code == 0xB1:
+            idx = 4 * (value & 0x0F)
+        else:
+            acc = value
+    raise AssertionError("BPF program ran off its end without a ret")
+
+
+def test_bpf_filter_accepts_dhcp_and_arp_replies_untagged_or_vid0(lk):
+    accept = lk._BPF_FILTER[-2][3]
+    for frame in (_dhcp_reply_frame(lk),                          # server -> client broadcast
+                  _dhcp_reply_frame(lk, sport=68, dport=67),      # client -> server (our own sends)
+                  _arp_reply_frame(lk)):
+        assert _run_bpf(lk._BPF_FILTER, frame) == accept
+        assert _run_bpf(lk._BPF_FILTER, _tagged(frame, vid=0, pcp=7)) == accept   # priority tag
+
+
+def test_bpf_filter_drops_other_vlans_and_other_traffic(lk):
+    dhcp, arp = _dhcp_reply_frame(lk), _arp_reply_frame(lk)
+    tcp = bytearray(dhcp)
+    tcp[14 + 9] = 6                                               # IPv4 proto TCP, same ports
+    fragment = bytearray(dhcp)
+    fragment[14 + 7] = 0x01                                       # fragment offset 1 (a later fragment)
+    arp_request = bytearray(arp)
+    arp_request[14 + 7] = 1                                       # who-has, not is-at
+    for frame in (_dhcp_reply_frame(lk, sport=53, dport=53),      # UDP, not DHCP ports
+                  bytes(tcp), bytes(fragment), bytes(arp_request),
+                  b"\x00" * 12 + b"\x08\x00"):                    # runt IPv4
+        assert _run_bpf(lk._BPF_FILTER, frame) == 0
+        assert _run_bpf(lk._BPF_FILTER, _tagged(frame, vid=0)) == 0        # tagging does not help
+    for frame in (dhcp, arp):
+        assert _run_bpf(lk._BPF_FILTER, _tagged(frame, vid=1)) == 0        # a real VLAN's traffic
+        assert _run_bpf(lk._BPF_FILTER, _tagged(frame, vid=4095, pcp=7)) == 0
+        assert _run_bpf(lk._BPF_FILTER, _tagged(frame)[:17]) == 0          # cut inside the tag

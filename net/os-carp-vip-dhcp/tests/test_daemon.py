@@ -1085,9 +1085,11 @@ def test_arp_reply_stamps_reachability_and_logs(lk, caplog):
 
 
 def test_sniffer_filter_is_static(lk):
-    # A fixed BPF boundary: DHCP + ARP replies (nudge reachability), no lease dependence.
-    assert "port 67 or port 68" in lk.SNIFFER_FILTER      # DHCP clause
-    assert "arp[6:2] = 2" in lk.SNIFFER_FILTER   # reachability clause
+    # A fixed BPF boundary: DHCP + ARP replies (nudge reachability), no lease
+    # dependence; the clauses repeat under `vlan 0` (802.1Q priority-tagged
+    # replies), untagged first because libpcap's `vlan` shifts every later offset.
+    assert lk.SNIFFER_FILTER == ("(udp and (port 67 or port 68)) or (arp and arp[6:2] = 2)"
+                                 " or (vlan 0 and ((udp and (port 67 or port 68)) or (arp and arp[6:2] = 2)))")
 
 
 def test_promisc_honoured_when_nudge_enabled(lk):

@@ -30,7 +30,7 @@ import logging
 from dataclasses import dataclass
 from enum import StrEnum
 
-from .constants import LOGGER_NAME, RECONCILE_HEARTBEAT_INTERVAL
+from .constants import DEFAULT_RESYNC_INTERVAL, LOGGER_NAME, RECONCILE_HEARTBEAT_INTERVAL
 from .ifprobe import iface_ipv4
 from .syscmd import run
 from .util import _UNSET, _RateLimit, _sane_ipv4
@@ -171,10 +171,13 @@ _PTP_PREFIXLENS = (30, 31)
 # ---- /sbin/route helpers (stateless; wrap syscmd.run; shared by both reconcilers) ----
 
 def _route(command, dest, gateway=None):
-    """Issue a `/sbin/route` command (best effort). The caller confirms the
-    resulting FIB state, so a non-zero exit -- an idempotent no-op or a real
-    failure alike -- is only debug-logged and left for that confirm to judge,
-    rather than guessed from route(8)'s wording here."""
+    """Issue a `/sbin/route` command (best effort); return the CompletedProcess (or
+    None if it could not be launched). The install/withdraw callers confirm the
+    resulting FIB state and ignore this, so a non-zero exit -- an idempotent no-op or
+    a real failure alike -- is only debug-logged and left for that confirm to judge,
+    rather than guessed from route(8)'s wording here. The return is for a caller whose
+    FIB read-back cannot distinguish success (see _reassert), which checks the exit
+    status instead."""
     cmd = [_ROUTE, _NUMERIC, command, _AF_INET, dest]
     if gateway is not None:
         cmd.append(gateway)
@@ -182,6 +185,7 @@ def _route(command, dest, gateway=None):
     if res is not None and res.returncode != 0:
         LOG.debug("route %s %s exit %d: %s", command, dest, res.returncode,
                   (res.stderr or "").strip())
+    return res
 
 
 def _log_at(changed, heartbeat):
@@ -236,7 +240,7 @@ def withdraw_unless_master(default_route, backup_egress, probe):
     default_route.reconcile(is_master=False, bound=False, gateway=None)
 
 
-class DefaultRouteReconciler:
+class DefaultRouteReconciler:  # pylint: disable=too-many-instance-attributes
     """Reconciles the IPv4 default route against (CARP role, lease-held,
     gateway). Level-triggered and idempotent: reconcile() may be called as often
     as the loop likes (edge or poll) and converges to the desired state,
@@ -270,6 +274,16 @@ class DefaultRouteReconciler:
         # backup/master does not log its (identical) decision every tick and churn
         # the log rotation. A change re-arms it (see _log_at).
         self._heartbeat = _RateLimit(RECONCILE_HEARTBEAT_INTERVAL)
+        # Zebra-resync (see _reassert): request_resync() sets this so the next tick
+        # that owns the default re-asserts it once (a CARP promotion, the common
+        # flap trigger); the gate bounds the steady-state re-assert so a flap that
+        # did NOT move the CARP role is still caught within one interval.
+        self._resync_requested = False
+        # Armed (not open) at construction so the FIRST owned tick is a pure
+        # compare-and-confirm with no route op -- the periodic re-assert waits a
+        # full interval, and a CARP promotion drives the immediate one via the flag.
+        self._resync_gate = _RateLimit(DEFAULT_RESYNC_INTERVAL)
+        self._resync_gate.reset()
 
     @property
     def mode(self):
@@ -280,6 +294,16 @@ class DefaultRouteReconciler:
     def enabled(self):
         """True in observe/enforce (off is inert); see DefaultRouteMode."""
         return self._mode in (DefaultRouteMode.OBSERVE, DefaultRouteMode.ENFORCE)
+
+    def request_resync(self):
+        """Ask the next reconcile that owns the default to re-assert it once (see
+        _reassert), even if the FIB already matches. The keeper calls this on a CARP
+        promotion -- the moment a redistributing router is most likely to have
+        dropped the kernel default, because the interface flap that drove the CARP
+        transition is exactly what desyncs it. Safe in any mode: only an enforce
+        reconcile that actually owns the default acts on it; off/observe never write,
+        so the flag is inert there."""
+        self._resync_requested = True
 
     def reconcile(self, is_master, bound, gateway):
         """Drive the FIB default toward the desired state for the current
@@ -338,6 +362,11 @@ class DefaultRouteReconciler:
         if want:
             if have == gateway:
                 self._confirm_owned(changed, gateway)  # already correct -- no route change
+                # Already-correct FIB, but a redistributing router may have dropped
+                # the route from its own RIB on an interface flap; re-assert it
+                # (idempotently) when a resync is due so 0/0 keeps being advertised.
+                if self._mode == DefaultRouteMode.ENFORCE and self._resync_due():
+                    self._reassert(gateway)
             else:
                 self._install(changed, gateway, replacing=have)
         else:
@@ -462,6 +491,49 @@ class DefaultRouteReconciler:
         else:
             LOG.error("failed to withdraw default (still via %s) -- this node keeps "
                       "advertising it", current)
+
+    def _resync_due(self):
+        """True when the owned default should be re-asserted this tick. A pending
+        request (a CARP promotion, consumed here) takes priority for immediate
+        recovery; otherwise the self-advancing gate fires at most once per
+        DEFAULT_RESYNC_INTERVAL, catching a flap that did not move the CARP role.
+        Evaluated only in enforce (the caller short-circuits), so observe never
+        consumes the request or the gate. A request re-arms the gate too, so it does
+        not fire a second re-assert on the very next tick when the daemon has already
+        been up longer than one interval (the gate would otherwise read elapsed)."""
+        if self._resync_requested:
+            self._resync_requested = False
+            self._resync_gate.reset()
+            return True
+        ready, _ = self._resync_gate.ready()
+        return ready
+
+    def _reassert(self, gateway):
+        """Re-issue the owned default via `route change` even though the FIB already
+        matches, so a redistributing router (FRR/zebra) re-learns a kernel default it
+        can silently drop: when the WAN interface flaps (link down/up) the kernel FIB
+        keeps the default but zebra loses it from its RIB, so `redistribute kernel`
+        stops advertising 0/0 while the route is still installed -- a black hole
+        upstream even though the FIB is correct. A bench repro on FreeBSD 14.3
+        confirmed both halves: an interface flap desyncs zebra from the FIB, and a
+        `route change` to the same gateway re-syncs it (0/0 returns to BGP). `route
+        change` is atomic (no no-default gap) and idempotent at the redistribution
+        level (no 0/0 flap when already in sync), so it is safe on a CARP promotion
+        and as a throttled steady-state net. Pure FreeBSD route op with no FRR call,
+        so a node running no redistributing router is unaffected."""
+        # Check the command's exit status, NOT a FIB read-back: _reassert runs only
+        # when the FIB default already equals `gateway`, so re-reading it confirms
+        # nothing about whether the `route change` actually ran. A non-zero exit (a
+        # stuck routing socket, or the route vanished so change hits "not in table")
+        # means the RTM_CHANGE that re-syncs zebra was never issued -- surface it, or
+        # the resync silently no-ops every interval and the black hole persists.
+        res = _route(RouteCommand.CHANGE, _DEFAULT, gateway)
+        if res is not None and res.returncode == 0:
+            LOG.debug("re-asserted default via %s (route-plane resync)", gateway)
+        else:
+            detail = "could not run route" if res is None else f"exit {res.returncode}"
+            LOG.error("default resync via %s failed (%s) -- redistribution may stay stale "
+                      "until the next tick reinstalls", gateway, detail)
 
     def _fib_default_gateway(self):
         """Current IPv4 default gateway, or None when there is no default. Any

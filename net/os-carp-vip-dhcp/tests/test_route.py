@@ -93,6 +93,78 @@ def test_enforce_idempotent_no_change_when_correct(lk, monkeypatch):
     assert fake.verbs == [RouteCommand.GET]  # compare-then-act: no add/delete, no churn
 
 
+# ---- zebra-resync: re-assert an already-correct default via `route change` ----
+
+def test_request_resync_reasserts_owned_default(lk, monkeypatch):
+    # A CARP promotion (request_resync) makes the next owned reconcile re-issue the
+    # default via `route change` even though the FIB already matches, so a
+    # redistributing router re-learns a default it dropped on the interface flap.
+    rec, fake = _rec(lk, monkeypatch, "enforce", initial=GW)
+    rec.request_resync()
+    rec.reconcile(True, True, GW)
+    assert fake.gw == GW  # same gateway -- atomic change, no flap
+    assert RouteCommand.CHANGE in fake.verbs
+
+
+def test_resync_request_fires_once_then_steady(lk, monkeypatch):
+    # The request re-asserts once AND re-arms the gate, so even on a long-running
+    # daemon (gate already elapsed) the next steady tick is a pure compare-and-confirm
+    # -- not a second back-to-back re-assert.
+    rec, fake = _rec(lk, monkeypatch, "enforce", initial=GW)
+    rec._resync_gate._deadline = 0.0  # simulate uptime > interval: the gate would be open
+    rec.request_resync()
+    rec.reconcile(True, True, GW)
+    assert RouteCommand.CHANGE in fake.verbs
+    fake.calls.clear()
+    rec.reconcile(True, True, GW)
+    assert fake.verbs == [RouteCommand.GET]  # gate re-armed by the request -> no second re-assert
+
+
+def test_resync_request_survives_a_non_owning_tick(lk, monkeypatch):
+    # Requested while backup (cannot re-assert): the flag is not spent on a tick that
+    # does not own the default, so the re-assert still lands once the node owns it.
+    rec, fake = _rec(lk, monkeypatch, "enforce", initial=GW)
+    rec.request_resync()
+    rec.reconcile(False, True, GW)   # backup -> withdraw; nothing to re-assert
+    rec.reconcile(True, True, GW)    # master, FIB now empty -> reinstall via add
+    fake.calls.clear()
+    rec.reconcile(True, True, GW)    # owned and correct -> the kept request re-asserts
+    assert RouteCommand.CHANGE in fake.verbs
+
+
+def test_periodic_gate_reasserts_after_interval(lk, monkeypatch):
+    # With no request, the self-advancing gate re-asserts once its interval elapses,
+    # catching a flap that never moved the CARP role. Force the gate open.
+    rec, fake = _rec(lk, monkeypatch, "enforce", initial=GW)
+    rec._resync_gate._deadline = 0.0  # pretend the interval has elapsed
+    rec.reconcile(True, True, GW)
+    assert RouteCommand.CHANGE in fake.verbs
+
+
+def test_observe_never_reasserts(lk, monkeypatch):
+    # observe never writes the FIB, so a resync request is inert -- the owned tick
+    # stays a pure would-own confirm with no route op.
+    rec, fake = _rec(lk, monkeypatch, "observe", initial=GW)
+    rec.request_resync()
+    rec.reconcile(True, True, GW)
+    assert fake.verbs == [RouteCommand.GET]
+    assert RouteCommand.CHANGE not in fake.verbs
+
+
+def test_reassert_failed_change_is_surfaced(lk, monkeypatch, caplog):
+    # A `route change` that fails (a stuck routing socket, or the route vanished so
+    # change hits "not in table") is logged at ERROR. The FIB read-back cannot catch
+    # it here -- the pre-state already equals gateway -- so the exit status is the
+    # only signal that the zebra resync did not actually happen. Mirrors the lying-add
+    # confirm test for _install.
+    rec, fake = _rec(lk, monkeypatch, "enforce", initial=GW, broken={RouteCommand.CHANGE})
+    rec.request_resync()
+    with caplog.at_level("ERROR", logger="lease-keeper"):
+        rec.reconcile(True, True, GW)
+    assert RouteCommand.CHANGE in fake.verbs  # the change was attempted
+    assert any(f"default resync via {GW} failed" in r.getMessage() for r in caplog.records)
+
+
 def test_install_reads_the_fib_back_to_confirm(lk, monkeypatch, caplog):
     # the success path must CONFIRM the FIB (a second get after the add), not
     # trust the add's exit code -- the read-back is what test_lying_add relies on.

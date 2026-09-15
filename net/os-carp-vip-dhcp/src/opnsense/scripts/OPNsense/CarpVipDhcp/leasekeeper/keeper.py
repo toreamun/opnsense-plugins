@@ -449,6 +449,10 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
                      self._cfg.vhid)
             self._renew_asap = True
             self._arp_nudge(force=True, master=master)
+            # The interface flap that drove this promotion is what desyncs a
+            # redistributing router (zebra) from the kernel default, so have the
+            # next owned reconcile re-assert it (see route.DefaultRouteReconciler).
+            self._defroute.request_resync()
         elif not master and self._was_master:
             # The symmetric event: without it, "why did the nudges stop?" needs
             # ifconfig instead of the log.

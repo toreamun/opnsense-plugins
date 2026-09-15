@@ -338,7 +338,7 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         # The dashboard banner reads master= to judge a stale arpok as a blackholed
         # return path ONLY on the master: only the master nudges, so a backup's
         # arpok freezes at its last master-era reply and is not a fault there.
-        role = "" if self._was_master is None else f" master={int(self._was_master)}"
+        role = "" if self._was_master is None else f" master={1 if self._was_master else 0}"
         self._write_hb(f"{int(time.time())} bound={self._dhcp.binding.yiaddr or '-'} "
                        f"lease={self._dhcp.binding.lease_secs} t1={t1} t2={t2} src={src}{role}{extra}\n")
 

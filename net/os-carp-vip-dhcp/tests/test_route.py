@@ -24,8 +24,8 @@ def _fake(lk, monkeypatch, initial=None, **fake_kw):
 
 
 def _rec(lk, monkeypatch, mode, initial=None, *,  # pylint: disable=too-many-arguments
-         broken=(), lying=(), ifaces=None, netstat_fails=False, local_ips=(), **kw):
-    fake = _fake(lk, monkeypatch, initial, broken=broken, lying=lying, ifaces=ifaces,
+         broken=(), lying=(), none=(), ifaces=None, netstat_fails=False, local_ips=(), **kw):
+    fake = _fake(lk, monkeypatch, initial, broken=broken, lying=lying, none=none, ifaces=ifaces,
                  netstat_fails=netstat_fails, local_ips=local_ips)
     return lk.DefaultRouteReconciler(mode=mode, **kw), fake
 
@@ -158,6 +158,18 @@ def test_reassert_failed_change_is_surfaced(lk, monkeypatch, caplog):
     # only signal that the zebra resync did not actually happen. Mirrors the lying-add
     # confirm test for _install.
     rec, fake = _rec(lk, monkeypatch, "enforce", initial=GW, broken={RouteCommand.CHANGE})
+    rec.request_resync()
+    with caplog.at_level("ERROR", logger="lease-keeper"):
+        rec.reconcile(True, True, GW)
+    assert RouteCommand.CHANGE in fake.verbs  # the change was attempted
+    assert any(f"default resync via {GW} failed" in r.getMessage() for r in caplog.records)
+
+
+def test_reassert_unlaunchable_change_is_surfaced(lk, monkeypatch, caplog):
+    # If the re-assert's `route change` cannot be launched at all (run() -> None), it
+    # is surfaced at ERROR too, via the "could not run route" arm -- mirroring how the
+    # install/withdraw confirms treat a None result.
+    rec, fake = _rec(lk, monkeypatch, "enforce", initial=GW, none={RouteCommand.CHANGE})
     rec.request_resync()
     with caplog.at_level("ERROR", logger="lease-keeper"):
         rec.reconcile(True, True, GW)

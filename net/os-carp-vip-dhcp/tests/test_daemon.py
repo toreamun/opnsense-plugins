@@ -1011,6 +1011,97 @@ def test_hb_master_token_true_without_vhid(lk, tmp_path):
     assert " master=1" in hb.read_text()
 
 
+def test_hb_demote_ok_only_for_lease_less_master_past_grace(lk, tmp_path):
+    # demote_ok drives the CARP hook's demote=1 decision: set only for a master that
+    # has stayed lease-less past DEMOTE_GRACE, never for a backup or a bound master,
+    # and a just-promoted master is spared during its acquire grace.
+    hb = tmp_path / "hb"
+    keeper = _keeper(lk, vhid=199, hbfile=str(hb))
+
+    # A passive backup that holds no lease is never demote-worthy.
+    keeper._was_master = False
+    keeper._dhcp.binding.yiaddr = None
+    keeper._hb()
+    assert " demote_ok=0" in hb.read_text()
+    assert keeper._unbound_master_since is None
+
+    # A just-promoted, still-acquiring master: lease-less but inside the grace.
+    keeper._was_master = True
+    keeper._hb()
+    assert " demote_ok=0" in hb.read_text()
+    assert keeper._unbound_master_since is not None
+
+    # Still a lease-less master, now past the grace -> demote-worthy.
+    keeper._unbound_master_since -= lk.DEMOTE_GRACE + 5
+    keeper._hb()
+    assert " demote_ok=1" in hb.read_text()
+
+    # It finally binds -> the episode clears and it is no longer demote-worthy.
+    keeper._dhcp.binding.yiaddr = "100.64.4.7"
+    keeper._hb()
+    assert " demote_ok=0" in hb.read_text()
+    assert keeper._unbound_master_since is None
+
+
+def test_hb_demote_ok_resets_when_master_lost_within_grace(lk, tmp_path):
+    # A promote->demote flap must reset the clock: a node demoted back to backup is
+    # not demote-worthy even though its unbound-master episode was already past grace.
+    hb = tmp_path / "hb"
+    keeper = _keeper(lk, vhid=199, hbfile=str(hb))
+    keeper._was_master = True
+    keeper._dhcp.binding.yiaddr = None
+    keeper._hb()
+    keeper._unbound_master_since -= lk.DEMOTE_GRACE + 5   # would demote as master...
+    keeper._was_master = False                            # ...but it lost master first
+    keeper._hb()
+    assert " demote_ok=0" in hb.read_text()
+    assert keeper._unbound_master_since is None
+
+
+def test_hb_demote_ok_zero_for_unknown_role(lk, tmp_path):
+    # Before the first CARP probe the role is unknown (None); a lease-less node with
+    # an unknown role must never be judged demote-worthy (fail-safe direction).
+    hb = tmp_path / "hb"
+    keeper = _keeper(lk, vhid=199, hbfile=str(hb))
+    assert keeper._was_master is None
+    keeper._dhcp.binding.yiaddr = None
+    keeper._hb()
+    assert " demote_ok=0" in hb.read_text()
+    assert keeper._unbound_master_since is None
+
+
+def test_demote_ok_grace_boundary_is_exclusive(lk):
+    # The grace is exclusive (> DEMOTE_GRACE): exactly at the grace is still not
+    # demote-worthy, one instant past it is. Drives _demote_ok directly so the clock
+    # is controlled rather than racing real time across two _hb calls.
+    keeper = _keeper(lk, vhid=199)
+    keeper._was_master = True
+    keeper._dhcp.binding.yiaddr = None
+    t0 = 1000.0
+    assert keeper._demote_ok(t0) is False                          # episode opens, within grace
+    assert keeper._demote_ok(t0 + lk.DEMOTE_GRACE) is False        # exactly at the grace: excluded
+    assert keeper._demote_ok(t0 + lk.DEMOTE_GRACE + 0.001) is True  # just past: demote-worthy
+
+
+def test_passive_backup_step_publishes_backup_role_not_stale_demote_ok(lk, tmp_path, monkeypatch):
+    # A lease-less master demoted to backup, first observed at the passive step's role
+    # gate, must publish master=0/demote_ok=0 in the SAME heartbeat, not a stale
+    # master=1/demote_ok=1 carried over from the pre-demotion role (which would read as
+    # a backup asking the CARP hook to demote it).
+    hb = tmp_path / "hb"
+    keeper = _keeper(lk, vhid=199, hbfile=str(hb))
+    keeper._was_master = True
+    keeper._dhcp.binding.yiaddr = None
+    keeper._unbound_master_since = time.time() - (lk.DEMOTE_GRACE + 5)   # was demote-worthy as master
+    monkeypatch.setattr(keeper, "_sleep_interruptible", lambda *a, **kw: True)
+    keeper._passive_backup_step()
+    content = hb.read_text()
+    assert " master=0" in content
+    assert " demote_ok=0" in content
+    assert keeper._was_master is False
+    assert keeper._unbound_master_since is None
+
+
 def test_master_transition_renews_early_and_nudges(lk):
     keeper = _nudge_keeper(lk, vhid=199)
     states = iter([True, False, True, True, True])
@@ -1403,9 +1494,10 @@ def test_backup_egress_reconciled_before_blocking_acquire_when_unbound(lk, monke
     assert order[:2] == [("backup", True), ("acquire", None)]     # real role, before the block
 
 
-def test_backup_egress_no_pre_acquire_probe_when_disabled(lk, monkeypatch):
-    # The unbound pre-acquire backup-egress settle runs only when the feature is enabled;
-    # with it off, the hot unbound loop adds no extra CARP probe or reconcile before acquire.
+def test_backup_egress_no_pre_acquire_reconcile_when_disabled(lk, monkeypatch):
+    # quiet-backup probes the CARP role once at the top of _maintain_step to gate
+    # transmit; with backup egress OFF the unbound path adds no FURTHER probe and no
+    # pre-acquire backup-egress reconcile before the (possibly long) acquire.
     k = _keeper(lk, vhid=254, default_route_mode="enforce")
     rec = _RecordingReconciler()
     brec = _RecordingBackup(enabled=False)         # feature off
@@ -1419,8 +1511,152 @@ def test_backup_egress_no_pre_acquire_probe_when_disabled(lk, monkeypatch):
     k._maintain_step()
     assert "acquire" in order
     before = order[:order.index("acquire")]
-    assert "probe" not in before                   # no extra probe before the block
-    assert not any(isinstance(x, tuple) for x in before)   # no pre-acquire backup reconcile
+    assert before == ["probe"]                     # only the one role-gate probe, no backup reconcile
+
+
+def test_backup_takes_passive_path_and_never_transmits(lk, monkeypatch):
+    # A CARP backup must not acquire (unbound) or renew (bound): its transmits would
+    # source the shared vMAC and flap the segment. _maintain_step routes to the
+    # passive hold instead, whether the backup currently holds a binding or not.
+    k = _keeper(lk, vhid=254, default_route_mode="off")
+    monkeypatch.setattr(k, "_probe_carp_master", lambda: False)   # CARP backup
+    calls = []
+    monkeypatch.setattr(k, "_acquire_step", lambda: calls.append("acquire"))
+    monkeypatch.setattr(k._dhcp, "renew", lambda *a, **kw: calls.append("renew") or True)
+    monkeypatch.setattr(k, "_passive_backup_step", lambda: calls.append("passive"))
+    k._dhcp.binding.yiaddr = None                  # unbound backup
+    k._maintain_step()
+    assert calls == ["passive"]
+    calls.clear()
+    k._dhcp.binding.yiaddr = "100.64.4.7"          # bound backup (stale/observed lease)
+    k._maintain_step()
+    assert calls == ["passive"]
+
+
+def test_passive_backup_step_does_upkeep_without_transmit(lk, monkeypatch):
+    # The passive hold refreshes the heartbeat / role / route (one maintenance tick
+    # with the real backup role) and sleeps, but transmits no DHCP.
+    k = _keeper(lk, vhid=254)
+    calls = []
+    monkeypatch.setattr(k, "_maintenance_tick", lambda master=None: calls.append(("tick", master)))
+    monkeypatch.setattr(k, "_sleep_interruptible", lambda *a, **kw: calls.append("sleep") or True)
+    monkeypatch.setattr(k, "_acquire_step", lambda: calls.append("acquire"))
+    monkeypatch.setattr(k._dhcp, "renew", lambda *a, **kw: calls.append("renew"))
+    k._passive_backup_step()
+    assert calls == [("tick", False), "sleep"]     # tick with the backup role, then sleep, no transmit
+
+
+def test_probe_glitch_falls_back_to_last_known_role(lk, monkeypatch):
+    # A probe returning None (transient ifconfig failure) uses the last known role:
+    # a known-backup stays passive, but an as-yet-unknown role transmits (a real
+    # master must never stop renewing over a probe glitch).
+    k = _keeper(lk, vhid=254, default_route_mode="off")
+    monkeypatch.setattr(k, "_probe_carp_master", lambda: None)    # probe glitch
+    calls = []
+    monkeypatch.setattr(k, "_acquire_step", lambda: calls.append("acquire"))
+    monkeypatch.setattr(k, "_passive_backup_step", lambda: calls.append("passive"))
+    k._dhcp.binding.yiaddr = None
+    k._was_master = False                          # last known: backup -> stay passive
+    k._maintain_step()
+    assert calls == ["passive"]
+    calls.clear()
+    k._was_master = None                           # role never determined -> transmit (safe)
+    k._maintain_step()
+    assert calls == ["acquire"]
+
+
+def test_demotion_during_t1_wait_skips_renew(lk, monkeypatch):
+    # Losing master during the T1 wait must not renew now (that transmit would flap
+    # the segment); the next _maintain_step handles the node passively.
+    k = _keeper(lk, vhid=254, default_route_mode="off")
+    k._dhcp.binding.yiaddr = "100.64.4.7"
+    monkeypatch.setattr(k, "_probe_carp_master", lambda: True)    # master at the top gate
+
+    def hold(_secs):
+        k._was_master = False                      # demoted during the wait
+        return True
+
+    monkeypatch.setattr(k, "_hold_lease", hold)
+    renews = []
+    monkeypatch.setattr(k._dhcp, "renew", lambda *a, **kw: renews.append(1) or True)
+    k._maintain_step()
+    assert not renews
+
+
+def test_demotion_during_rebind_stops_transmit(lk, monkeypatch):
+    # A demotion mid-REBIND stops transmitting: the T1 renew attempt is made while
+    # still master, but once the role poll reads backup the loop returns before the
+    # rebind renew.
+    k = _keeper(lk, vhid=254, default_route_mode="off")
+    k._dhcp.binding.yiaddr = "100.64.4.7"
+    k._was_master = True
+    monkeypatch.setattr(k, "_probe_carp_master", lambda: True)
+    monkeypatch.setattr(k, "_hold_lease", lambda _secs: True)     # T1 elapsed, still master
+    monkeypatch.setattr(k._dhcp, "timing", lambda: (1, 4, "server"))
+    monkeypatch.setattr(k, "_sleep_interruptible", lambda *a, **kw: True)
+    monkeypatch.setattr(k, "_role_tick", lambda *a, **kw: False)  # demoted during REBIND
+    renews = []
+    monkeypatch.setattr(k._dhcp, "renew", lambda *a, **kw: renews.append(kw.get("rebind", False)) or False)
+    k._maintain_step()
+    assert renews == [False]                       # only the T1 attempt; no rebind renew after demotion
+
+
+def test_promotion_wakes_passive_sleep(lk, monkeypatch):
+    # A CARP promotion during a sleep returns _sleep_interruptible early (via the
+    # _renew_asap the role recheck sets), so a promoted passive backup starts its
+    # acquire/renew at once instead of waiting out HB_REFRESH.
+    k = _keeper(lk, vhid=254)
+    k._signals.request_recheck_role()              # SIGUSR2 pending (CARP transition)
+
+    def role_tick(*_a, **_kw):
+        k._renew_asap = True                       # _poll_carp_role sets this on became-master
+        return True
+
+    monkeypatch.setattr(k, "_role_tick", role_tick)
+    start = time.monotonic()
+    ret = k._sleep_interruptible(30)               # would sleep 30s without the early return
+    assert ret is True
+    assert time.monotonic() - start < 5            # returned promptly, not after 30s
+
+
+def test_acquire_clears_renew_asap(lk, monkeypatch):
+    # A fresh DORA supersedes a pending renew-asap (e.g. from a promotion that
+    # landed while unbound), so _acquire_step clears it; otherwise the bound path
+    # would immediately renew the just-acquired lease -- a redundant vMAC transmit.
+    k = _keeper(lk, vhid=254)
+    k._renew_asap = True
+    monkeypatch.setattr(k, "_ensure_sniffer", lambda: None)
+    monkeypatch.setattr(k, "_iface_link_up", lambda: True)
+    monkeypatch.setattr(k._dhcp, "acquire", lambda *a, **kw: True)   # DORA succeeds
+    monkeypatch.setattr(k, "_arp_nudge", lambda *a, **kw: None)
+    k._acquire_step()
+    assert k._renew_asap is False
+
+
+def test_demotion_clears_renew_asap(lk):
+    # A demotion cancels a pending early renew (a backup must not renew); otherwise
+    # _renew_asap would drift stale-True and later wake the passive sleep on any
+    # signal even without a real promotion.
+    k = _keeper(lk, vhid=254)
+    k._was_master = True                # currently master
+    k._renew_asap = True                # a renew was pending
+    k._poll_carp_role(False)            # CARP demotes us to backup
+    assert k._was_master is False
+    assert k._renew_asap is False
+
+
+def test_passive_backup_sends_no_nudge(lk, monkeypatch):
+    # Safety property, end-to-end through the real _maintenance_tick: a passive
+    # backup nudges nothing. An ARP nudge is a gratuitous ARP from the shared vMAC
+    # -- the exact transmit this change removes -- so the backup role gate must
+    # suppress it even with the nudge feature enabled.
+    k = _nudge_keeper(lk, arp_nudge=240)
+    sends = []
+    monkeypatch.setattr(k._nudge._capture, "send_arp_request", lambda *a, **kw: sends.append(a))
+    monkeypatch.setattr(k, "_sleep_interruptible", lambda *a, **kw: True)
+    monkeypatch.setattr(k, "_reconcile_default_route", lambda *a, **kw: None)
+    k._passive_backup_step()
+    assert not sends
 
 
 def test_default_route_bound_keyed_on_yiaddr_not_router(lk):

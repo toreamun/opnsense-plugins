@@ -151,7 +151,25 @@ class CarpVipDhcpStatus extends AbstractStatus
         if (strpos($content, 'bound=' . $request . ' ') !== false) {
             return $this->arpReachabilityReason($content);
         }
-        return gettext('not holding the lease');
+        // Not holding the requested lease is a fault only on the master (see
+        // heartbeatIsMaster): a passive CARP backup holds no lease of its own.
+        if ($this->heartbeatIsMaster($content)) {
+            return gettext('not holding the lease');
+        }
+        return null;
+    }
+
+    /**
+     * Whether the keeper's heartbeat reports it is the CARP master (master=1).
+     * Lease-holding faults (a not-held lease, a gateway that stopped answering ARP)
+     * are judged only on the master: a passive backup transmits no DHCP, nudges
+     * nothing and holds no lease of its own, so those states are its normal, healthy
+     * condition. An absent marker (an older keeper, or before the first CARP probe)
+     * reads as "not confirmed master" and is likewise not faulted.
+     */
+    private function heartbeatIsMaster(string $content): bool
+    {
+        return strpos($content, ' master=1') !== false;
     }
 
     /**
@@ -172,7 +190,7 @@ class CarpVipDhcpStatus extends AbstractStatus
      */
     private function arpReachabilityReason(string $content): ?string
     {
-        if (strpos($content, ' master=1') === false) {
+        if (!$this->heartbeatIsMaster($content)) {
             return null;   // not the CARP master -> arpok is not a return-path signal here
         }
         if (strpos($content, ' nudge=') === false) {

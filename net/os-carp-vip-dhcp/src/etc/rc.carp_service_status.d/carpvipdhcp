@@ -45,14 +45,18 @@ while IFS= read -r line || [ -n "${line}" ]; do
     mtime=$(stat -f %m "${hb}" 2>/dev/null || echo 0)
     age=$(( now - mtime ))
     [ "${age}" -le "${MAX_AGE}" ] || exit 1
-    # Freshness alone is not enough: a fresh heartbeat is written even on
-    # MISMATCH (ISP handed a different IP). Demote unless the keeper actually
-    # holds the requested VIP lease.
     content=$(cat "${hb}" 2>/dev/null)
-    case "${content}" in
-        *MISMATCH*) exit 1 ;;
-        *"bound=${request} "*) : ;;
-        *) exit 1 ;;   # bound=- (lost/not-yet-acquired lease) or anything else -> demote
-    esac
+    # A lease MISMATCH (ISP handed a different IP than the reserved VIP) is a fault
+    # on either role, so judge it before the demote gate (as the status page does).
+    # Its heartbeat carries no master= token, and the fail-stop is wanted on both.
+    case "${content}" in *MISMATCH*) exit 1 ;; esac
+    # Otherwise demote only when the daemon says so: demote_ok=1 means this node is
+    # the CARP master AND has been unable to hold the requested lease past the
+    # acquire grace. The keeper owns that timing (it knows how long it has been a
+    # lease-less master), so the hook stays a thin executor: a passive backup
+    # (transmits no DHCP, holds no lease, bound=-) never sets it, and a just-promoted
+    # master's normal acquire DORA is inside the grace, so neither is demoted. This
+    # subsumes the old master=1 + bound= role check.
+    case "${content}" in *" demote_ok=1"*) exit 1 ;; esac
 done < "${CONF}"
 exit 0

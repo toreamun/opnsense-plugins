@@ -15,13 +15,13 @@ GW2 = "185.41.66.9"
 CGNAT_GW = "100.64.4.1"   # the production case: a 100.64/10 single-IP CGNAT WAN
 
 
-class FakeRoute:
+class FakeRoute:  # pylint: disable=too-many-instance-attributes
     """In-memory stand-in for /sbin/route + /usr/bin/netstat + /sbin/ifconfig: a
     dest->nexthop table (dest 'default' or a CIDR), a verb log, and per-interface
     (addr, prefixlen) for backup-egress peer derivation. `gw` is the default's
     nexthop, kept as a property so the default-route tests read it unchanged."""
 
-    def __init__(self, initial=None, *, broken=(), lying=(),  # pylint: disable=too-many-arguments
+    def __init__(self, initial=None, *, broken=(), lying=(), none=(),  # pylint: disable=too-many-arguments
                  ifaces=None, netstat_fails=False, local_ips=()):
         self.routes = {}
         if initial is not None:
@@ -29,6 +29,7 @@ class FakeRoute:
         self.calls = []
         self.broken = set(broken)  # verbs that fail with a genuine (non-benign) error
         self.lying = set(lying)    # verbs that exit 0 but do NOT mutate the FIB
+        self.none = set(none)      # verbs whose run() could not launch at all (returns None)
         self.ifaces = dict(ifaces or {})   # iface -> (addr, prefixlen)
         self.netstat_fails = netstat_fails  # netstat -rn exits non-zero (unreadable table)
         self.local_ips = set(local_ips)     # addresses a `route get` resolves to lo0 (own IPs)
@@ -58,10 +59,12 @@ class FakeRoute:
             return self._ifconfig(iface)
         return self._route(cmd)
 
-    def _route(self, cmd):
+    def _route(self, cmd):  # pylint: disable=too-many-branches
         # ["/sbin/route","-n",verb,"-inet",dest[,gw]]; single return to keep the verb
         # branches readable without tripping too-many-return-statements.
         verb, dest = cmd[2], cmd[4]
+        if verb in self.none:  # run() could not launch the command at all -> None
+            return None
         rc, out, err = 0, "", ""
         if verb in self.broken:  # a real failure: stuck route / bad socket, not a no-op
             rc, err = 1, "route: writing to routing socket: permission denied"

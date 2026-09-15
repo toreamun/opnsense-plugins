@@ -30,7 +30,7 @@ import logging
 from dataclasses import dataclass
 from enum import StrEnum
 
-from .constants import LOGGER_NAME, RECONCILE_HEARTBEAT_INTERVAL
+from .constants import DEFAULT_RESYNC_INTERVAL, LOGGER_NAME, RECONCILE_HEARTBEAT_INTERVAL
 from .ifprobe import iface_ipv4
 from .syscmd import run
 from .util import _UNSET, _RateLimit, _sane_ipv4
@@ -171,10 +171,13 @@ _PTP_PREFIXLENS = (30, 31)
 # ---- /sbin/route helpers (stateless; wrap syscmd.run; shared by both reconcilers) ----
 
 def _route(command, dest, gateway=None):
-    """Issue a `/sbin/route` command (best effort). The caller confirms the
-    resulting FIB state, so a non-zero exit -- an idempotent no-op or a real
-    failure alike -- is only debug-logged and left for that confirm to judge,
-    rather than guessed from route(8)'s wording here."""
+    """Issue a `/sbin/route` command (best effort); return the CompletedProcess (or
+    None if it could not be launched). The install/withdraw callers confirm the
+    resulting FIB state and ignore this, so a non-zero exit -- an idempotent no-op or
+    a real failure alike -- is only debug-logged and left for that confirm to judge,
+    rather than guessed from route(8)'s wording here. The return is for a caller whose
+    FIB read-back cannot distinguish success (see _reassert), which checks the exit
+    status instead."""
     cmd = [_ROUTE, _NUMERIC, command, _AF_INET, dest]
     if gateway is not None:
         cmd.append(gateway)
@@ -182,6 +185,7 @@ def _route(command, dest, gateway=None):
     if res is not None and res.returncode != 0:
         LOG.debug("route %s %s exit %d: %s", command, dest, res.returncode,
                   (res.stderr or "").strip())
+    return res
 
 
 def _log_at(changed, heartbeat):
@@ -236,11 +240,84 @@ def withdraw_unless_master(default_route, backup_egress, probe):
     default_route.reconcile(is_master=False, bound=False, gateway=None)
 
 
+class _UnreadableRole:
+    """Fail-closed state for consecutive unreadable CARP-role probes while a lease is
+    held (see DefaultRouteReconciler._on_unknown_role). record() counts one unreadable
+    probe and returns whether the strike limit is now reached; take_warning() is the
+    rising edge for the once-per-episode fail-closed warning. The two are separate on
+    purpose: the caller calls take_warning() only once it actually withdraws (past its
+    own FIB-read guard), so a tick that reaches the limit but cannot act yet does not
+    consume the episode's one warning. reset() ends the episode when the role reads
+    definite again. The caller owns the withdraw action; this owns only the decision.
+    Single-thread use."""
+
+    def __init__(self, limit):
+        self._limit = limit
+        self._strikes = 0
+        self._warned = False
+
+    def reset(self):
+        """Role readable again: clear the strike count and re-arm the warn-once."""
+        self._strikes = 0
+        self._warned = False
+
+    def record(self):
+        """Count one unreadable probe; return True once the strike limit is reached."""
+        self._strikes += 1
+        return self._strikes >= self._limit
+
+    def take_warning(self):
+        """True at most once per unreadable episode -- the rising edge for the
+        fail-closed warning. Consumed only when the caller actually acts, so it stays
+        tied to a real withdraw rather than to merely reaching the strike limit."""
+        if self._warned:
+            return False
+        self._warned = True
+        return True
+
+    @property
+    def strikes(self):
+        """The current consecutive-unreadable count (for the warning message)."""
+        return self._strikes
+
+
+class _ResyncGate:
+    """Decides when the reconciler re-asserts an already-correct default (see
+    DefaultRouteReconciler._reassert). request() marks an immediate re-assert (a CARP
+    promotion); due() is True on a requested tick or once the periodic interval has
+    elapsed. A request re-arms the periodic gate, so a promotion does not also open it
+    for a back-to-back second re-assert. Armed (not open) at construction, so the first
+    owned tick is a pure confirm. Single-thread use (the reconciler's main loop)."""
+
+    def __init__(self, interval):
+        self._requested = False
+        self._gate = _RateLimit(interval)
+        self._gate.reset()   # arm: the first periodic re-assert waits a full interval
+
+    def request(self):
+        """Ask for one re-assert on the next owned tick (a CARP promotion)."""
+        self._requested = True
+
+    def due(self):
+        """True when a re-assert should fire now. A pending request (consumed here)
+        takes priority and re-arms the gate; otherwise the self-advancing gate fires
+        at most once per interval."""
+        if self._requested:
+            self._requested = False
+            self._gate.reset()
+            return True
+        ready, _ = self._gate.ready()
+        return ready
+
+
 class DefaultRouteReconciler:
     """Reconciles the IPv4 default route against (CARP role, lease-held,
     gateway). Level-triggered and idempotent: reconcile() may be called as often
     as the loop likes (edge or poll) and converges to the desired state,
-    emitting a route change only when the FIB actually differs.
+    emitting a route change only when the FIB actually differs -- with one
+    deliberate exception, the requested/periodic re-assert (see _reassert), which
+    idempotently re-issues an already-correct default so a redistributing router
+    re-learns one it dropped.
 
     All methods run on the keeper's main loop thread only; the class holds no
     lock because nothing else in the keeper mutates routes."""
@@ -254,15 +331,14 @@ class DefaultRouteReconciler:
         self._mode = DefaultRouteMode.coerce(mode)
         if unreadable_role_strikes < 1:
             raise ValueError("unreadable_role_strikes must be >= 1")
-        self._strike_limit = unreadable_role_strikes
+        # Fail-closed-on-unreadable-role decision (strikes + warn-once); see _on_unknown_role.
+        self._unreadable = _UnreadableRole(unreadable_role_strikes)
         # liveness_probe: optional callable() -> bool|None gating the INSTALL side
         # (the split-brain guard). None (no callable) or a None result means "no
         # opinion" and never blocks; only an explicit False blocks. It must be
         # debounced by the caller -- a single transient miss must not read False,
         # or a healthy master would flap its default (see the README).
         self._liveness_probe = liveness_probe
-        self._strikes = 0
-        self._unreadable_warned = False   # rising-edge gate for the fail-closed warning
         # Last (want, gateway) we logged, so a steady desired state is confirmed
         # once at INFO then repeats at DEBUG (see _log_at / _UNSET).
         self._last_desired = _UNSET
@@ -270,6 +346,10 @@ class DefaultRouteReconciler:
         # backup/master does not log its (identical) decision every tick and churn
         # the log rotation. A change re-arms it (see _log_at).
         self._heartbeat = _RateLimit(RECONCILE_HEARTBEAT_INTERVAL)
+        # Zebra-resync decision (see _reassert / request_resync): a CARP promotion
+        # drives an immediate re-assert, and a periodic gate bounds the residual case
+        # (a flap that did not move the CARP role) to one interval.
+        self._resync = _ResyncGate(DEFAULT_RESYNC_INTERVAL)
 
     @property
     def mode(self):
@@ -280,6 +360,16 @@ class DefaultRouteReconciler:
     def enabled(self):
         """True in observe/enforce (off is inert); see DefaultRouteMode."""
         return self._mode in (DefaultRouteMode.OBSERVE, DefaultRouteMode.ENFORCE)
+
+    def request_resync(self):
+        """Ask the next reconcile that owns the default to re-assert it once (see
+        _reassert), even if the FIB already matches. The keeper calls this on a CARP
+        promotion -- the moment a redistributing router is most likely to have
+        dropped the kernel default, because the interface flap that drove the CARP
+        transition is exactly what desyncs it. Safe in any mode: only an enforce
+        reconcile that actually owns the default acts on it; off/observe never write,
+        so the flag is inert there."""
+        self._resync.request()
 
     def reconcile(self, is_master, bound, gateway):
         """Drive the FIB default toward the desired state for the current
@@ -312,8 +402,7 @@ class DefaultRouteReconciler:
         if is_master is None and holds_lease:
             self._on_unknown_role()
             return
-        self._strikes = 0
-        self._unreadable_warned = False   # not in an unreadable-while-bound episode -> re-arm
+        self._unreadable.reset()   # not in an unreadable-while-bound episode -> re-arm
 
         want = (is_master is True) and holds_lease
 
@@ -338,6 +427,14 @@ class DefaultRouteReconciler:
         if want:
             if have == gateway:
                 self._confirm_owned(changed, gateway)  # already correct -- no route change
+                # Already-correct FIB, but a redistributing router may have dropped
+                # the route from its own RIB on an interface flap; re-assert it
+                # (idempotently) when a resync is due so 0/0 keeps being advertised.
+                if self._mode == DefaultRouteMode.ENFORCE and self._resync.due():
+                    if not self._reassert(gateway):
+                        # The change did not run; keep the desync on the books so the
+                        # next tick retries rather than waiting out the periodic gate.
+                        self._resync.request()
             else:
                 self._install(changed, gateway, replacing=have)
         else:
@@ -395,17 +492,17 @@ class DefaultRouteReconciler:
         default we still hold so a former master stops advertising once its role
         can no longer be confirmed. The warning fires once per unreadable episode
         (re-armed when the role reads definite again), not every tick."""
-        self._strikes += 1
-        if self._strikes < self._strike_limit:
+        if not self._unreadable.record():
             return
         have = self._fib_default_gateway()
         if have is None:
             return
-        first_time = not self._unreadable_warned
+        # take the warn-once ONLY now that we are actually withdrawing (past the
+        # FIB-read guard), so a limit-hit tick that could not act does not swallow it.
+        first_time = self._unreadable.take_warning()
         if first_time:
             LOG.warning("CARP role unreadable for %d checks -- failing closed on "
-                        "the default", self._strikes)
-            self._unreadable_warned = True
+                        "the default", self._unreadable.strikes)
         self._withdraw(first_time, have, "CARP role unreadable")
 
     def _liveness_blocks(self):
@@ -462,6 +559,36 @@ class DefaultRouteReconciler:
         else:
             LOG.error("failed to withdraw default (still via %s) -- this node keeps "
                       "advertising it", current)
+
+    def _reassert(self, gateway):
+        """Re-issue the owned default via `route change` even though the FIB already
+        matches, so a redistributing router (FRR/zebra) re-learns a kernel default it
+        can silently drop: when the WAN interface flaps (link down/up) the kernel FIB
+        keeps the default but zebra loses it from its RIB, so `redistribute kernel`
+        stops advertising 0/0 while the route is still installed -- a black hole
+        upstream even though the FIB is correct. A bench repro on FreeBSD 14.3
+        confirmed both halves: an interface flap desyncs zebra from the FIB, and a
+        `route change` to the same gateway re-syncs it (0/0 returns to BGP). `route
+        change` is atomic (no no-default gap) and idempotent at the redistribution
+        level (no 0/0 flap when already in sync), so it is safe on a CARP promotion
+        and as a throttled steady-state net. Pure FreeBSD route op with no FRR call,
+        so a node running no redistributing router is unaffected. Returns True iff the
+        `route change` was issued (exit 0); the caller re-requests on False so a failed
+        resync is retried on the next tick rather than lost until the periodic gate."""
+        # Check the command's exit status, NOT a FIB read-back: _reassert runs only
+        # when the FIB default already equals `gateway`, so re-reading it confirms
+        # nothing about whether the `route change` actually ran. A non-zero exit (a
+        # stuck routing socket, or the route vanished so change hits "not in table")
+        # means the RTM_CHANGE that re-syncs zebra was never issued -- surface it, or
+        # the resync silently no-ops and the black hole persists.
+        res = _route(RouteCommand.CHANGE, _DEFAULT, gateway)
+        if res is not None and res.returncode == 0:
+            LOG.debug("re-asserted default via %s (route-plane resync)", gateway)
+            return True
+        detail = "could not run route" if res is None else f"exit {res.returncode}"
+        LOG.error("default resync via %s failed (%s) -- retrying next tick; redistribution "
+                  "may stay stale until it succeeds", gateway, detail)
+        return False
 
     def _fib_default_gateway(self):
         """Current IPv4 default gateway, or None when there is no default. Any

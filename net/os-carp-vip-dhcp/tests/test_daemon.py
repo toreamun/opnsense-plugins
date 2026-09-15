@@ -994,6 +994,23 @@ def test_master_transition_renews_early_and_nudges(lk):
     assert keeper._nudge.last_nudge == first
 
 
+def test_promotion_requests_default_route_resync(lk):
+    # Becoming CARP master asks the reconciler to re-assert the default (the zebra
+    # resync after the interface flap that drove the promotion), and only on the
+    # backup->master edge, not on every steady master tick.
+    keeper = _nudge_keeper(lk, vhid=199)
+    rec = _RecordingReconciler()
+    keeper._defroute = rec
+    states = iter([False, True, True])
+    keeper._probe_carp_master = lambda: next(states)
+    keeper._poll_carp_role()   # backup -> seeds role, no promotion
+    assert rec.resync_requests == 0
+    keeper._poll_carp_role()   # backup -> master: promotion -> resync requested once
+    assert rec.resync_requests == 1
+    keeper._poll_carp_role()   # still master -> no new request
+    assert rec.resync_requests == 1
+
+
 def test_losing_master_is_logged(lk, caplog):
     keeper = _nudge_keeper(lk, vhid=199)
     states = iter([True, False])
@@ -1268,15 +1285,20 @@ def test_backoff_jitter(lk):
 
 # ---- default-route ownership wiring (keeper <-> DefaultRouteReconciler) ----
 
-class _RecordingReconciler:  # pylint: disable=too-few-public-methods
-    """Stand-in for DefaultRouteReconciler that records reconcile() args, so the
-    keeper-side 0/0 wiring can be asserted without a real route(8) probe."""
+class _RecordingReconciler:
+    """Stand-in for DefaultRouteReconciler that records reconcile() args and
+    request_resync() calls, so the keeper-side 0/0 wiring can be asserted without a
+    real route(8) probe."""
     def __init__(self, enabled=True):
         self.enabled = enabled
         self.calls = []
+        self.resync_requests = 0
 
     def reconcile(self, is_master, bound, gateway):
         self.calls.append((is_master, bound, gateway))
+
+    def request_resync(self):
+        self.resync_requests += 1
 
 
 class _RecordingBackup:  # pylint: disable=too-few-public-methods

@@ -153,6 +153,15 @@ LEASE_PULSE_INTERVAL = 3600    # emit a throttled "lease healthy" INFO pulse at 
 # rotation, flushing real events out of the retained backups.
 RECONCILE_HEARTBEAT_INTERVAL = 300
 
+# How often the enforce reconciler re-asserts an already-correct default via
+# `route change` (a zebra-resync safety net; see DefaultRouteReconciler._reassert).
+# A CARP promotion re-asserts at once and covers the common case (a real WAN flap
+# demotes the CARP role, so recovery rides the promotion); this only bounds the
+# residual case -- a desync that never moved the CARP role -- to at most one
+# interval of stale advertising. Checked every HB_REFRESH tick, and idempotent (no
+# redistribute flap when already in sync), so a short interval is nearly free.
+DEFAULT_RESYNC_INTERVAL = 60
+
 # Follow (VIP-rewrite) throttle + apply-retry.
 MIN_FOLLOW_INTERVAL = 60   # min seconds between follow (VIP rewrite) events -- damps flap/spoof storms
 FOLLOW_RETRY_DEADLINE = 120  # re-drive follow_update if we are not restarted within this after firing

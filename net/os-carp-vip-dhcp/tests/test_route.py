@@ -111,7 +111,7 @@ def test_resync_request_fires_once_then_steady(lk, monkeypatch):
     # daemon (gate already elapsed) the next steady tick is a pure compare-and-confirm
     # -- not a second back-to-back re-assert.
     rec, fake = _rec(lk, monkeypatch, "enforce", initial=GW)
-    rec._resync_gate._deadline = 0.0  # simulate uptime > interval: the gate would be open
+    rec._resync._gate._deadline = 0.0  # simulate uptime > interval: the gate would be open
     rec.request_resync()
     rec.reconcile(True, True, GW)
     assert RouteCommand.CHANGE in fake.verbs
@@ -136,7 +136,7 @@ def test_periodic_gate_reasserts_after_interval(lk, monkeypatch):
     # With no request, the self-advancing gate re-asserts once its interval elapses,
     # catching a flap that never moved the CARP role. Force the gate open.
     rec, fake = _rec(lk, monkeypatch, "enforce", initial=GW)
-    rec._resync_gate._deadline = 0.0  # pretend the interval has elapsed
+    rec._resync._gate._deadline = 0.0  # pretend the interval has elapsed
     rec.reconcile(True, True, GW)
     assert RouteCommand.CHANGE in fake.verbs
 
@@ -288,6 +288,24 @@ def test_unreadable_role_warns_once_per_episode_and_rearms(lk, monkeypatch, capl
         for _ in range(5):            # second episode -> a second, distinct warning
             rec.reconcile(None, True, GW)
     assert len([r for r in caplog.records if "failing closed" in r.getMessage()]) == 2
+
+
+def test_unreadable_warning_deferred_until_a_default_is_present(lk, monkeypatch, caplog):
+    # Regression for the _UnreadableRole extraction: the fail-closed warning must not
+    # be swallowed by a strike-limit tick that cannot act. If the FIB default reads as
+    # None exactly when the limit is crossed (a transient route-get failure, or no
+    # default yet), the warn-once stays for the tick that actually withdraws. Starts
+    # with NO default, so have is None at the limit-hit tick.
+    rec, fake = _rec(lk, monkeypatch, "enforce", unreadable_role_strikes=2)
+    with caplog.at_level("WARNING", logger="lease-keeper"):
+        rec.reconcile(None, True, GW)   # strike 1
+        rec.reconcile(None, True, GW)   # strike 2 -> limit, but have is None -> cannot act
+    assert not any("failing closed" in r.getMessage() for r in caplog.records)
+    fake.gw = GW                        # a default is now present in the FIB
+    with caplog.at_level("WARNING", logger="lease-keeper"):
+        rec.reconcile(None, True, GW)   # still unreadable, have=GW -> warn once + withdraw
+    assert any("failing closed" in r.getMessage() for r in caplog.records)
+    assert fake.gw is None              # withdrawn
 
 
 # ---- liveness gate (split-brain guard) ----

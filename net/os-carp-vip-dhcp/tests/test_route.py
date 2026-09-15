@@ -177,6 +177,18 @@ def test_reassert_unlaunchable_change_is_surfaced(lk, monkeypatch, caplog):
     assert any(f"default resync via {GW} failed" in r.getMessage() for r in caplog.records)
 
 
+def test_failed_reassert_retries_next_tick(lk, monkeypatch):
+    # A re-assert whose `route change` fails re-arms the request, so the desync is
+    # retried on the next owned tick rather than lost until the periodic gate reopens.
+    rec, fake = _rec(lk, monkeypatch, "enforce", initial=GW, broken={RouteCommand.CHANGE})
+    rec.request_resync()
+    rec.reconcile(True, True, GW)   # change fails -> re-requested
+    fake.broken.clear()            # the routing socket recovers
+    fake.calls.clear()
+    rec.reconcile(True, True, GW)   # retry on the next owned tick: change now succeeds
+    assert RouteCommand.CHANGE in fake.verbs
+
+
 def test_install_reads_the_fib_back_to_confirm(lk, monkeypatch, caplog):
     # the success path must CONFIRM the FIB (a second get after the add), not
     # trust the add's exit code -- the read-back is what test_lying_add relies on.

@@ -172,7 +172,7 @@ class CarpVipDhcpStatus extends AbstractStatus
      */
     private function arpReachabilityReason(string $content): ?string
     {
-        if (!preg_match('/\bmaster=1\b/', $content)) {
+        if (strpos($content, ' master=1') === false) {
             return null;   // not the CARP master -> arpok is not a return-path signal here
         }
         if (strpos($content, ' nudge=') === false) {

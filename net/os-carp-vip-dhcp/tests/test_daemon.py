@@ -982,7 +982,7 @@ def test_hb_master_token_reflects_carp_role(lk, tmp_path):
     # The status banner judges a stale arpok only on the master (master=1), so the
     # heartbeat must carry the current CARP role.
     hb = tmp_path / "hb"
-    keeper = _nudge_keeper(lk, hbfile=str(hb))
+    keeper = _nudge_keeper(lk, vhid=199, hbfile=str(hb))
     keeper._was_master = True
     keeper._hb()
     assert " master=1" in hb.read_text()
@@ -992,13 +992,23 @@ def test_hb_master_token_reflects_carp_role(lk, tmp_path):
 
 
 def test_hb_no_master_token_before_first_probe(lk, tmp_path):
-    # Until the first CARP probe seeds the role, the token is omitted; the banner
-    # reads that as "not confirmed master" and does not judge arpok.
+    # A vhid keeper's role is unknown until the first CARP probe; the token is then
+    # omitted and the banner reads that as "not confirmed master", not judging arpok.
     hb = tmp_path / "hb"
-    keeper = _nudge_keeper(lk, hbfile=str(hb))
+    keeper = _nudge_keeper(lk, vhid=199, hbfile=str(hb))
     assert keeper._was_master is None
     keeper._hb()
     assert "master=" not in hb.read_text()
+
+
+def test_hb_master_token_true_without_vhid(lk, tmp_path):
+    # A no-vhid keeper is the sole (non-CARP) master and still nudges, so its arpok
+    # is a real signal the banner must judge: the role is seeded True and emitted.
+    hb = tmp_path / "hb"
+    keeper = _nudge_keeper(lk, hbfile=str(hb))   # _keeper builds with no vhid
+    assert keeper._was_master is True
+    keeper._hb()
+    assert " master=1" in hb.read_text()
 
 
 def test_master_transition_renews_early_and_nudges(lk):

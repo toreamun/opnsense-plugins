@@ -190,7 +190,11 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         # CARP-role probe (via the _nudge_is_master shim).
         self._nudge = ArpNudge(self._capture, self._cfg.chaddr, arp_nudge, self._nudge_is_master)
 
-        self._was_master = None        # CARP role at the last nudge check (None = unknown yet)
+        # CARP role at the last poll. A vhid keeper is unknown until its first
+        # probe (None); a no-vhid keeper has no CARP role to watch and is the
+        # permanent sole master, so seed True -- it still nudges, so the banner
+        # that reads master= must judge its arpok.
+        self._was_master = None if self._cfg.vhid else True
 
         # The only shared state a signal handler may write (invariant on the type).
         self._signals = _SignalFlags()
@@ -334,10 +338,12 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
             gw = self._nudge_target()
             if gw:
                 extra += f" gw={gw}"
-        # Publish the CARP role (omitted until the first probe seeds _was_master).
-        # The dashboard banner reads master= to judge a stale arpok as a blackholed
-        # return path ONLY on the master: only the master nudges, so a backup's
-        # arpok freezes at its last master-era reply and is not a fault there.
+        # Publish the CARP role (omitted only for a vhid keeper before its first
+        # probe). The dashboard banner reads master= to judge a stale arpok as a
+        # blackholed return path ONLY on the master: only the master nudges, so a
+        # backup's arpok freezes at its last master-era reply and is not a fault
+        # there. Banner-only: status.py ignores this token (it derives the live
+        # role from ifconfig), so it is deliberately not in _HB_TOKENS.
         role = "" if self._was_master is None else f" master={1 if self._was_master else 0}"
         self._write_hb(f"{int(time.time())} bound={self._dhcp.binding.yiaddr or '-'} "
                        f"lease={self._dhcp.binding.lease_secs} t1={t1} t2={t2} src={src}{role}{extra}\n")

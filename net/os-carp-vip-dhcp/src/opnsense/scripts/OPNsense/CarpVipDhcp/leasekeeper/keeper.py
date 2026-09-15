@@ -327,15 +327,20 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         # Publish nudge state so the status page can show it: nudge=<epoch of the
         # last sent nudge, 0 = never>, arpok=<epoch of the gateway's last ARP reply,
         # 0 = none seen> and the current target gateway (if known). status.py's
-        # _HB_TOKENS table is the reader -- keep the tokens in lockstep.
+        # _HB_TOKENS table is the reader -- keep those tokens in lockstep.
         extra = ""
         if self._nudge.interval:
             extra = f" nudge={int(self._nudge.last_nudge)} arpok={int(self._nudge.last_reply)}"
             gw = self._nudge_target()
             if gw:
                 extra += f" gw={gw}"
+        # Publish the CARP role (omitted until the first probe seeds _was_master).
+        # The dashboard banner reads master= to judge a stale arpok as a blackholed
+        # return path ONLY on the master: only the master nudges, so a backup's
+        # arpok freezes at its last master-era reply and is not a fault there.
+        role = "" if self._was_master is None else f" master={int(self._was_master)}"
         self._write_hb(f"{int(time.time())} bound={self._dhcp.binding.yiaddr or '-'} "
-                       f"lease={self._dhcp.binding.lease_secs} t1={t1} t2={t2} src={src}{extra}\n")
+                       f"lease={self._dhcp.binding.lease_secs} t1={t1} t2={t2} src={src}{role}{extra}\n")
 
     def _hb_mismatch(self, got, want):
         # Write a clear marker into the heartbeat file so a supervisor/human sees the mismatch.

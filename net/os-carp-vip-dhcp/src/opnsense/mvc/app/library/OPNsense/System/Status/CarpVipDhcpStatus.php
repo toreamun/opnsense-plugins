@@ -162,9 +162,19 @@ class CarpVipDhcpStatus extends AbstractStatus
      * the dashboard (CARP still masters, the lease is still held). We ignore
      * arpok==0 (never seen): freshly acquired, or a NIC that drops the unicast
      * reply (the promiscuous-listen fallback) -- flagging it would cry wolf.
+     *
+     * Only judged on the CARP master (heartbeat master=1). Only the master nudges,
+     * so on a backup arpok freezes at its last master-era reply; a stale value
+     * there is not a fault (the backup is healthy and failover-ready), and judging
+     * it raised a false banner on every node that had once been master. An absent
+     * master token (an older keeper, or before the first CARP probe) is likewise
+     * treated as "not confirmed master" and not judged.
      */
     private function arpReachabilityReason(string $content): ?string
     {
+        if (!preg_match('/\bmaster=1\b/', $content)) {
+            return null;   // not the CARP master -> arpok is not a return-path signal here
+        }
         if (strpos($content, ' nudge=') === false) {
             return null;   // ARP nudge not enabled for this keeper -> no signal to judge
         }

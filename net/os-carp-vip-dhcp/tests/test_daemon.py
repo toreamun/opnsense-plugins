@@ -1749,6 +1749,10 @@ def test_unbound_withdraws_when_acquire_does_not_bind(lk):
     k = _keeper(lk, vhid=254, default_route_mode="enforce")
     rec = _RecordingReconciler()
     k._defroute = rec
+    # Pin the CARP probe: the real one forks ifconfig, whose output (and so the
+    # role) depends on the runner. None = unknown role, which reaches the same
+    # role-independent acquire arm this test exercises on every OS.
+    k._probe_carp_master = lambda: None
     k._acquire_step = lambda: None             # the acquire does not bind
     k._dhcp.binding.yiaddr = None              # unbound
     k._dhcp.binding.lease_router = "100.64.4.1"
@@ -1763,6 +1767,10 @@ def test_unbound_keeps_default_when_acquire_binds(lk):
     k = _keeper(lk, vhid=254, default_route_mode="enforce")
     rec = _RecordingReconciler()
     k._defroute = rec
+    # Pin the CARP probe: the real one forks ifconfig, whose output (and so the
+    # role) depends on the runner. None = unknown role, which reaches the same
+    # role-independent acquire arm this test exercises on every OS.
+    k._probe_carp_master = lambda: None
 
     def fake_acquire():
         k._dhcp.binding.yiaddr = "100.64.4.7"   # the acquire re-adopts the lease

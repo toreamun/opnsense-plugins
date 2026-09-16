@@ -1083,23 +1083,40 @@ def test_demote_ok_grace_boundary_is_exclusive(lk):
     assert keeper._demote_ok(t0 + lk.DEMOTE_GRACE + 0.001) is True  # just past: demote-worthy
 
 
-def test_passive_backup_step_publishes_backup_role_not_stale_demote_ok(lk, tmp_path, monkeypatch):
-    # A lease-less master demoted to backup, first observed at the passive step's role
-    # gate, must publish master=0/demote_ok=0 in the SAME heartbeat, not a stale
+def test_maintain_step_demotion_publishes_backup_role_not_stale_demote_ok(lk, tmp_path, monkeypatch):
+    # A lease-less master demoted to backup, first observed at _maintain_step's role
+    # gate, must publish master=0/demote_ok=0 in that step's heartbeat, not a stale
     # master=1/demote_ok=1 carried over from the pre-demotion role (which would read as
-    # a backup asking the CARP hook to demote it).
+    # a backup asking the CARP hook to demote it). The gate commits the role first.
     hb = tmp_path / "hb"
     keeper = _keeper(lk, vhid=199, hbfile=str(hb))
     keeper._was_master = True
     keeper._dhcp.binding.yiaddr = None
     keeper._unbound_master_since = time.time() - (lk.DEMOTE_GRACE + 5)   # was demote-worthy as master
+    monkeypatch.setattr(keeper, "_probe_carp_master", lambda: False)     # CARP just demoted us
     monkeypatch.setattr(keeper, "_sleep_interruptible", lambda *a, **kw: True)
-    keeper._passive_backup_step()
+    keeper._maintain_step()
     content = hb.read_text()
     assert " master=0" in content
     assert " demote_ok=0" in content
     assert keeper._was_master is False
     assert keeper._unbound_master_since is None
+
+
+def test_maintain_step_gate_commits_promotion_when_sigusr2_missed(lk, monkeypatch):
+    # A promotion whose SIGUSR2 wake was missed/coalesced must still be committed at
+    # the role gate: _was_master flips to True and the early-renew latch is set, rather
+    # than the node running the transmit path while _was_master stays False (which would
+    # keep the heartbeat at master=0 and block the enforce-mode fail-stop).
+    keeper = _keeper(lk, vhid=199)
+    keeper._was_master = False
+    keeper._dhcp.binding.yiaddr = None
+    monkeypatch.setattr(keeper, "_probe_carp_master", lambda: True)         # promoted, SIGUSR2 missed
+    monkeypatch.setattr(keeper, "_acquire_step", lambda: None)              # don't actually DORA
+    monkeypatch.setattr(keeper, "_reconcile_default_route", lambda *a, **kw: None)
+    keeper._maintain_step()
+    assert keeper._was_master is True
+    assert keeper._renew_asap is True
 
 
 def test_master_transition_renews_early_and_nudges(lk):

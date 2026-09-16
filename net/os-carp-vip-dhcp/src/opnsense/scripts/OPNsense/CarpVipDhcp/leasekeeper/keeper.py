@@ -858,16 +858,9 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         poll, default route + backup egress, follow convergence via the sleep's
         check_observed), minus the renew. On promotion the sleep breaks and the
         _maintain_step gate reopens: a backup already holding a lease (from the
-        master's exchanges) routes at once, a lease-less one after a single DORA."""
-        # Commit the backup role before the tick writes the heartbeat, so a demotion
-        # first seen at this step's role gate is reflected in THIS heartbeat: a
-        # lease-less master that has just been demoted must not publish a stale
-        # master=1/demote_ok=1 (which would read as a backup asking to be demoted).
-        # Safe ahead of the heartbeat: with the role supplied this neither forks
-        # ifconfig nor touches routes, so it cannot throw and delay heartbeat
-        # freshness the way _maintenance_tick's later reconcile deliberately runs
-        # after _hb. The tick's own _role_tick(False) below is then a no-op poll.
-        self._poll_carp_role(False)
+        master's exchanges) routes at once, a lease-less one after a single DORA.
+        _maintain_step has already committed the backup role at its gate, so this
+        tick's heartbeat reflects master=0/demote_ok=0."""
         self._maintenance_tick(master=False)
         self._sleep_interruptible(HB_REFRESH, poll_link=False)
 
@@ -882,6 +875,16 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         role = self._probe_carp_master()
         if role is None:
             role = self._was_master
+        # Commit the role before dispatching, so a transition first seen at THIS gate
+        # (a missed or coalesced SIGUSR2) is acted on now instead of being lost until
+        # the node next binds. _poll_carp_role fires the promotion side effects (the
+        # early-renew latch, the failover nudge, the route resync) and the demotion
+        # clear, and updates _was_master so this step's heartbeat, demote_ok and the
+        # transmit gate all key off the true role. A long _acquire_step never returns
+        # to the loop head to do this, so an unbound promoted master would otherwise
+        # keep publishing master=0 and could not fail-stop. Reuses the probed role (no
+        # extra ifconfig); a None/unknown role is a no-op (the transmit fail-safe below).
+        self._poll_carp_role(role)
         if role is False:
             self._passive_backup_step()
             return

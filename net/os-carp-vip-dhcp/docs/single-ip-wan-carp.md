@@ -430,12 +430,14 @@ the keeper) only need doing once.
    virtual MAC and rewrites the VIP - address, prefix and gateway - to whatever the ISP
    actually hands out ([section 6.1](#s6-1)).
 4. **Plugin** [os-carp-vip-dhcp](../README.md): a keeper on the VIP with **Follow dynamic
-   DHCP address** on, and set its **Sync firewall alias** to `wan_carp_vip` ([section 6.2](#s6-2)). Both
-   nodes hold the lease warm, so failover is seamless, but on a shared WAN-front switch
-   both nodes periodically source the virtual MAC (DHCP renewals), which can cause a
-   MAC-table flap; use a switch/topology that tolerates it (or a dedicated point-to-point
-   uplink). (The ARP nudge is master-gated, so it never adds to the flap; only the DHCP
-   renewals do.) Leave **Client MAC override (chaddr)** blank: the keeper uses the CARP virtual MAC
+   DHCP address** on, and set its **Sync firewall alias** to `wan_carp_vip` ([section 6.2](#s6-2)). Only the CARP master
+   sources the virtual MAC: the backup stays passive (it holds no lease of its own and
+   transmits no DHCP) until it is promoted, so the two nodes never flap the virtual MAC on
+   the shared WAN switch. On failover the new master acquires the lease at once and nudges
+   the gateway, so failover stays CARP-speed. (This holds once **both** nodes run this
+   version or later; during a rolling upgrade a not-yet-upgraded backup still sources the
+   MAC, so upgrade the node that is currently CARP **backup** first.) Leave **Client MAC
+   override (chaddr)** blank: the keeper uses the CARP virtual MAC
    automatically, which is what the lease, the ISP binding and the VIP's traffic all need.
    Only set it for an ISP reservation on a fixed *different* MAC, and never to this node's own
    NIC MAC (that binds the lease to one MAC while the VIP still sends from the CARP MAC, so an

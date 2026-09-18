@@ -137,6 +137,12 @@ REDORA_MIN = 10            # initial wait after a failed acquire; also the hold-
 REDORA_MAX = 45            # max exponential-backoff wait after a failed acquire
 LINK_POLL_STEP = 3         # while UNBOUND, poll interface carrier this often (s) for the link-return fast path
 LINK_KICK_DEBOUNCE = 8     # min seconds between link-return re-DORA kicks (damps a flapping link)
+# How long a CARP master may be lease-less before the keeper judges it demote-worthy
+# (demote_ok heartbeat token, honoured by the CARP eligibility hook when demote=1). Long
+# enough to cover a normal promotion acquire (INIT-REBOOT sub-1s, a DORA plus one backoff
+# retry: REPLY_TIMEOUT 4s + REDORA_MIN 10s .. REDORA_MAX 45s), so a just-promoted master is
+# never demoted mid-acquire; far below the operator-facing STALE/MAX_AGE thresholds.
+DEMOTE_GRACE = 45
 SNIFFER_RETRY = 5          # wait before retrying a failed packet-sniffer start
 SNIFFER_WARMUP = 0.5       # let the capture thread attach before the first send
 LOOP_ERROR_BACKOFF = 10    # wait after an unexpected main-loop error before retrying

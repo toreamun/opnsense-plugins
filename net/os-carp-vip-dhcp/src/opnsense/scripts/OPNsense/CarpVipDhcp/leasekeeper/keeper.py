@@ -3,6 +3,9 @@ DhcpClient, ARP replies to ArpNudge and peer-ACK observations to FollowPolicy),
 the heartbeat, the CARP role watch, the acquire pacing and the signal-driven
 operator actions.
 """
+# The Keeper is one cohesive lease/CARP state machine; splitting the module purely
+# to satisfy the line ceiling would scatter that one machine, so allow the length.
+# pylint: disable=too-many-lines
 import logging
 import select
 import socket
@@ -14,7 +17,7 @@ from .capture import Capture
 from .capture_bpf import BpfCapture
 from .constants import (
     LOGGER_NAME,
-    ACK, BootpOp, DhcpOptName, HB_REFRESH, LEASE_PULSE_INTERVAL, LINK_KICK_DEBOUNCE,
+    ACK, BootpOp, DEMOTE_GRACE, DhcpOptName, HB_REFRESH, LEASE_PULSE_INTERVAL, LINK_KICK_DEBOUNCE,
     LINK_POLL_STEP, LOOP_ERROR_BACKOFF, Phase, REBIND_POLL_STEP, REDORA_MAX, REDORA_MIN,
     SNIFFER_RETRY, SNIFFER_WARMUP)
 from .dhcpclient import DhcpClient, DhcpHooks
@@ -201,6 +204,9 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
 
         # Main-loop-only state (set by the loop itself, never by a handler):
         self._renew_asap = False       # renew at the next _hold_lease tick instead of waiting for T1
+        # Epoch (time.time()) at which this node most recently became a lease-less
+        # CARP master, or None when it is not one; feeds the demote_ok grace in _hb.
+        self._unbound_master_since = None
         self._pulse = _RateLimit(LEASE_PULSE_INTERVAL)   # throttles the "lease healthy" INFO
 
         # DHCP client component: owns the lease state and the protocol sequences;
@@ -339,14 +345,38 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
             if gw:
                 extra += f" gw={gw}"
         # Publish the CARP role (omitted only for a vhid keeper before its first
-        # probe). The dashboard banner reads master= to judge a stale arpok as a
-        # blackholed return path ONLY on the master: only the master nudges, so a
-        # backup's arpok freezes at its last master-era reply and is not a fault
-        # there. Banner-only: status.py ignores this token (it derives the live
-        # role from ifconfig), so it is deliberately not in _HB_TOKENS.
+        # probe). Lease-holding is judged only on the master via this token: the
+        # status banner (a stale arpok, and a not-held lease, are faults only at
+        # master=1, since a passive backup nudges nothing and holds no lease) and
+        # the CARP eligibility hook (a passive backup is not demoted for being
+        # lease-less). status.py ignores the token (it derives the live role from
+        # ifconfig), so it is deliberately not in _HB_TOKENS.
+        now = time.time()
         role = "" if self._was_master is None else f" master={1 if self._was_master else 0}"
-        self._write_hb(f"{int(time.time())} bound={self._dhcp.binding.yiaddr or '-'} "
-                       f"lease={self._dhcp.binding.lease_secs} t1={t1} t2={t2} src={src}{role}{extra}\n")
+        # demote_ok=1 tells the CARP eligibility hook (when demote=1) to demote this
+        # node: it is the master and has failed to hold the lease past the grace.
+        demote_ok = 1 if self._demote_ok(now) else 0
+        self._write_hb(f"{int(now)} bound={self._dhcp.binding.yiaddr or '-'} "
+                       f"lease={self._dhcp.binding.lease_secs} t1={t1} t2={t2} src={src}"
+                       f"{role} demote_ok={demote_ok}{extra}\n")
+
+    def _demote_ok(self, now):
+        """Whether a demote=1 keeper should now be demoted: it is the CARP master but
+        has been unable to hold the requested lease for longer than DEMOTE_GRACE. A
+        just-promoted master's normal acquire DORA falls inside the grace, so it is not
+        demoted mid-acquire; a passive backup (never master) and a healthy bound master
+        never qualify. Level-based: the unbound-as-master epoch is set on the first
+        master-and-lease-less tick and cleared the moment the node binds or leaves master
+        (so a promote->demote flap resets the clock, and a probe glitch does not, since
+        _was_master keeps its last definite role). Published unconditionally -- the daemon
+        does not know the demote flag (it lives only in keeperconf for the hook), so the
+        hook's own demote=1 gate decides which keepers act on this token."""
+        if self._was_master is True and self._dhcp.binding.yiaddr is None:
+            if self._unbound_master_since is None:
+                self._unbound_master_since = now
+            return now - self._unbound_master_since > DEMOTE_GRACE
+        self._unbound_master_since = None
+        return False
 
     def _hb_mismatch(self, got, want):
         # Write a clear marker into the heartbeat file so a supervisor/human sees the mismatch.
@@ -468,6 +498,10 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
             # The symmetric event: without it, "why did the nudges stop?" needs
             # ifconfig instead of the log.
             LOG.info("lost CARP master for vhid %s -- ARP nudges pause on this node", self._cfg.vhid)
+            # A demotion cancels a pending early renew (a backup must not renew), so
+            # _renew_asap stays accurate ("a live, unconsumed promotion") instead of
+            # drifting stale-True and waking the passive sleep on a later signal.
+            self._renew_asap = False
         self._was_master = master
 
     def _log_initial_carp_role(self):
@@ -651,10 +685,12 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
             slept += 1
         return slept
 
-    def _sleep_interruptible(self, secs):
+    def _sleep_interruptible(self, secs, poll_link=True):
         """Sleep up to secs (1s steps). Return False early on stop. Also services an
         operator-requested immediate nudge (SIGUSR1) and a CARP-transition re-check
-        (SIGUSR2) so both act within a second instead of at the next heartbeat tick."""
+        (SIGUSR2) so both act within a second instead of at the next heartbeat tick.
+        poll_link=False skips the unbound carrier poll for the passive-backup hold,
+        which cannot act on a link-return (it never acquires while backup)."""
         slept = 0
         while slept < secs and not self._signals.stopping:
             if self._signals.take_recheck_role():
@@ -664,6 +700,12 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
                 # re-own the default route on the same edge (a failover flips which
                 # node installs 0/0). One shared CARP probe feeds both, as the tick does.
                 self._role_tick()
+                if self._renew_asap:
+                    # That transition was a promotion (backup->master): return so
+                    # _maintain_step re-runs and the transmit flow acquires/renews at
+                    # once, rather than the newly-promoted node waiting out this sleep
+                    # (a lease-less backup cannot route until it has a lease).
+                    return not self._signals.stopping
 
             if self._signals.take_nudge():
                 # Operator actions are rare and intentional -- always log them,
@@ -677,10 +719,12 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
             # dual-master window it closes: FollowPolicy.check_observed).
             self._follow.check_observed()
 
-            # Link-return fast path: only while UNBOUND, poll carrier every few
-            # seconds; a down->up edge means the WAN just came back, so stop waiting
-            # and let _maintain_step re-DORA immediately (the bound path skips this).
-            if self._dhcp.binding.yiaddr is None and slept % LINK_POLL_STEP == 0 and self._check_link_returned():
+            # Link-return fast path: only while UNBOUND (and not the passive-backup
+            # hold, which cannot act on it), poll carrier every few seconds; a
+            # down->up edge means the WAN just came back, so stop waiting and let
+            # _maintain_step re-DORA immediately (the bound path skips this).
+            if (poll_link and self._dhcp.binding.yiaddr is None
+                    and slept % LINK_POLL_STEP == 0 and self._check_link_returned()):
                 self._link.returned = True
                 return not self._signals.stopping
 
@@ -695,6 +739,21 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
                     pass
             slept += 1
         return not self._signals.stopping
+
+    def _maintenance_tick(self, master=_UNSET):
+        """One round of steady-state upkeep, shared by _hold_lease (a master
+        waiting out T1) and the passive-backup hold: refresh the heartbeat and the
+        health pulse, re-drive a stalled follow, poll the CARP role + reconcile the
+        default route (via _role_tick), and run the ARP nudge. Transmits NO DHCP --
+        the caller owns when (and whether) to renew. Pass an already-probed role to
+        skip the ifconfig."""
+        self._hb()
+        self._maybe_pulse()       # ~1/h "lease healthy" so a quiet keeper shows life
+        self._follow.watchdog()   # re-drive a follow whose apply stalled
+        # One CARP-role probe per tick, shared by the role poll, the route
+        # reconcile (both via _role_tick) and the nudge below.
+        master = self._role_tick(master)
+        self._arp_nudge(master=master)
 
     def _hold_lease(self, secs):
         """Sleep up to secs while holding a lease, rewriting the heartbeat every
@@ -714,13 +773,7 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
                 return False
             remaining -= chunk
 
-            self._hb()
-            self._maybe_pulse()       # ~1/h "lease healthy" so a quiet keeper shows life
-            self._follow.watchdog()   # re-drive a follow whose apply stalled
-            # One CARP-role probe per tick, shared by the role poll, the route
-            # reconcile (both via _role_tick) and the nudge below.
-            master = self._role_tick()
-            self._arp_nudge(master=master)
+            self._maintenance_tick()
         return not self._signals.stopping
 
     def _maybe_pulse(self):
@@ -797,10 +850,44 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         self._capture.stop()
         return 0 if ok else 1
 
+    def _passive_backup_step(self):
+        """A CARP backup transmits nothing on the WAN: its own DHCP renewals would
+        source the shared CARP virtual MAC, move it to this node's switch port and
+        flap the master's return path. So it just holds whatever binding it has and
+        does the same steady upkeep as a master waiting out T1 (heartbeat, role
+        poll, default route + backup egress, follow convergence via the sleep's
+        check_observed), minus the renew. On promotion the sleep breaks and the
+        _maintain_step gate reopens: a backup already holding a lease (from the
+        master's exchanges) routes at once, a lease-less one after a single DORA.
+        _maintain_step has already committed the backup role at its gate, so this
+        tick's heartbeat reflects master=0/demote_ok=0."""
+        self._maintenance_tick(master=False)
+        self._sleep_interruptible(HB_REFRESH, poll_link=False)
+
     def _maintain_step(self):
         """One iteration of the maintain loop. Returns to run() (which loops again)
         on every state transition; any exception it raises is caught by run() and
         retried, so a transient fault can never terminate the keeper."""
+        # A CARP backup must not transmit DHCP (see _passive_backup_step). Skip the
+        # transmit flow only when DEFINITELY the backup: a probe glitch (None) falls
+        # back to the last known role, and a still-unknown role transmits (fail-safe,
+        # so a real master never stops renewing). no-vhid probes True and transmits.
+        role = self._probe_carp_master()
+        if role is None:
+            role = self._was_master
+        # Commit the role before dispatching, so a transition first seen at THIS gate
+        # (a missed or coalesced SIGUSR2) is acted on now instead of being lost until
+        # the node next binds. _poll_carp_role fires the promotion side effects (the
+        # early-renew latch, the failover nudge, the route resync) and the demotion
+        # clear, and updates _was_master so this step's heartbeat, demote_ok and the
+        # transmit gate all key off the true role. A long _acquire_step never returns
+        # to the loop head to do this, so an unbound promoted master would otherwise
+        # keep publishing master=0 and could not fail-stop. Reuses the probed role (no
+        # extra ifconfig); a None/unknown role is a no-op (the transmit fail-safe below).
+        self._poll_carp_role(role)
+        if role is False:
+            self._passive_backup_step()
+            return
         binding = self._dhcp.binding
         if not binding.yiaddr:
             # Unbound: (re)acquire FIRST, then withdraw only if that did not bind. A
@@ -817,7 +904,9 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
             # acquire (the no-flap restart path above). A promotion that lands mid-acquire is
             # caught by the post-acquire reconcile on the next iteration.
             if self._backup.enabled:
-                self._backup.reconcile_backup_egress(self._probe_carp_master())
+                # Reuse the role the top-of-step gate already probed (this arm only
+                # runs for a master/unknown role; a backup never reaches it).
+                self._backup.reconcile_backup_egress(role)
             self._acquire_step()
             if not binding.yiaddr:
                 # master=False is the fictional role for the role-independent 0/0
@@ -826,13 +915,26 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
                 self._reconcile_default_route(
                     master=False, probe_for_backup=self._backup.enabled)
             return
-        # Bound: own the default by CARP role, here at the loop head. _maintain_step
-        # is re-entered after every transition (a just-acquired lease, a renew that
-        # changed the gateway, a NAK, an expiry), so this single reconcile tracks
-        # them all; only the long blocking waits below (which do not return to the
-        # loop head) add their own periodic reconcile.
-        self._reconcile_default_route()
+        # Bound: own the default by CARP role, here at the loop head (reusing the
+        # role the top-of-step gate already probed). _maintain_step is re-entered
+        # after every transition (a just-acquired lease, a renew that changed the
+        # gateway, a NAK, an expiry), so this single reconcile tracks them all; only
+        # the long blocking waits below (which do not return to the loop head) add
+        # their own periodic reconcile.
+        self._reconcile_default_route(role)
 
+        # Wait out T1 and RENEW; on failure REBIND until T2, then expire. Split into
+        # its own method so this dispatcher stays small; the renew/rebind flow
+        # inherently branches a lot.
+        self._renew_bound_lease()
+
+    def _renew_bound_lease(self):  # pylint: disable=too-many-return-statements
+        """Maintain a held lease: wait until T1 then RENEW; on failure REBIND until
+        T2, then expire and re-acquire. Returns to _maintain_step (and its loop) on
+        the first meaningful transition. A demotion to backup during either wait
+        stops transmitting -- the next _maintain_step then handles the node
+        passively."""
+        binding = self._dhcp.binding
         # Maintain: wait until T1, then RENEW; bail early on stop.
         t1, t2, src = self._dhcp.timing()
         # The renew/rebind plan is verbose and identical every cycle for a stable
@@ -842,6 +944,11 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         LOG.debug("DHCP lease %ds; renew at T1=%ds (~%s), rebind by T2=%ds (~%s) (timing source: %s)",
                   binding.lease_secs, t1, _clock_at(t1), t2, _clock_at(t2), src)
         if not self._hold_lease(t1):
+            return
+        # A demotion to backup during the T1 wait must not renew now: that transmit
+        # would move the shared vMAC and flap the segment. _hold_lease kept
+        # _was_master fresh; the next _maintain_step handles this node passively.
+        if self._was_master is False:
             return
         prior = self._lease_facts()   # snapshot to report what a renew changed
         if self._dhcp.renew():
@@ -869,7 +976,10 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
             # _hold_lease does per tick. Otherwise a failover during this degraded
             # path relies solely on the SIGUSR2 edge, with no periodic fallback
             # for a missed one until REBIND exits.
-            self._role_tick()
+            if self._role_tick() is False:
+                # Demoted mid-REBIND: stop transmitting and let the passive path
+                # take over on the next _maintain_step.
+                return
             if self._dhcp.renew(rebind=True):
                 ok = True
                 break
@@ -928,6 +1038,10 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
                      f"/{binding.mask_bits}" if binding.mask_bits else "none")
             self._hb()
             self._arp_nudge(force=True)
+            # A fresh DORA is a new lease, so a pending "renew asap" (e.g. from a
+            # promotion that landed while unbound) is moot: clear it so the bound
+            # path does not immediately renew the lease we just acquired.
+            self._renew_asap = False
             self.redora_wait = REDORA_MIN
             # Owning the default is the loop-head reconcile on the next _maintain_step
             # entry (now bound): _acquire_step returns straight to run(), which

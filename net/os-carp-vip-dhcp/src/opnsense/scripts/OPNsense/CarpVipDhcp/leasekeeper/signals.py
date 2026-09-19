@@ -1,7 +1,6 @@
-"""The signal-driven request flags shared between the async signal handlers and
-the maintain loop, behind a tiny protocol that makes the safe usage the only
-usage. Kept in its own module so the concurrency invariant ("a handler only ever
-sets True, the loop only ever clears") lives in one small, self-contained place.
+"""The signal-driven request flags (_SignalFlags), in their own small module so the
+async-signal-safe handshake between the signal handlers and the maintain loop lives
+in one self-contained place. See the class for the protocol and its invariant.
 """
 from dataclasses import dataclass
 

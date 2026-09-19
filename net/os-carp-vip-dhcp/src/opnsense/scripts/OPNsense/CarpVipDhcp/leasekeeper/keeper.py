@@ -828,9 +828,10 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         # Commit the role before dispatching, so a transition first seen at THIS gate
         # (a missed or coalesced SIGUSR2) is acted on now instead of being lost until
         # the node next binds. _poll_carp_role fires the promotion side effects (the
-        # early-renew latch, the failover nudge, the route resync) and the demotion
-        # clear, and updates _was_master so this step's heartbeat, demote_ok and the
-        # transmit gate all key off the true role. A long _acquire_step never returns
+        # early-renew latch, the failover nudge, the route resync) and updates
+        # _was_master so this step's heartbeat, demote_ok and the transmit gate all key
+        # off the true role (a demotion needs no side effect here: the early-renew latch
+        # is role-gated inert, see _renew_pending). A long _acquire_step never returns
         # to the loop head to do this, so an unbound promoted master would otherwise
         # keep publishing master=0 and could not fail-stop. Reuses the probed role (no
         # extra ifconfig); a None/unknown role is a no-op (the transmit fail-safe below).

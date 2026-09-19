@@ -1660,7 +1660,8 @@ def test_demotion_makes_renew_asap_inert(lk):
     k._renew_asap = True                # a renew was pending
     k._poll_carp_role(False)            # CARP demotes us to backup
     assert k._was_master is False
-    assert k._renew_pending() is False  # inert while backup...
+    assert k._renew_asap is True        # deliberately LEFT set (not hand-cleared)...
+    assert k._renew_pending() is False  # ...but role-gated inert while backup...
     assert k._take_renew() is False     # ...and the hold loop will not consume it
 
 

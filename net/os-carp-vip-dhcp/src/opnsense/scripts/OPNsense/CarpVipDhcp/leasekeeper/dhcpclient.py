@@ -22,6 +22,22 @@ from .wire import DhcpReply, DhcpSend, _dhcp_options, _fmt_reply, _msg_text
 LOG = logging.getLogger(LOGGER_NAME)
 
 
+def _identity_options(vendor_class, client_id, hostname):
+    """Optional DHCP identity options (empty -> not sent), added to every
+    DISCOVER/REQUEST/RENEW so the server sees a consistent client identity.
+    ISP interplay: satisfies servers that only lease to a known vendor-class
+    (opt 60), client-id (61) or hostname (12) -- the "client identity checks"
+    row of the README's ISP-security section."""
+    id_opts = []
+    if vendor_class:
+        id_opts.append((DhcpOptName.VENDOR_CLASS_ID, vendor_class))
+    if client_id:
+        id_opts.append((DhcpOptName.CLIENT_ID, client_id.encode()))
+    if hostname:
+        id_opts.append((DhcpOptName.HOSTNAME, hostname))
+    return id_opts
+
+
 @dataclass
 class Lease:  # pylint: disable=too-many-instance-attributes
     """The held DHCP binding: address, granting server, timing, and the

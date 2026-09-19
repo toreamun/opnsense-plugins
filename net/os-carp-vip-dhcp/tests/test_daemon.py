@@ -1650,16 +1650,18 @@ def test_acquire_clears_renew_asap(lk, monkeypatch):
     assert k._renew_asap is False
 
 
-def test_demotion_clears_renew_asap(lk):
-    # A demotion cancels a pending early renew (a backup must not renew); otherwise
-    # _renew_asap would drift stale-True and later wake the passive sleep on any
-    # signal even without a real promotion.
+def test_demotion_makes_renew_asap_inert(lk):
+    # A demotion must not let a pending early renew fire (a backup must not renew).
+    # The latch is role-gated rather than cleared by hand: after a demotion it reads as
+    # not-pending (and the hold loop will not consume it), so it cannot wake the passive
+    # sleep or renew from the shared vMAC; a later promotion re-arms it.
     k = _keeper(lk, vhid=254)
     k._was_master = True                # currently master
     k._renew_asap = True                # a renew was pending
     k._poll_carp_role(False)            # CARP demotes us to backup
     assert k._was_master is False
-    assert k._renew_asap is False
+    assert k._renew_pending() is False  # inert while backup...
+    assert k._take_renew() is False     # ...and the hold loop will not consume it
 
 
 def test_passive_backup_sends_no_nudge(lk, monkeypatch):

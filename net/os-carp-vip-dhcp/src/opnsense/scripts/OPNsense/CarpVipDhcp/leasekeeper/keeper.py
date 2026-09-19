@@ -17,14 +17,15 @@ from .capture import Capture
 from .capture_bpf import BpfCapture
 from .constants import (
     LOGGER_NAME,
-    ACK, BootpOp, DEMOTE_GRACE, DhcpOptName, HB_REFRESH, LEASE_PULSE_INTERVAL, LINK_KICK_DEBOUNCE,
+    ACK, BootpOp, DEMOTE_GRACE, HB_REFRESH, LEASE_PULSE_INTERVAL, LINK_KICK_DEBOUNCE,
     LINK_POLL_STEP, LOOP_ERROR_BACKOFF, Phase, REBIND_POLL_STEP, REDORA_MAX, REDORA_MIN,
     SNIFFER_RETRY, SNIFFER_WARMUP)
-from .dhcpclient import DhcpClient, DhcpHooks
+from .dhcpclient import DhcpClient, DhcpHooks, _identity_options
 from .ifprobe import carrier_up, is_carp_master
 from .policy import ArpNudge, FollowHooks, FollowPolicy
 from .route import (BackupEgressReconciler, DefaultRouteMode, DefaultRouteReconciler,
                     withdraw_unless_master)
+from .signals import _SignalFlags
 from .syscmd import ifconfig, spawn
 from .util import _UNSET, _RateLimit, _atomic_write, _clock_at, _jittered, _sane_ipv4
 from .wire import _parse_reply
@@ -53,71 +54,6 @@ def carp_master(iface, vhid):
     exist; the Keeper's per-tick probe (_probe_carp_master) shares the same
     ifprobe parse through _carp_master."""
     return _carp_master(ifconfig(iface), vhid)
-
-
-@dataclass
-class _SignalFlags:
-    """The only shared state a signal handler may write, behind a tiny protocol
-    that makes the safe usage the only usage.
-
-    A signal handler (request_stop / request_nudge / request_recheck_role) runs
-    on the MAIN thread, between bytecodes; the single safe thing it does is flip
-    one of these booleans to True -- one bytecode, hence atomic w.r.t. signal
-    delivery (never torn), and independent of the others. The maintain loop
-    drains each edge flag with take_*() (check-and-clear in one place) and polls
-    the terminal stop flag via `stopping`. The fields are private and reached
-    only through these methods so the rule "a handler only ever sets True, the
-    loop only ever clears" is structural, not a comment a later edit can quietly
-    break: this is what makes the path correct WITHOUT a lock. Do NOT let a
-    handler do more (no I/O, no mutation of the binding / lease / role), and do
-    NOT set a flag from another thread -- either reintroduces re-entrancy and
-    consistency bugs. Add a new signal-driven request as another private bool
-    plus a request_*/take_* pair, never by doing work in the handler.
-    """
-    _stop: bool = False           # SIGINT / SIGTERM
-    _nudge: bool = False          # SIGUSR1
-    _recheck_role: bool = False   # SIGUSR2 (CARP transition / route_reload)
-
-    # -- handler side: set True (idempotent, async-signal-safe: one bytecode) --
-    def request_stop(self):
-        """Ask the loop to exit (SIGINT/SIGTERM handler)."""
-        self._stop = True
-
-    def request_nudge(self):
-        """Ask for an immediate ARP nudge (SIGUSR1 handler)."""
-        self._nudge = True
-
-    def request_recheck_role(self):
-        """Ask for a CARP-role re-check (SIGUSR2 handler)."""
-        self._recheck_role = True
-
-    # -- main-loop side --
-    # take_*() reads-then-clears and is NOT masked against signal delivery: a
-    # signal landing between the read and the store can be erased by the store,
-    # dropping that one edge. This needs no lock or signal masking because each
-    # edge has a periodic fallback -- a dropped CARP re-check (SIGUSR2) is caught
-    # by the next per-tick role poll, and the periodic ARP nudge keeps reachability
-    # fresh regardless of a dropped manual nudge (SIGUSR1) -- so a lost edge costs
-    # at most one poll interval of latency, never a missed state change.
-    # The one stretch where that interval is longer than a tick is inside a
-    # blocking DhcpClient.renew()/reboot() reply wait, which services only the stop
-    # callback: a CARP edge that lands there is reconciled when the call returns
-    # (the renew/rebind-success arms and the REBIND loop all reconcile), so failover
-    # convergence is delayed by at most one renew/rebind attempt there, not lost.
-    @property
-    def stopping(self):
-        """Terminal stop flag; polled (never cleared) by every loop/sleep guard."""
-        return self._stop
-
-    def take_nudge(self):
-        """Whether an immediate ARP nudge was requested; clears it (loop only)."""
-        pending, self._nudge = self._nudge, False
-        return pending
-
-    def take_recheck_role(self):
-        """Whether a CARP-role re-check was requested; clears it (loop only)."""
-        pending, self._recheck_role = self._recheck_role, False
-        return pending
 
 
 @dataclass(frozen=True)
@@ -496,13 +432,28 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
             self._defroute.request_resync()
         elif not master and self._was_master:
             # The symmetric event: without it, "why did the nudges stop?" needs
-            # ifconfig instead of the log.
+            # ifconfig instead of the log. A pending early-renew latch is left as-is:
+            # _renew_pending()/_take_renew() gate on the role, so it goes inert now that
+            # this node is backup (a backup must not renew), and the next promotion
+            # re-arms it -- no by-hand clear here to drift out of sync.
             LOG.info("lost CARP master for vhid %s -- ARP nudges pause on this node", self._cfg.vhid)
-            # A demotion cancels a pending early renew (a backup must not renew), so
-            # _renew_asap stays accurate ("a live, unconsumed promotion") instead of
-            # drifting stale-True and waking the passive sleep on a later signal.
-            self._renew_asap = False
         self._was_master = master
+
+    def _renew_pending(self):
+        """Whether the early-renew latch is live: armed by a promotion AND this node is
+        not a confirmed backup. Role-gating the read makes the latch inert on a backup
+        with no by-hand clear, so a demotion that never consumed it cannot later fire a
+        renew from the shared vMAC; an unknown role stays live (the transmit fail-safe)."""
+        return self._renew_asap and self._was_master is not False
+
+    def _take_renew(self):
+        """Consume the early-renew latch once: the hold loop renews immediately instead
+        of waiting out T1. A no-op (and no clear) on a confirmed backup -- see
+        _renew_pending()."""
+        if self._renew_pending():
+            self._renew_asap = False
+            return True
+        return False
 
     def _log_initial_carp_role(self):
         """Announce the CARP role once at startup and seed _was_master, so the role
@@ -700,7 +651,7 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
                 # re-own the default route on the same edge (a failover flips which
                 # node installs 0/0). One shared CARP probe feeds both, as the tick does.
                 self._role_tick()
-                if self._renew_asap:
+                if self._renew_pending():
                     # That transition was a promotion (backup->master): return so
                     # _maintain_step re-runs and the transmit flow acquires/renews at
                     # once, rather than the newly-promoted node waiting out this sleep
@@ -762,10 +713,9 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         on stop."""
         remaining = secs
         while remaining > 0 and not self._signals.stopping:
-            if self._renew_asap:
+            if self._take_renew():
                 # Return as if T1 elapsed: the caller renews right away, which
                 # re-teaches upstream DHCP-snooping state after a master change.
-                self._renew_asap = False
                 return not self._signals.stopping
 
             chunk = min(HB_REFRESH, remaining)
@@ -1050,19 +1000,3 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
             LOG.warning("DHCP acquire (DISCOVER/REQUEST) failed -- retrying in %ds", self.redora_wait)
             if not self._wait_unbound(_jittered(self.redora_wait)):
                 self.redora_wait = min(self.redora_wait * 2, REDORA_MAX)
-
-
-def _identity_options(vendor_class, client_id, hostname):
-    """Optional DHCP identity options (empty -> not sent), added to every
-    DISCOVER/REQUEST/RENEW so the server sees a consistent client identity.
-    ISP interplay: satisfies servers that only lease to a known vendor-class
-    (opt 60), client-id (61) or hostname (12) -- the "client identity checks"
-    row of the README's ISP-security section."""
-    id_opts = []
-    if vendor_class:
-        id_opts.append((DhcpOptName.VENDOR_CLASS_ID, vendor_class))
-    if client_id:
-        id_opts.append((DhcpOptName.CLIENT_ID, client_id.encode()))
-    if hostname:
-        id_opts.append((DhcpOptName.HOSTNAME, hostname))
-    return id_opts

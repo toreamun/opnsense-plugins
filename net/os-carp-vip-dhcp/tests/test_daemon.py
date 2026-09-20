@@ -1123,15 +1123,15 @@ def test_master_transition_renews_early_and_nudges(lk):
     keeper = _nudge_keeper(lk, vhid=199)
     states = iter([True, False, True, True, True])
     keeper._probe_carp_master = lambda: next(states)
-    keeper._poll_carp_role()   # master from the start -> no transition
+    keeper._role.poll()   # master from the start -> no transition
     assert keeper._renew_asap is False
     assert keeper._nudge.last_nudge == 0.0
-    keeper._poll_carp_role()   # backup -> remembers the role
-    keeper._poll_carp_role()   # backup -> master (the forced nudge probes again)
+    keeper._role.poll()   # backup -> remembers the role
+    keeper._role.poll()   # backup -> master (the forced nudge probes again)
     assert keeper._renew_asap is True
     first = keeper._nudge.last_nudge
     assert first > 0
-    keeper._poll_carp_role()   # still master -> nothing new
+    keeper._role.poll()   # still master -> nothing new
     assert keeper._nudge.last_nudge == first
 
 
@@ -1144,11 +1144,11 @@ def test_promotion_requests_default_route_resync(lk):
     keeper._defroute = rec
     states = iter([False, True, True])
     keeper._probe_carp_master = lambda: next(states)
-    keeper._poll_carp_role()   # backup -> seeds role, no promotion
+    keeper._role.poll()   # backup -> seeds role, no promotion
     assert rec.resync_requests == 0
-    keeper._poll_carp_role()   # backup -> master: promotion -> resync requested once
+    keeper._role.poll()   # backup -> master: promotion -> resync requested once
     assert rec.resync_requests == 1
-    keeper._poll_carp_role()   # still master -> no new request
+    keeper._role.poll()   # still master -> no new request
     assert rec.resync_requests == 1
 
 
@@ -1157,8 +1157,8 @@ def test_losing_master_is_logged(lk, caplog):
     states = iter([True, False])
     keeper._probe_carp_master = lambda: next(states)
     with caplog.at_level("INFO", logger="lease-keeper"):
-        keeper._poll_carp_role()         # master
-        keeper._poll_carp_role()         # master -> backup
+        keeper._role.poll()         # master
+        keeper._role.poll()         # master -> backup
     assert any("lost CARP master" in r.getMessage() for r in caplog.records)
     assert keeper._renew_asap is False   # losing master triggers nothing else
 
@@ -1167,8 +1167,8 @@ def test_master_transition_renews_even_with_nudge_off(lk):
     keeper = _nudge_keeper(lk, arp_nudge=0, vhid=199)
     states = iter([False, True])
     keeper._probe_carp_master = lambda: next(states)
-    keeper._poll_carp_role()
-    keeper._poll_carp_role()
+    keeper._role.poll()
+    keeper._role.poll()
     assert keeper._renew_asap is True    # the early renew is not tied to the nudge
     assert keeper._nudge.last_nudge == 0.0     # but no nudge was sent
 
@@ -1201,7 +1201,7 @@ def test_sigusr2_flag_rechecks_carp_role_within_a_second(lk):
         calls["n"] += 1
         return calls["n"] > 1
     keeper._probe_carp_master = probe
-    keeper._poll_carp_role()   # first observation: records backup
+    keeper._role.poll()   # first observation: records backup
     assert keeper._renew_asap is False
     keeper._signals.request_recheck_role()       # what the SIGUSR2 handler sets on a CARP event
     keeper._sleep_interruptible(1)   # services the flag -> re-check -> transition
@@ -1663,11 +1663,11 @@ def test_demotion_makes_renew_asap_inert(lk):
     k = _keeper(lk, vhid=254)
     k._was_master = True                # currently master
     k._renew_asap = True                # a renew was pending
-    k._poll_carp_role(False)            # CARP demotes us to backup
+    k._role.poll(False)            # CARP demotes us to backup
     assert k._was_master is False
     assert k._renew_asap is True        # deliberately LEFT set (not hand-cleared)...
-    assert k._renew_pending() is False  # ...but role-gated inert while backup...
-    assert k._take_renew() is False     # ...and the hold loop will not consume it
+    assert k._role.renew_pending() is False  # ...but role-gated inert while backup...
+    assert k._role.take_renew() is False     # ...and the hold loop will not consume it
 
 
 def test_passive_backup_sends_no_nudge(lk, monkeypatch):
@@ -2235,7 +2235,7 @@ def test_log_initial_carp_role_announces_and_seeds(lk, caplog):
     k = _keeper(lk, vhid=254)
     k._probe_carp_master = lambda: True
     with caplog.at_level("INFO", logger="lease-keeper"):
-        k._log_initial_carp_role()
+        k._role.log_initial()
     assert k._was_master is True    # seeded so the first poll does not log a spurious transition
     assert any("initial CARP role for vhid 254: MASTER" in r.getMessage() for r in caplog.records)
 
@@ -2243,7 +2243,7 @@ def test_log_initial_carp_role_announces_and_seeds(lk, caplog):
 def test_log_initial_carp_role_skips_without_vhid(lk, caplog):
     k = _keeper(lk)   # no vhid
     with caplog.at_level("INFO", logger="lease-keeper"):
-        k._log_initial_carp_role()
+        k._role.log_initial()
     assert not any("initial CARP role" in r.getMessage() for r in caplog.records)
 
 
@@ -2254,12 +2254,12 @@ def test_initial_unknown_carp_role_is_resolved_on_first_poll(lk, caplog):
     k = _keeper(lk, vhid=254)
     k._probe_carp_master = lambda: None
     with caplog.at_level("INFO", logger="lease-keeper"):
-        k._log_initial_carp_role()
+        k._role.log_initial()
     assert k._was_master is None
     assert any("initial CARP role for vhid 254: unknown" in r.getMessage() for r in caplog.records)
     caplog.clear()
     with caplog.at_level("INFO", logger="lease-keeper"):
-        k._poll_carp_role(master=True)          # role becomes definite -> announced, no failover action
+        k._role.poll(master=True)          # role becomes definite -> announced, no failover action
     assert k._was_master is True
     assert any("CARP role for vhid 254: MASTER" in r.getMessage() for r in caplog.records)
     assert not k._renew_asap                     # initial determination, not a promotion

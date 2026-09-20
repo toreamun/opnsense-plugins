@@ -804,7 +804,7 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
             # keeper restart re-adopts its still-valid lease here (INIT-REBOOT, a few
             # ms), so a master keeps its inherited default -- no 0/0 flap -- instead of
             # tearing it down and reinstalling. Only when the acquire cannot bind (a
-            # lost lease, or a dead WAN: mode-D) do we withdraw, so a node that cannot
+            # lost lease, or a dead WAN) do we withdraw, so a node that cannot
             # route stops advertising 0/0. Role-independent, no ifconfig probe.
             #
             # Before that (possibly long: DORA + backoff) acquire, settle backup egress on

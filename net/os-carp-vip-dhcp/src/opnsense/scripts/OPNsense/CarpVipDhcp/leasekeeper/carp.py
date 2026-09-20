@@ -1,7 +1,7 @@
 """The CARP-role state machine for one keeper: it watches the master/backup role,
 owns the early-renew latch and the demote-on-lease-loss grace clock, and fires the
 promotion side effects through an injected hook. Kept in its own module so the role
-logic (which the enforce fail-stop / mode-D work builds on) has one home, separate
+logic (which a planned enforce-mode fail-stop follow-up builds on) has one home, separate
 from the maintain loop that drives it. The raw ifconfig probe and the promotion side
 effects (ARP nudge + default-route resync) are injected, so this object stays pure
 role logic with no capture / route / nudge dependencies.

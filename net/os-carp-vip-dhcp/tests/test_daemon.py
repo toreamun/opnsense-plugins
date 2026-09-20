@@ -1626,7 +1626,12 @@ def test_promotion_wakes_passive_sleep(lk, monkeypatch):
     k._signals.request_recheck_role()              # SIGUSR2 pending (CARP transition)
 
     def role_tick(*_a, **_kw):
-        k._renew_asap = True                       # _poll_carp_role sets this on became-master
+        # Model the became-master branch of _poll_carp_role faithfully: it both arms
+        # the early-renew latch AND commits _was_master=True. Committing the role is
+        # what makes _renew_pending() live via the role gate (rather than leaning on
+        # the unknown-role fail-safe), so this exercises a real promotion.
+        k._renew_asap = True
+        k._was_master = True
         return True
 
     monkeypatch.setattr(k, "_role_tick", role_tick)
@@ -1650,16 +1655,19 @@ def test_acquire_clears_renew_asap(lk, monkeypatch):
     assert k._renew_asap is False
 
 
-def test_demotion_clears_renew_asap(lk):
-    # A demotion cancels a pending early renew (a backup must not renew); otherwise
-    # _renew_asap would drift stale-True and later wake the passive sleep on any
-    # signal even without a real promotion.
+def test_demotion_makes_renew_asap_inert(lk):
+    # A demotion must not let a pending early renew fire (a backup must not renew).
+    # The latch is role-gated rather than cleared by hand: after a demotion it reads as
+    # not-pending (and the hold loop will not consume it), so it cannot wake the passive
+    # sleep or renew from the shared vMAC; a later promotion re-arms it.
     k = _keeper(lk, vhid=254)
     k._was_master = True                # currently master
     k._renew_asap = True                # a renew was pending
     k._poll_carp_role(False)            # CARP demotes us to backup
     assert k._was_master is False
-    assert k._renew_asap is False
+    assert k._renew_asap is True        # deliberately LEFT set (not hand-cleared)...
+    assert k._renew_pending() is False  # ...but role-gated inert while backup...
+    assert k._take_renew() is False     # ...and the hold loop will not consume it
 
 
 def test_passive_backup_sends_no_nudge(lk, monkeypatch):

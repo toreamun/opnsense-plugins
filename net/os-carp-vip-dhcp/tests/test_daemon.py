@@ -1626,7 +1626,12 @@ def test_promotion_wakes_passive_sleep(lk, monkeypatch):
     k._signals.request_recheck_role()              # SIGUSR2 pending (CARP transition)
 
     def role_tick(*_a, **_kw):
-        k._renew_asap = True                       # _poll_carp_role sets this on became-master
+        # Model the became-master branch of _poll_carp_role faithfully: it both arms
+        # the early-renew latch AND commits _was_master=True. Committing the role is
+        # what makes _renew_pending() live via the role gate (rather than leaning on
+        # the unknown-role fail-safe), so this exercises a real promotion.
+        k._renew_asap = True
+        k._was_master = True
         return True
 
     monkeypatch.setattr(k, "_role_tick", role_tick)

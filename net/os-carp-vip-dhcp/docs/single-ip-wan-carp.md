@@ -853,6 +853,8 @@ Most of these are edge cases - a WAN where the ISP isolates you per VLAN/port (t
   see step 4 in [section 6.3](#s6-3) for the WAN Hostname case.
 - **Changing the client-id of an existing keeper:** keepers created before the `mac`
   default keep their stored setting (empty = no option 61), so upgrading changes nothing.
+  The one exception is a keeper whose client-id was set to the literal text `mac` (any
+  case): that value now means type 1 + the MAC instead of the three letters.
   Most have no reason to change. To switch anyway (for example to be able to go back to a
   normal WAN DHCP later without a wait): pick a quiet time and check the lease time on the
   status page (an ISP that holds the old lease can refuse the new identity until it runs

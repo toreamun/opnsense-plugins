@@ -149,10 +149,12 @@ def iface_names():
 
 
 def client_id_label(setting, chaddr):
-    """The DHCP client-id (option 61) the keeper sends, as the daemon logs it: built
-    with the daemon's own encoder so the status page can never disagree with the
-    wire. "none" when the field is empty; the raw setting if it cannot be encoded
-    (a malformed chaddr would stop the daemon too)."""
+    """The configured DHCP client-id (option 61), formatted as the daemon logs it and
+    built with the daemon's own encoder, so it is exactly what a keeper started from
+    this keeper.conf sends. A running keeper keeps the value it was started with
+    until it restarts; its startup log line shows that one. "none" when the field is
+    empty; the raw setting if it cannot be encoded (a malformed chaddr would stop
+    the daemon too)."""
     if not setting:
         return _fmt_client_id(None)
     try:

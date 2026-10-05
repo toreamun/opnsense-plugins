@@ -394,18 +394,6 @@ def test_dhcpnak_in_reboot_names_the_client_identity_cause(lk, caplog, phase, hi
     assert any("client-id was changed" in r.getMessage() for r in caplog.records) is hinted
 
 
-def test_enforce_mismatch_names_the_client_identity_cause(lk, caplog):
-    # The server offering another address is not only a reservation problem: it also
-    # happens while it holds the target for a different client identity.
-    keeper = _keeper(lk)
-    keeper._dhcp._capture = types.SimpleNamespace(send_dhcp=lambda _msg: None)   # the RELEASE
-    with caplog.at_level("ERROR", logger="lease-keeper"):
-        assert keeper._follow.on_changed_address(
-            "100.64.4.60", _ack(lk, "100.64.4.60"), "DORA", True) is False
-    msg = " ".join(r.getMessage() for r in caplog.records)
-    assert "IP mismatch" in msg and "another client identity" in msg
-
-
 def test_follow_accepts_same_class(lk, tmp_path):
     keeper = _follow_keeper(lk, tmp_path)
     assert keeper._follow.on_changed_address("100.64.4.60", _ack(lk, "100.64.4.60"), "DORA", True) is True
@@ -433,15 +421,20 @@ def test_follow_throttled_within_interval(lk, tmp_path):
     assert keeper._follow.on_changed_address("100.64.4.61", _ack(lk, "100.64.4.61"), "DORA", True) is False
 
 
-def test_enforce_mismatch_refused(lk):
+def test_enforce_mismatch_refused(lk, caplog):
     keeper = _keeper(lk, follow=False)
     keeper._dhcp.binding.server = "100.64.4.1"
     keeper._dhcp.binding.yiaddr = "100.64.4.7"
     released = []
     keeper._dhcp.release = lambda *a: released.append(a)
-    assert keeper._follow.on_changed_address("100.64.4.60", _ack(lk, "100.64.4.60"), "DORA", True) is False
+    with caplog.at_level("ERROR", logger="lease-keeper"):
+        assert keeper._follow.on_changed_address("100.64.4.60", _ack(lk, "100.64.4.60"), "DORA", True) is False
     assert released == [("100.64.4.60", "100.64.4.1")]  # the refused grant is released...
     assert keeper._dhcp.binding.yiaddr is None   # ...and not held (run loop re-acquires)
+    # Not only a reservation problem: a server keyed on option 61 also offers another
+    # address while it holds the target for a different client identity.
+    msg = " ".join(r.getMessage() for r in caplog.records)
+    assert "IP mismatch" in msg and "another client identity" in msg
 
 
 # ---- observed peer ACK: converge follow from the peer's exchange (single-ip s.3) ----

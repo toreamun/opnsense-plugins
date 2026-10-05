@@ -12,10 +12,9 @@ from typing import Callable
 from .constants import (
     LOGGER_NAME,
     ACK, ATTEMPT_BACKOFF_CAP, BROADCAST_FLAG, CLIENT_ID_MAC, DEFAULT_LEASE, DhcpOptName,
-    DORA_ATTEMPTS, HTYPE_ETHERNET, IPV4_BROADCAST, MIN_LEASE, MIN_T1, NAK, OFFER, Phase, REBIND_MARGIN,
-    REBOOT_ATTEMPTS, RENEW_ATTEMPTS,
-    RENEW_TIMEOUT, REPLY_TIMEOUT, SEND_RETRY_DELAY, SendMsgType, T1_FACTOR, T2_FACTOR,
-    TimingSource)
+    DORA_ATTEMPTS, HTYPE_ETHERNET, IPV4_BROADCAST, MIN_LEASE, MIN_T1, NAK, OFFER, Phase,
+    REBIND_MARGIN, REBOOT_ATTEMPTS, RENEW_ATTEMPTS, RENEW_TIMEOUT, REPLY_TIMEOUT,
+    SEND_RETRY_DELAY, SendMsgType, T1_FACTOR, T2_FACTOR, TimingSource)
 from .util import _jittered, _mask_to_bits, _new_xid, mac2raw
 from .wire import DhcpReply, DhcpSend, _dhcp_options, _fmt_reply, _msg_text
 
@@ -432,14 +431,15 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
         # the parameter request list, and section 2 requires the same client-id as
         # in the messages that obtained the lease, or a server that keys on option
         # 61 cannot match the release to that lease.
-        cid = [(DhcpOptName.CLIENT_ID, self.client_id)] if self.client_id else []
+        options = [(DhcpOptName.MESSAGE_TYPE, SendMsgType.RELEASE), (DhcpOptName.SERVER_ID, server)]
+        if self.client_id is not None:
+            options.append((DhcpOptName.CLIENT_ID, self.client_id))
+        options.append("end")
         try:
             # No broadcast flag: RELEASE expects no reply to capture.
             self._capture.send_dhcp(DhcpSend(
                 eth_src=self.eth_src, ip_src=yiaddr, ip_dst=server or IPV4_BROADCAST,
-                chaddr=self.chraw, xid=self.xid, ciaddr=yiaddr, flags=0,
-                options=[(DhcpOptName.MESSAGE_TYPE, SendMsgType.RELEASE), (DhcpOptName.SERVER_ID, server)]
-                + cid + ["end"]))
+                chaddr=self.chraw, xid=self.xid, ciaddr=yiaddr, flags=0, options=options))
             LOG.info("DHCP RELEASE of %s sent (server %s)", yiaddr, server or "broadcast")
         except Exception as e:  # pylint: disable=broad-exception-caught
             LOG.warning("DHCP RELEASE of %s failed (server %s): %s",

@@ -458,12 +458,15 @@ the keeper) only need doing once.
      address for the node, one for the VIP), the keeper needs a *different* identity, or the
      ISP sees the two as one client.
 
-   A different identity is not an error, but an ISP that uses option 61 may treat the keeper
-   as a new device and refuse it until the old lease runs out (see [section 9.2](#s9)
-   *First cutover*). The keeper logs the client-id it sends in its startup line, and the
-   status page shows it under the lease MAC. If the ISP refuses the keeper after an identity
-   change, the log says so: a NAK to the first REQUEST, or an "IP mismatch" that names a
-   different client identity as a possible cause. `mac` needs
+   A different identity is not an error, but an ISP that uses option 61 treats the keeper as
+   a new device while it still holds the old lease (see [section 9.2](#s9) *First cutover*).
+   It may refuse the keeper until that lease runs out, or offer it a *different* address.
+   With **Follow** on, the keeper then follows that address and moves the VIP to it; with
+   Follow off it refuses it and keeps asking. The keeper logs the client-id it sends in its
+   startup line (the status page shows the configured one under the lease MAC). The log
+   shows an identity problem as a NAK to the first REQUEST, then either "ISP gave ... --
+   following" (Follow on) or an "IP mismatch" that names a different client identity as a
+   possible cause (Follow off). `mac` needs
    this plugin version or later on **both** nodes: an older keeper sends it as the three
    letters "mac", so the two nodes would present different identities. Upgrade both nodes
    before you create a keeper or set `mac`, and do not downgrade one node while it is in use.
@@ -851,7 +854,8 @@ Most of these are edge cases - a WAN where the ISP isolates you per VLAN/port (t
   release the lease, wait the cooldown out, *then* start the keeper. Failover reuses the
   *same* virtual MAC, so neither trap recurs. *(3)* An ISP that identifies clients by
   option 61 (the client-id) sees a new device if the keeper's client-id differs from what
-  the WAN sent before, and may stay silent until the old lease runs out. A new keeper sends
+  the WAN sent before, and may stay silent until the old lease runs out, or hand out a
+  different address (which a keeper with Follow on adopts as the new VIP). A new keeper sends
   `mac` (type 1 + the virtual MAC), which matches a normal OPNsense WAN in a default setup;
   see step 4 in [section 6.3](#s6-3) for the WAN Hostname case.
 - **Changing the client-id of an existing keeper:** keepers created before the `mac`
@@ -861,12 +865,14 @@ Most of these are edge cases - a WAN where the ISP isolates you per VLAN/port (t
   Most have no reason to change. To switch anyway (for example to be able to go back to a
   normal WAN DHCP later without a wait): pick a quiet time and check the lease time on the
   status page (an ISP that holds the old lease can refuse the new identity until it runs
-  out); make sure **both** nodes run this plugin version or later (an older keeper sends
-  `mac` as text); set **DHCP client-id** to `mac` on the master and save; sync the backup
-  with the keeper's **Synchronize and Restart** button (the backup must have the same
-  identity before any failover); then restart the keeper on the master. Check the status
-  page, the keeper's startup log line, or `tcpdump -vvni <wan> port 67` for
-  `Client-ID (61), length 7: ether`
+  out, or offer a different address). Decide what you want if it does: with **Follow** on
+  the keeper moves the VIP to the new address (a renumber); turn Follow off for the switch
+  (and back on afterwards) if you would rather wait and keep the address. Make sure **both** nodes run this plugin
+  version or later (an older keeper sends `mac` as text); set **DHCP client-id** to `mac`
+  on the master and save; sync the backup with the keeper's **Synchronize and Restart**
+  button (the backup must have the same identity before any failover); then restart the
+  keeper on the master. Check the keeper's startup log line (what the running keeper
+  sends), or `tcpdump -vvni <wan> port 67` for `Client-ID (61), length 7: ether`
   followed by the keeper's MAC (the virtual MAC `00:00:5e:00:01:xx`, where `xx` is the vhid
   in hex, or the chaddr override if one is set). Going back is the same with an empty field.
 - **Follow tracks an ISP renumber, including cross-subnet:** the keeper rewrites the CARP

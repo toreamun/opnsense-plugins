@@ -702,21 +702,13 @@ def test_client_id_mac_on_the_wire(lk):
     assert raw == bytes([61, 7, 1]) + CHADDR + bytes([255])
 
 
-class _SendRecorder:
-    """A capture stand-in that keeps every DhcpSend, to inspect the options sent."""
-    def __init__(self):
-        self.sent = []
-
-    def send_dhcp(self, msg):
-        self.sent.append(msg)
-
-
 def _release_options(keeper):
-    rec = _SendRecorder()
-    keeper._dhcp._capture = rec
+    # A capture stand-in that keeps every DhcpSend, to inspect the options sent.
+    sent = []
+    keeper._dhcp._capture = types.SimpleNamespace(send_dhcp=sent.append)
     keeper._dhcp.release("100.64.4.7", "100.64.4.1")
-    assert len(rec.sent) == 1
-    return [o for o in rec.sent[0].options if isinstance(o, tuple)]
+    assert len(sent) == 1
+    return [o for o in sent[0].options if isinstance(o, tuple)]
 
 
 def test_release_carries_the_client_id(lk):

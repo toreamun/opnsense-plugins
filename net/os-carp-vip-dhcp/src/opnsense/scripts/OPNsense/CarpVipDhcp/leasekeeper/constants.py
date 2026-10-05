@@ -54,6 +54,17 @@ class ArpOp(IntEnum):
     REPLY = 2
 
 
+# The client-id (option 61) setting that means "hardware type 1 (Ethernet) + this
+# keeper's chaddr" instead of a text identifier: the form FreeBSD dhclient sends when no
+# client-id is configured (RFC 2132 section 9.14), so the ISP sees the same client a
+# stock OPNsense WAN on the CARP virtual MAC would be. Matched case-insensitively.
+# RFC 4361 asks for DUID-based identifiers instead of ones built from a MAC that is
+# hard-wired to a NIC; the CARP virtual MAC is not hard-wired (it moves with the CARP
+# role), and matching the stock client is the point of this form.
+CLIENT_ID_MAC = "mac"
+HTYPE_ETHERNET = 1    # RFC 1700 hardware type, the first byte of a type-1 client-id
+
+
 class DhcpOpt(IntEnum):
     """DHCP option codes (RFC 2132) for exactly the options the keeper sends or
     reads, plus the two options-field markers (PAD/END). Names the wire numbers

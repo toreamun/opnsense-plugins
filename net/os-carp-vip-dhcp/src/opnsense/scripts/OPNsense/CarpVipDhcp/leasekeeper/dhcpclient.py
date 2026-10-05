@@ -11,8 +11,8 @@ from typing import Callable
 
 from .constants import (
     LOGGER_NAME,
-    ACK, ATTEMPT_BACKOFF_CAP, BROADCAST_FLAG, DEFAULT_LEASE, DhcpOptName, DORA_ATTEMPTS,
-    IPV4_BROADCAST, MIN_LEASE, MIN_T1, NAK, OFFER, Phase, REBIND_MARGIN,
+    ACK, ATTEMPT_BACKOFF_CAP, BROADCAST_FLAG, CLIENT_ID_MAC, DEFAULT_LEASE, DhcpOptName,
+    DORA_ATTEMPTS, HTYPE_ETHERNET, IPV4_BROADCAST, MIN_LEASE, MIN_T1, NAK, OFFER, Phase, REBIND_MARGIN,
     REBOOT_ATTEMPTS, RENEW_ATTEMPTS,
     RENEW_TIMEOUT, REPLY_TIMEOUT, SEND_RETRY_DELAY, SendMsgType, T1_FACTOR, T2_FACTOR,
     TimingSource)
@@ -22,17 +22,39 @@ from .wire import DhcpReply, DhcpSend, _dhcp_options, _fmt_reply, _msg_text
 LOG = logging.getLogger(LOGGER_NAME)
 
 
-def _identity_options(vendor_class, client_id, hostname):
+def _client_id_bytes(client_id, chaddr):
+    """The option 61 value for a client-id setting. CLIENT_ID_MAC (any case) gives
+    hardware type 1 followed by the 6 bytes of chaddr, the form FreeBSD dhclient
+    sends by default, so both HA nodes (same chaddr) present the same identity.
+    Any other value is sent as its text bytes."""
+    if client_id.strip().lower() == CLIENT_ID_MAC:
+        return bytes([HTYPE_ETHERNET]) + mac2raw(chaddr)
+    return client_id.encode()
+
+
+def _fmt_client_id(raw):
+    """A readable form of an option 61 value for the log: the type-1 MAC form,
+    the text form, or "none" when no client-id is sent."""
+    if raw is None:
+        return "none"
+    if len(raw) == 7 and raw[0] == HTYPE_ETHERNET:
+        return f"type 1 + {raw[1:].hex(':')}"
+    return repr(raw.decode(errors="replace"))
+
+
+def _identity_options(vendor_class, client_id, hostname, chaddr):
     """Optional DHCP identity options (empty -> not sent), added to every
     DISCOVER/REQUEST/RENEW so the server sees a consistent client identity.
     ISP interplay: satisfies servers that only lease to a known vendor-class
     (opt 60), client-id (61) or hostname (12) -- the "client identity checks"
-    row of the README's ISP-security section."""
+    row of the README's ISP-security section. A server that keys the lease on
+    option 61 (RFC 2131 section 4.2) treats a different client-id as a different
+    client, even on the same chaddr."""
     id_opts = []
     if vendor_class:
         id_opts.append((DhcpOptName.VENDOR_CLASS_ID, vendor_class))
     if client_id:
-        id_opts.append((DhcpOptName.CLIENT_ID, client_id.encode()))
+        id_opts.append((DhcpOptName.CLIENT_ID, _client_id_bytes(client_id, chaddr)))
     if hostname:
         id_opts.append((DhcpOptName.HOSTNAME, hostname))
     return id_opts
@@ -100,6 +122,11 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
 
         self._rx = None                # latest DhcpReply snapshot (set via feed(), sniffer thread)
         self._reply_ready = threading.Event()
+
+    @property
+    def client_id(self):
+        """The option 61 bytes this client sends, or None when it sends none."""
+        return next((v for n, v in self._id_opts if n == DhcpOptName.CLIENT_ID), None)
 
     def feed(self, rx):
         """Hand a first-party (xid-matched) DhcpReply to the waiting sequence.

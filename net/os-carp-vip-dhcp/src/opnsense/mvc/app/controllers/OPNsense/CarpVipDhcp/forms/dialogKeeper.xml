@@ -93,7 +93,7 @@
         <label>Client MAC override (chaddr)</label>
         <type>text</type>
         <advanced>true</advanced>
-        <help><![CDATA[Leave blank. By default the keeper's DHCP client uses the CARP virtual MAC, which is what you want: the lease, the ISP's IP-to-MAC binding and the VIP's own outbound traffic all sit on one MAC, and the lease follows the VIP to the peer on failover. Override ONLY if your ISP has a fixed reservation bound to a specific, different MAC that you cannot change. Do NOT enter this node's own interface MAC: the VIP still sends from the CARP virtual MAC, so on an ISP that binds the leased IP to the MAC (IP source guard) the gateway becomes unreachable ("No route to host"). Empty = the derived CARP virtual MAC.]]></help>
+        <help><![CDATA[Leave blank. By default the keeper's DHCP client uses the CARP virtual MAC, which is what you want: the lease, the ISP's IP-to-MAC binding and the VIP's own outbound traffic all sit on one MAC, and the lease follows the VIP to the peer on failover. Override ONLY if your ISP has a fixed reservation bound to a specific, different MAC that you cannot change. Do NOT enter this node's own interface MAC: the VIP still sends from the CARP virtual MAC, so on an ISP that binds the leased IP to the MAC (IP source guard) the gateway becomes unreachable ("No route to host"). Empty = the derived CARP virtual MAC. A DHCP client-id of <b>mac</b> follows this MAC.]]></help>
     </field>
     <field>
         <id>keeper.vendorClass</id>
@@ -107,14 +107,14 @@
         <label>DHCP client-id</label>
         <type>text</type>
         <advanced>true</advanced>
-        <help><![CDATA[Optional DHCP option 61, sent as an ASCII identifier for the keeper's own DHCP client. Do NOT copy the WAN interface's client-id verbatim, or the server may treat the keeper and the node's own WAN lease as one client. Empty = not sent.]]></help>
+        <help><![CDATA[DHCP option 61, the client identity some ISPs use instead of the MAC address. <b>mac</b> (the default for new keepers) sends hardware type 1 + the keeper's MAC (the CARP virtual MAC, or the override above), the same form a normal OPNsense WAN sends when its Hostname field is empty. Both HA nodes then send the same identity automatically. Any other value is sent as plain text. Empty = not sent. If your WAN interface had its Hostname field set (Interfaces > WAN, DHCP client section; not the system hostname), the normal WAN sent that text instead: put the same text here and in DHCP hostname. Changing this changes the identity the ISP sees, so an ISP that uses option 61 may refuse the keeper until the old lease runs out. Only if normal WAN DHCP still runs on the same interface next to the keeper, the two must have different identities.]]></help>
     </field>
     <field>
         <id>keeper.hostname</id>
         <label>DHCP hostname</label>
         <type>text</type>
         <advanced>true</advanced>
-        <help><![CDATA[Optional DHCP option 12 (hostname). Empty = not sent.]]></help>
+        <help><![CDATA[Optional DHCP option 12 (hostname). Empty = not sent. If your WAN interface had its Hostname field set before you moved to the keeper (Interfaces > WAN, DHCP client section), the normal WAN sent it both as hostname and as client identity: put the same text here and in DHCP client-id.]]></help>
     </field>
     <field>
         <id>keeper.description</id>

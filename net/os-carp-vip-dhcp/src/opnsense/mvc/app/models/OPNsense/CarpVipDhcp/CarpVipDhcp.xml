@@ -80,10 +80,17 @@
                 <!--
                     Optional DHCP request options for ISPs that only lease when they
                     see a specific vendor-class / client-id / hostname. Empty = the
-                    option is not sent. These identify the KEEPER's own DHCP client
-                    (its own chaddr); do not copy the WAN interface's client-id
-                    verbatim or the server may treat them as the same client. The
-                    masks forbid a pipe so the rendered keeper.conf line stays parseable.
+                    option is not sent. The masks forbid a pipe so the rendered
+                    keeper.conf line stays parseable.
+
+                    clientId "mac" sends option 61 as hardware type 1 + this keeper's
+                    chaddr, the same form a stock OPNsense WAN sends (FreeBSD dhclient
+                    default), so moving from a normal WAN DHCP on the virtual MAC to the
+                    keeper keeps the client identity the ISP already knows. It is the
+                    default for NEW keepers only: an existing keeper record stores the
+                    field (empty) in config.xml, and a stored value always wins over
+                    the model default, so upgrading does not change the identity of a
+                    keeper whose lease is already bound without option 61.
                 -->
                 <vendorClass type="TextField">
                     <Mask>/^[A-Za-z0-9 ._\/+-]{0,64}$/u</Mask>
@@ -91,8 +98,11 @@
                     <Required>N</Required>
                 </vendorClass>
                 <clientId type="TextField">
-                    <Mask>/^[A-Za-z0-9:._-]{0,128}$/u</Mask>
-                    <ValidationMessage>Client-id: letters, digits and : . _ - only (max 128).</ValidationMessage>
+                    <Default>mac</Default>
+                    <!-- RFC 2132 section 9.14: option 61 is at least 2 octets, so a
+                         1-character value would put an invalid option on the wire. -->
+                    <Mask>/^([A-Za-z0-9:._-]{2,128})?$/u</Mask>
+                    <ValidationMessage>Client-id: empty, or 2 to 128 of letters, digits and : . _ - only.</ValidationMessage>
                     <Required>N</Required>
                 </clientId>
                 <hostname type="TextField">

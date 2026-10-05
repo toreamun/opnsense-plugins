@@ -662,6 +662,63 @@ def test_id_opts_built_from_args(lk):
     assert ("hostname", "vip") in keeper._dhcp._id_opts
 
 
+@pytest.mark.parametrize("setting", ["mac", "MAC", " Mac "])
+def test_client_id_mac_sends_type1_plus_chaddr(lk, setting):
+    # "mac" = hardware type 1 + the chaddr (the dhclient default form), any case.
+    keeper = _keeper(lk, client_id=setting)
+    assert keeper._dhcp.client_id == b"\x01" + CHADDR
+
+
+def test_client_id_mac_follows_the_chaddr_override(lk):
+    # The keeper's chaddr IS the override when one is set (the template passes it as
+    # --chaddr), so "mac" must follow it, never the NIC's own MAC.
+    override = "02:aa:bb:cc:dd:ee"
+    keeper = lk.Keeper("eth0", override, "100.64.4.7", hbfile=None, client_id="mac")
+    assert keeper._dhcp.client_id == b"\x01" + bytes.fromhex("02aabbccddee")
+
+
+def test_client_id_mac_uses_chaddr_not_eth_src(lk):
+    # A separate frame source MAC must not leak into the identity: option 61 mirrors
+    # chaddr, which is what the server keys the lease on.
+    keeper = _keeper(lk, client_id="mac", eth_src="02:11:22:33:44:55")
+    assert keeper._dhcp.client_id == b"\x01" + CHADDR
+
+
+def test_client_id_text_is_sent_as_text(lk):
+    # A value that only contains "mac" is still text, as is a MAC typed by hand.
+    assert _keeper(lk, client_id="macbook")._dhcp.client_id == b"macbook"
+    assert _keeper(lk, client_id=CHADDR_STR)._dhcp.client_id == CHADDR_STR.encode()
+
+
+def test_client_id_absent_when_empty(lk):
+    assert _keeper(lk, client_id="")._dhcp.client_id is None
+    assert _keeper(lk)._dhcp.client_id is None
+
+
+def test_client_id_mac_on_the_wire(lk):
+    # Option 61, length 7, type 1, then the 6 MAC bytes: the bytes a server compares.
+    keeper = _keeper(lk, client_id="mac")
+    raw = lk._encode_dhcp_options([(lk.DhcpOptName.CLIENT_ID, keeper._dhcp.client_id)])
+    assert raw == bytes([61, 7, 1]) + CHADDR + bytes([255])
+
+
+def test_fmt_client_id(lk):
+    assert lk._fmt_client_id(None) == "none"
+    assert lk._fmt_client_id(b"\x01" + CHADDR) == "type 1 + " + CHADDR_STR
+    assert lk._fmt_client_id(b"keeper-1") == "'keeper-1'"
+
+
+def test_model_client_id_default_matches_the_daemon_keyword(lk):
+    # The GUI default for new keepers must be exactly the value the daemon treats as
+    # "type 1 + chaddr", or a new keeper would silently send the text instead.
+    model = os.path.join(os.path.dirname(__file__), "..", "src", "opnsense", "mvc", "app",
+                         "models", "OPNsense", "CarpVipDhcp", "CarpVipDhcp.xml")
+    with open(model, encoding="utf-8") as f:
+        text = f.read()
+    m = re.search(r'<clientId type="TextField">\s*<Default>([^<]*)</Default>', text)
+    assert m is not None and m.group(1) == lk.CLIENT_ID_MAC
+
+
 class _FakeCapture:
     """A no-op capture for tests that drive the keeper's send paths (nudge/DORA) without a
     real /dev/bpf socket: the send methods just succeed, so the ArpNudge stamps its clock."""

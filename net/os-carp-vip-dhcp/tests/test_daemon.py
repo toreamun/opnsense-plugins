@@ -383,6 +383,29 @@ def test_dhcpnak_logs_reason(lk, caplog, message, expect):
     assert any(expect in r.getMessage() for r in caplog.records)
 
 
+@pytest.mark.parametrize("phase, hinted", [("REBOOT", True), ("DORA", False), ("RENEW", False)])
+def test_dhcpnak_in_reboot_names_the_client_identity_cause(lk, caplog, phase, hinted):
+    # A NAK to INIT-REBOOT is what a server keyed on option 61 sends after a client-id
+    # change; the hint belongs there only, not on every NAK.
+    keeper = _keeper(lk)
+    keeper._dhcp._rx = _reply(lk, lk.NAK, lease=None, message="requested address not available")
+    with caplog.at_level("WARNING", logger="lease-keeper"):
+        keeper._dhcp._wait_for_dhcp_reply(lk.ACK, 0.2, phase)
+    assert any("client-id was changed" in r.getMessage() for r in caplog.records) is hinted
+
+
+def test_enforce_mismatch_names_the_client_identity_cause(lk, caplog):
+    # The server offering another address is not only a reservation problem: it also
+    # happens while it holds the target for a different client identity.
+    keeper = _keeper(lk)
+    keeper._dhcp._capture = types.SimpleNamespace(send_dhcp=lambda _msg: None)   # the RELEASE
+    with caplog.at_level("ERROR", logger="lease-keeper"):
+        assert keeper._follow.on_changed_address(
+            "100.64.4.60", _ack(lk, "100.64.4.60"), "DORA", True) is False
+    msg = " ".join(r.getMessage() for r in caplog.records)
+    assert "IP mismatch" in msg and "another client identity" in msg
+
+
 def test_follow_accepts_same_class(lk, tmp_path):
     keeper = _follow_keeper(lk, tmp_path)
     assert keeper._follow.on_changed_address("100.64.4.60", _ack(lk, "100.64.4.60"), "DORA", True) is True

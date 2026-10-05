@@ -17,6 +17,7 @@ import time
 import xml.etree.ElementTree as ET
 
 from keeperconf import CONFFILE, keeper_id, keeper_records
+from leasekeeper.dhcpclient import _client_id_bytes, _fmt_client_id
 from leasekeeper.ifprobe import carp_roles
 from leasekeeper.syscmd import ifconfig, run
 
@@ -147,6 +148,19 @@ def iface_names():
     return names
 
 
+def client_id_label(setting, chaddr):
+    """The DHCP client-id (option 61) the keeper sends, as the daemon logs it: built
+    with the daemon's own encoder so the status page can never disagree with the
+    wire. "none" when the field is empty; the raw setting if it cannot be encoded
+    (a malformed chaddr would stop the daemon too)."""
+    if not setting:
+        return _fmt_client_id(None)
+    try:
+        return _fmt_client_id(_client_id_bytes(setting, chaddr))
+    except ValueError:
+        return setting
+
+
 def read_keepers(states, names, conffile=CONFFILE, run_dir=RUN_DIR):
     """One status entry per keeper.conf line: config, process, CARP role and
     heartbeat fields, plus the derived arp_confirmed freshness flag. conffile /
@@ -168,6 +182,7 @@ def read_keepers(states, names, conffile=CONFFILE, run_dir=RUN_DIR):
             "iface": iface,
             "iface_name": names.get(iface, iface),
             "chaddr": chaddr,
+            "client_id": client_id_label(rec.get("clientid", ""), chaddr),
             "vhid": vhid,
             "carp_state": states.get(vhid) if vhid else None,
             "demote_on_lease_loss": rec.get("demote", "0") == "1",

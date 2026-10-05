@@ -80,6 +80,24 @@ def test_read_keepers_arp_nudge_field(tmp_path):
     assert keepers[1]["arp_nudge"] == 0
 
 
+def test_client_id_label():
+    # The daemon's own encoder/formatter, so the page shows exactly what goes on the wire.
+    assert status.client_id_label("", "00:00:5e:00:01:fe") == "none"
+    assert status.client_id_label("mac", "00:00:5e:00:01:fe") == "type 1 + 00:00:5e:00:01:fe"
+    assert status.client_id_label("keeper-1", "00:00:5e:00:01:fe") == "'keeper-1'"
+    assert status.client_id_label("mac", "zz:zz") == "mac"    # unencodable chaddr -> the raw setting
+
+
+def test_read_keepers_client_id_field(tmp_path):
+    conf = tmp_path / "keeper.conf"
+    conf.write_text(
+        "request=100.64.4.7|iface=eth0|chaddr=00:00:5e:00:01:fe|vhid=254|clientid=mac\n"
+        "request=100.64.4.8|iface=eth0|chaddr=00:00:5e:00:01:fd|vhid=253|clientid=\n")
+    keepers = status.read_keepers({}, {}, conffile=str(conf), run_dir=str(tmp_path))
+    assert keepers[0]["client_id"] == "type 1 + 00:00:5e:00:01:fe"
+    assert keepers[1]["client_id"] == "none"
+
+
 def _write_hb(path, arpok_age, now):
     path.write_text(
         f"{now} bound=100.64.4.7 lease=1800 t1=900 t2=1575 src=derived"

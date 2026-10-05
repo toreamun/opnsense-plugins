@@ -460,7 +460,10 @@ the keeper) only need doing once.
 
    A different identity is not an error, but an ISP that uses option 61 may treat the keeper
    as a new device and refuse it until the old lease runs out (see [section 9.2](#s9)
-   *First cutover*). The keeper logs the client-id it sends in its startup line. `mac` needs
+   *First cutover*). The keeper logs the client-id it sends in its startup line, and the
+   status page shows it under the lease MAC. If the ISP refuses the keeper after an identity
+   change, the log says so: a NAK to the first REQUEST, or an "IP mismatch" that names a
+   different client identity as a possible cause. `mac` needs
    this plugin version or later on **both** nodes: an older keeper sends it as the three
    letters "mac", so the two nodes would present different identities. Upgrade both nodes
    before you create a keeper or set `mac`, and do not downgrade one node while it is in use.
@@ -861,8 +864,9 @@ Most of these are edge cases - a WAN where the ISP isolates you per VLAN/port (t
   out); make sure **both** nodes run this plugin version or later (an older keeper sends
   `mac` as text); set **DHCP client-id** to `mac` on the master and save; sync the backup
   with the keeper's **Synchronize and Restart** button (the backup must have the same
-  identity before any failover); then restart the keeper on the master. Check the keeper's
-  startup log line, or `tcpdump -vvni <wan> port 67` for `Client-ID (61), length 7: ether`
+  identity before any failover); then restart the keeper on the master. Check the status
+  page, the keeper's startup log line, or `tcpdump -vvni <wan> port 67` for
+  `Client-ID (61), length 7: ether`
   followed by the keeper's MAC (the virtual MAC `00:00:5e:00:01:xx`, where `xx` is the vhid
   in hex, or the chaddr override if one is set). Going back is the same with an empty field.
 - **Follow tracks an ISP renumber, including cross-subnet:** the keeper rewrites the CARP

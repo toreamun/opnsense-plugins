@@ -263,9 +263,14 @@ class FollowPolicy:  # pylint: disable=too-many-instance-attributes
             self.target = got
             self._dhcp.adopt(rx)
             return True
-        # Enforce: a fixed reservation must always return the target.
-        LOG.error("%s: IP mismatch -- server %s gave %s, requested %s (reservation problem?)",
-                  phase, rx.server_id, got, self.target)
+        # Enforce: a fixed reservation must always return the target. A server that
+        # keys on the client-id (option 61) also hands out another address while it
+        # still holds the target for a different client identity, for example after
+        # the client-id was changed, so name that cause next to the reservation one.
+        LOG.error("%s: IP mismatch -- server %s gave %s, requested %s (reservation problem, or "
+                  "the server still holds %s for another client identity, e.g. after a client-id "
+                  "change, until that lease runs out)",
+                  phase, rx.server_id, got, self.target, self.target)
         self._hb_mismatch(got, self.target)
         if release_on_enforce:
             self._dhcp.release(got, rx.server_id)

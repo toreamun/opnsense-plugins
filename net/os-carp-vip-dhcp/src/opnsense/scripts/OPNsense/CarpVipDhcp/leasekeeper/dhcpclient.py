@@ -168,10 +168,15 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
                 # it is the operator's main clue for a rejected renew.
                 txt = _msg_text(rx.message)
                 reason = f" -- {txt}" if txt else ""
-                LOG.warning("DHCPNAK in %s for %s (server %s, xid 0x%08x%s)%s",
+                # A NAK to INIT-REBOOT means the server refuses the known address. Besides
+                # a lost reservation, a server that keys on the client-id does this while
+                # it holds the address for a different client identity.
+                hint = (" (if the client-id was changed, the server may hold this address for "
+                        "the old identity until that lease runs out)") if phase == Phase.REBOOT else ""
+                LOG.warning("DHCPNAK in %s for %s (server %s, xid 0x%08x%s)%s%s",
                             phase, for_addr or "an unspecified address",
                             rx.server_id or "unknown", self.xid,
-                            f" via relay {rx.giaddr}" if rx.giaddr else "", reason)
+                            f" via relay {rx.giaddr}" if rx.giaddr else "", reason, hint)
                 return rx
         return None
 

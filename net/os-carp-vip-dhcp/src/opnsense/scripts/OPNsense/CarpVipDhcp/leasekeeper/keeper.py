@@ -227,6 +227,12 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
             return
         # First-party path: a reply to OUR in-flight exchange (random xid,
         # regenerated per DORA). Parsed and fed to the waiting client sequence.
+        # Replies are matched on xid (and, for the peer path below, chaddr) only.
+        # RFC 6842 section 3 has servers echo option 61 and clients discard a reply
+        # whose client-id differs from their own; the keeper does not decode or
+        # compare the echoed client-id (an xid mismatch already rejects a reply to
+        # another exchange, and a server that alters the echo would otherwise
+        # block the lease entirely).
         if frame.xid == self._dhcp.xid:
             self._dhcp.feed(_parse_reply(frame))
             return

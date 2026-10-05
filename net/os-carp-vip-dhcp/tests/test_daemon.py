@@ -702,6 +702,40 @@ def test_client_id_mac_on_the_wire(lk):
     assert raw == bytes([61, 7, 1]) + CHADDR + bytes([255])
 
 
+class _SendRecorder:
+    """A capture stand-in that keeps every DhcpSend, to inspect the options sent."""
+    def __init__(self):
+        self.sent = []
+
+    def send_dhcp(self, msg):
+        self.sent.append(msg)
+
+
+def _release_options(keeper):
+    rec = _SendRecorder()
+    keeper._dhcp._capture = rec
+    keeper._dhcp.release("100.64.4.7", "100.64.4.1")
+    assert len(rec.sent) == 1
+    return [o for o in rec.sent[0].options if isinstance(o, tuple)]
+
+
+def test_release_carries_the_client_id(lk):
+    # RFC 2131: the same client-id as the messages that got the lease, or a server
+    # keyed on option 61 cannot match the RELEASE to it.
+    keeper = _keeper(lk, client_id="mac", vendor_class="acme", hostname="fw1")
+    opts = _release_options(keeper)
+    assert (lk.DhcpOptName.CLIENT_ID, b"\x01" + CHADDR) in opts
+    # Table 5: vendor class and hostname MUST NOT be in a RELEASE.
+    names = [n for n, _ in opts]
+    assert lk.DhcpOptName.VENDOR_CLASS_ID not in names
+    assert lk.DhcpOptName.HOSTNAME not in names
+
+
+def test_release_without_client_id_sends_none(lk):
+    names = [n for n, _ in _release_options(_keeper(lk))]
+    assert lk.DhcpOptName.CLIENT_ID not in names
+
+
 def test_fmt_client_id(lk):
     assert lk._fmt_client_id(None) == "none"
     assert lk._fmt_client_id(b"\x01" + CHADDR) == "type 1 + " + CHADDR_STR

@@ -94,6 +94,12 @@
     }
 
     function leaseCell(k) {
+        // A stopped keeper's heartbeat file is left over from its last run, so its
+        // bound/mismatch values are stale: show it neutral (the Running column
+        // already flags it), like the dashboard widget does.
+        if (k.running !== true) {
+            return '<span class="label label-default">' + "{{ lang._('not held') }}" + '</span>';
+        }
         if (k.mismatch === true) {
             return '<span class="label label-warning">'
                 + "{{ lang._('mismatch') }}" + ': ' + dash(k.bound) + '</span>';
@@ -104,17 +110,15 @@
         if (k.bound) {
             return '<span class="label label-warning">' + dash(k.bound) + '</span>';
         }
-        // A running CARP backup sends no DHCP and holds no lease of its own until it
-        // is promoted, so that is its normal state. Not holding is a fault anywhere
-        // else (master, INIT, a keeper without CARP); a stopped keeper is already
-        // flagged in the Running column.
-        if (k.running === true && k.carp_state === 'BACKUP') {
+        // A CARP backup sends no DHCP and holds no lease of its own until it is
+        // promoted, so that is its normal state. Not holding is a fault anywhere
+        // else (master, INIT, a keeper without CARP).
+        if (k.carp_state === 'BACKUP') {
             return '<span class="label label-default" title="'
                 + "{{ lang._('A CARP backup sends no DHCP; it takes over the lease when promoted') }}"
                 + '">' + "{{ lang._('standby') }}" + '</span>';
         }
-        let style = (k.running === true) ? 'label-warning' : 'label-default';
-        return '<span class="label ' + style + '">' + "{{ lang._('not held') }}" + '</span>';
+        return '<span class="label label-warning">' + "{{ lang._('not held') }}" + '</span>';
     }
 
     function leaseTimeCell(k) {

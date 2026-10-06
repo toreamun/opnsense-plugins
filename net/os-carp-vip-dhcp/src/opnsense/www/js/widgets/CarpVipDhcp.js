@@ -72,12 +72,15 @@ export default class CarpVipDhcp extends BaseTableWidget {
         $('#carpvipdhcp-widget-table').empty().append($('<div></div>').text(message));
     }
 
-    // ---- cell builders (return outerHTML strings; jQuery .text() escapes) ----
+    // ---- cell builders (return outerHTML strings; jQuery .text()/.attr() escape) ----
 
-    _cell(text, cls) {
+    _cell(text, cls, title) {
         const $s = $('<span></span>').text(text);
         if (cls) {
             $s.addClass(cls);
+        }
+        if (title) {
+            $s.attr('title', title);
         }
         return $s.prop('outerHTML');
     }
@@ -120,7 +123,7 @@ export default class CarpVipDhcp extends BaseTableWidget {
         // and CARP hook gate on, so it warns on transitional/unknown states those
         // positive gates do not.
         if (k.carp_state === 'BACKUP') {
-            return this._cell(this.translations.standby, 'text-muted');
+            return this._cell(this.translations.standby, 'text-muted', this.translations.standbytip);
         }
         return this._cell(this.translations.notheld, 'text-warning');
     }

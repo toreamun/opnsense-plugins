@@ -443,6 +443,34 @@ the keeper) only need doing once.
    NIC MAC (that binds the lease to one MAC while the VIP still sends from the CARP MAC, so an
    IP-source-guard ISP blackholes the gateway).
 
+   **Keep the client identity the ISP already knows.** Some ISPs identify a DHCP client by
+   option 61 (the client-id), not by the MAC. A normal OPNsense WAN sends option 61 as
+   hardware type 1 + the interface MAC. If you ran the pre-flight with the WAN MAC set to the
+   virtual MAC, the ISP now knows that identity. The keeper's **DHCP client-id** (advanced
+   mode) decides which identity the keeper uses:
+
+   - `mac` (the default for new keepers): type 1 + the virtual MAC, the same as a normal WAN
+     sends when its MAC is the virtual MAC. Leave it like this in a default setup.
+   - If the **Hostname field on the WAN interface** was set (_Interfaces ‣ [WAN]_, DHCP client
+     section; not the system hostname), the normal WAN sent that text as the client-id
+     instead. Put the same text in the keeper's **DHCP client-id** and **DHCP hostname**.
+   - Only if normal WAN DHCP keeps running on the same interface next to the keeper (one ISP
+     address for the node, one for the VIP), the keeper needs a *different* identity, or the
+     ISP sees the two as one client.
+
+   A different identity is not an error, but an ISP that uses option 61 treats the keeper as
+   a new device while it still holds the old lease (see [section 9.2](#s9) *First cutover*).
+   It may refuse the keeper until that lease runs out, or offer it a *different* address.
+   With **Follow** on, the keeper then follows that address and moves the VIP to it; with
+   Follow off it refuses it and keeps asking. The keeper logs the client-id it sends in its
+   startup line (the status page shows the configured one under the lease MAC). The log
+   shows an identity problem as a NAK to the first REQUEST, then either "ISP gave ... --
+   following" (Follow on) or an "IP mismatch" that names a different client identity as a
+   possible cause (Follow off). `mac` needs
+   this plugin version or later on **both** nodes: an older keeper sends it as the three
+   letters "mac", so the two nodes would present different identities. Upgrade both nodes
+   before you create a keeper or set `mac`, and do not downgrade one node while it is in use.
+
    <p align="center"><img src="img/settings-advanced.png" alt="Keeper dialog in advanced mode: Follow on, Sync firewall alias wan_carp_vip, Own default route by CARP role off, Client MAC override blank" width="700"><br>
    <sub><i>The keeper, advanced mode on: Follow on, alias <code>wan_carp_vip</code>, Client MAC override blank. <b>Own default route by CARP role</b> stays off in the baseline design (<a href="#s7">section 7</a>).</i></sub></p>
 5. **SYNC interface:** `10.2.2.1/30` / `.2/30`; pfsync + XMLRPC config-sync, under
@@ -824,7 +852,29 @@ Most of these are edge cases - a WAN where the ISP isolates you per VLAN/port (t
   MAC-binding ISP may hold the address on the *old* MAC for a few minutes and stay silent
   to the virtual MAC's `DISCOVER` (**ISP-dependent** - check with the probe above), so
   release the lease, wait the cooldown out, *then* start the keeper. Failover reuses the
-  *same* virtual MAC, so neither trap recurs.
+  *same* virtual MAC, so neither trap recurs. *(3)* An ISP that identifies clients by
+  option 61 (the client-id) sees a new device if the keeper's client-id differs from what
+  the WAN sent before, and may stay silent until the old lease runs out, or hand out a
+  different address (which a keeper with Follow on adopts as the new VIP). A new keeper sends
+  `mac` (type 1 + the virtual MAC), which matches a normal OPNsense WAN in a default setup;
+  see step 4 in [section 6.3](#s6-3) for the WAN Hostname case.
+- **Changing the client-id of an existing keeper:** keepers created before the `mac`
+  default keep their stored setting (empty = no option 61), so upgrading changes nothing.
+  The one exception is a keeper whose client-id was set to the literal text `mac` (any
+  case): that value now means type 1 + the MAC instead of the three letters.
+  Most have no reason to change. To switch anyway (for example to be able to go back to a
+  normal WAN DHCP later without a wait): pick a quiet time and check the lease time on the
+  status page (an ISP that holds the old lease can refuse the new identity until it runs
+  out, or offer a different address). Decide what you want if it does: with **Follow** on
+  the keeper moves the VIP to the new address (a renumber); turn Follow off for the switch
+  (and back on afterwards) if you would rather wait and keep the address. Make sure **both** nodes run this plugin
+  version or later (an older keeper sends `mac` as text); set **DHCP client-id** to `mac`
+  on the master and save; sync the backup with the keeper's **Synchronize and Restart**
+  button (the backup must have the same identity before any failover); then restart the
+  keeper on the master. Check the keeper's startup log line (what the running keeper
+  sends), or `tcpdump -vvni <wan> port 67` for `Client-ID (61), length 7: ether`
+  followed by the keeper's MAC (the virtual MAC `00:00:5e:00:01:xx`, where `xx` is the vhid
+  in hex, or the chaddr override if one is set). Going back is the same with an empty field.
 - **Follow tracks an ISP renumber, including cross-subnet:** the keeper rewrites the CARP
   VIP to the new address (after checking it is sane, in the same routability class, and
   from the expected server). A **same-subnet** change is seamless; on a **cross-subnet**
@@ -832,10 +882,10 @@ Most of these are edge cases - a WAN where the ISP isolates you per VLAN/port (t
   routing, so outbound keeps working - parity with a plain DHCP interface. The one gap: if
   the ACK carries **no subnet mask**, it can only move the address and logs a warning to
   fix the prefix and gateway by hand. (`follow off` pins the address and does none of this.)
-- **Identical DHCP client-id across nodes:** the shared-lease premise assumes the server
-  keys on `chaddr`. If it keys on the client-id (option 61) and the two nodes present
-  different ones, they can get *different* addresses - set the same client-id on both
-  (config-sync makes this automatic).
+- **Identical DHCP client-id across nodes:** if the server keys on the client-id
+  (option 61) instead of `chaddr` and the two nodes present different ones, they can get
+  *different* addresses. With `mac` both nodes derive it from the same virtual MAC; a text
+  value is kept identical by config-sync, as long as the backup is synced before a failover.
 
 ### 9.3 Failover and routing
 

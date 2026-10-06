@@ -18,7 +18,7 @@ from .constants import (
     ACK, BootpOp, HB_REFRESH, LEASE_PULSE_INTERVAL, LINK_KICK_DEBOUNCE,
     LINK_POLL_STEP, LOOP_ERROR_BACKOFF, Phase, REBIND_POLL_STEP, REDORA_MAX, REDORA_MIN,
     SNIFFER_RETRY, SNIFFER_WARMUP)
-from .dhcpclient import DhcpClient, DhcpHooks, _identity_options
+from .dhcpclient import DhcpClient, DhcpHooks, _fmt_client_id, _identity_options
 from .ifprobe import carrier_up, is_carp_master
 from .policy import ArpNudge, FollowHooks, FollowPolicy
 from .route import (BackupEgressReconciler, DefaultRouteMode, DefaultRouteReconciler,
@@ -147,7 +147,7 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         # policy hooks.
         self._dhcp = DhcpClient(
             self._capture, self._cfg.chaddr, self._cfg.eth_src,
-            _identity_options(vendor_class, client_id, hostname),
+            _identity_options(vendor_class, client_id, hostname, self._cfg.chaddr),
             hooks=DhcpHooks(
                 should_stop=lambda: self._signals.stopping,
                 ensure_sniffer=self._ensure_sniffer,
@@ -227,6 +227,12 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
             return
         # First-party path: a reply to OUR in-flight exchange (random xid,
         # regenerated per DORA). Parsed and fed to the waiting client sequence.
+        # Replies are matched on xid (and, for the peer path below, chaddr) only.
+        # RFC 6842 section 3 has servers echo option 61 and clients discard a reply
+        # whose client-id differs from their own; the keeper does not decode or
+        # compare the echoed client-id (an xid mismatch already rejects a reply to
+        # another exchange, and a server that alters the echo would otherwise
+        # block the lease entirely).
         if frame.xid == self._dhcp.xid:
             self._dhcp.feed(_parse_reply(frame))
             return
@@ -714,10 +720,13 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
 
         # eth-src matters for L2 debugging but only when it differs from the chaddr.
         ethsrc = f", eth-src {self._cfg.eth_src}" if self._cfg.eth_src != self._cfg.chaddr else ""
+        # The client-id is the ISP-visible identity when the server keys on option 61,
+        # so state it here instead of leaving it to a packet capture.
         LOG.info("lease-keeper %s up on %s (vhid %s, default-route %s): "
-                 "CARP MAC %s%s, requesting %s",
+                 "CARP MAC %s%s, client-id %s, requesting %s",
                  __version__, self._cfg.iface, self._cfg.vhid or "none", self._defroute.mode,
-                 self._cfg.chaddr, ethsrc, self._follow.target or "any")
+                 self._cfg.chaddr, ethsrc, _fmt_client_id(self._dhcp.client_id),
+                 self._follow.target or "any")
         self._role.log_initial()
         time.sleep(SNIFFER_WARMUP)
 

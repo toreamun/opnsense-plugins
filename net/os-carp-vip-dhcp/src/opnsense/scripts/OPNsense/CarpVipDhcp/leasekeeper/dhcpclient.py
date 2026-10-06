@@ -11,28 +11,52 @@ from typing import Callable
 
 from .constants import (
     LOGGER_NAME,
-    ACK, ATTEMPT_BACKOFF_CAP, BROADCAST_FLAG, DEFAULT_LEASE, DhcpOptName, DORA_ATTEMPTS,
-    IPV4_BROADCAST, MIN_LEASE, MIN_T1, NAK, OFFER, Phase, REBIND_MARGIN,
-    REBOOT_ATTEMPTS, RENEW_ATTEMPTS,
-    RENEW_TIMEOUT, REPLY_TIMEOUT, SEND_RETRY_DELAY, SendMsgType, T1_FACTOR, T2_FACTOR,
-    TimingSource)
+    ACK, ATTEMPT_BACKOFF_CAP, BROADCAST_FLAG, CLIENT_ID_MAC, DEFAULT_LEASE, DhcpOptName,
+    DORA_ATTEMPTS, HTYPE_ETHERNET, IPV4_BROADCAST, MIN_LEASE, MIN_T1, NAK, OFFER, Phase,
+    REBIND_MARGIN, REBOOT_ATTEMPTS, RENEW_ATTEMPTS, RENEW_TIMEOUT, REPLY_TIMEOUT,
+    SEND_RETRY_DELAY, SendMsgType, T1_FACTOR, T2_FACTOR, TimingSource)
 from .util import _jittered, _mask_to_bits, _new_xid, mac2raw
 from .wire import DhcpReply, DhcpSend, _dhcp_options, _fmt_reply, _msg_text
 
 LOG = logging.getLogger(LOGGER_NAME)
 
 
-def _identity_options(vendor_class, client_id, hostname):
+def _client_id_bytes(client_id, chaddr):
+    """The option 61 value for a client-id setting. CLIENT_ID_MAC (any case) gives
+    hardware type 1 followed by the 6 bytes of chaddr, the form FreeBSD dhclient
+    sends by default, so both HA nodes (same chaddr) present the same identity.
+    Any other value is sent as its text bytes, without a type byte, as dhclient
+    sends a configured text identifier. RFC 2132 section 9.14 defines the option
+    (type + identifier, at least 2 octets); servers compare it as opaque bytes,
+    so any change of value is a different client to them."""
+    if client_id.strip().lower() == CLIENT_ID_MAC:
+        return bytes([HTYPE_ETHERNET]) + mac2raw(chaddr)
+    return client_id.encode()
+
+
+def _fmt_client_id(raw):
+    """A readable form of an option 61 value for the log: the type-1 MAC form,
+    the text form, or "none" when no client-id is sent."""
+    if raw is None:
+        return "none"
+    if len(raw) == 7 and raw[0] == HTYPE_ETHERNET:
+        return f"type 1 + {raw[1:].hex(':')}"
+    return repr(raw.decode(errors="replace"))
+
+
+def _identity_options(vendor_class, client_id, hostname, chaddr):
     """Optional DHCP identity options (empty -> not sent), added to every
     DISCOVER/REQUEST/RENEW so the server sees a consistent client identity.
     ISP interplay: satisfies servers that only lease to a known vendor-class
     (opt 60), client-id (61) or hostname (12) -- the "client identity checks"
-    row of the README's ISP-security section."""
+    row of the README's ISP-security section. A server that keys the lease on
+    option 61 (RFC 2131 section 4.2) treats a different client-id as a different
+    client, even on the same chaddr."""
     id_opts = []
     if vendor_class:
         id_opts.append((DhcpOptName.VENDOR_CLASS_ID, vendor_class))
     if client_id:
-        id_opts.append((DhcpOptName.CLIENT_ID, client_id.encode()))
+        id_opts.append((DhcpOptName.CLIENT_ID, _client_id_bytes(client_id, chaddr)))
     if hostname:
         id_opts.append((DhcpOptName.HOSTNAME, hostname))
     return id_opts
@@ -88,7 +112,9 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
         self.eth_src = eth_src
 
         # Optional DHCP request options (empty -> not sent); added to every
-        # DISCOVER/REQUEST/RENEW so the server sees a consistent client identity.
+        # DISCOVER/REQUEST/RENEW/REBIND/RELEASE so the server sees a consistent
+        # client identity: RFC 2131 sections 2 and 4.2 require a client that sends
+        # a client-id to send the same one in all subsequent messages.
         self._id_opts = id_opts
         self._should_stop = hooks.should_stop
         self._ensure_sniffer = hooks.ensure_sniffer
@@ -100,6 +126,11 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
 
         self._rx = None                # latest DhcpReply snapshot (set via feed(), sniffer thread)
         self._reply_ready = threading.Event()
+
+    @property
+    def client_id(self):
+        """The option 61 bytes this client sends, or None when it sends none."""
+        return next((v for n, v in self._id_opts if n == DhcpOptName.CLIENT_ID), None)
 
     def feed(self, rx):
         """Hand a first-party (xid-matched) DhcpReply to the waiting sequence.
@@ -136,10 +167,15 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
                 # it is the operator's main clue for a rejected renew.
                 txt = _msg_text(rx.message)
                 reason = f" -- {txt}" if txt else ""
-                LOG.warning("DHCPNAK in %s for %s (server %s, xid 0x%08x%s)%s",
+                # A NAK to INIT-REBOOT means the server refuses the known address. Besides
+                # a lost reservation, a server that keys on the client-id does this while
+                # it holds the address for a different client identity.
+                hint = (" (if the client-id was changed, the server may hold this address for "
+                        "the old identity until that lease runs out)") if phase == Phase.REBOOT else ""
+                LOG.warning("DHCPNAK in %s for %s (server %s, xid 0x%08x%s)%s%s",
                             phase, for_addr or "an unspecified address",
                             rx.server_id or "unknown", self.xid,
-                            f" via relay {rx.giaddr}" if rx.giaddr else "", reason)
+                            f" via relay {rx.giaddr}" if rx.giaddr else "", reason, hint)
                 return rx
         return None
 
@@ -390,12 +426,20 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
         if not yiaddr:
             return
 
+        # The client-id is the only identity option a RELEASE carries: RFC 2131
+        # table 5 (section 4.4.1) allows it but forbids vendor class, hostname and
+        # the parameter request list, and section 2 requires the same client-id as
+        # in the messages that obtained the lease, or a server that keys on option
+        # 61 cannot match the release to that lease.
+        options = [(DhcpOptName.MESSAGE_TYPE, SendMsgType.RELEASE), (DhcpOptName.SERVER_ID, server)]
+        if self.client_id is not None:
+            options.append((DhcpOptName.CLIENT_ID, self.client_id))
+        options.append("end")
         try:
             # No broadcast flag: RELEASE expects no reply to capture.
             self._capture.send_dhcp(DhcpSend(
                 eth_src=self.eth_src, ip_src=yiaddr, ip_dst=server or IPV4_BROADCAST,
-                chaddr=self.chraw, xid=self.xid, ciaddr=yiaddr, flags=0,
-                options=[(DhcpOptName.MESSAGE_TYPE, SendMsgType.RELEASE), (DhcpOptName.SERVER_ID, server), "end"]))
+                chaddr=self.chraw, xid=self.xid, ciaddr=yiaddr, flags=0, options=options))
             LOG.info("DHCP RELEASE of %s sent (server %s)", yiaddr, server or "broadcast")
         except Exception as e:  # pylint: disable=broad-exception-caught
             LOG.warning("DHCP RELEASE of %s failed (server %s): %s",

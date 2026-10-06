@@ -383,6 +383,17 @@ def test_dhcpnak_logs_reason(lk, caplog, message, expect):
     assert any(expect in r.getMessage() for r in caplog.records)
 
 
+@pytest.mark.parametrize("phase, hinted", [("REBOOT", True), ("DORA", False), ("RENEW", False)])
+def test_dhcpnak_in_reboot_names_the_client_identity_cause(lk, caplog, phase, hinted):
+    # A NAK to INIT-REBOOT is what a server keyed on option 61 sends after a client-id
+    # change; the hint belongs there only, not on every NAK.
+    keeper = _keeper(lk)
+    keeper._dhcp._rx = _reply(lk, lk.NAK, lease=None, message="requested address not available")
+    with caplog.at_level("WARNING", logger="lease-keeper"):
+        keeper._dhcp._wait_for_dhcp_reply(lk.ACK, 0.2, phase)
+    assert any("client-id was changed" in r.getMessage() for r in caplog.records) is hinted
+
+
 def test_follow_accepts_same_class(lk, tmp_path):
     keeper = _follow_keeper(lk, tmp_path)
     assert keeper._follow.on_changed_address("100.64.4.60", _ack(lk, "100.64.4.60"), "DORA", True) is True
@@ -410,15 +421,20 @@ def test_follow_throttled_within_interval(lk, tmp_path):
     assert keeper._follow.on_changed_address("100.64.4.61", _ack(lk, "100.64.4.61"), "DORA", True) is False
 
 
-def test_enforce_mismatch_refused(lk):
+def test_enforce_mismatch_refused(lk, caplog):
     keeper = _keeper(lk, follow=False)
     keeper._dhcp.binding.server = "100.64.4.1"
     keeper._dhcp.binding.yiaddr = "100.64.4.7"
     released = []
     keeper._dhcp.release = lambda *a: released.append(a)
-    assert keeper._follow.on_changed_address("100.64.4.60", _ack(lk, "100.64.4.60"), "DORA", True) is False
+    with caplog.at_level("ERROR", logger="lease-keeper"):
+        assert keeper._follow.on_changed_address("100.64.4.60", _ack(lk, "100.64.4.60"), "DORA", True) is False
     assert released == [("100.64.4.60", "100.64.4.1")]  # the refused grant is released...
     assert keeper._dhcp.binding.yiaddr is None   # ...and not held (run loop re-acquires)
+    # Not only a reservation problem: a server keyed on option 61 also offers another
+    # address while it holds the target for a different client identity.
+    msg = " ".join(r.getMessage() for r in caplog.records)
+    assert "IP mismatch" in msg and "another client identity" in msg
 
 
 # ---- observed peer ACK: converge follow from the peer's exchange (single-ip s.3) ----
@@ -660,6 +676,89 @@ def test_id_opts_built_from_args(lk):
     assert ("vendor_class_id", "MSFT 5.0") in keeper._dhcp._id_opts
     assert ("client_id", b"keeper-1") in keeper._dhcp._id_opts
     assert ("hostname", "vip") in keeper._dhcp._id_opts
+
+
+@pytest.mark.parametrize("setting", ["mac", "MAC", " Mac "])
+def test_client_id_mac_sends_type1_plus_chaddr(lk, setting):
+    # "mac" = hardware type 1 + the chaddr (the dhclient default form), any case.
+    keeper = _keeper(lk, client_id=setting)
+    assert keeper._dhcp.client_id == b"\x01" + CHADDR
+
+
+def test_client_id_mac_follows_the_chaddr_override(lk):
+    # The keeper's chaddr IS the override when one is set (the template passes it as
+    # --chaddr), so "mac" must follow it, never the NIC's own MAC.
+    override = "02:aa:bb:cc:dd:ee"
+    keeper = lk.Keeper("eth0", override, "100.64.4.7", hbfile=None, client_id="mac")
+    assert keeper._dhcp.client_id == b"\x01" + bytes.fromhex("02aabbccddee")
+
+
+def test_client_id_mac_uses_chaddr_not_eth_src(lk):
+    # A separate frame source MAC must not leak into the identity: option 61 mirrors
+    # chaddr, which is what the server keys the lease on.
+    keeper = _keeper(lk, client_id="mac", eth_src="02:11:22:33:44:55")
+    assert keeper._dhcp.client_id == b"\x01" + CHADDR
+
+
+def test_client_id_text_is_sent_as_text(lk):
+    # A value that only contains "mac" is still text, as is a MAC typed by hand.
+    assert _keeper(lk, client_id="macbook")._dhcp.client_id == b"macbook"
+    assert _keeper(lk, client_id=CHADDR_STR)._dhcp.client_id == CHADDR_STR.encode()
+
+
+def test_client_id_absent_when_empty(lk):
+    assert _keeper(lk, client_id="")._dhcp.client_id is None
+    assert _keeper(lk)._dhcp.client_id is None
+
+
+def test_client_id_mac_on_the_wire(lk):
+    # Option 61, length 7, type 1, then the 6 MAC bytes: the bytes a server compares.
+    keeper = _keeper(lk, client_id="mac")
+    raw = lk._encode_dhcp_options([(lk.DhcpOptName.CLIENT_ID, keeper._dhcp.client_id)])
+    assert raw == bytes([61, 7, 1]) + CHADDR + bytes([255])
+
+
+def _release_options(keeper):
+    # A capture stand-in that keeps every DhcpSend, to inspect the options sent.
+    sent = []
+    keeper._dhcp._capture = types.SimpleNamespace(send_dhcp=sent.append)
+    keeper._dhcp.release("100.64.4.7", "100.64.4.1")
+    assert len(sent) == 1
+    return [o for o in sent[0].options if isinstance(o, tuple)]
+
+
+def test_release_carries_the_client_id(lk):
+    # RFC 2131: the same client-id as the messages that got the lease, or a server
+    # keyed on option 61 cannot match the RELEASE to it.
+    keeper = _keeper(lk, client_id="mac", vendor_class="acme", hostname="fw1")
+    opts = _release_options(keeper)
+    assert (lk.DhcpOptName.CLIENT_ID, b"\x01" + CHADDR) in opts
+    # Table 5: vendor class and hostname MUST NOT be in a RELEASE.
+    names = [n for n, _ in opts]
+    assert lk.DhcpOptName.VENDOR_CLASS_ID not in names
+    assert lk.DhcpOptName.HOSTNAME not in names
+
+
+def test_release_without_client_id_sends_none(lk):
+    names = [n for n, _ in _release_options(_keeper(lk))]
+    assert lk.DhcpOptName.CLIENT_ID not in names
+
+
+def test_fmt_client_id(lk):
+    assert lk._fmt_client_id(None) == "none"
+    assert lk._fmt_client_id(b"\x01" + CHADDR) == "type 1 + " + CHADDR_STR
+    assert lk._fmt_client_id(b"keeper-1") == "'keeper-1'"
+
+
+def test_model_client_id_default_matches_the_daemon_keyword(lk):
+    # The GUI default for new keepers must be exactly the value the daemon treats as
+    # "type 1 + chaddr", or a new keeper would silently send the text instead.
+    model = os.path.join(os.path.dirname(__file__), "..", "src", "opnsense", "mvc", "app",
+                         "models", "OPNsense", "CarpVipDhcp", "CarpVipDhcp.xml")
+    with open(model, encoding="utf-8") as f:
+        text = f.read()
+    m = re.search(r'<clientId type="TextField">\s*<Default>([^<]*)</Default>', text)
+    assert m is not None and m.group(1) == lk.CLIENT_ID_MAC
 
 
 class _FakeCapture:

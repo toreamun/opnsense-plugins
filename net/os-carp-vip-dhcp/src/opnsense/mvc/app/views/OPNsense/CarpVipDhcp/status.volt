@@ -189,7 +189,9 @@
                     + '<td>' + hbAgeCell(k.hb_age) + '</td>'
                     + '<td>' + leaseTimeCell(k) + '</td>'
                     + '<td>' + nudgeCell(k) + '</td>'
-                    + '<td>' + dash(k.chaddr) + '</td>'
+                    + '<td>' + dash(k.chaddr)
+                    + '<br><small class="text-muted">' + "{{ lang._('client-id') }}" + ': '
+                    + dash(k.client_id) + '</small></td>'
                     + '</tr>';
             });
             $('#keeper_rows').html(rows);

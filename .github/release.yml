@@ -1,0 +1,22 @@
+# Categories for GitHub's "Generate release notes". A pull request lands in the
+# first category whose label it carries, so a PR labelled both bug and
+# documentation is listed under Bug fixes.
+changelog:
+  categories:
+    - title: Features
+      labels:
+        - enhancement
+    - title: Bug fixes
+      labels:
+        - bug
+    - title: Documentation
+      labels:
+        - documentation
+    - title: Maintenance
+      labels:
+        - maintenance
+        - dependencies
+        - github_actions
+    - title: Other changes
+      labels:
+        - "*"

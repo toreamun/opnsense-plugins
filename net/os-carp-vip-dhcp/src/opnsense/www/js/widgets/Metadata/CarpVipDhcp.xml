@@ -9,6 +9,8 @@
             <nudge>nudge</nudge>
             <held>held</held>
             <notheld>not held</notheld>
+            <standby>standby</standby>
+            <standbytip>A CARP backup sends no DHCP; it takes over the lease when promoted</standbytip>
             <mismatch>mismatch</mismatch>
             <stopped>stopped</stopped>
             <off>off</off>

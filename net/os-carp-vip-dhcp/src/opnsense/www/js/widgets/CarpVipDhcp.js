@@ -72,12 +72,15 @@ export default class CarpVipDhcp extends BaseTableWidget {
         $('#carpvipdhcp-widget-table').empty().append($('<div></div>').text(message));
     }
 
-    // ---- cell builders (return outerHTML strings; jQuery .text() escapes) ----
+    // ---- cell builders (return outerHTML strings; jQuery .text()/.attr() escape) ----
 
-    _cell(text, cls) {
+    _cell(text, cls, title) {
         const $s = $('<span></span>').text(text);
         if (cls) {
             $s.addClass(cls);
+        }
+        if (title) {
+            $s.attr('title', title);
         }
         return $s.prop('outerHTML');
     }
@@ -113,14 +116,16 @@ export default class CarpVipDhcp extends BaseTableWidget {
             return this._cell(this.translations.held, 'text-success');
         }
         // Not holding the lease. A CARP backup is passive (no DHCP, no lease of its
-        // own until promoted), so that is its normal state -- neutral. Everything
-        // else (master, INIT, a non-CARP sole keeper, an unknown state) is warned:
-        // only a confirmed BACKUP is silenced. Note this reads the live ifconfig
-        // carp_state, not the heartbeat master= token the status banner and CARP
-        // hook gate on, so it warns on transitional/unknown states those positive
-        // gates do not.
-        const cls = k.carp_state === 'BACKUP' ? 'text-muted' : 'text-warning';
-        return this._cell(this.translations.notheld, cls);
+        // own until promoted), so that is its normal state: shown as standby,
+        // neutral. Everything else (master, INIT, a non-CARP sole keeper, an unknown
+        // state) is warned: only a confirmed BACKUP is silenced. Note this reads the
+        // live ifconfig carp_state, not the heartbeat master= token the status banner
+        // and CARP hook gate on, so it warns on transitional/unknown states those
+        // positive gates do not.
+        if (k.carp_state === 'BACKUP') {
+            return this._cell(this.translations.standby, 'text-muted', this.translations.standbytip);
+        }
+        return this._cell(this.translations.notheld, 'text-warning');
     }
 
     _nudgeText(k) {

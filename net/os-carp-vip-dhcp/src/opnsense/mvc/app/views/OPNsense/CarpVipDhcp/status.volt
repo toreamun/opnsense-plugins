@@ -192,9 +192,12 @@
         } else if (mtagPcp === 0) {
             warn = "{{ lang._('VLAN priority not applied: net.link.vlan.mtag_pcp is 0. Set it to 1 under System: Settings: Tunables.') }}";
         }
+        // Visible text, like the ARP nudge's "no reply", so the warning does not
+        // depend on hovering the icon; the tooltip carries the detail.
         if (warn !== null) {
-            line += ' <span class="text-warning" title="' + warn + '">'
-                + '<i class="fa fa-exclamation-triangle fa-fw"></i></span>';
+            line += ' <small class="text-warning" title="' + warn + '">'
+                + '<i class="fa fa-exclamation-triangle fa-fw" aria-hidden="true"></i>'
+                + "{{ lang._('not applied') }}" + '</small>';
         }
         return line;
     }

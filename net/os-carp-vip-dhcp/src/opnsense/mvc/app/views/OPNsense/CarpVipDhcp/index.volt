@@ -24,10 +24,12 @@
     // Base dialogs have no declarative "show-if-other-field", so field couplings are
     // toggled in JS, mirroring the core pattern (the OpenVPN instance dialog does the
     // same). Hidden rows keep their values (the daemon ignores an inapplicable field);
-    // this only declutters the dialog. Every field toggled here is advanced, so it never
-    // appears unless advanced mode is on, gated on the toggle state exactly as core does.
+    // this only declutters the dialog. An advanced field toggled here never appears
+    // unless advanced mode is on, gated on the toggle state exactly as core does; a basic
+    // field depends only on its condition.
     function cvdToggleConditionalFields() {
         let advancedOn = $("#DialogKeeper [id^='show_advanced_']").hasClass("fa-toggle-on");
+        function basicRow(id, show) { $("#keeper\\." + id).closest("tr").toggle(show); }
         function advRow(id, show) { $("#keeper\\." + id).closest("tr").toggle(show && advancedOn); }
 
         // CARP failover on lease loss applies only to a fixed reservation, so it is
@@ -38,7 +40,7 @@
         if (following) {
             $("#keeper\\.demoteOnLeaseLoss").prop("checked", false);
         }
-        advRow("demoteOnLeaseLoss", !following);
+        basicRow("demoteOnLeaseLoss", !following);
 
         // Backup egress needs "Own default route by CARP role" on observe/enforce; its
         // sub-fields need the feature enabled, and the prefix list needs the prefixes form.

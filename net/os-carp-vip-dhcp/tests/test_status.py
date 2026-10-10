@@ -84,8 +84,8 @@ def test_client_id_label():
     # The daemon's own encoder/formatter, so the page shows exactly what goes on the wire.
     assert status.client_id_label("", "00:00:5e:00:01:fe") == "none"
     assert status.client_id_label("mac", "00:00:5e:00:01:fe") == "type 1 + 00:00:5e:00:01:fe"
-    assert status.client_id_label("keeper-1", "00:00:5e:00:01:fe") == "'keeper-1'"
-    assert status.client_id_label("mac", "zz:zz") == "mac"    # unencodable chaddr -> the raw setting
+    assert status.client_id_label("keeper-1", "00:00:5e:00:01:fe") == "text, 8 bytes"   # value never shown
+    assert status.client_id_label("mac", "zz:zz") == "invalid"    # unencodable chaddr, never the setting
 
 
 def test_read_keepers_client_id_field(tmp_path):

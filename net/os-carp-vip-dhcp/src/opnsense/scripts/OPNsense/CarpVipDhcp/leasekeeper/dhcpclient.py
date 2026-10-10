@@ -35,13 +35,15 @@ def _client_id_bytes(client_id, chaddr):
 
 
 def _fmt_client_id(raw):
-    """A readable form of an option 61 value for the log: the type-1 MAC form,
-    the text form, or "none" when no client-id is sent."""
+    """A readable form of an option 61 value for the log and the status page: the
+    type-1 MAC form, "none" when no client-id is sent, and for any other value only
+    its kind and length. Some ISPs put a credential in the client-id, so its text is
+    never shown."""
     if raw is None:
         return "none"
     if len(raw) == 7 and raw[0] == HTYPE_ETHERNET:
         return f"type 1 + {raw[1:].hex(':')}"
-    return repr(raw.decode(errors="replace"))
+    return f"text, {len(raw)} bytes"
 
 
 def _identity_options(vendor_class, client_id, hostname, chaddr):

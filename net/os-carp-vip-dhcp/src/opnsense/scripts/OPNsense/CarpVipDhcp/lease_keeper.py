@@ -49,8 +49,17 @@ the carrier's guards see consistent state. The README's "Playing nicely with
 ISP access-network security" section is the full map.
 
 Usage:
+  lease_keeper.py --conf <keeper.conf> --keeper-id <id> ...  # as rc.d starts it
   lease_keeper.py --iface <if> --chaddr <mac> --request <ip>
   lease_keeper.py ... --once            # one-shot claim+verify+release (test)
+
+rc.d passes only the keeper id and the file paths; the daemon reads its settings
+from its own keeper.conf record, so values such as the DHCP client-id never
+appear on the command line (visible to every local user in ps). A value option
+given on the command line wins over the record; a flag is on if either sets it.
+The full option set stays for manual runs, --once, and a daemon(8) supervisor
+started by an older version, which respawns this script with every setting on
+its command line.
 """
 
 import argparse
@@ -60,6 +69,7 @@ import signal
 import sys
 from logging.handlers import RotatingFileHandler
 
+import keeperconf
 from leasekeeper.capture_bpf import BpfCapture
 from leasekeeper.constants import LOGGER_NAME
 from leasekeeper.keeper import Keeper, carp_master
@@ -75,6 +85,35 @@ LOG = logging.getLogger(LOGGER_NAME)
 # only consumer rather than in the shared constants module.
 LOG_MAX_BYTES = 512 * 1024
 LOG_BACKUPS = 3
+
+# Exit status when --keeper-id has no record in --conf (or the file is unreadable).
+# configd re-renders keeper.conf by truncating it first, so a restart can briefly
+# find the file empty; daemon(8) -r restarts the child after its restart delay and
+# the next start finds the record.
+EXIT_NO_RECORD = 6
+
+# keeper.conf keys and the argparse destinations they fill (template keys; see
+# keeperconf.py). "demote" is read only by the CARP status hook.
+_CONF_VALUES = {
+    "request": "request",
+    "iface": "iface",
+    "chaddr": "chaddr",
+    "vhid": "vhid",
+    "vendorclass": "vendor_class",
+    "clientid": "client_id",
+    "hostname": "hostname",
+    "arpnudge": "arp_nudge",
+    "defaultroutemode": "default_route_mode",
+    "backupegressform": "backup_egress_form",
+    "backupegressgateway": "backup_egress_gateway",
+    "backupegressinterface": "backup_egress_interface",
+    "backupegressprefixes": "backup_egress_prefixes",
+}
+_CONF_FLAGS = {
+    "follow": "follow",
+    "arplistenpromisc": "arp_listen_promisc",
+    "backupegress": "backup_egress",
+}
 
 
 def acquire_pidfile(path):
@@ -133,11 +172,41 @@ def _split_prefixes(raw):
     return tuple((raw or "").replace(",", " ").split())
 
 
+def _find_record(conf, keeper_id):
+    """This keeper's keeper.conf record, or None when the file has no line for it."""
+    for record in keeperconf.keeper_records(conf):
+        if keeperconf.keeper_id(record["request"]) == keeper_id:
+            return record
+    return None
+
+
+def _record_defaults(record):
+    """Parser defaults from a keeper.conf record, so an option given on the command
+    line still wins. An empty field means "not set" in keeper.conf and leaves the
+    parser default; a flag field turns the flag on only when it is "1". An ARP nudge
+    interval that is not a number (only reachable via a hand-edited config.xml) is
+    dropped with a warning, so the nudge stays off instead of argparse exiting 2 into
+    a daemon(8) -r crash loop."""
+    defaults = {dest: record[key] for key, dest in _CONF_VALUES.items() if record.get(key)}
+    defaults.update({dest: True for key, dest in _CONF_FLAGS.items() if record.get(key) == "1"})
+    try:
+        int(defaults.get("arp_nudge", 0))
+    except ValueError:
+        LOG.warning("invalid ARP nudge interval %r -- the nudge stays off", defaults.pop("arp_nudge"))
+    return defaults
+
+
 def _build_arg_parser():
     """The daemon's CLI."""
     ap = argparse.ArgumentParser(description="Robust DHCP lease-keeper (chaddr decoupled from the iface MAC)")
-    ap.add_argument("--iface", required=True)
-    ap.add_argument("--chaddr", required=True)
+    ap.add_argument("--conf", default=None,
+                    help="keeper.conf to read this keeper's settings from (with --keeper-id)")
+    ap.add_argument("--keeper-id", default=None,
+                    help="filesystem-safe id of the keeper.conf record to use (the request IP)")
+    # --iface and --chaddr are required, but may come from the keeper.conf record;
+    # _settings() checks them once the record is applied.
+    ap.add_argument("--iface", default=None)
+    ap.add_argument("--chaddr", default=None)
     ap.add_argument("--request", default=None)
     ap.add_argument("--eth-src", default=None)
     ap.add_argument("--pidfile", default="/var/run/lease-keeper.pid")
@@ -156,17 +225,14 @@ def _build_arg_parser():
                     help="put the capture socket in promiscuous mode so the gateway's "
                          "unicast ARP reply is seen on NICs that filter non-primary "
                          "unicast MACs (default off; only needed if replies aren't seen)")
-    # Backward compatibility for one upgrade cycle: the capture-backend selector
-    # was removed (bpf is the only backend now), but a keeper started by the
-    # previous version has a daemon(8) supervisor whose command line still carries
-    # --capture-backend. Accept and ignore it so that supervisor's next restart
-    # runs this script without exiting 2 and crash-looping until a reconfigure
-    # re-renders the arguments.
+    # Accepted and ignored (bpf is the only backend): a daemon(8) supervisor started by
+    # an older version may still carry --capture-backend on its command line, and its
+    # next restart must run this script instead of exiting 2 and crash-looping.
     ap.add_argument("--capture-backend", help=argparse.SUPPRESS)
     # No argparse `choices` on the two enum args below: an unrecognised value is
-    # coerced to a safe default with a warning in main() (see DefaultRouteMode /
+    # coerced to a safe default with a warning in _settings() (see DefaultRouteMode /
     # BackupEgressForm .coerce), not rejected with exit 2 -- which daemon(8) -r
-    # would turn into a crash loop. rc.d passes them through unchecked.
+    # would turn into a crash loop. The keeper.conf record carries any string.
     ap.add_argument("--default-route-mode", default=DefaultRouteMode.OFF.value,
                     help="own the IPv4 default route by CARP role: off (default), observe "
                          "(log what it would do, no FIB write), or enforce (install/withdraw "
@@ -210,16 +276,37 @@ def _setup_logging(logfile):
                     logfile, logfile_error)
 
 
-def main():
-    """CLI entry point: parse args, wire up the Keeper and signals, run."""
-    args = _build_arg_parser().parse_args()
+def _settings():
+    """Parse the command line and set up logging. With --conf/--keeper-id, this
+    keeper's keeper.conf record becomes the parser defaults and the command line is
+    parsed again; the free-string enum values are then coerced now that logging is
+    up. Returns the settings; exits the process (2, or EXIT_NO_RECORD when the record
+    is missing) when the daemon cannot start."""
+    parser = _build_arg_parser()
+    args = parser.parse_args()
     _setup_logging(args.logfile)
-
-    # Validate the two free-string enum args now that logging is up: an unknown
-    # value (only reachable via a hand-edited config.xml) falls back to a safe
-    # default with a warning instead of crash-looping under daemon(8) -r.
+    if bool(args.conf) != bool(args.keeper_id):
+        LOG.critical("--conf and --keeper-id must be given together -- the lease keeper cannot start")
+        sys.exit(2)
+    if args.conf:
+        record = _find_record(args.conf, args.keeper_id)
+        if record is None:
+            LOG.error("no keeper %s in %s (being rewritten, or the keeper was removed) -- "
+                      "exiting; the supervisor retries", args.keeper_id, args.conf)
+            sys.exit(EXIT_NO_RECORD)
+        parser.set_defaults(**_record_defaults(record))
+        args = parser.parse_args()
     args.default_route_mode = DefaultRouteMode.coerce(args.default_route_mode)
     args.backup_egress_form = BackupEgressForm.coerce(args.backup_egress_form)
+    if not args.iface or not args.chaddr:
+        LOG.critical("no interface or client MAC (chaddr) given -- the lease keeper cannot start")
+        sys.exit(2)
+    return args
+
+
+def main():
+    """CLI entry point: parse args, wire up the Keeper and signals, run."""
+    args = _settings()
 
     # Single-instance guard BEFORE any FIB mutation: the startup fail-stop withdraw
     # below deletes a default, so a duplicate start (pidfile held by the live owner)

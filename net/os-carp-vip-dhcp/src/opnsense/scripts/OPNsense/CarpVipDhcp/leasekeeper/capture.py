@@ -11,14 +11,18 @@ from .wire import DhcpSend
 
 class Capture(Protocol):
     """The interface a capture backend satisfies once constructed (with the
-    interface, a promiscuous flag and the two neutral-frame callbacks): the
-    keeper drives it via start/stop/alive and the two send methods, and main()
-    probes the static availability check before starting. Typing the keeper's
+    interface, a promiscuous flag, the two neutral-frame callbacks and a VLAN
+    priority): the keeper drives it via start/stop/alive and the two send methods,
+    and main() probes the static availability check before starting. The keeper
+    also reads vlan_pcp_error (why the VLAN priority could not be set at the last
+    start, or None) for its heartbeat. Typing the keeper's
     backend against this catches an implementation that drifts from the shape it
     drives. Construction is not part of the protocol (nothing builds a backend
     through it), so an untyped backend __init__ does not have to match here."""
     # Interface stubs: the class docstring documents the contract.
     # pylint: disable=missing-function-docstring
+
+    vlan_pcp_error: "str | None"
 
     @staticmethod
     def unavailable_reason() -> "str | None": ...

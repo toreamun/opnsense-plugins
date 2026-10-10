@@ -4,6 +4,7 @@ fcntl (for the ioctls) is imported defensively so the module still loads on
 non-POSIX dev hosts; BpfCapture.start() reports the missing module at runtime.
 """
 import ctypes
+import errno
 import logging
 import os
 import select
@@ -17,7 +18,7 @@ from .constants import (
     DHCP_CLIENT_PORT, DHCP_SERVER_PORT, ETHER_BROADCAST, PARSE_ERROR_LOG_INTERVAL,
     THREAD_JOIN_TIMEOUT)
 from .codec import (BIOCGBLEN, BIOCGDLT, BIOCIMMEDIATE, BIOCPROMISC, BIOCSETF,
-                    BIOCSETIF, BIOCSHDRCMPLT, DLT_EN10MB,
+                    BIOCSETIF, BIOCSETVLANPCP, BIOCSHDRCMPLT, DLT_EN10MB,
                     ETHER_MIN_FRAME, ETHERTYPE_ARP, ETHERTYPE_IPV4,
                     _BPF_FILTER, _bpf_frames, _decode_arp, _decode_ipv4_bootp,
                     _encode_arp_request, _encode_bootp_request, _encode_ether,
@@ -53,7 +54,10 @@ class _ReaderGeneration:
     wake_writer: int
 
 
-class BpfCapture:
+class BpfCapture:  # pylint: disable=too-many-instance-attributes
+    # Eight attributes: the three descriptor settings (iface, promisc, vlan_pcp), the
+    # two callbacks, the reader generation, the parse-error throttle and the published
+    # vlan_pcp_error. Grouping the settings would only add an indirection.
     """Capture/send on a raw /dev/bpf descriptor -- no packet library. A
     reader thread walks the bpf buffer and hands decoded backend-neutral frames
     to the Capture protocol's callbacks. FreeBSD-only (OPNsense's platform).
@@ -70,9 +74,13 @@ class BpfCapture:
     back off the shared instance, so a concurrent restart's _configure cannot
     disturb a still-running old reader."""
 
-    def __init__(self, iface, promisc, on_bootp, on_arp):
+    def __init__(self, iface, promisc, on_bootp, on_arp, vlan_pcp=0):
         self.iface = iface
         self.promisc = promisc
+        self.vlan_pcp = vlan_pcp
+        # Why the VLAN priority could not be set on the current descriptor (an errno
+        # name), or None. Set by _configure on the main thread, read by the heartbeat.
+        self.vlan_pcp_error = None
         self._on_bootp = on_bootp
         self._on_arp = on_arp
         self._gen = None               # the current _ReaderGeneration, or None when stopped
@@ -157,10 +165,28 @@ class BpfCapture:
         # Header-complete: our frames carry the CARP vMAC as the Ethernet source;
         # without this the kernel would overwrite it with the NIC's own MAC.
         fcntl.ioctl(fd, BIOCSHDRCMPLT, struct.pack("I", 1))
+        self._set_vlan_pcp(fd)
         if self.promisc:
             fcntl.ioctl(fd, BIOCPROMISC)
         # bpf read(2) calls must request exactly the kernel buffer size.
         return struct.unpack("I", fcntl.ioctl(fd, BIOCGBLEN, b"\x00" * 4))[0]
+
+    def _set_vlan_pcp(self, fd):
+        """Have the kernel put the 802.1p priority (PCP) on every frame written to
+        this descriptor, DHCP and ARP alike. 0 sets nothing: the VLAN device's own
+        priority applies, as with bpf's own default. Outside a vlan(4) interface the
+        kernel adds a priority tag with VLAN ID 0. A failure does not stop the
+        capture: the frames go out without the priority, logged at ERROR on every
+        descriptor open and published in vlan_pcp_error for the status banner."""
+        error = None
+        if self.vlan_pcp:
+            try:
+                fcntl.ioctl(fd, BIOCSETVLANPCP, struct.pack("I", self.vlan_pcp))
+            except OSError as e:
+                error = errno.errorcode.get(e.errno or 0, "error")
+                LOG.error("VLAN priority %d not set on %s: %s -- DHCP and ARP are sent "
+                          "without it", self.vlan_pcp, self.iface, e)
+        self.vlan_pcp_error = error
 
     def stop(self):
         """Ask the current reader to exit and wait briefly for it. The reader

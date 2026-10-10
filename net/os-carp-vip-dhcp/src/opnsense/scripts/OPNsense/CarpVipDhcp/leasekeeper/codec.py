@@ -299,6 +299,7 @@ BIOCGDLT = 0x4004426A        # _IOR('B', 106, u_int): the interface's data-link 
 BIOCSETIF = 0x8020426C       # _IOW('B', 108, struct ifreq): bind to the interface
 BIOCIMMEDIATE = 0x80044270   # _IOW('B', 112, u_int): deliver per packet, not per full buffer
 BIOCSHDRCMPLT = 0x80044275   # _IOW('B', 117, u_int): we supply the Ethernet source MAC
+BIOCSETVLANPCP = 0x80044285  # _IOW('B', 133, u_int): 802.1p priority on written frames
 DLT_EN10MB = 1               # Ethernet: the only link type this codec's offsets assume
 BPF_ALIGNMENT = 8            # capture records align to sizeof(long)
 BPF_HDR_FIXED = 26           # bh_tstamp(16) + bh_caplen(4) + bh_datalen(4) + bh_hdrlen(2)

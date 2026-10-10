@@ -3,9 +3,11 @@
 Tests reach into private state/methods by design, and use comments over
 per-test docstrings."""
 # pylint: disable=protected-access, missing-function-docstring, too-many-lines
+import errno
 import os
 import re
 import select
+import struct
 import time
 import types
 
@@ -651,7 +653,7 @@ def test_main_once_closes_keeper_without_arming_wakeup_fd(monkeypatch):
 _CONF_LINE = ("request=100.64.4.7|iface=vtnet0|chaddr=00:00:5e:00:01:fe|demote=0|vhid=254|"
               "follow=1|vendorclass=sagem|clientid=user@isp|hostname=fw1|arpnudge=120|"
               "arplistenpromisc=0|defaultroutemode=enforce|backupegress=1|backupegressform=split|"
-              "backupegressgateway=10.0.0.1|backupegressinterface=|backupegressprefixes=")
+              "backupegressgateway=10.0.0.1|backupegressinterface=|backupegressprefixes=|vlanpcp=6")
 
 
 def _spy_main(monkeypatch, *argv, iface_args=False):
@@ -701,14 +703,30 @@ def test_main_reads_its_settings_from_keeper_conf(monkeypatch, tmp_path):
     assert k["default_route_mode"] == "enforce"
     assert k["backup_egress"].enabled and k["backup_egress"].gateway == "10.0.0.1"
     assert k["backup_egress"].interface is None and k["backup_egress"].prefixes == ()
+    assert k["vlan_pcp"] == 6
+
+
+@pytest.mark.parametrize("case", [
+    ("", 0, False), ("0", 0, False), ("7", 7, False),
+    ("8", 0, True), ("-1", 0, True), ("six", 0, True)])
+def test_main_vlan_priority_from_keeper_conf(monkeypatch, tmp_path, caplog, case):
+    # case = (vlanpcp value, the priority the keeper gets, whether it warns). Blank is
+    # Disabled; a value outside 0-7 (only reachable via a hand-edited config.xml)
+    # sets no priority, with a warning, instead of crash-looping.
+    value, expected, warns = case
+    line = _CONF_LINE.replace("vlanpcp=6", f"vlanpcp={value}")
+    rc, built = _conf_main(monkeypatch, tmp_path, line, "--keeper-id", "100_64_4_7")
+    assert rc == 0 and built["kwargs"]["vlan_pcp"] == expected
+    assert ("invalid VLAN priority" in caplog.text) == warns
 
 
 def test_main_command_line_wins_over_keeper_conf(monkeypatch, tmp_path):
     # A manual run can override one setting without editing keeper.conf.
     rc, built = _conf_main(monkeypatch, tmp_path, _CONF_LINE, "--keeper-id", "100_64_4_7",
-                           "--client-id=other", "--arp-nudge", "30")
+                           "--client-id=other", "--arp-nudge", "30", "--vlan-pcp", "3")
     assert rc == 0
     assert built["kwargs"]["client_id"] == "other" and built["kwargs"]["arp_nudge"] == 30
+    assert built["kwargs"]["vlan_pcp"] == 3
     assert built["kwargs"]["vendor_class"] == "sagem"   # the rest still from the record
 
 
@@ -836,6 +854,55 @@ def test_read_loop_uses_its_own_buflen_arg(lk, monkeypatch):
     assert reads == [9000]
 
 
+def _bpf_ioctls(lk, monkeypatch, fail_req=None):
+    """Patch capture_bpf's fcntl with an ioctl recorder; returns the list of
+    (request, argument) calls. fail_req raises EINVAL for that request."""
+    from leasekeeper import capture_bpf  # pylint: disable=import-outside-toplevel
+    calls = []
+
+    def _ioctl(_fd, req, arg=None):
+        calls.append((req, arg))
+        if req == fail_req:
+            raise OSError(errno.EINVAL, "Invalid argument")
+        if req == lk.BIOCGDLT:
+            return struct.pack("I", lk.DLT_EN10MB)
+        if req == lk.BIOCGBLEN:
+            return struct.pack("I", 4096)
+        return 0
+    monkeypatch.setattr(capture_bpf, "fcntl", types.SimpleNamespace(ioctl=_ioctl))
+    return calls
+
+
+def test_bpf_sets_the_vlan_priority_on_each_descriptor(lk, monkeypatch):
+    calls = _bpf_ioctls(lk, monkeypatch)
+    cap = lk.BpfCapture("vlan832", False, lambda _f: None, lambda _f: None, vlan_pcp=6)
+    assert cap._configure(5) == 4096
+    assert (lk.BIOCSETVLANPCP, struct.pack("I", 6)) in calls
+    assert cap.vlan_pcp_error is None
+
+
+def test_bpf_vlan_priority_zero_sets_nothing(lk, monkeypatch):
+    # 0 (Disabled and Best Effort) leaves the priority to the VLAN device, like
+    # bpf's own default.
+    calls = _bpf_ioctls(lk, monkeypatch)
+    cap = lk.BpfCapture("vlan832", False, lambda _f: None, lambda _f: None, vlan_pcp=0)
+    cap._configure(5)
+    assert lk.BIOCSETVLANPCP not in [req for req, _arg in calls]
+
+
+def test_bpf_vlan_priority_failure_keeps_the_capture(lk, monkeypatch, caplog):
+    # An environment error must not stop DHCP: send without the priority, log it
+    # and publish it for the banner; a later descriptor that takes it clears it.
+    _bpf_ioctls(lk, monkeypatch, fail_req=lk.BIOCSETVLANPCP)
+    cap = lk.BpfCapture("vlan832", False, lambda _f: None, lambda _f: None, vlan_pcp=6)
+    assert cap._configure(5) == 4096
+    assert cap.vlan_pcp_error == "EINVAL"
+    assert "VLAN priority 6 not set on vlan832" in caplog.text
+    _bpf_ioctls(lk, monkeypatch)    # the next descriptor takes the priority
+    cap._configure(6)
+    assert cap.vlan_pcp_error is None
+
+
 def test_id_opts_empty_by_default(lk):
     keeper = _keeper(lk)
     assert keeper._dhcp._id_opts == []
@@ -936,6 +1003,7 @@ class _FakeCapture:
     real /dev/bpf socket: the send methods just succeed, so the ArpNudge stamps its clock."""
     def __init__(self, *_a, **_k):
         self.promisc = False
+        self.vlan_pcp_error = None
 
     def start(self):
         return True
@@ -1245,6 +1313,17 @@ def test_hb_no_nudge_tokens_when_off(lk, tmp_path):
     content = hb.read_text()
     assert "nudge=" not in content
     assert "arpok=" not in content
+
+
+def test_hb_pcperr_token_only_when_the_vlan_priority_failed(lk, tmp_path):
+    # The system status banner shows the cause (pcperr) before the lease symptom.
+    hb = tmp_path / "hb"
+    keeper = _nudge_keeper(lk, hbfile=str(hb))
+    keeper._hb()
+    assert "pcperr=" not in hb.read_text()
+    keeper._capture.vlan_pcp_error = "EINVAL"
+    keeper._hb()
+    assert " pcperr=EINVAL" in hb.read_text()
 
 
 def test_hb_master_token_reflects_carp_role(lk, tmp_path):

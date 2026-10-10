@@ -4,6 +4,8 @@ import json
 import time
 import types
 
+import pytest
+
 import status  # sys.path via conftest  # type: ignore
 from leasekeeper import syscmd  # status runs commands through it  # type: ignore
 
@@ -27,6 +29,12 @@ def test_parse_heartbeat_bound():
 def test_parse_heartbeat_unbound():
     text = "1783350773 bound=- lease=1800 t1=900 t2=1575 src=derived\n"
     assert status.parse_heartbeat_text(text)["bound"] is None
+
+
+def test_parse_heartbeat_vlan_priority_error():
+    text = "1783350773 bound=- lease=1800 t1=900 t2=1575 src=derived demote_ok=0 pcperr=EINVAL\n"
+    assert status.parse_heartbeat_text(text)["vlan_pcp_error"] == "EINVAL"
+    assert status.parse_heartbeat_text(text.replace(" pcperr=EINVAL", ""))["vlan_pcp_error"] is None
 
 
 def test_parse_heartbeat_mismatch():
@@ -256,15 +264,38 @@ def test_main_maps_carp_state_and_iface_name_onto_keeper(monkeypatch, capsys):
     # order, and read_keepers must key them onto the keeper by vhid / iface. A
     # swapped arg order or a broken .get would misassign the GUI feed.
     rec = {"request": "100.64.4.7", "iface": "igb0", "chaddr": "aa",
-           "vhid": "149", "follow": "1", "arpnudge": "240"}
+           "vhid": "149", "follow": "1", "arpnudge": "240", "vlanpcp": "6"}
     monkeypatch.setattr(status, "keeper_records", lambda conffile: [rec])
     monkeypatch.setattr(status, "carp_states", lambda: {"149": "MASTER"})
     monkeypatch.setattr(status, "iface_names", lambda: {"igb0": "WAN"})
     monkeypatch.setattr(status, "carp_demotion", lambda: 0)
+    monkeypatch.setattr(status, "vlan_mtag_pcp", lambda: 0)
     status.main()
     doc = json.loads(capsys.readouterr().out)
     assert doc["carp_demotion"] == 0
+    assert doc["vlan_mtag_pcp"] == 0
     keeper = doc["keepers"][0]
     assert keeper["request"] == "100.64.4.7" and keeper["vhid"] == "149"
     assert keeper["carp_state"] == "MASTER"    # from carp_states(), keyed by vhid
     assert keeper["iface_name"] == "WAN"       # from iface_names(), keyed by iface
+    assert keeper["vlan_pcp"] == 6
+
+
+@pytest.mark.parametrize("value, expected", [("", None), ("0", 0), ("6", 6), ("9", None)])
+def test_read_keepers_vlan_priority(tmp_path, value, expected):
+    # Blank (Disabled) is None; the GUI shows nothing for None and 0. A value the
+    # keeper drops (outside 0-7) is shown as it runs: none.
+    conf = tmp_path / "keeper.conf"
+    conf.write_text(f"request=100.64.4.7|iface=igb0|chaddr=aa|vlanpcp={value}\n")
+    assert status.read_keepers({}, {}, str(conf), str(tmp_path))[0]["vlan_pcp"] == expected
+
+
+def test_vlan_mtag_pcp_reads_the_sysctl(monkeypatch):
+    seen = []
+
+    def fake_run(cmd, **_k):
+        seen.append(cmd)
+        return types.SimpleNamespace(returncode=0, stdout="1\n")
+    monkeypatch.setattr(syscmd.subprocess, "run", fake_run)
+    assert status.vlan_mtag_pcp() == 1
+    assert seen[0][-1] == "net.link.vlan.mtag_pcp"

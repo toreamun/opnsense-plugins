@@ -148,6 +148,14 @@ class CarpVipDhcpStatus extends AbstractStatus
         if (strpos($content, 'MISMATCH') !== false) {
             return gettext('ISP handed a different address than the VIP');
         }
+        // The cause before its symptom: without the VLAN priority the ISP may not
+        // answer, so this comes before the lease checks. Shown on both nodes.
+        if (preg_match('/\bpcperr=(\S+)/', $content, $m)) {
+            return sprintf(
+                gettext('VLAN priority not applied (%s), DHCP is sent without it'),
+                $m[1]
+            );
+        }
         if (strpos($content, 'bound=' . $request . ' ') !== false) {
             return $this->arpReachabilityReason($content);
         }

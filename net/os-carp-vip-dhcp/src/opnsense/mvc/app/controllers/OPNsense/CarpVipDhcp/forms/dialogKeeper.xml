@@ -70,6 +70,12 @@
         <help><![CDATA[Optional DHCP option 60. Set only if your ISP requires a specific vendor-class identifier before it hands out a lease. Empty = not sent.]]></help>
     </field>
     <field>
+        <id>keeper.vlanPriority</id>
+        <label>Use VLAN priority</label>
+        <type>dropdown</type>
+        <help><![CDATA[Certain ISPs require DHCP requests sent with a specific VLAN priority (802.1p), like this field on the interface page. The keeper sets it on everything it sends: DHCP, including renewals and release, and ARP nudges. Best Effort (0) works like Disabled here: frames keep the priority of the VLAN device. On an interface that is not a VLAN, frames get a priority tag with VLAN ID 0. Needs the tunable net.link.vlan.mtag_pcp at 1 (the default); the status page warns if it is 0.]]></help>
+    </field>
+    <field>
         <type>header</type>
         <label>Gateway configuration</label>
     </field>

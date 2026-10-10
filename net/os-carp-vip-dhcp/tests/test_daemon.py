@@ -579,10 +579,10 @@ def test_close_releases_the_wake_socket(lk):
         keeper._wake_w.send(b"\x00")   # write end is closed
 
 
-def _stub_main(monkeypatch, keeper_cls, *argv_extra, identity=True):
+def _stub_main(monkeypatch, keeper_cls, *argv_extra, iface_args=True):
     """Wire lease_keeper.main() for a spy test on a non-FreeBSD host: a fake Keeper,
     a runnable capture backend, no-op signal wiring (with the POSIX-only SIGUSR
-    numbers faked in), and a synthetic argv (with --iface/--chaddr unless identity is
+    numbers faked in), and a synthetic argv (with --iface/--chaddr unless iface_args is
     False). Returns the module so the caller can also spy set_wakeup_fd."""
     import lease_keeper  # noqa: E402  # pylint: disable=import-outside-toplevel
     monkeypatch.setattr(lease_keeper, "_setup_logging", lambda _logfile: None)
@@ -591,7 +591,7 @@ def _stub_main(monkeypatch, keeper_cls, *argv_extra, identity=True):
     monkeypatch.setattr(lease_keeper.signal, "signal", lambda *_a: None)
     monkeypatch.setattr(lease_keeper.signal, "SIGUSR1", 30, raising=False)
     monkeypatch.setattr(lease_keeper.signal, "SIGUSR2", 31, raising=False)
-    ident = ["--iface", "eth0", "--chaddr", CHADDR_STR] if identity else []
+    ident = ["--iface", "eth0", "--chaddr", CHADDR_STR] if iface_args else []
     monkeypatch.setattr("sys.argv", [
         "lease_keeper", *ident, "--pidfile", "", "--hbfile", "", "--logfile", "", *argv_extra])
     return lease_keeper
@@ -654,7 +654,7 @@ _CONF_LINE = ("request=100.64.4.7|iface=vtnet0|chaddr=00:00:5e:00:01:fe|demote=0
               "backupegressgateway=10.0.0.1|backupegressinterface=|backupegressprefixes=")
 
 
-def _spy_main(monkeypatch, *argv, identity=False):
+def _spy_main(monkeypatch, *argv, iface_args=False):
     """lease_keeper wired by _stub_main with a spy Keeper and no route(8) or wakeup-fd
     side effects; returns (module, built) where built receives the Keeper's args and
     kwargs (stays empty when it was never built)."""
@@ -673,7 +673,7 @@ def _spy_main(monkeypatch, *argv, identity=False):
         def close(self):
             pass
 
-    lease_keeper = _stub_main(monkeypatch, _SpyKeeper, *argv, identity=identity)
+    lease_keeper = _stub_main(monkeypatch, _SpyKeeper, *argv, iface_args=iface_args)
     monkeypatch.setattr(lease_keeper, "withdraw_unless_master", lambda *_a: None)   # no route(8)
     monkeypatch.setattr(lease_keeper.signal, "set_wakeup_fd", lambda _fd: None)
     return lease_keeper, built
@@ -759,14 +759,18 @@ def test_main_missing_record_exits_for_a_retry(monkeypatch, tmp_path, conf_text)
     if conf_text is not None:
         conf.write_text(conf_text)
     lease_keeper, built = _spy_main(monkeypatch, "--conf", str(conf), "--keeper-id", "100_64_4_7")
-    assert lease_keeper.main() == lease_keeper.EXIT_NO_RECORD
+    with pytest.raises(SystemExit) as exc:
+        lease_keeper.main()
+    assert exc.value.code == lease_keeper.EXIT_NO_RECORD
     assert not built
 
 
 @pytest.mark.parametrize("argv", [("--conf", "keeper.conf"), ("--keeper-id", "100_64_4_7")])
 def test_main_conf_and_keeper_id_go_together(monkeypatch, argv):
     lease_keeper, built = _spy_main(monkeypatch, *argv)
-    assert lease_keeper.main() == 2 and not built
+    with pytest.raises(SystemExit) as exc:
+        lease_keeper.main()
+    assert exc.value.code == 2 and not built
 
 
 def test_main_invalid_mode_in_conf_falls_back_with_a_warning(monkeypatch, tmp_path, caplog):
@@ -788,7 +792,7 @@ def test_main_runs_with_an_older_supervisors_full_command_line(monkeypatch):
         monkeypatch, "--request", "100.64.4.7", "--vhid", "254", "--follow",
         "--client-id=user@isp", "--arp-nudge", "120", "--default-route-mode=enforce",
         "--backup-egress", "--backup-egress-form=prefixes", "--backup-egress-prefixes", "1.0.0.0/8",
-        "--capture-backend", "bpf", identity=True)
+        "--capture-backend", "bpf", iface_args=True)
     assert lease_keeper.main() == 0
     k = built["kwargs"]
     assert (k["vhid"], k["follow"], k["client_id"], k["arp_nudge"]) == ("254", True, "user@isp", 120)
@@ -809,7 +813,9 @@ def test_main_without_conf_still_needs_iface_and_chaddr(monkeypatch):
     # Manual runs without --conf keep the old CLI; with no interface/chaddr at all the
     # daemon refuses to start.
     lease_keeper, built = _spy_main(monkeypatch)
-    assert lease_keeper.main() == 2 and not built
+    with pytest.raises(SystemExit) as exc:
+        lease_keeper.main()
+    assert exc.value.code == 2 and not built
 
 
 def test_read_loop_uses_its_own_buflen_arg(lk, monkeypatch):

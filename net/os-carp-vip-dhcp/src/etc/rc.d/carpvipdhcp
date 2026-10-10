@@ -46,6 +46,10 @@ carpvipdhcp_start()
 {
     [ -f "${conf}" ] || { echo "no config"; return 0; }
     count=0
+    # The loop reads keeper.conf and passes its path to each keeper, which only reads
+    # it (daemon -f also points the keeper's stdin at /dev/null), so the file is never
+    # written here.
+    # shellcheck disable=SC2094
     while IFS= read -r line || [ -n "${line}" ]; do
         case "${line}" in ''|\#*) continue ;; esac
         # Parse the record's KEY=VALUE fields into request/iface/chaddr (see

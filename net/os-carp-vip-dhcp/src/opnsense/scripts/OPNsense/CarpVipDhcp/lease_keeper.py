@@ -203,8 +203,8 @@ def _build_arg_parser():
                     help="keeper.conf to read this keeper's settings from (with --keeper-id)")
     ap.add_argument("--keeper-id", default=None,
                     help="filesystem-safe id of the keeper.conf record to use (the request IP)")
-    # --iface and --chaddr are required, but may come from the keeper.conf record; main()
-    # checks them once the record is applied.
+    # --iface and --chaddr are required, but may come from the keeper.conf record;
+    # _settings() checks them once the record is applied.
     ap.add_argument("--iface", default=None)
     ap.add_argument("--chaddr", default=None)
     ap.add_argument("--request", default=None)
@@ -225,15 +225,12 @@ def _build_arg_parser():
                     help="put the capture socket in promiscuous mode so the gateway's "
                          "unicast ARP reply is seen on NICs that filter non-primary "
                          "unicast MACs (default off; only needed if replies aren't seen)")
-    # Backward compatibility for one upgrade cycle: the capture-backend selector
-    # was removed (bpf is the only backend now), but a keeper started by the
-    # previous version has a daemon(8) supervisor whose command line still carries
-    # --capture-backend. Accept and ignore it so that supervisor's next restart
-    # runs this script without exiting 2 and crash-looping until a reconfigure
-    # re-renders the arguments.
+    # Accepted and ignored (bpf is the only backend): a daemon(8) supervisor started by
+    # an older version may still carry --capture-backend on its command line, and its
+    # next restart must run this script instead of exiting 2 and crash-looping.
     ap.add_argument("--capture-backend", help=argparse.SUPPRESS)
     # No argparse `choices` on the two enum args below: an unrecognised value is
-    # coerced to a safe default with a warning in main() (see DefaultRouteMode /
+    # coerced to a safe default with a warning in _settings() (see DefaultRouteMode /
     # BackupEgressForm .coerce), not rejected with exit 2 -- which daemon(8) -r
     # would turn into a crash loop. The keeper.conf record carries any string.
     ap.add_argument("--default-route-mode", default=DefaultRouteMode.OFF.value,
@@ -283,34 +280,33 @@ def _settings():
     """Parse the command line and set up logging. With --conf/--keeper-id, this
     keeper's keeper.conf record becomes the parser defaults and the command line is
     parsed again; the free-string enum values are then coerced now that logging is
-    up. Returns the settings, or an exit status when the daemon cannot start."""
+    up. Returns the settings; exits the process (2, or EXIT_NO_RECORD when the record
+    is missing) when the daemon cannot start."""
     parser = _build_arg_parser()
     args = parser.parse_args()
     _setup_logging(args.logfile)
-    if args.conf or args.keeper_id:
-        if not (args.conf and args.keeper_id):
-            LOG.critical("--conf and --keeper-id must be given together -- the lease keeper cannot start")
-            return 2
+    if bool(args.conf) != bool(args.keeper_id):
+        LOG.critical("--conf and --keeper-id must be given together -- the lease keeper cannot start")
+        sys.exit(2)
+    if args.conf:
         record = _find_record(args.conf, args.keeper_id)
         if record is None:
             LOG.error("no keeper %s in %s (being rewritten, or the keeper was removed) -- "
                       "exiting; the supervisor retries", args.keeper_id, args.conf)
-            return EXIT_NO_RECORD
+            sys.exit(EXIT_NO_RECORD)
         parser.set_defaults(**_record_defaults(record))
         args = parser.parse_args()
     args.default_route_mode = DefaultRouteMode.coerce(args.default_route_mode)
     args.backup_egress_form = BackupEgressForm.coerce(args.backup_egress_form)
     if not args.iface or not args.chaddr:
         LOG.critical("no interface or client MAC (chaddr) given -- the lease keeper cannot start")
-        return 2
+        sys.exit(2)
     return args
 
 
 def main():
     """CLI entry point: parse args, wire up the Keeper and signals, run."""
     args = _settings()
-    if isinstance(args, int):
-        return args
 
     # Single-instance guard BEFORE any FIB mutation: the startup fail-stop withdraw
     # below deletes a default, so a duplicate start (pidfile held by the live owner)

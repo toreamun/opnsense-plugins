@@ -11,20 +11,16 @@
 # order (rendered by the configd template).
 
 # carpvipdhcp_parse_line <line>: parse one record into the keeper field variables
-# (request, iface, chaddr, demote, vhid, follow, vendorclass, clientid, hostname,
-# arpnudge, arplistenpromisc, defaultroutemode, backupegress, backupegressform,
-# backupegressgw, backupegressiface, backupegressprefixes). All are reset first,
-# then each field is dispatched by key -- an unknown key is ignored and a missing
-# key keeps the empty reset. Peels one field at a time with parameter expansion,
-# so there are no IFS/glob side effects (the caller may be part-way through
-# building an argv with `set --`). Values may contain '=' (split on the first
-# only). The caller reads the variables above after the call.
+# the shell callers use (request, iface, chaddr, demote). The daemon reads the rest
+# of its record itself (lease_keeper.py --conf), so settings such as the DHCP
+# client-id are not handled here. All four are reset first, then each field is
+# dispatched by key -- any other key is ignored and a missing key keeps the empty
+# reset. Peels one field at a time with parameter expansion, so there are no
+# IFS/glob side effects. Values may contain '=' (split on the first only). The
+# caller reads the variables above after the call.
 carpvipdhcp_parse_line()
 {
-    request='' iface='' chaddr='' demote='' vhid='' follow='' vendorclass=''
-    clientid='' hostname='' arpnudge='' arplistenpromisc='' defaultroutemode=''
-    backupegress='' backupegressform='' backupegressgw='' backupegressiface=''
-    backupegressprefixes=''
+    request='' iface='' chaddr='' demote=''
     # Namespaced scratch temporaries (POSIX sh has no `local`), unset at the end so
     # sourcing this parser does not leak them into the caller's environment.
     _kc_rec="$1"
@@ -36,19 +32,6 @@ carpvipdhcp_parse_line()
             iface=*) iface="${_kc_field#*=}" ;;
             chaddr=*) chaddr="${_kc_field#*=}" ;;
             demote=*) demote="${_kc_field#*=}" ;;
-            vhid=*) vhid="${_kc_field#*=}" ;;
-            follow=*) follow="${_kc_field#*=}" ;;
-            vendorclass=*) vendorclass="${_kc_field#*=}" ;;
-            clientid=*) clientid="${_kc_field#*=}" ;;
-            hostname=*) hostname="${_kc_field#*=}" ;;
-            arpnudge=*) arpnudge="${_kc_field#*=}" ;;
-            arplistenpromisc=*) arplistenpromisc="${_kc_field#*=}" ;;
-            defaultroutemode=*) defaultroutemode="${_kc_field#*=}" ;;
-            backupegress=*) backupegress="${_kc_field#*=}" ;;
-            backupegressform=*) backupegressform="${_kc_field#*=}" ;;
-            backupegressgateway=*) backupegressgw="${_kc_field#*=}" ;;
-            backupegressinterface=*) backupegressiface="${_kc_field#*=}" ;;
-            backupegressprefixes=*) backupegressprefixes="${_kc_field#*=}" ;;
         esac
     done
     unset _kc_rec _kc_field

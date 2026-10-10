@@ -10,7 +10,8 @@
 # (request=, iface=, chaddr=, ...) in no fixed order. We dispatch by key name, so
 # an unknown key is ignored and a missing key keeps its default -- fields can be
 # added or removed without shifting a positional column.
-# Starts one supervised daemon per line, keyed by a filesystem-safe request-IP id.
+# Starts one supervised daemon per line, keyed by a filesystem-safe request-IP id;
+# the daemon reads the rest of its line itself (see carpvipdhcp_start).
 
 . /etc/rc.subr
 
@@ -47,7 +48,7 @@ carpvipdhcp_start()
     count=0
     while IFS= read -r line || [ -n "${line}" ]; do
         case "${line}" in ''|\#*) continue ;; esac
-        # Parse the record's KEY=VALUE fields into request/iface/chaddr/... (see
+        # Parse the record's KEY=VALUE fields into request/iface/chaddr (see
         # keeperconf.sh, the shared reader).
         carpvipdhcp_parse_line "${line}"
         if [ -z "${request}" ] || [ -z "${iface}" ] || [ -z "${chaddr}" ]; then
@@ -65,45 +66,17 @@ carpvipdhcp_start()
         if [ -f "${pidfile}" ] && kill -0 "$(cat "${pidfile}")" 2>/dev/null; then
             continue
         fi
-        set -- --iface "${iface}" --chaddr "${chaddr}" --request "${request}" \
+        # The daemon reads its settings from its own keeper.conf record (by id), so no
+        # setting -- the DHCP client-id, vendor class or hostname among them -- is on
+        # the command line, where every local user can read it (ps). Only the id and
+        # the per-keeper file paths are passed. A respawn by daemon(8) re-reads the
+        # record, so it runs the current settings.
+        # -f detach; -r supervise/restart on crash; -R 5 restart delay; -P supervisor pidfile.
+        /usr/sbin/daemon -f -r -R 5 -P "${pidfile}" -t "${name}-${id}" "${keeper}" \
+            --conf "${conf}" --keeper-id "${id}" \
             --pidfile "${run_dir}/carpvipdhcp-${id}.child.pid" \
             --hbfile "${run_dir}/carpvipdhcp-${id}.hb" \
             --logfile "${log_dir}/carpvipdhcp-${id}.log"
-        # The vhid identifies the keeper's CARP VIP; the ARP nudge uses it to only
-        # nudge while this node is CARP master.
-        [ -n "${vhid}" ] && set -- "$@" --vhid "${vhid}"
-        # Follow mode: accept a changed ISP address and rewrite the CARP VIP to match.
-        if [ "${follow}" = "1" ]; then
-            set -- "$@" --follow
-        fi
-        # Optional DHCP request options -- only passed when the operator set them.
-        # Use the --flag=value form: these masks allow a leading '-', and a separate
-        # "-foo" token would be read as another option (argparse exit 2, a crash loop
-        # under daemon(8) -r) instead of the value.
-        [ -n "${vendorclass}" ] && set -- "$@" --vendor-class="${vendorclass}"
-        [ -n "${clientid}" ] && set -- "$@" --client-id="${clientid}"
-        [ -n "${hostname}" ] && set -- "$@" --hostname="${hostname}"
-        [ -n "${arpnudge}" ] && set -- "$@" --arp-nudge "${arpnudge}"
-        # Promiscuous ARP capture is an opt-in fallback (default off).
-        [ "${arplistenpromisc}" = "1" ] && set -- "$@" --arp-listen-promisc
-        # Default-route ownership by CARP role. Passed through as --flag=value (so a
-        # leading-'-' value reaches the daemon, not argparse); the daemon coerces an
-        # empty or unrecognised value to the inert "off" default, so a typo can't
-        # crash-loop it.
-        [ -n "${defaultroutemode}" ] && set -- "$@" --default-route-mode="${defaultroutemode}"
-        # Backup egress: while CARP backup, route this node's own internet traffic to
-        # the master. Only acts under observe/enforce (the daemon gates on that); a
-        # blank gateway/interface/prefixes field passes nothing. The form is passed
-        # through verbatim (the daemon coerces an unrecognised value to "split").
-        if [ "${backupegress}" = "1" ]; then
-            set -- "$@" --backup-egress
-            [ -n "${backupegressform}" ] && set -- "$@" --backup-egress-form="${backupegressform}"
-            [ -n "${backupegressgw}" ] && set -- "$@" --backup-egress-gateway "${backupegressgw}"
-            [ -n "${backupegressiface}" ] && set -- "$@" --backup-egress-interface "${backupegressiface}"
-            [ -n "${backupegressprefixes}" ] && set -- "$@" --backup-egress-prefixes "${backupegressprefixes}"
-        fi
-        # -f detach; -r supervise/restart on crash; -R 5 restart delay; -P supervisor pidfile.
-        /usr/sbin/daemon -f -r -R 5 -P "${pidfile}" -t "${name}-${id}" "${keeper}" "$@"
         count=$((count + 1))
     done < "${conf}"
     echo "Started ${count} keeper(s)."

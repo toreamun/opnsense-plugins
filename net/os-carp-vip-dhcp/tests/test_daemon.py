@@ -579,11 +579,11 @@ def test_close_releases_the_wake_socket(lk):
         keeper._wake_w.send(b"\x00")   # write end is closed
 
 
-def _stub_main(monkeypatch, keeper_cls, *argv_extra):
+def _stub_main(monkeypatch, keeper_cls, *argv_extra, identity=True):
     """Wire lease_keeper.main() for a spy test on a non-FreeBSD host: a fake Keeper,
     a runnable capture backend, no-op signal wiring (with the POSIX-only SIGUSR
-    numbers faked in), and a synthetic argv. Returns the module so the caller can
-    also spy set_wakeup_fd."""
+    numbers faked in), and a synthetic argv (with --iface/--chaddr unless identity is
+    False). Returns the module so the caller can also spy set_wakeup_fd."""
     import lease_keeper  # noqa: E402  # pylint: disable=import-outside-toplevel
     monkeypatch.setattr(lease_keeper, "_setup_logging", lambda _logfile: None)
     monkeypatch.setattr(lease_keeper, "Keeper", keeper_cls)
@@ -591,9 +591,9 @@ def _stub_main(monkeypatch, keeper_cls, *argv_extra):
     monkeypatch.setattr(lease_keeper.signal, "signal", lambda *_a: None)
     monkeypatch.setattr(lease_keeper.signal, "SIGUSR1", 30, raising=False)
     monkeypatch.setattr(lease_keeper.signal, "SIGUSR2", 31, raising=False)
+    ident = ["--iface", "eth0", "--chaddr", CHADDR_STR] if identity else []
     monkeypatch.setattr("sys.argv", [
-        "lease_keeper", "--iface", "eth0", "--chaddr", CHADDR_STR,
-        "--pidfile", "", "--hbfile", "", "--logfile", "", *argv_extra])
+        "lease_keeper", *ident, "--pidfile", "", "--hbfile", "", "--logfile", "", *argv_extra])
     return lease_keeper
 
 
@@ -646,6 +646,170 @@ def test_main_once_closes_keeper_without_arming_wakeup_fd(monkeypatch):
     assert lease_keeper.main() == 0
     assert events == ["claim_once", "close"]   # closed after the one-shot claim
     assert not armed                           # --once never armed the signal wakeup fd
+
+
+_CONF_LINE = ("request=100.64.4.7|iface=vtnet0|chaddr=00:00:5e:00:01:fe|demote=0|vhid=254|"
+              "follow=1|vendorclass=sagem|clientid=user@isp|hostname=fw1|arpnudge=120|"
+              "arplistenpromisc=0|defaultroutemode=enforce|backupegress=1|backupegressform=split|"
+              "backupegressgateway=10.0.0.1|backupegressinterface=|backupegressprefixes=")
+
+
+def _spy_main(monkeypatch, *argv, identity=False):
+    """lease_keeper wired by _stub_main with a spy Keeper and no route(8) or wakeup-fd
+    side effects; returns (module, built) where built receives the Keeper's args and
+    kwargs (stays empty when it was never built)."""
+    built = {}
+
+    class _SpyKeeper:
+        def __init__(self, *a, **k):
+            built["args"], built["kwargs"] = a, k
+
+        def wake_fileno(self):
+            return 7
+
+        def run(self):
+            return 0
+
+        def close(self):
+            pass
+
+    lease_keeper = _stub_main(monkeypatch, _SpyKeeper, *argv, identity=identity)
+    monkeypatch.setattr(lease_keeper, "withdraw_unless_master", lambda *_a: None)   # no route(8)
+    monkeypatch.setattr(lease_keeper.signal, "set_wakeup_fd", lambda _fd: None)
+    return lease_keeper, built
+
+
+def _conf_main(monkeypatch, tmp_path, conf_text, *argv):
+    """Run lease_keeper.main() the way rc.d starts it (--conf, no settings on the
+    command line) with a spy Keeper; returns (exit code, built as in _spy_main)."""
+    conf = tmp_path / "keeper.conf"
+    conf.write_text(conf_text)
+    lease_keeper, built = _spy_main(monkeypatch, "--conf", str(conf), *argv)
+    return lease_keeper.main(), built
+
+
+def test_main_reads_its_settings_from_keeper_conf(monkeypatch, tmp_path):
+    # rc.d passes only the id: every setting, the DHCP identity included, comes from the
+    # keeper's own keeper.conf record, so none of it is on the command line (ps).
+    rc, built = _conf_main(monkeypatch, tmp_path, "# header\n" + _CONF_LINE + "\n",
+                           "--keeper-id", "100_64_4_7")
+    assert rc == 0
+    assert built["args"][:3] == ("vtnet0", "00:00:5e:00:01:fe", "100.64.4.7")
+    k = built["kwargs"]
+    assert (k["vhid"], k["follow"], k["arp_nudge"], k["arp_listen_promisc"]) == ("254", True, 120, False)
+    assert (k["vendor_class"], k["client_id"], k["hostname"]) == ("sagem", "user@isp", "fw1")
+    assert k["default_route_mode"] == "enforce"
+    assert k["backup_egress"].enabled and k["backup_egress"].gateway == "10.0.0.1"
+    assert k["backup_egress"].interface is None and k["backup_egress"].prefixes == ()
+
+
+def test_main_command_line_wins_over_keeper_conf(monkeypatch, tmp_path):
+    # A manual run can override one setting without editing keeper.conf.
+    rc, built = _conf_main(monkeypatch, tmp_path, _CONF_LINE, "--keeper-id", "100_64_4_7",
+                           "--client-id=other", "--arp-nudge", "30")
+    assert rc == 0
+    assert built["kwargs"]["client_id"] == "other" and built["kwargs"]["arp_nudge"] == 30
+    assert built["kwargs"]["vendor_class"] == "sagem"   # the rest still from the record
+
+
+def test_main_empty_and_zero_fields_mean_not_set(monkeypatch, tmp_path):
+    # An empty value means "not set" (the option keeps its default) and a flag is on
+    # only for "1".
+    line = "request=100.64.4.7|iface=vtnet0|chaddr=00:00:5e:00:01:fe|follow=0|clientid=|arpnudge="
+    rc, built = _conf_main(monkeypatch, tmp_path, line, "--keeper-id", "100_64_4_7")
+    assert rc == 0
+    k = built["kwargs"]
+    assert (k["follow"], k["client_id"], k["arp_nudge"]) == (False, None, 0)
+    assert k["default_route_mode"] == "off" and not k["backup_egress"].enabled
+
+
+@pytest.mark.parametrize("flag_key, read", [
+    ("follow", lambda k: k["follow"]),
+    ("arplistenpromisc", lambda k: k["arp_listen_promisc"]),
+    ("backupegress", lambda k: k["backup_egress"].enabled),
+])
+def test_main_flag_field_turns_its_flag_on(monkeypatch, tmp_path, flag_key, read):
+    base = "request=100.64.4.7|iface=vtnet0|chaddr=00:00:5e:00:01:fe|defaultroutemode=enforce"
+    rc, built = _conf_main(monkeypatch, tmp_path, f"{base}|{flag_key}=0", "--keeper-id", "100_64_4_7")
+    assert rc == 0 and read(built["kwargs"]) is False
+    rc, built = _conf_main(monkeypatch, tmp_path, f"{base}|{flag_key}=1", "--keeper-id", "100_64_4_7")
+    assert rc == 0 and read(built["kwargs"]) is True
+
+
+def test_daemon_reads_every_keeper_conf_key():
+    # The daemon's key map is the only place a keeper.conf field becomes a setting: a
+    # key the template emits but the map lacks would be ignored silently. "demote" is
+    # read only by the CARP status hook.
+    import lease_keeper  # noqa: E402  # pylint: disable=import-outside-toplevel
+    template = os.path.join(os.path.dirname(__file__), "..", "src", "opnsense", "service",
+                            "templates", "OPNsense", "CarpVipDhcp", "keeper.conf")
+    with open(template, encoding="utf-8") as f:
+        emitted = set(re.findall(r"(\w+)=\{\{", f.read()))
+    assert {"request", "clientid", "demote"} <= emitted     # the regex itself still matches
+    assert set(lease_keeper._CONF_VALUES) | set(lease_keeper._CONF_FLAGS) | {"demote"} == emitted
+
+
+@pytest.mark.parametrize("conf_text", ["", "# only a comment\n",
+                                       _CONF_LINE.replace("100.64.4.7", "100.64.4.8"), None])
+def test_main_missing_record_exits_for_a_retry(monkeypatch, tmp_path, conf_text):
+    # configd rewrites keeper.conf by truncating it first, so a respawn can find the
+    # file empty (or, None here, absent): exit with the dedicated code (daemon(8)
+    # restarts the child) and build nothing.
+    conf = tmp_path / "keeper.conf"
+    if conf_text is not None:
+        conf.write_text(conf_text)
+    lease_keeper, built = _spy_main(monkeypatch, "--conf", str(conf), "--keeper-id", "100_64_4_7")
+    assert lease_keeper.main() == lease_keeper.EXIT_NO_RECORD
+    assert not built
+
+
+@pytest.mark.parametrize("argv", [("--conf", "keeper.conf"), ("--keeper-id", "100_64_4_7")])
+def test_main_conf_and_keeper_id_go_together(monkeypatch, argv):
+    lease_keeper, built = _spy_main(monkeypatch, *argv)
+    assert lease_keeper.main() == 2 and not built
+
+
+def test_main_invalid_mode_in_conf_falls_back_with_a_warning(monkeypatch, tmp_path, caplog):
+    line = _CONF_LINE.replace("defaultroutemode=enforce", "defaultroutemode=bogus").replace(
+        "backupegressform=split", "backupegressform=bogus")
+    rc, built = _conf_main(monkeypatch, tmp_path, line, "--keeper-id", "100_64_4_7")
+    assert rc == 0
+    assert built["kwargs"]["default_route_mode"] == "off"
+    assert built["kwargs"]["backup_egress"].form == "split"
+    assert "unknown default-route mode 'bogus'" in caplog.text
+    assert "unknown backup-egress form 'bogus'" in caplog.text
+
+
+def test_main_runs_with_an_older_supervisors_full_command_line(monkeypatch):
+    # A daemon(8) supervisor started by an older version respawns this script with
+    # every setting on its command line (and --capture-backend); until the upgrade
+    # restarts it, that must still run with the same settings.
+    lease_keeper, built = _spy_main(
+        monkeypatch, "--request", "100.64.4.7", "--vhid", "254", "--follow",
+        "--client-id=user@isp", "--arp-nudge", "120", "--default-route-mode=enforce",
+        "--backup-egress", "--backup-egress-form=prefixes", "--backup-egress-prefixes", "1.0.0.0/8",
+        "--capture-backend", "bpf", identity=True)
+    assert lease_keeper.main() == 0
+    k = built["kwargs"]
+    assert (k["vhid"], k["follow"], k["client_id"], k["arp_nudge"]) == ("254", True, "user@isp", 120)
+    assert k["default_route_mode"] == "enforce"
+    assert k["backup_egress"].form == "prefixes" and k["backup_egress"].prefixes == ("1.0.0.0/8",)
+
+
+def test_main_invalid_arp_nudge_in_conf_turns_the_nudge_off(monkeypatch, tmp_path, caplog):
+    # Only reachable via a hand-edited config.xml: fall back to off with a warning
+    # rather than crash-loop the supervised daemon.
+    line = _CONF_LINE.replace("arpnudge=120", "arpnudge=soon")
+    rc, built = _conf_main(monkeypatch, tmp_path, line, "--keeper-id", "100_64_4_7")
+    assert rc == 0 and built["kwargs"]["arp_nudge"] == 0
+    assert "invalid ARP nudge interval" in caplog.text
+
+
+def test_main_without_conf_still_needs_iface_and_chaddr(monkeypatch):
+    # Manual runs without --conf keep the old CLI; with no interface/chaddr at all the
+    # daemon refuses to start.
+    lease_keeper, built = _spy_main(monkeypatch)
+    assert lease_keeper.main() == 2 and not built
 
 
 def test_read_loop_uses_its_own_buflen_arg(lk, monkeypatch):
@@ -747,7 +911,7 @@ def test_release_without_client_id_sends_none(lk):
 def test_fmt_client_id(lk):
     assert lk._fmt_client_id(None) == "none"
     assert lk._fmt_client_id(b"\x01" + CHADDR) == "type 1 + " + CHADDR_STR
-    assert lk._fmt_client_id(b"keeper-1") == "'keeper-1'"
+    assert lk._fmt_client_id(b"keeper-1") == "text, 8 bytes"   # value never shown
 
 
 def test_model_client_id_default_matches_the_daemon_keyword(lk):

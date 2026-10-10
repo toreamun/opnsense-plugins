@@ -288,6 +288,10 @@ are examples, substitute your own.*
 | 9 | Allow `SYNC net -> any` | Firewall ‣ Rules ‣ SYNC |
 | 10 | Verify (`pfctl`, `tcpdump -T carp`, a failover) | shell |
 
+> **Interface pages:** _Interfaces ‣ [WAN]_ is the classic per-interface page. From 26.7.6 the
+> same settings are also under _Interfaces ‣ Assignments_ (edit the interface row). There
+> **Save** only queues a change and **Apply** activates it; a reboot before Apply discards it.
+
 > **NAT menu:** the Firewall ‣ NAT menu carries both a **Source NAT** page and a legacy
 > **Outbound** page (both are present on 26.1 and 26.7). Either can host the source-NAT rule
 > this guide needs; the steps below use **Source NAT** (_Firewall ‣ NAT ‣ Source NAT_). See
@@ -702,8 +706,9 @@ route and only its on-link path (the VIP) changes. That is the default
 (`defaultRouteMode = off`), and everything above applies unchanged.
 
 `enforce` is an opt-in alternative for when you want exactly one node to hold a default
-at a time. In the GUI this is the keeper's **Own default route by CARP role** field (advanced
-mode); `defaultRouteMode` is its name in the config and the log. The keeper then owns the IPv4 default route (`0.0.0.0/0`) as a function of its
+at a time. In the GUI this is the keeper's **Own default route by CARP role** field (the
+keeper dialog's Gateway configuration section); `defaultRouteMode` is its name in the config
+and the log. The keeper then owns the IPv4 default route (`0.0.0.0/0`) as a function of its
 CARP role and whether it holds a lease: **only the CARP master that actually holds a
 lease keeps a default in the FIB; every other state has none.** The failure mode is
 therefore a *withdrawn* default, never a black-holed one, a node that cannot route stops
@@ -728,7 +733,7 @@ wiring. FRR is not required by the plugin.
 Only one keeper may run `enforce` (a model validation enforces this): two keepers both
 trying to own the single `0.0.0.0/0` would fight over it.
 
-<p align="center"><img src="img/settings-enforce.png" alt="Keeper dialog in advanced mode: Own default route by CARP role set to Enforce, Backup egress on, route form /1-split, gateway = an internal CARP VIP" width="700"><br>
+<p align="center"><img src="img/settings-enforce.png" alt="Keeper dialog in advanced mode: Own default route by CARP role set to Enforce, Backup egress on, route form /1-split" width="700"><br>
 <sub><i>The WAN keeper in the role-driven design: <b>Own default route by CARP role</b> = Enforce, <b>Backup egress</b> on with the <code>/1</code>-split form and an internal CARP VIP as the gateway.</i></sub></p>
 
 ### The gateway, and `force_down`

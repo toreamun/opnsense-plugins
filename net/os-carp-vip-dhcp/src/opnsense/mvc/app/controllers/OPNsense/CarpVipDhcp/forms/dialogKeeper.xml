@@ -1,5 +1,9 @@
 <form>
     <field>
+        <type>header</type>
+        <label>Basic configuration</label>
+    </field>
+    <field>
         <id>keeper.enabled</id>
         <label>Enabled</label>
         <type>checkbox</type>
@@ -12,10 +16,25 @@
         <help>The CARP virtual IP to keep a lease for. Interface, VHID and IP are derived from it; the DHCP client MAC (chaddr) is the CARP virtual MAC for that VHID, so the lease follows the VIP to the peer on failover.</help>
     </field>
     <field>
+        <id>keeper.description</id>
+        <label>Description</label>
+        <type>text</type>
+    </field>
+    <field>
+        <type>header</type>
+        <label>Address configuration [IPv4]</label>
+    </field>
+    <field>
         <id>keeper.followIp</id>
         <label>Follow dynamic DHCP address</label>
         <type>checkbox</type>
         <help><![CDATA[When set (the default), if the DHCP server hands out a different address than the configured VIP, the keeper accepts it and rewrites the CARP virtual IP to match, so the VIP stays online on a dynamic address instead of going down. Both HA nodes converge on the same address automatically because they share the same chaddr (the server gives one lease per chaddr). Pair it with "Sync firewall alias" so outbound NAT and rules follow the new address. Unset to ENFORCE a fixed reservation instead: a different address then raises a mismatch alarm (and, with "CARP failover on lease loss", hands the VIP to the peer) rather than being accepted.]]></help>
+    </field>
+    <field>
+        <id>keeper.demoteOnLeaseLoss</id>
+        <label>CARP failover on lease loss</label>
+        <type>checkbox</type>
+        <help><![CDATA[Only with "Follow dynamic DHCP address" off, for a fixed reservation (a following keeper adopts a new address instead of losing its lease, so the two are mutually exclusive). When set, this node demotes itself, handing the CARP virtual IP to the peer, if this keeper stops holding its DHCP lease. When unset (default), losing the lease does not affect CARP.]]></help>
     </field>
     <field>
         <id>keeper.aliasName</id>
@@ -24,18 +43,41 @@
         <help><![CDATA[Optional. The plugin creates and maintains a firewall Host alias with this name, always set to this CARP VIP's current address. Point your outbound NAT translation address (and any firewall rules that must follow the address) at this alias, so they follow automatically when "Follow dynamic DHCP address" changes it (applied by a state-preserving filter reload). NOTE: inbound port-forwards cannot follow a dynamic address (the upstream only routes inbound to a reserved address). The plugin never deletes the alias. See the plugin README.]]></help>
     </field>
     <field>
-        <id>keeper.demoteOnLeaseLoss</id>
-        <label>CARP failover on lease loss</label>
-        <type>checkbox</type>
+        <id>keeper.hostname</id>
+        <label>DHCP hostname</label>
+        <type>text</type>
+        <help><![CDATA[Optional DHCP option 12 (hostname). Empty = not sent. Unlike the WAN interface's Hostname field, this does not also set the client-id: if that field was set before you moved to the keeper (Interfaces > WAN, DHCP client section), put the same text here and in DHCP client-id (advanced mode).]]></help>
+    </field>
+    <field>
+        <id>keeper.chaddrOverride</id>
+        <label>Client MAC override (chaddr)</label>
+        <type>text</type>
         <advanced>true</advanced>
-        <help><![CDATA[Enforce mode only. When set, this node demotes itself (handing the CARP virtual IP to the peer) if this keeper stops holding its DHCP lease. Only meaningful with "Follow dynamic DHCP address" OFF (a following keeper adopts a new address instead of losing its lease, so the two are mutually exclusive). When unset (default), the keeper just keeps the lease alive on both nodes redundantly, without affecting CARP.]]></help>
+        <help><![CDATA[Leave blank. By default the keeper's DHCP client uses the CARP virtual MAC, which is what you want: the lease, the ISP's IP-to-MAC binding and the VIP's own outbound traffic all sit on one MAC, and the lease follows the VIP to the peer on failover. Override ONLY if your ISP has a fixed reservation bound to a specific, different MAC that you cannot change. Do NOT enter this node's own interface MAC: the VIP still sends from the CARP virtual MAC, so on an ISP that binds the leased IP to the MAC (IP source guard) the gateway becomes unreachable ("No route to host"). Empty = the derived CARP virtual MAC. A DHCP client-id of <b>mac</b> follows this MAC.]]></help>
+    </field>
+    <field>
+        <id>keeper.clientId</id>
+        <label>DHCP client-id</label>
+        <type>text</type>
+        <advanced>true</advanced>
+        <help><![CDATA[DHCP option 61, the client identity some ISPs use instead of the MAC address. <b>mac</b> (the default for new keepers) sends hardware type 1 + the keeper's MAC (the CARP virtual MAC, or the override above), the same form a normal OPNsense WAN sends when its Hostname field is empty. Both HA nodes then send the same identity automatically. Any other value is sent as plain text. Empty = not sent. If your WAN interface had its Hostname field set (Interfaces > WAN, DHCP client section; not the system hostname), the normal WAN sent that text instead: put the same text here and in DHCP hostname. Changing this changes the identity the ISP sees, so an ISP that uses option 61 may refuse the keeper until the old lease runs out. Only if normal WAN DHCP still runs on the same interface next to the keeper, the two must have different identities.]]></help>
+    </field>
+    <field>
+        <id>keeper.vendorClass</id>
+        <label>DHCP vendor class</label>
+        <type>text</type>
+        <advanced>true</advanced>
+        <help><![CDATA[Optional DHCP option 60. Set only if your ISP requires a specific vendor-class identifier before it hands out a lease. Empty = not sent.]]></help>
+    </field>
+    <field>
+        <type>header</type>
+        <label>Gateway configuration</label>
     </field>
     <field>
         <id>keeper.defaultRouteMode</id>
         <label>Own default route by CARP role</label>
         <type>dropdown</type>
-        <advanced>true</advanced>
-        <help><![CDATA[Default OFF. Make this keeper own the IPv4 default route (0.0.0.0/0) by CARP role: the master node holding this keeper's lease keeps a default via the lease gateway, every other state keeps none, so a node offers a default only while it can actually route one (a failover moves it, a backup withdraws it, instead of black-holing). <b>Off</b>: inert. <b>Observe</b>: log the decision it would make, without touching the routing table (use this first). <b>Enforce</b>: actually install and withdraw the default. Only ONE keeper (the WAN VIP) may enforce. In enforce mode, also tick the WAN gateway's "Mark Gateway as Down" (force_down) so OPNsense does not install a competing default. With os-frr the redistributed kernel default then follows the CARP role automatically; it also works without FRR. See the README.]]></help>
+        <help><![CDATA[Default OFF. Make this keeper own the IPv4 default route (0.0.0.0/0) by CARP role: the master node holding this keeper's lease keeps a default via the lease gateway, every other state keeps none, so a node offers a default only while it can actually route one (a failover moves it, a backup withdraws it, instead of black-holing). <b>Off</b>: inert. <b>Observe</b>: log the decision it would make, without touching the routing table (use this first). <b>Enforce</b>: actually install and withdraw the default. Only ONE keeper (the WAN VIP) may enforce. In enforce mode, also tick the WAN gateway's "Mark Gateway as Down" (force_down) so OPNsense does not install a competing default. With os-frr the redistributed kernel default then follows the CARP role automatically; it also works without FRR. To give the backup internet while it holds no default, see Backup egress (advanced mode). See the README.]]></help>
     </field>
     <field>
         <id>keeper.backupEgress</id>
@@ -78,7 +120,6 @@
         <id>keeper.arpNudgeInterval</id>
         <label>ARP nudge interval (s)</label>
         <type>text</type>
-        <advanced>true</advanced>
         <help><![CDATA[Periodically broadcast an ARP request from the VIP (with its CARP virtual MAC) for the upstream gateway, so the gateway's ARP entry for the VIP never expires. Use when the upstream ignores gratuitous ARP and never re-ARPs an expired entry. The symptom is that traffic NATed to the VIP works right after a CARP event or DHCP exchange, then silently blackholes some minutes later (outbound packets leave, nothing returns). Only sent while this node is CARP master for the VIP. Default: 120 (on), one broadcast ARP per interval; lower toward the 30 s floor if a short-ARP-timeout gateway still blackholes the VIP between nudges. Setting 0 disables the nudge entirely: the periodic nudge, the automatic nudge on CARP failover AND the manual nudge button on the status page (the early lease renew on failover is unaffected).]]></help>
     </field>
     <field>
@@ -87,38 +128,5 @@
         <type>checkbox</type>
         <advanced>true</advanced>
         <help><![CDATA[Fallback, default OFF. Applies only while the ARP nudge is enabled (interval > 0), since it only helps capture the nudge's reply; it is ignored when the nudge is off. The keeper listens for the gateway's ARP reply to each nudge and shows on the Status page when the gateway last confirmed reachability. Normally the reply is captured without promiscuous mode (the CARP master already accepts the VIP's MAC). Enable this ONLY if the Status page shows the nudge is never confirmed on a bound master, since some NICs drop frames addressed to a non-primary unicast MAC unless the interface is promiscuous. WARNING: promiscuous mode makes this root daemon receive ALL traffic on the segment, not just its own; leave it off unless you need it.]]></help>
-    </field>
-    <field>
-        <id>keeper.chaddrOverride</id>
-        <label>Client MAC override (chaddr)</label>
-        <type>text</type>
-        <advanced>true</advanced>
-        <help><![CDATA[Leave blank. By default the keeper's DHCP client uses the CARP virtual MAC, which is what you want: the lease, the ISP's IP-to-MAC binding and the VIP's own outbound traffic all sit on one MAC, and the lease follows the VIP to the peer on failover. Override ONLY if your ISP has a fixed reservation bound to a specific, different MAC that you cannot change. Do NOT enter this node's own interface MAC: the VIP still sends from the CARP virtual MAC, so on an ISP that binds the leased IP to the MAC (IP source guard) the gateway becomes unreachable ("No route to host"). Empty = the derived CARP virtual MAC. A DHCP client-id of <b>mac</b> follows this MAC.]]></help>
-    </field>
-    <field>
-        <id>keeper.vendorClass</id>
-        <label>DHCP vendor class</label>
-        <type>text</type>
-        <advanced>true</advanced>
-        <help><![CDATA[Optional DHCP option 60. Set only if your ISP requires a specific vendor-class identifier before it hands out a lease. Empty = not sent.]]></help>
-    </field>
-    <field>
-        <id>keeper.clientId</id>
-        <label>DHCP client-id</label>
-        <type>text</type>
-        <advanced>true</advanced>
-        <help><![CDATA[DHCP option 61, the client identity some ISPs use instead of the MAC address. <b>mac</b> (the default for new keepers) sends hardware type 1 + the keeper's MAC (the CARP virtual MAC, or the override above), the same form a normal OPNsense WAN sends when its Hostname field is empty. Both HA nodes then send the same identity automatically. Any other value is sent as plain text. Empty = not sent. If your WAN interface had its Hostname field set (Interfaces > WAN, DHCP client section; not the system hostname), the normal WAN sent that text instead: put the same text here and in DHCP hostname. Changing this changes the identity the ISP sees, so an ISP that uses option 61 may refuse the keeper until the old lease runs out. Only if normal WAN DHCP still runs on the same interface next to the keeper, the two must have different identities.]]></help>
-    </field>
-    <field>
-        <id>keeper.hostname</id>
-        <label>DHCP hostname</label>
-        <type>text</type>
-        <advanced>true</advanced>
-        <help><![CDATA[Optional DHCP option 12 (hostname). Empty = not sent. If your WAN interface had its Hostname field set before you moved to the keeper (Interfaces > WAN, DHCP client section), the normal WAN sent it both as hostname and as client identity: put the same text here and in DHCP client-id.]]></help>
-    </field>
-    <field>
-        <id>keeper.description</id>
-        <label>Description</label>
-        <type>text</type>
     </field>
 </form>

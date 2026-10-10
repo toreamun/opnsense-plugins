@@ -24,11 +24,15 @@
     // Base dialogs have no declarative "show-if-other-field", so field couplings are
     // toggled in JS, mirroring the core pattern (the OpenVPN instance dialog does the
     // same). Hidden rows keep their values (the daemon ignores an inapplicable field);
-    // this only declutters the dialog. Every field toggled here is advanced, so it never
-    // appears unless advanced mode is on, gated on the toggle state exactly as core does.
+    // this only declutters the dialog. A row the form marks advanced (core renders it with
+    // data-advanced="true") also needs advanced mode on, gated on the toggle state exactly
+    // as core does, so the script follows the form's basic/advanced choice by itself.
     function cvdToggleConditionalFields() {
         let advancedOn = $("#DialogKeeper [id^='show_advanced_']").hasClass("fa-toggle-on");
-        function advRow(id, show) { $("#keeper\\." + id).closest("tr").toggle(show && advancedOn); }
+        function toggleRow(id, show) {
+            let row = $("#keeper\\." + id).closest("tr");
+            row.toggle(show && (advancedOn || row.attr("data-advanced") !== "true"));
+        }
 
         // CARP failover on lease loss applies only to a fixed reservation, so it is
         // mutually exclusive with "Follow dynamic DHCP address" (a follower adopts a new
@@ -38,21 +42,21 @@
         if (following) {
             $("#keeper\\.demoteOnLeaseLoss").prop("checked", false);
         }
-        advRow("demoteOnLeaseLoss", !following);
+        toggleRow("demoteOnLeaseLoss", !following);
 
         // Backup egress needs "Own default route by CARP role" on observe/enforce; its
         // sub-fields need the feature enabled, and the prefix list needs the prefixes form.
         let routeOwned = $("#keeper\\.defaultRouteMode").val() !== "off";
         let backupOn = routeOwned && $("#keeper\\.backupEgress").is(":checked");
-        advRow("backupEgress", routeOwned);
-        advRow("backupEgressForm", backupOn);
-        advRow("backupEgressGateway", backupOn);
-        advRow("backupEgressInterface", backupOn);
-        advRow("backupEgressPrefixes", backupOn && $("#keeper\\.backupEgressForm").val() === "prefixes");
+        toggleRow("backupEgress", routeOwned);
+        toggleRow("backupEgressForm", backupOn);
+        toggleRow("backupEgressGateway", backupOn);
+        toggleRow("backupEgressInterface", backupOn);
+        toggleRow("backupEgressPrefixes", backupOn && $("#keeper\\.backupEgressForm").val() === "prefixes");
 
         // Promiscuous ARP listen only has a reply to catch while the ARP nudge is enabled
         // (interval 0 disables the nudge).
-        advRow("arpListenPromisc", parseInt($("#keeper\\.arpNudgeInterval").val(), 10) > 0);
+        toggleRow("arpListenPromisc", parseInt($("#keeper\\.arpNudgeInterval").val(), 10) > 0);
     }
 
     $(document).ready(function () {

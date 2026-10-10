@@ -1,7 +1,8 @@
 """Shared keeper.conf access for the CarpVipDhcp configd scripts.
 
-Lives in the same directory as its consumers (status.py, logparse.py), which
-Python puts on sys.path when configd runs them, so no packaging is needed.
+Lives in the same directory as its consumers (lease_keeper.py, status.py,
+logparse.py), which Python puts on sys.path when they run, so no packaging is
+needed.
 """
 import re
 

@@ -13,6 +13,12 @@
 # the already-supervised keepers running on the old in-memory code rather than
 # stop them into a broken parse; the next reconfigure (or the boot-time config
 # apply) renders keeper.conf and restarts them cleanly.
+#
+# keeper.conf can hold DHCP identity values a provider treats as a credential, so
+# its directory is root:wheel 0750. configd gives each rendered file its
+# directory's mode minus the execute bits, so keeper.conf follows as 0640 on
+# every render; setting the directory once here is enough.
+install -d -o root -g wheel -m 0750 /usr/local/etc/carpvipdhcp
 if [ -x /usr/local/etc/rc.d/carpvipdhcp ]; then
     if /usr/local/sbin/configctl template reload OPNsense/CarpVipDhcp; then
         /usr/local/etc/rc.d/carpvipdhcp restart || true

@@ -153,14 +153,14 @@ def client_id_label(setting, chaddr):
     built with the daemon's own encoder, so it is exactly what a keeper started from
     this keeper.conf sends. A running keeper keeps the value it was started with
     until it restarts; its startup log line shows that one. "none" when the field is
-    empty; the raw setting if it cannot be encoded (a malformed chaddr would stop
-    the daemon too)."""
+    empty; "invalid" if it cannot be encoded (a malformed chaddr would stop the
+    daemon too). Never the setting itself, which may hold a credential."""
     if not setting:
         return _fmt_client_id(None)
     try:
         return _fmt_client_id(_client_id_bytes(setting, chaddr))
     except ValueError:
-        return setting
+        return "invalid"
 
 
 def read_keepers(states, names, conffile=CONFFILE, run_dir=RUN_DIR):

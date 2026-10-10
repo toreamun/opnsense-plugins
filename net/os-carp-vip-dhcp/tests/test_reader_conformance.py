@@ -31,33 +31,25 @@ _KEEPERCONF_SH = os.path.join(_SCRIPT_DIR, "keeperconf.sh")
 _HAS_SH = shutil.which("sh") is not None
 _UNDER_CI = os.environ.get("CI") == "true"
 
-# keeper.conf key -> the shell variable carpvipdhcp_parse_line sets for it. All
-# match the key name except the two backup-egress fields (shorter var names).
-_KEYS = [
-    "request", "iface", "chaddr", "demote", "vhid", "follow", "vendorclass",
-    "clientid", "hostname", "arpnudge", "arplistenpromisc", "defaultroutemode",
-    "backupegress", "backupegressform", "backupegressgateway",
-    "backupegressinterface", "backupegressprefixes",
-]
-_VAR = {k: k for k in _KEYS}
-_VAR["backupegressgateway"] = "backupegressgw"
-_VAR["backupegressinterface"] = "backupegressiface"
+# The keeper.conf keys carpvipdhcp_parse_line extracts (each into the shell
+# variable of the same name); the daemon reads the other keys itself.
+_KEYS = ["request", "iface", "chaddr", "demote"]
 
 _FIXTURES = [
-    # A full record.
+    # A full record (the keys the shell parser skips must not disturb the others).
     "request=185.41.66.101|iface=lagg1|chaddr=00:00:5e:00:01:c7|demote=0|vhid=199|"
     "follow=1|vendorclass=|clientid=|hostname=|arpnudge=240|arplistenpromisc=0|"
     "defaultroutemode=enforce|backupegress=1|backupegressform=split|"
     "backupegressgateway=10.0.0.1|backupegressinterface=em0|backupegressprefixes=",
-    # Reordered, an unknown key, and several keys missing.
+    # Reordered, an unknown key, and a key missing.
     "vhid=42|newkey=x|request=1.2.3.4|iface=em0|chaddr=aa",
-    # Empty values, and a value that itself contains '='.
-    "request=1.2.3.4|iface=em0|chaddr=aa|clientid=id=with=eq|hostname=",
-    # Leading-dash values (the DHCP-option masks allow them; must survive as the value).
-    "request=1.2.3.4|iface=em0|chaddr=aa|vendorclass=-foo|defaultroutemode=-bad",
+    # An empty value, and a value that itself contains '='.
+    "request=1.2.3.4|iface=em0|chaddr=id=with=eq|demote=",
+    # A leading-dash value (must survive as the value).
+    "request=1.2.3.4|iface=-foo|chaddr=aa|demote=-bad",
     # A glob/special character in a value (guards the "no glob side effects"
     # contract against a future missing quote in the parser).
-    "request=1.2.3.4|iface=em0|chaddr=aa|vendorclass=a[b]*c|hostname=",
+    "request=1.2.3.4|iface=a[b]*c|chaddr=aa",
     # A stray field with no '=' (must be ignored, not mis-dispatched).
     "request=1.2.3.4|garbage|iface=em0|chaddr=aa",
 ]
@@ -67,7 +59,7 @@ def _sh_parse(line):
     """{key: value} as keeperconf.sh's carpvipdhcp_parse_line extracts it (one
     `printf` per key, in _KEYS order, so the split lines up)."""
     assert _HAS_SH, "POSIX sh not found -- required to exercise keeperconf.sh"
-    dump = "\n".join(f'printf "%s\\n" "${{{_VAR[k]}}}"' for k in _KEYS)
+    dump = "\n".join(f'printf "%s\\n" "${{{k}}}"' for k in _KEYS)
     script = f'. "$1"\ncarpvipdhcp_parse_line "$2"\n{dump}\n'
     out = subprocess.run(
         ["sh", "-c", script, "sh", _KEEPERCONF_SH, line],

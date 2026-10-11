@@ -486,10 +486,14 @@ the keeper) only need doing once.
    Status_ and press the keeper's **Synchronize and Restart** button, which copies the
    config to the backup and restarts that keeper with it. **Synchronize and reconfigure
    all** also works but restarts every service on the backup, and it does not start a
-   keeper you have just added (start it from its own row after the sync). The cron job
-   **HA update and reconfigure backup** copies the config but does not restart the
-   keepers, so the backup keeps running its previous settings (for example a stale
-   client MAC override) until you restart them.
+   keeper you have just added (start it from its own row after the sync). If you
+   schedule the cron job **HA update and reconfigure backup** on the master
+   (_System ‣ Settings ‣ Cron_), it copies the config, re-renders the templates on the
+   backup and restarts its services, the keepers included, so keeper changes reach the
+   backup by the next run at the latest. It runs only while every CARP interface on the
+   master is MASTER (OPNsense
+   [HA documentation](https://docs.opnsense.org/manual/hacarp.html)). The restart is
+   harmless on a backup keeper: it holds no lease.
 6. **Gateway:** add `WAN_ISP` (`123.123.123.1`, on the WAN interface, **Far Gateway**,
    see step 2) under _System ‣ Gateways_ and mark it **Upstream Gateway** so it is the
    system default. There is no "pick the default" dropdown on 26.7: the default is the

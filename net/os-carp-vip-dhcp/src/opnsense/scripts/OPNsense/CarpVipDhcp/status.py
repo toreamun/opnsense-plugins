@@ -4,11 +4,13 @@
 Reads the rendered keeper table (keeper.conf) and, per keeper, its supervisor
 pidfile and heartbeat file. Output:
 
-    {"carp_demotion": <int|null>, "keepers": [ {per-keeper status}, ... ]}
+    {"carp_demotion": <int|null>, "vlan_mtag_pcp": <int|null>,
+     "keepers": [ {per-keeper status}, ... ]}
 
 The heartbeat file is written by lease_keeper.py in one of two forms:
     <epoch> bound=<ip> lease=<seconds> t1=<seconds> t2=<seconds> src=<server|derived>
-            [nudge=<epoch|0> arpok=<epoch|0> [gw=<ip>]]
+            [master=<0|1>] demote_ok=<0|1> [nudge=<epoch|0> arpok=<epoch|0> [gw=<ip>]]
+            [pcperr=<errno name>]
     <epoch> MISMATCH got=<ip> want=<ip>
 """
 import json
@@ -77,6 +79,7 @@ _HB_TOKENS = {
     "nudge": (("nudge_epoch", "nudge_age"), _epoch_pair),
     "arpok": (("arp_reply_epoch", "arp_reply_age"), _epoch_pair),
     "gw": (("gw",), lambda v: (v,)),
+    "pcperr": (("vlan_pcp_error",), lambda v: (v,)),
     "got": (("mismatch_got",), lambda v: (v,)),
     "want": (("mismatch_want",), lambda v: (v,)),
 }
@@ -89,7 +92,7 @@ def parse_heartbeat_text(raw):
     result = {"bound": None, "lease": None, "t1": None, "t2": None, "timing_source": None,
               "mismatch": False, "mismatch_got": None, "mismatch_want": None,
               "hb_epoch": None, "hb_age": None, "nudge_epoch": None, "nudge_age": None, "gw": None,
-              "arp_reply_epoch": None, "arp_reply_age": None}
+              "arp_reply_epoch": None, "arp_reply_age": None, "vlan_pcp_error": None}
     parts = raw.split()
     if not parts:
         return result
@@ -163,6 +166,14 @@ def client_id_label(setting, chaddr):
         return "invalid"
 
 
+def vlan_pcp_label(setting):
+    """The configured 802.1p priority as the keeper uses it: None for Disabled (blank)
+    and for a value outside 0-7, which the keeper drops. 0 sets none of its own
+    either; the GUI shows nothing for None or 0."""
+    pcp = _int_token(setting)
+    return pcp if pcp in range(8) else None
+
+
 def read_keepers(states, names, conffile=CONFFILE, run_dir=RUN_DIR):
     """One status entry per keeper.conf line: config, process, CARP role and
     heartbeat fields, plus the derived arp_confirmed freshness flag. conffile /
@@ -190,6 +201,7 @@ def read_keepers(states, names, conffile=CONFFILE, run_dir=RUN_DIR):
             "demote_on_lease_loss": rec.get("demote", "0") == "1",
             "follow_ip": rec.get("follow", "0") == "1",
             "arp_nudge": arp_nudge,
+            "vlan_pcp": vlan_pcp_label(rec.get("vlanpcp", "")),
             "running": pid is not None,
             "pid": pid,
         }
@@ -201,9 +213,9 @@ def read_keepers(states, names, conffile=CONFFILE, run_dir=RUN_DIR):
     return keepers
 
 
-def carp_demotion():
-    """The kernel CARP demotion counter, or None when unreadable."""
-    res = run(["/sbin/sysctl", "-n", "net.inet.carp.demotion"], quiet=True)
+def sysctl_int(name):
+    """An integer sysctl, or None when unreadable."""
+    res = run(["/sbin/sysctl", "-n", name], quiet=True)
     if res is None or res.returncode != 0:
         return None
     try:
@@ -212,10 +224,22 @@ def carp_demotion():
         return None
 
 
+def carp_demotion():
+    """The kernel CARP demotion counter, or None when unreadable."""
+    return sysctl_int("net.inet.carp.demotion")
+
+
+def vlan_mtag_pcp():
+    """net.link.vlan.mtag_pcp, or None when unreadable. At 0 the kernel drops the
+    VLAN priority the keeper sets, with no error, so it is read on every call."""
+    return sysctl_int("net.link.vlan.mtag_pcp")
+
+
 def main():
     """Emit the status JSON document on stdout."""
     print(json.dumps({
         "carp_demotion": carp_demotion(),
+        "vlan_mtag_pcp": vlan_mtag_pcp(),
         "keepers": read_keepers(carp_states(), iface_names()),
     }))
 

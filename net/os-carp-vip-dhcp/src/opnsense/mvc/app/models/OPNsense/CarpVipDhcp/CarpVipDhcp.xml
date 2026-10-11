@@ -1,6 +1,6 @@
 <model>
     <mount>//OPNsense/CarpVipDhcp</mount>
-    <version>1.1.0</version>
+    <version>1.2.0</version>
     <description>CARP-VIP DHCP lease keeper</description>
     <items>
         <keepers>
@@ -110,6 +110,28 @@
                     <ValidationMessage>Hostname: letters, digits, dot and dash only (max 63).</ValidationMessage>
                     <Required>N</Required>
                 </hostname>
+
+                <!--
+                    802.1p priority (PCP) on every frame the keeper sends (DHCP and ARP
+                    nudge), set on its bpf descriptor. Same field and values as the
+                    interface's DHCP client "Use VLAN priority" (core NetworkInterface
+                    dhcpvlanprio). Blank = Disabled; 0 also leaves the priority to the
+                    VLAN device.
+                -->
+                <vlanPriority type="OptionField">
+                    <Required>N</Required>
+                    <BlankDesc>Disabled</BlankDesc>
+                    <OptionValues>
+                        <pcp1 value="1">Background (1, lowest)</pcp1>
+                        <pcp0 value="0">Best Effort (0, default)</pcp0>
+                        <pcp2 value="2">Excellent Effort (2)</pcp2>
+                        <pcp3 value="3">Critical Applications (3)</pcp3>
+                        <pcp4 value="4">Video (4)</pcp4>
+                        <pcp5 value="5">Voice (5)</pcp5>
+                        <pcp6 value="6">Internetwork Control (6)</pcp6>
+                        <pcp7 value="7">Network Control (7, highest)</pcp7>
+                    </OptionValues>
+                </vlanPriority>
 
                 <!--
                     Own the IPv4 WAN default route as a function of CARP role and

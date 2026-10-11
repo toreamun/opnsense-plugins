@@ -108,11 +108,20 @@ _CONF_VALUES = {
     "backupegressgateway": "backup_egress_gateway",
     "backupegressinterface": "backup_egress_interface",
     "backupegressprefixes": "backup_egress_prefixes",
+    "vlanpcp": "vlan_pcp",
 }
 _CONF_FLAGS = {
     "follow": "follow",
     "arplistenpromisc": "arp_listen_promisc",
     "backupegress": "backup_egress",
+}
+# The 802.1p priorities (PCP); 0 sets none of its own.
+VLAN_PCP_VALUES = range(8)
+# The integer record fields: destination -> (what it is, its valid values or None for
+# any integer, what an invalid value leaves).
+_CONF_INTS = {
+    "arp_nudge": ("ARP nudge interval", None, "the nudge stays off"),
+    "vlan_pcp": ("VLAN priority", VLAN_PCP_VALUES, "no VLAN priority is set"),
 }
 
 
@@ -183,16 +192,23 @@ def _find_record(conf, keeper_id):
 def _record_defaults(record):
     """Parser defaults from a keeper.conf record, so an option given on the command
     line still wins. An empty field means "not set" in keeper.conf and leaves the
-    parser default; a flag field turns the flag on only when it is "1". An ARP nudge
-    interval that is not a number (only reachable via a hand-edited config.xml) is
-    dropped with a warning, so the nudge stays off instead of argparse exiting 2 into
-    a daemon(8) -r crash loop."""
+    parser default; a flag field turns the flag on only when it is "1". An integer
+    field (_CONF_INTS) that is not a number or is out of range (only reachable via a
+    hand-edited config.xml) is dropped with a warning, so its option keeps the off
+    default instead of argparse exiting 2 into a daemon(8) -r crash loop."""
     defaults = {dest: record[key] for key, dest in _CONF_VALUES.items() if record.get(key)}
     defaults.update({dest: True for key, dest in _CONF_FLAGS.items() if record.get(key) == "1"})
-    try:
-        int(defaults.get("arp_nudge", 0))
-    except ValueError:
-        LOG.warning("invalid ARP nudge interval %r -- the nudge stays off", defaults.pop("arp_nudge"))
+    for dest, (what, allowed, consequence) in _CONF_INTS.items():
+        if dest not in defaults:
+            continue
+        try:
+            value = int(defaults[dest])
+        except ValueError:
+            valid = False
+        else:
+            valid = allowed is None or value in allowed
+        if not valid:
+            LOG.warning("invalid %s %r -- %s", what, defaults.pop(dest), consequence)
     return defaults
 
 
@@ -225,6 +241,9 @@ def _build_arg_parser():
                     help="put the capture socket in promiscuous mode so the gateway's "
                          "unicast ARP reply is seen on NICs that filter non-primary "
                          "unicast MACs (default off; only needed if replies aren't seen)")
+    ap.add_argument("--vlan-pcp", type=int, choices=VLAN_PCP_VALUES, default=0, metavar="0-7",
+                    help="802.1p priority on every frame the keeper sends (DHCP and ARP); "
+                         "0 (default) sets none, so the VLAN device's own priority applies")
     # Accepted and ignored (bpf is the only backend): a daemon(8) supervisor started by
     # an older version may still carry --capture-backend on its command line, and its
     # next restart must run this script instead of exiting 2 and crash-looping.
@@ -358,6 +377,7 @@ def main():
                         vhid=args.vhid, follow=args.follow,
                         vendor_class=args.vendor_class, client_id=args.client_id, hostname=args.hostname,
                         arp_nudge=args.arp_nudge, arp_listen_promisc=args.arp_listen_promisc,
+                        vlan_pcp=args.vlan_pcp,
                         default_route_mode=args.default_route_mode,
                         backup_egress=backup_egress)
 

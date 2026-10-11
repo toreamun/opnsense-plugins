@@ -64,6 +64,7 @@ class _Config:
     hbfile: "str | None"
     release_on_exit: bool
     vhid: "str | None"
+    vlan_pcp: int
 
 
 @dataclass
@@ -96,7 +97,7 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
                  eth_src=None, *,
                  hbfile=None, release_on_exit=False, vhid=None,
                  follow=False, vendor_class=None, client_id=None, hostname=None,
-                 arp_nudge=0, arp_listen_promisc=False,
+                 arp_nudge=0, arp_listen_promisc=False, vlan_pcp=0,
                  default_route_mode="off", backup_egress=None):
         # Fixed identity/config, immutable once set (see _Config).
         self._cfg = _Config(
@@ -105,7 +106,8 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
             eth_src=(eth_src or chaddr).lower(),
             hbfile=hbfile,
             release_on_exit=release_on_exit,
-            vhid=str(vhid) if vhid else None)
+            vhid=str(vhid) if vhid else None,
+            vlan_pcp=vlan_pcp)
 
         # Capture backend component: owns the capture socket/thread and the
         # wire codec on both directions, and hands decoded neutral frames
@@ -121,7 +123,7 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
             LOG.info("ARP listen promiscuous is set but the ARP nudge is disabled (interval "
                      "0) -- ignoring it; promiscuous capture only serves the nudge reply")
         self._capture: Capture = BpfCapture(
-            iface, effective_promisc, self._on_dhcp_reply, self._on_arp_reply)
+            iface, effective_promisc, self._on_dhcp_reply, self._on_arp_reply, vlan_pcp)
 
         # ARP nudge component: owns the pacing and reachability state; the
         # keeper supplies the lease binding per nudge (_arp_nudge) and the
@@ -295,6 +297,12 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         # demote_ok=1 tells the CARP eligibility hook (when demote=1) to demote this
         # node: it is the master and has failed to hold the lease past the grace.
         demote_ok = 1 if self._demote_ok(now) else 0
+        # pcperr=<errno name>: the VLAN priority could not be set, so the frames go
+        # out without it. Read by the system status banner (CarpVipDhcpStatus.php)
+        # and status.py's _HB_TOKENS.
+        pcperr = self._capture.vlan_pcp_error
+        if pcperr:
+            extra += f" pcperr={pcperr}"
         self._write_hb(f"{int(now)} bound={self._dhcp.binding.yiaddr or '-'} "
                        f"lease={self._dhcp.binding.lease_secs} t1={t1} t2={t2} src={src}"
                        f"{role} demote_ok={demote_ok}{extra}\n")
@@ -720,12 +728,14 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
 
         # eth-src matters for L2 debugging but only when it differs from the chaddr.
         ethsrc = f", eth-src {self._cfg.eth_src}" if self._cfg.eth_src != self._cfg.chaddr else ""
+        # The VLAN priority only when set (Disabled and 0 send none of their own).
+        pcp = f", VLAN priority {self._cfg.vlan_pcp}" if self._cfg.vlan_pcp else ""
         # The client-id is the ISP-visible identity when the server keys on option 61,
         # so state it here instead of leaving it to a packet capture.
         LOG.info("lease-keeper %s up on %s (vhid %s, default-route %s): "
-                 "CARP MAC %s%s, client-id %s, requesting %s",
+                 "CARP MAC %s%s, client-id %s%s, requesting %s",
                  __version__, self._cfg.iface, self._cfg.vhid or "none", self._defroute.mode,
-                 self._cfg.chaddr, ethsrc, _fmt_client_id(self._dhcp.client_id),
+                 self._cfg.chaddr, ethsrc, _fmt_client_id(self._dhcp.client_id), pcp,
                  self._follow.target or "any")
         self._role.log_initial()
         time.sleep(SNIFFER_WARMUP)

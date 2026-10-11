@@ -177,6 +177,31 @@
         return cell;
     }
 
+    function vlanPcpLine(k, mtagPcp) {
+        // Disabled and 0 both leave the priority to the VLAN device: nothing to show.
+        if (!k.vlan_pcp) {
+            return '';
+        }
+        let tip = "{{ lang._('802.1p priority on everything the keeper sends. On an interface that is not a VLAN, frames carry a priority tag with VLAN ID 0.') }}";
+        let line = '<br><small class="text-muted" title="' + tip + '">'
+            + "{{ lang._('VLAN priority') }}" + ': ' + k.vlan_pcp + '</small>';
+        let warn = null;
+        if (k.running === true && k.vlan_pcp_error) {
+            warn = "{{ lang._('VLAN priority not applied') }}" + ' (' + k.vlan_pcp_error + '). '
+                + "{{ lang._('DHCP is sent without priority. On a VLAN interface, set the priority on the VLAN device instead (Interfaces: Devices: VLAN).') }}";
+        } else if (mtagPcp === 0) {
+            warn = "{{ lang._('VLAN priority not applied: net.link.vlan.mtag_pcp is 0. Set it to 1 under System: Settings: Tunables.') }}";
+        }
+        // Visible text, like the ARP nudge's "no reply", so the warning does not
+        // depend on hovering the icon; the tooltip carries the detail.
+        if (warn !== null) {
+            line += ' <small class="text-warning" title="' + warn + '">'
+                + '<i class="fa fa-exclamation-triangle fa-fw" aria-hidden="true"></i>'
+                + "{{ lang._('not applied') }}" + '</small>';
+        }
+        return line;
+    }
+
     function refreshStatus() {
         ajaxGet('/api/carpvipdhcp/diagnostics/status', {}, function (data) {
             if (data === undefined) {
@@ -205,7 +230,7 @@
                     + '<td>' + nudgeCell(k) + '</td>'
                     + '<td>' + dash(k.chaddr)
                     + '<br><small class="text-muted">' + "{{ lang._('client-id') }}" + ': '
-                    + dash(k.client_id) + '</small></td>'
+                    + dash(k.client_id) + '</small>' + vlanPcpLine(k, data.vlan_mtag_pcp) + '</td>'
                     + '</tr>';
             });
             $('#keeper_rows').html(rows);

@@ -87,7 +87,7 @@
                 + '">' + "{{ lang._('follow') }}" + '</span>';
         }
         let extra = (k.demote_on_lease_loss === true)
-            ? ' + ' + "{{ lang._('demote') }}" : '';
+            ? ' + ' + "{{ lang._('fail over') }}" : '';
         return '<span class="label label-default" title="'
             + "{{ lang._('Enforces the fixed reservation; a different address raises a mismatch') }}"
             + '">' + "{{ lang._('enforce') }}" + extra + '</span>';
@@ -249,7 +249,7 @@
                     + '<td>' + leaseTimeCell(k) + '</td>'
                     + '<td>' + nudgeCell(k) + '</td>'
                     + '<td>' + dash(k.chaddr)
-                    + '<br><small class="text-muted">' + "{{ lang._('client-id') }}" + ': '
+                    + '<br><small class="text-muted">' + "{{ lang._('client identifier') }}" + ': '
                     + dash(k.client_id) + '</small>' + vlanPcpLine(k, data.vlan_mtag_pcp) + dhcpOptionsLines(k) + '</td>'
                     + '</tr>';
             });

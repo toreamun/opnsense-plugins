@@ -280,7 +280,7 @@ are examples, substitute your own.*
 | 1 | Put a switch between the ISP hand-off and both nodes' WAN ports | hardware |
 | 2 | Give each node's WAN a static **link-local** IP (`169.254.255.1/29`, `.2/29`) | Interfaces ‣ [WAN] |
 | 3 | Create the CARP VIP (vhid, password, advskew 0 / 100) | Interfaces ‣ Virtual IPs |
-| 4 | Add a plugin keeper on that VIP, Follow on, alias `wan_carp_vip` | Interfaces ‣ Virtual IPs DHCP |
+| 4 | Add a plugin keeper on that VIP, lease policy Follow dynamic address, alias `wan_carp_vip` | Interfaces ‣ Virtual IPs DHCP |
 | 5 | SYNC interface, pfsync + config sync incl. `carpvipdhcp` | System ‣ High Availability |
 | 6 | Add gateway `WAN_ISP` (**Far Gateway**, **Upstream**), delete the old `<WANIF>_DHCP` one | System ‣ Gateways |
 | 7 | No gateway group for the default route | System ‣ Gateways ‣ Group |
@@ -347,7 +347,7 @@ are examples, substitute your own.*
 
 > **The VIP is not a network you choose:** it is whatever address the ISP leases on the
 > virtual MAC, so it always sits in the ISP gateway's subnet. The `/24` here is
-> illustrative; the real mask is the ISP's. With **Follow dynamic DHCP address** on, the plugin follows a
+> illustrative; the real mask is the ISP's. With the lease policy **Follow dynamic address**, the plugin follows a
 > changed lease, including a cross-subnet renumber: it adopts the new address and, from
 > the DHCP ACK's subnet mask and gateway, updates the VIP prefix and the WAN gateway too,
 > so outbound keeps working (the same as a plain DHCP interface). If the ACK carries no
@@ -430,11 +430,11 @@ the keeper) only need doing once.
    [Setup Virtual IPs](https://docs.opnsense.org/manual/how-tos/carp.html#setup-virtual-ips)).
    **You don't need to know the final public address:** seed the VIP with your current
    WAN's public IP (the Interfaces overview shows it), or any routable placeholder if the
-   line is fresh. With **Follow dynamic DHCP address** on (step 4) the keeper DHCPs on the
+   line is fresh. With the lease policy **Follow dynamic address** (step 4) the keeper DHCPs on the
    virtual MAC and rewrites the VIP - address, prefix and gateway - to whatever the ISP
    actually hands out ([section 6.1](#s6-1)).
-4. **Plugin** [os-carp-vip-dhcp](../README.md): a keeper on the VIP with **Follow dynamic
-   DHCP address** on, and set its **Sync firewall alias** to `wan_carp_vip` ([section 6.2](#s6-2)). Only the CARP master
+4. **Plugin** [os-carp-vip-dhcp](../README.md): a keeper on the VIP with the **IPv4 lease
+   policy** **Follow dynamic address** (the default), and set its **Sync firewall alias** to `wan_carp_vip` ([section 6.2](#s6-2)). Only the CARP master
    sources the virtual MAC: the backup stays passive (it holds no lease of its own and
    transmits no DHCP) until it is promoted, so the two nodes never flap the virtual MAC on
    the shared WAN switch. On failover the new master acquires the lease at once and nudges
@@ -448,16 +448,18 @@ the keeper) only need doing once.
    IP-source-guard ISP blackholes the gateway).
 
    **Keep the client identity the ISP already knows.** Some ISPs identify a DHCP client by
-   option 61 (the client-id), not by the MAC. A normal OPNsense WAN sends option 61 as
+   option 61 (Client Identifier), not by the MAC. A normal OPNsense WAN sends option 61 as
    hardware type 1 + the interface MAC. If you ran the pre-flight with the WAN MAC set to the
-   virtual MAC, the ISP now knows that identity. The keeper's **DHCP client-id** (advanced
+   virtual MAC, the ISP now knows that identity. The keeper's **Client identifier** (advanced
    mode) decides which identity the keeper uses:
 
-   - `mac` (the default for new keepers): type 1 + the virtual MAC, the same as a normal WAN
-     sends when its MAC is the virtual MAC. Leave it like this in a default setup.
+   - **Default** (new keepers): type 1 + the virtual MAC, the same as a normal WAN sends when
+     its MAC is the virtual MAC. Leave it like this in a default setup.
    - If the **Hostname field on the WAN interface** was set (_Interfaces ‣ [WAN]_, DHCP client
-     section; not the system hostname), the normal WAN sent that text as the client-id
-     instead. Put the same text in the keeper's **DHCP client-id** and **DHCP hostname**.
+     section; not the system hostname), the normal WAN sent that text as the client identifier
+     instead. Put the same text in the keeper's **DHCP hostname**, set **Client identifier** to
+     **From Send Options**, and add the line `dhcp-client-identifier "the same text"` to
+     **Send Options**.
    - Only if normal WAN DHCP keeps running on the same interface next to the keeper (one ISP
      address for the node, one for the VIP), the keeper needs a *different* identity, or the
      ISP sees the two as one client.
@@ -465,15 +467,15 @@ the keeper) only need doing once.
    A different identity is not an error, but an ISP that uses option 61 treats the keeper as
    a new device while it still holds the old lease (see [section 9.2](#s9) *First cutover*).
    It may refuse the keeper until that lease runs out, or offer it a *different* address.
-   With **Follow** on, the keeper then follows that address and moves the VIP to it; with
-   Follow off it refuses it and keeps asking. The keeper logs the client-id it sends in its
-   startup line (the status page shows the configured one under the lease MAC). The log
-   shows an identity problem as a NAK to the first REQUEST, then either "ISP gave ... --
-   following" (Follow on) or an "IP mismatch" that names a different client identity as a
-   possible cause (Follow off). `mac` needs
-   this plugin version or later on **both** nodes: an older keeper sends it as the three
-   letters "mac", so the two nodes would present different identities. Upgrade both nodes
-   before you create a keeper or set `mac`, and do not downgrade one node while it is in use.
+   With **Follow dynamic address**, the keeper then follows that address and moves the VIP
+   to it; with **Enforce reservation** it refuses it and keeps asking. The keeper logs the
+   client identifier it sends in its startup line (the status page shows the configured one
+   under the lease MAC). The log shows an identity problem as a NAK to the first REQUEST,
+   then either "ISP gave ... -- following" (Follow) or an "IP mismatch" that names a
+   different client identity as a possible cause (Enforce). Run the same plugin version on
+   **both** nodes: a node on an older version reads the keeper settings differently and can
+   present a different identity. Upgrade both nodes before you create a keeper or change
+   its identity, and do not downgrade one node while it is in use.
 
    <p align="center"><img src="img/settings-advanced.png" alt="Keeper dialog in advanced mode: Follow on, Sync firewall alias wan_carp_vip, Own default route by CARP role off, Client MAC override blank" width="700"><br>
    <sub><i>The keeper, advanced mode on: Follow on, alias <code>wan_carp_vip</code>, Client MAC override blank. <b>Own default route by CARP role</b> stays off in the baseline design (<a href="#s7">section 7</a>).</i></sub></p>
@@ -839,7 +841,7 @@ Most of these are edge cases - a WAN where the ISP isolates you per VLAN/port (t
   move per 60 s). During a T2 **REBIND** the expected-server check is intentionally
   relaxed (any server may answer - legitimate DHCP), widening the window. This is the
   same untrusted-shared-L2 exposure as the ARP-spoofing bullet above, and moot where the
-  ISP isolates you per VLAN/port. On a shared L2, pin the address (follow off) or use a
+  ISP isolates you per VLAN/port. On a shared L2, pin the address (lease policy **Enforce reservation**) or use a
   strict upstream.
 
 ### 9.2 DHCP, the lease, and the cutover
@@ -862,39 +864,39 @@ Most of these are edge cases - a WAN where the ISP isolates you per VLAN/port (t
   to the virtual MAC's `DISCOVER` (**ISP-dependent** - check with the probe above), so
   release the lease, wait the cooldown out, *then* start the keeper. Failover reuses the
   *same* virtual MAC, so neither trap recurs. *(3)* An ISP that identifies clients by
-  option 61 (the client-id) sees a new device if the keeper's client-id differs from what
+  option 61 (Client Identifier) sees a new device if the keeper's client identifier differs from what
   the WAN sent before, and may stay silent until the old lease runs out, or hand out a
-  different address (which a keeper with Follow on adopts as the new VIP). A new keeper sends
-  `mac` (type 1 + the virtual MAC), which matches a normal OPNsense WAN in a default setup;
+  different address (which a keeper with Follow dynamic address adopts as the new VIP). A new
+  keeper sends type 1 + the virtual MAC (Client identifier Default), which matches a normal OPNsense WAN in a default setup;
   see step 4 in [section 6.3](#s6-3) for the WAN Hostname case.
-- **Changing the client-id of an existing keeper:** keepers created before the `mac`
-  default keep their stored setting (empty = no option 61), so upgrading changes nothing.
-  The one exception is a keeper whose client-id was set to the literal text `mac` (any
-  case): that value now means type 1 + the MAC instead of the three letters.
-  Most have no reason to change. To switch anyway (for example to be able to go back to a
-  normal WAN DHCP later without a wait): pick a quiet time and check the lease time on the
-  status page (an ISP that holds the old lease can refuse the new identity until it runs
-  out, or offer a different address). Decide what you want if it does: with **Follow** on
-  the keeper moves the VIP to the new address (a renumber); turn Follow off for the switch
-  (and back on afterwards) if you would rather wait and keep the address. Make sure **both** nodes run this plugin
-  version or later (an older keeper sends `mac` as text); set **DHCP client-id** to `mac`
-  on the master and save; sync the backup with the keeper's **Synchronize and Restart**
-  button (the backup must have the same identity before any failover); then restart the
-  keeper on the master. Check the keeper's startup log line (what the running keeper
-  sends), or `tcpdump -vvni <wan> port 67` for `Client-ID (61), length 7: ether`
+- **Changing the client identifier of an existing keeper:** upgrading keeps what a keeper
+  sent: a client-id of `mac` becomes **Default**, an empty one **None**, and a text one a
+  `dhcp-client-identifier` line in **Send Options** with **From Send Options**. Most have no
+  reason to change. To switch anyway (for example to be able to go back to a normal WAN
+  DHCP later without a wait): pick a quiet time and check the lease time on the status page
+  (an ISP that holds the old lease can refuse the new identity until it runs out, or offer a
+  different address). Decide what you want if it does: with **Follow dynamic address** the
+  keeper moves the VIP to the new address (a renumber); set the lease policy to **Enforce
+  reservation** for the switch (and back afterwards) if you would rather wait and keep the
+  address. Make sure **both** nodes run the same plugin version; set **Client identifier** to
+  **Default** on the master and save; sync the backup with the keeper's **Synchronize and
+  Restart** button (the backup must have the same identity before any failover); then
+  restart the keeper on the master. Check the keeper's startup log line (what the running
+  keeper sends), or `tcpdump -vvni <wan> port 67` for `Client-ID (61), length 7: ether`
   followed by the keeper's MAC (the virtual MAC `00:00:5e:00:01:xx`, where `xx` is the vhid
-  in hex, or the chaddr override if one is set). Going back is the same with an empty field.
+  in hex, or the chaddr override if one is set). Going back is the same with **None**.
 - **Follow tracks an ISP renumber, including cross-subnet:** the keeper rewrites the CARP
   VIP to the new address (after checking it is sane, in the same routability class, and
   from the expected server). A **same-subnet** change is seamless; on a **cross-subnet**
   move it also updates the VIP prefix and the WAN gateway from the DHCP ACK and reapplies
   routing, so outbound keeps working - parity with a plain DHCP interface. The one gap: if
   the ACK carries **no subnet mask**, it can only move the address and logs a warning to
-  fix the prefix and gateway by hand. (`follow off` pins the address and does none of this.)
-- **Identical DHCP client-id across nodes:** if the server keys on the client-id
-  (option 61) instead of `chaddr` and the two nodes present different ones, they can get
-  *different* addresses. With `mac` both nodes derive it from the same virtual MAC; a text
-  value is kept identical by config-sync, as long as the backup is synced before a failover.
+  fix the prefix and gateway by hand. (**Enforce reservation** pins the address and does none of this.)
+- **Identical client identifier across nodes:** if the server keys on option 61 (Client
+  Identifier) instead of `chaddr` and the two nodes present different ones, they can get
+  *different* addresses. With **Default** both nodes derive it from the same virtual MAC; a
+  Send Options value is kept identical by config-sync, as long as the backup is synced
+  before a failover.
 
 ### 9.3 Failover and routing
 
@@ -923,7 +925,7 @@ Most of these are edge cases - a WAN where the ISP isolates you per VLAN/port (t
 - **Stopping the service is not the same as disabling a keeper:** disabling/removing a
   keeper and pressing Apply drops it from `keeper.conf`, so the CARP eligibility hook
   ignores it - no demotion. Stopping the whole *service*, by contrast, freezes the
-  heartbeats; a `demote_on_lease_loss` keeper then reads as failed and the node demotes,
+  heartbeats; a keeper with **Enforce reservation and fail over on loss** then reads as failed and the node demotes,
   handing the VIP to the peer. To take a node out of rotation on purpose that may be
   what you want; to pause a keeper **without** a failover, disable the keeper - don't
   stop the service.

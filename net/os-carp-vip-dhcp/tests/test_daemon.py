@@ -46,7 +46,7 @@ def test_fs_safe(lk):
 def _client(lk, id_opts=None, on_changed=None):
     """A bare DhcpClient with stub hooks and a captured send list -- the
     protocol tests need no Keeper and no capture backend."""
-    c = lk.DhcpClient(None, CHADDR_STR, CHADDR_STR, id_opts or [],
+    c = lk.DhcpClient(None, CHADDR_STR, CHADDR_STR, lk.RequestOptions(id_opts or []),
                       hooks=lk.DhcpHooks(
                           should_stop=lambda: False,
                           ensure_sniffer=lambda: None,
@@ -704,6 +704,28 @@ def test_main_reads_its_settings_from_keeper_conf(monkeypatch, tmp_path):
     assert k["backup_egress"].enabled and k["backup_egress"].gateway == "10.0.0.1"
     assert k["backup_egress"].interface is None and k["backup_egress"].prefixes == ()
     assert k["vlan_pcp"] == 6
+
+
+def test_main_dhcp_options_from_keeper_conf(monkeypatch, tmp_path):
+    # The model writes Send Options as code:hex and Request Options as codes.
+    line = _CONF_LINE + "|sendopts=60:7361676d,90:0102|reqopts=119,6"
+    rc, built = _conf_main(monkeypatch, tmp_path, line, "--keeper-id", "100_64_4_7")
+    assert rc == 0
+    k = built["kwargs"]
+    assert k["send_opts"] == [(60, b"sagm"), (90, b"\x01\x02")]
+    assert k["request_codes"] == [119, 6]
+    assert k["config_error"] is None
+
+
+@pytest.mark.parametrize("field", ["sendopts=60", "sendopts=60:zz", "sendopts=0:01",
+                                   "sendopts=300:01", "reqopts=1,x", "reqopts=0"])
+def test_main_unusable_dhcp_options_are_a_config_error(monkeypatch, tmp_path, field):
+    # A hand-edited or foreign keeper.conf: the keeper still starts (no crash loop)
+    # with a configuration error, so it sends no DHCP and the banner says why.
+    rc, built = _conf_main(monkeypatch, tmp_path, f"{_CONF_LINE}|{field}", "--keeper-id", "100_64_4_7")
+    assert rc == 0
+    assert built["kwargs"]["config_error"].startswith("keeper.conf DHCP options unusable")
+    assert built["kwargs"]["send_opts"] == [] and built["kwargs"]["request_codes"] == []
 
 
 @pytest.mark.parametrize("case", [

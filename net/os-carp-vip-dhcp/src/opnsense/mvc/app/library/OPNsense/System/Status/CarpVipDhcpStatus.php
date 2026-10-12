@@ -148,8 +148,13 @@ class CarpVipDhcpStatus extends AbstractStatus
         if (strpos($content, 'MISMATCH') !== false) {
             return gettext('ISP handed a different address than the VIP');
         }
-        // The cause before its symptom: without the VLAN priority the ISP may not
-        // answer, so this comes before the lease checks. Shown on both nodes.
+        // Causes before their symptom, both shown on both nodes: a configuration
+        // error stops all DHCP, and without the VLAN priority the ISP may not
+        // answer, so both come before the lease checks.
+        if (strpos($content, ' cfgerr=1') !== false) {
+            return gettext('configuration error, the keeper sends no DHCP: open the keeper and save it '
+                . 'again, or upgrade this node if the settings came from a newer HA peer');
+        }
         if (preg_match('/\bpcperr=(\S+)/', $content, $m)) {
             return sprintf(
                 gettext('VLAN priority not applied (%s), DHCP is sent without it'),

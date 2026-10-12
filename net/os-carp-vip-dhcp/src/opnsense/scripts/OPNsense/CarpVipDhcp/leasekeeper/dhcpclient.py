@@ -6,7 +6,7 @@ replies arrive via feed().
 import logging
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable
 
 from .constants import (
@@ -16,7 +16,7 @@ from .constants import (
     REBIND_MARGIN, REBOOT_ATTEMPTS, RENEW_ATTEMPTS, RENEW_TIMEOUT, REPLY_TIMEOUT,
     SEND_RETRY_DELAY, SendMsgType, T1_FACTOR, T2_FACTOR, TimingSource)
 from .util import _jittered, _mask_to_bits, _new_xid, mac2raw
-from .wire import DhcpReply, DhcpSend, _dhcp_options, _fmt_reply, _msg_text
+from .wire import DhcpReply, DhcpSend, _dhcp_options, _fmt_reply, _msg_text, request_list
 
 LOG = logging.getLogger(LOGGER_NAME)
 
@@ -87,6 +87,17 @@ class Lease:  # pylint: disable=too-many-instance-attributes
 
 
 @dataclass(frozen=True)
+class RequestOptions:
+    """What the client adds to its requests: the identity options (vendor class,
+    client-id, hostname; see _identity_options), the operator's Send Options as
+    raw (code, bytes) and the Request Options codes that lead the Parameter
+    Request List (see wire.request_list)."""
+    identity: list
+    send: list = field(default_factory=list)
+    request_codes: list = field(default_factory=list)
+
+
+@dataclass(frozen=True)
 class DhcpHooks:
     """The three policy hooks the caller injects into DhcpClient, grouped so the
     follow/keeper policy (not the protocol engine) owns them: should_stop aborts
@@ -107,7 +118,7 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
     to feed(). Policy stays with the caller through the injected DhcpHooks
     (should_stop / ensure_sniffer / on_changed_address; see that type)."""
 
-    def __init__(self, capture, chaddr, eth_src, id_opts, *, hooks: DhcpHooks):
+    def __init__(self, capture, chaddr, eth_src, options: RequestOptions, *, hooks: DhcpHooks):
         self._capture = capture
         self.chaddr = chaddr
         self.chraw = mac2raw(chaddr)
@@ -117,7 +128,12 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
         # DISCOVER/REQUEST/RENEW/REBIND/RELEASE so the server sees a consistent
         # client identity: RFC 2131 sections 2 and 4.2 require a client that sends
         # a client-id to send the same one in all subsequent messages.
-        self._id_opts = id_opts
+        self._id_opts = list(options.identity)
+        # The operator's Send Options as raw (code, bytes): in DISCOVER, REQUEST,
+        # RENEW and REBIND, not in RELEASE (RFC 2131 table 5, see release()).
+        self._send_opts = list(options.send)
+        # The Parameter Request List: Request Options first, then the keeper's own.
+        self._prl = request_list(options.request_codes)
         self._should_stop = hooks.should_stop
         self._ensure_sniffer = hooks.ensure_sniffer
         self._on_changed = hooks.on_changed_address
@@ -128,6 +144,11 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
 
         self._rx = None                # latest DhcpReply snapshot (set via feed(), sniffer thread)
         self._reply_ready = threading.Event()
+
+    def send_options_summary(self):
+        """The Send Options by code and byte count ("60 (5 bytes), 90 (70 bytes)"),
+        never their values; "" when there are none."""
+        return ", ".join(f"{code} ({len(value)} bytes)" for code, value in self._send_opts)
 
     @property
     def client_id(self):
@@ -147,7 +168,7 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
         self._capture.send_dhcp(DhcpSend(
             eth_src=self.eth_src, ip_src=ciaddr, ip_dst=IPV4_BROADCAST,
             chaddr=self.chraw, xid=self.xid, ciaddr=ciaddr, flags=BROADCAST_FLAG,
-            options=_dhcp_options(mtype, extra, self._id_opts)))
+            options=_dhcp_options(mtype, extra, self._id_opts, self._send_opts, self._prl)))
 
     def _wait_for_dhcp_reply(self, want, timeout, phase, for_addr=None) -> DhcpReply | None:
         """Wait up to timeout for a reply of message-type `want`. Returns the

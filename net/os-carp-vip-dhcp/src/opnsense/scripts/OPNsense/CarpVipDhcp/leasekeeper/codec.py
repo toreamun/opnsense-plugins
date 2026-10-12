@@ -8,9 +8,10 @@ access is bounds-checked and a malformed frame decodes to None (dropped).
 import ipaddress
 import struct
 
-from .constants import ArpOp, BootpOp, DhcpOpt, DhcpOptName, ETHER_ZERO, MsgType, SendMsgType
+from .constants import (ArpOp, BootpOp, DhcpOpt, DhcpOptName, ETHER_ZERO, MAX_REQUEST_BYTES, MsgType,
+                        RESERVED_SEND_CODES, SendMsgType)
 from .util import mac2raw
-from .wire import ArpFrame, BootpFrame
+from .wire import ArpFrame, BootpFrame, _dhcp_options, request_list
 
 
 # ---- raw wire codec (bpf backend) ----
@@ -77,14 +78,18 @@ _OPT_ENCODERS = {
 
 def _encode_dhcp_options(options):
     """An option list (name/value tuples + "end") -> the raw options field.
-    Options with a None value are dropped (a broadcast RELEASE carries no
-    server-id); the end option is always appended."""
+    A tuple whose name is an int is a raw (code, bytes) option, sent as is (the
+    operator's Send Options). Options with a None value are dropped (a broadcast
+    RELEASE carries no server-id); the end option is always appended."""
     out = bytearray()
     for o in options:
         if not isinstance(o, tuple) or o[1] is None:
             continue   # the "end" marker (appended below) or a valueless option
-        code, encode = _OPT_ENCODERS[o[0]]
-        raw = encode(o[1])
+        if isinstance(o[0], int):
+            code, raw = o
+        else:
+            code, encode = _OPT_ENCODERS[o[0]]
+            raw = encode(o[1])
         out += bytes([code, len(raw)]) + raw
     out.append(DhcpOpt.END)
     return bytes(out)
@@ -102,6 +107,41 @@ def _encode_bootp_request(chaddr, xid, ciaddr, flags, options):
     hdr += b"\x00" * 192                                     # sname (64) + file (128), unused
     payload = hdr + DHCP_MAGIC + _encode_dhcp_options(options)
     return payload.ljust(BOOTP_MIN_PAYLOAD, b"\x00")
+
+
+def send_options_problem(send_opts, id_opts):
+    """Why the operator's Send Options cannot go out as they are, or None: a
+    reserved code, a code given twice, or a code another keeper field already
+    sends (vendor class, client-id). The model refuses all of these on save, so
+    this only catches a hand-edited config or one synced from another version."""
+    seen = {_OPT_ENCODERS[name][0] for name, _value in id_opts}
+    for code, value in send_opts:
+        if code in RESERVED_SEND_CODES:
+            return f"Send Options carry reserved option {code}"
+        if code in seen:
+            return f"Send Options set option {code} twice, or a field of the keeper already sends it"
+        if not 0 < len(value) < 256:
+            return f"Send Options give option {code} {len(value)} bytes (1-255)"
+        seen.add(code)
+    return None
+
+
+def request_size(id_opts, send_opts, request_codes):
+    """The IP datagram size of the keeper's largest request: a REQUEST that
+    carries every option it can (requested address and server identifier too)."""
+    extra = [(DhcpOptName.REQUESTED_ADDR, "0.0.0.0"), (DhcpOptName.SERVER_ID, "0.0.0.0")]
+    options = _dhcp_options(SendMsgType.REQUEST, extra, id_opts, send_opts, request_list(request_codes))
+    return IP_HDR_LEN + UDP_HDR_LEN + len(_encode_bootp_request(b"\x00" * 6, 0, "0.0.0.0", 0, options))
+
+
+def dhcp_options_check(id_opts, send_opts, request_codes):
+    """(configuration problem or None, largest request size): an unusable Send
+    Option (send_options_problem), or a request too large for one frame."""
+    size = request_size(id_opts, send_opts, request_codes)
+    problem = send_options_problem(send_opts, id_opts)
+    if problem is None and size > MAX_REQUEST_BYTES:
+        problem = f"the DHCP request is {size} bytes, more than one {MAX_REQUEST_BYTES}-byte frame"
+    return problem, size
 
 
 def _inet_checksum(data):

@@ -37,12 +37,33 @@ use OPNsense\Base\Messages\Message;
 class CarpVipDhcp extends BaseModel
 {
     /**
+     * Codes Send Options refuse because another keeper field sends them. Both
+     * fields move into Send Options when the client-id becomes a choice.
+     */
+    private const FIELD_OPTIONS = [
+        60 => 'dhcp-class-identifier (option 60) is set by the DHCP vendor class field',
+        61 => 'dhcp-client-identifier (option 61) is set by the DHCP client-id field',
+    ];
+
+    /**
      * The daemon is IPv4 DHCP only, so a keeper must reference an IPv4 CARP VIP.
+     * Send Options and Request Options must parse (DhcpOptions).
      * {@inheritdoc}
      */
     public function performValidation($validateFullModel = false)
     {
         $messages = parent::performValidation($validateFullModel);
+        foreach ($this->keepers->keeper->iterateItems() as $keeper) {
+            $base = $keeper->__reference;
+            $send = DhcpOptions::parseSendOptions((string)$keeper->sendOptions, self::FIELD_OPTIONS);
+            foreach ($send['errors'] as $error) {
+                $messages->appendMessage(new Message($error, $base . '.sendOptions'));
+            }
+            $request = DhcpOptions::parseRequestOptions((string)$keeper->requestOptions);
+            foreach ($request['errors'] as $error) {
+                $messages->appendMessage(new Message($error, $base . '.requestOptions'));
+            }
+        }
         foreach ($this->getFlatNodes() as $key => $node) {
             if (!$validateFullModel && !$node->isFieldChanged()) {
                 continue;
@@ -114,5 +135,26 @@ class CarpVipDhcp extends BaseModel
         }
 
         return $messages;
+    }
+
+    /**
+     * Write the keeper.conf form of each keeper's Send Options and Request
+     * Options into the derived *Encoded fields before saving, so every save path
+     * (the dialog, the API, HA sync of a saved config, a migration) stores what
+     * the template renders. Text that does not parse encodes to nothing; the
+     * validation that runs on save refuses it anyway.
+     * {@inheritdoc}
+     */
+    public function serializeToConfig($validateFullModel = false, $disable_validation = false)
+    {
+        foreach ($this->keepers->keeper->iterateItems() as $keeper) {
+            $send = DhcpOptions::parseSendOptions((string)$keeper->sendOptions, self::FIELD_OPTIONS);
+            $keeper->sendOptionsEncoded = $send['errors']
+                ? '' : DhcpOptions::encodeSendOptions($send['options']);
+            $request = DhcpOptions::parseRequestOptions((string)$keeper->requestOptions);
+            $keeper->requestOptionsEncoded = $request['errors']
+                ? '' : DhcpOptions::encodeRequestOptions($request['codes']);
+        }
+        return parent::serializeToConfig($validateFullModel, $disable_validation);
     }
 }

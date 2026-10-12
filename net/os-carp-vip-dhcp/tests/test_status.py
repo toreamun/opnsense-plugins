@@ -31,6 +31,32 @@ def test_parse_heartbeat_unbound():
     assert status.parse_heartbeat_text(text)["bound"] is None
 
 
+def test_parse_heartbeat_config_error():
+    text = "1783350773 bound=- lease=0 t1=0 t2=0 src=derived demote_ok=0 cfgerr=1\n"
+    assert status.parse_heartbeat_text(text)["config_error"] is True
+    assert status.parse_heartbeat_text(text.replace(" cfgerr=1", ""))["config_error"] is False
+
+
+@pytest.mark.parametrize("value, expected", [
+    ("", ""),
+    ("60:7361676d", "60 (4 bytes)"),
+    ("60:7361676d,90:" + "00" * 70, "60 (4 bytes), 90 (70 bytes)"),
+    ("60:zz", "invalid"),
+    ("x:01", "invalid"),
+])
+def test_send_options_label_shows_codes_and_lengths_only(value, expected):
+    assert status.send_options_label(value) == expected
+
+
+def test_read_keepers_dhcp_options(tmp_path):
+    conf = tmp_path / "keeper.conf"
+    conf.write_text("request=100.64.4.7|iface=igb0|chaddr=aa|sendopts=60:7361676d|reqopts=119,6\n")
+    entry = status.read_keepers({}, {}, str(conf), str(tmp_path))[0]
+    assert entry["send_options"] == "60 (4 bytes)"
+    assert entry["request_options"] == "119, 6"
+    assert "7361676d" not in str(entry)          # the value never reaches the status JSON
+
+
 def test_parse_heartbeat_vlan_priority_error():
     text = "1783350773 bound=- lease=1800 t1=900 t2=1575 src=derived demote_ok=0 pcperr=EINVAL\n"
     assert status.parse_heartbeat_text(text)["vlan_pcp_error"] == "EINVAL"

@@ -30,7 +30,7 @@ class RoleWatcher:
         self._on_promote = on_promote
         # None until the first definite probe (a vhid keeper is unknown until then); a
         # no-vhid keeper has no CARP role to watch and is the permanent sole master.
-        self.was_master = None if vhid else True
+        self.was_master: "bool | None" = None if vhid else True
         # Raw latch / grace fields, managed through the methods below (renew_pending /
         # take_renew / cancel_renew / demote_ok); private so a caller cannot bypass the
         # role gate or shift the grace epoch by writing them directly.
@@ -68,7 +68,7 @@ class RoleWatcher:
             # this node is backup (a backup must not renew), and the next promotion
             # re-arms it -- no by-hand clear here to drift out of sync.
             LOG.info("lost CARP master for vhid %s -- ARP nudges pause on this node", self._vhid)
-        self.was_master = master
+        self.was_master = bool(master)   # a definite role here: _UNSET was probed, None returned above
 
     def log_initial(self):
         """Announce the CARP role once at startup and seed was_master, so the role is in

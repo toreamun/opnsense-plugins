@@ -131,6 +131,20 @@ THREAD_JOIN_TIMEOUT = 2
 PARAM_REQ_LIST = [DhcpOpt.SUBNET_MASK, DhcpOpt.ROUTER, DhcpOpt.LEASE_TIME,
                   DhcpOpt.SERVER_ID, DhcpOpt.RENEWAL_TIME, DhcpOpt.REBINDING_TIME]
 
+# Option codes the operator's Send Options must not carry: pad/end, the
+# protocol fields the keeper sets itself (50 requested address, 51 lease time,
+# 52 overload, 53 message type, 54 server identifier, 55 request list, 57 maximum
+# message size), 82 (relay agent, not a client option) and 12 (the Hostname
+# field). Mirrors DhcpOptions::RESERVED in the model, which refuses them on save.
+RESERVED_SEND_CODES = frozenset({0, 12, 50, 51, 52, 53, 54, 55, 57, 82, 255})
+
+# Request size (IP datagram bytes). Above MAX_REQUEST_BYTES (a standard Ethernet
+# MTU) the request cannot go out in one frame: a configuration error. Above
+# RFC2131_MIN_MESSAGE it is larger than the 576 every server must accept (RFC 2131
+# section 2): only a warning, since most servers take more.
+MAX_REQUEST_BYTES = 1500
+RFC2131_MIN_MESSAGE = 576
+
 # Timing / retry tunables (seconds unless noted).
 HB_REFRESH = 30            # rewrite the heartbeat at least this often while holding a lease
 DEFAULT_LEASE = 3600       # fallback lease time if the server sends none

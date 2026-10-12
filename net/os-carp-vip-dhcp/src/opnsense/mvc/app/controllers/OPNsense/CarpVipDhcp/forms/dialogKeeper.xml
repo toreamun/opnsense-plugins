@@ -76,6 +76,20 @@
         <help><![CDATA[Certain ISPs require DHCP requests sent with a specific VLAN priority (802.1p), like this field on the interface page. The keeper sets it on everything it sends: DHCP, including renewals and release, and ARP nudges. Best Effort (0) works like Disabled here: frames keep the priority of the VLAN device. On an interface that is not a VLAN, frames get a priority tag with VLAN ID 0. Needs the tunable net.link.vlan.mtag_pcp at 1 (the default); the status page warns if it is 0.]]></help>
     </field>
     <field>
+        <id>keeper.sendOptions</id>
+        <label>Send Options</label>
+        <type>textbox</type>
+        <advanced>true</advanced>
+        <help><![CDATA[Extra DHCP options some ISPs require, one per line as on the interface page: <b>name value</b>. Text in double quotes, or for an option-N also colon-separated hex. Example: <code>user-class "+FSVDSL_livebox.Internet.softathome.Livebox5"</code> or <code>option-90 00:00:00:00</code>. Sent in every request and renewal, not in a release. The vendor class (option 60) and client-id (option 61) have their own fields here, and the hostname (option 12) the Hostname field. Values are never shown outside this dialog.]]></help>
+    </field>
+    <field>
+        <id>keeper.requestOptions</id>
+        <label>Request Options</label>
+        <type>textbox</type>
+        <advanced>true</advanced>
+        <help><![CDATA[DHCP options to ask the server for, one name per line, as on the interface page. They are added in this order before the options the keeper always asks for (subnet mask, router, lease and renewal times, server identifier), never replacing them. This only shapes the request: the keeper does not apply DNS servers, routes or other values from the reply.]]></help>
+    </field>
+    <field>
         <type>header</type>
         <label>Gateway configuration</label>
     </field>

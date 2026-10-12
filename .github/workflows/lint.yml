@@ -72,6 +72,9 @@ jobs:
         run: $(composer global config bin-dir --absolute)/phpcs --standard=PSR12 net/*/src/opnsense/mvc
       - name: php -l (syntax)
         run: find net -name '*.php' -print0 | xargs -0 -n1 php -l
+      # The DHCP option syntax and bytes (a plain class, no OPNsense needed).
+      - name: php tests
+        run: php net/os-carp-vip-dhcp/tests/php/test_dhcp_options.php
 
   shell:
     name: Shell (shellcheck)

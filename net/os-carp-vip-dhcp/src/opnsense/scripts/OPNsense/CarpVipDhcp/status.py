@@ -10,7 +10,7 @@ pidfile and heartbeat file. Output:
 The heartbeat file is written by lease_keeper.py in one of two forms:
     <epoch> bound=<ip> lease=<seconds> t1=<seconds> t2=<seconds> src=<server|derived>
             [master=<0|1>] demote_ok=<0|1> [nudge=<epoch|0> arpok=<epoch|0> [gw=<ip>]]
-            [pcperr=<errno name>]
+            [pcperr=<errno name>] [cfgerr=1]
     <epoch> MISMATCH got=<ip> want=<ip>
 """
 import json
@@ -69,7 +69,7 @@ def _epoch_pair(value):
 
 # Heartbeat token dispatch: token -> (result fields, value parser). The parser
 # returns one value per field. Tokens are data, not logic -- adding one is a
-# table row, in lockstep with what lease_keeper.py's _hb()/_hb_mismatch() emit.
+# table row, in lockstep with what leasekeeper/heartbeat.py writes.
 _HB_TOKENS = {
     "bound": (("bound",), lambda v: (None if v == "-" else v,)),
     "lease": (("lease",), lambda v: (_int_token(v),)),
@@ -80,6 +80,7 @@ _HB_TOKENS = {
     "arpok": (("arp_reply_epoch", "arp_reply_age"), _epoch_pair),
     "gw": (("gw",), lambda v: (v,)),
     "pcperr": (("vlan_pcp_error",), lambda v: (v,)),
+    "cfgerr": (("config_error",), lambda v: (v == "1",)),
     "got": (("mismatch_got",), lambda v: (v,)),
     "want": (("mismatch_want",), lambda v: (v,)),
 }
@@ -92,7 +93,8 @@ def parse_heartbeat_text(raw):
     result = {"bound": None, "lease": None, "t1": None, "t2": None, "timing_source": None,
               "mismatch": False, "mismatch_got": None, "mismatch_want": None,
               "hb_epoch": None, "hb_age": None, "nudge_epoch": None, "nudge_age": None, "gw": None,
-              "arp_reply_epoch": None, "arp_reply_age": None, "vlan_pcp_error": None}
+              "arp_reply_epoch": None, "arp_reply_age": None, "vlan_pcp_error": None,
+              "config_error": False}
     parts = raw.split()
     if not parts:
         return result
@@ -166,6 +168,22 @@ def client_id_label(setting, chaddr):
         return "invalid"
 
 
+def send_options_label(setting):
+    """The keeper.conf sendopts field ("code:hex,...") as option codes and byte
+    counts, e.g. "60 (5 bytes), 77 (44 bytes)": never the values, which may hold
+    a credential. "" when empty; "invalid" when it cannot be read."""
+    if not setting:
+        return ""
+    try:
+        parts = []
+        for field in setting.split(","):
+            code, _sep, value = field.partition(":")
+            parts.append(f"{int(code)} ({len(bytes.fromhex(value))} bytes)")
+        return ", ".join(parts)
+    except ValueError:
+        return "invalid"
+
+
 def vlan_pcp_label(setting):
     """The configured 802.1p priority as the keeper uses it: None for Disabled (blank)
     and for a value outside 0-7, which the keeper drops. 0 sets none of its own
@@ -202,6 +220,8 @@ def read_keepers(states, names, conffile=CONFFILE, run_dir=RUN_DIR):
             "follow_ip": rec.get("follow", "0") == "1",
             "arp_nudge": arp_nudge,
             "vlan_pcp": vlan_pcp_label(rec.get("vlanpcp", "")),
+            "send_options": send_options_label(rec.get("sendopts", "")),
+            "request_options": rec.get("reqopts", "").replace(",", ", "),
             "running": pid is not None,
             "pid": pid,
         }

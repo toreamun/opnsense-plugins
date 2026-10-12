@@ -1,6 +1,6 @@
 <model>
     <mount>//OPNsense/CarpVipDhcp</mount>
-    <version>1.2.0</version>
+    <version>1.3.0</version>
     <description>CARP-VIP DHCP lease keeper</description>
     <items>
         <keepers>
@@ -132,6 +132,28 @@
                         <pcp7 value="7">Network Control (7, highest)</pcp7>
                     </OptionValues>
                 </vlanPriority>
+
+                <!--
+                    Extra DHCP options to send and to request, in the syntax of the
+                    interface page (one per line: "name value" / "name"). Validated and
+                    turned into bytes by DhcpOptions (CarpVipDhcp.php); the derived
+                    *Encoded fields are what the template writes to keeper.conf
+                    ("code:hex,..." / "code,..."), set on every save.
+                -->
+                <sendOptions type="TextField">
+                    <Required>N</Required>
+                </sendOptions>
+                <requestOptions type="TextField">
+                    <Required>N</Required>
+                </requestOptions>
+                <sendOptionsEncoded type="TextField">
+                    <Mask>/^[0-9a-f:,]*$/</Mask>
+                    <Required>N</Required>
+                </sendOptionsEncoded>
+                <requestOptionsEncoded type="TextField">
+                    <Mask>/^[0-9,]*$/</Mask>
+                    <Required>N</Required>
+                </requestOptionsEncoded>
 
                 <!--
                     Own the IPv4 WAN default route as a function of CARP role and

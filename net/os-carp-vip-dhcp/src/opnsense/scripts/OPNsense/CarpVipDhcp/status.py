@@ -19,7 +19,7 @@ import time
 import xml.etree.ElementTree as ET
 
 from keeperconf import CONFFILE, keeper_id, keeper_records
-from leasekeeper.dhcpclient import _client_id_bytes, _fmt_client_id
+from leasekeeper.dhcpclient import _client_id_bytes, _fmt_client_id, _fmt_send_option
 from leasekeeper.ifprobe import carp_roles
 from leasekeeper.syscmd import ifconfig, run
 
@@ -178,7 +178,7 @@ def send_options_label(setting):
         parts = []
         for field in setting.split(","):
             code, _sep, value = field.partition(":")
-            parts.append(f"{int(code)} ({len(bytes.fromhex(value))} bytes)")
+            parts.append(_fmt_send_option(int(code), len(bytes.fromhex(value))))
         return ", ".join(parts)
     except ValueError:
         return "invalid"

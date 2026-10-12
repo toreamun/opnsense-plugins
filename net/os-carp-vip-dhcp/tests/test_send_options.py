@@ -67,6 +67,7 @@ def test_release_carries_no_send_options(lk):
 def test_send_options_summary_shows_codes_and_lengths_only(lk):
     keeper = _keeper(lk, send_opts=[SAGEM, TOKEN])
     assert keeper._dhcp.send_options_summary() == "60 (5 bytes), 90 (10 bytes)"
+    assert _keeper(lk, send_opts=[(90, b"\x01")])._dhcp.send_options_summary() == "90 (1 byte)"
     assert _keeper(lk)._dhcp.send_options_summary() == ""
 
 

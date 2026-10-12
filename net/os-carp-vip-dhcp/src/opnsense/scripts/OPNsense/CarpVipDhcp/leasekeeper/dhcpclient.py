@@ -46,6 +46,12 @@ def _fmt_client_id(raw):
     return f"text, {len(raw)} bytes"
 
 
+def _fmt_send_option(code, length):
+    """One Send Option for a log line or the status page: its code and byte
+    count, never the value (some ISPs put a credential in it)."""
+    return f"{code} ({length} byte{'' if length == 1 else 's'})"
+
+
 def _identity_options(vendor_class, client_id, hostname, chaddr):
     """Optional DHCP identity options (empty -> not sent), added to every
     DISCOVER/REQUEST/RENEW so the server sees a consistent client identity.
@@ -148,7 +154,7 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
     def send_options_summary(self):
         """The Send Options by code and byte count ("60 (5 bytes), 90 (70 bytes)"),
         never their values; "" when there are none."""
-        return ", ".join(f"{code} ({len(value)} bytes)" for code, value in self._send_opts)
+        return ", ".join(_fmt_send_option(code, len(value)) for code, value in self._send_opts)
 
     @property
     def client_id(self):

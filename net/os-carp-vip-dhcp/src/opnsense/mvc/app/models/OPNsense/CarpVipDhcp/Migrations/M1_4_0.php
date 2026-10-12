@@ -36,7 +36,11 @@ use OPNsense\Core\Config;
  * What goes on the wire does not change: a field missing from the stored config
  * reads as empty, which is also what the 1.3.0 template rendered for it
  * (followIp|default('0'), clientId|default('')).
+ *
+ * Core finds a migration by this name (M<major>_<minor>_<patch>), so it cannot
+ * be PascalCase.
  */
+// phpcs:ignore Squiz.Classes.ValidClassName.NotCamelCaps
 class M1_4_0 extends BaseModelMigration
 {
     public function run($model)

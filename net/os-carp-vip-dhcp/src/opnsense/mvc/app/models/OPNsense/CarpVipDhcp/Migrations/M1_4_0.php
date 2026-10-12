@@ -40,7 +40,7 @@ use OPNsense\Core\Config;
  * Core finds a migration by this name (M<major>_<minor>_<patch>), so it cannot
  * be PascalCase.
  */
-// phpcs:ignore Squiz.Classes.ValidClassName.NotCamelCaps
+// phpcs:ignore Squiz.Classes.ValidClassName
 class M1_4_0 extends BaseModelMigration
 {
     public function run($model)

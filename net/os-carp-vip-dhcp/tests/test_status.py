@@ -46,9 +46,20 @@ def test_parse_heartbeat_config_error():
     ("60", "invalid"),            # what the daemon refuses is shown as invalid too
     ("300:01", "invalid"),
     ("60:01,", "invalid"),
+    ("53:01", "invalid"),         # reserved
+    ("90:01,90:02", "invalid"),   # twice
+    ("90:", "invalid"),           # no bytes
 ])
 def test_send_options_label_shows_codes_and_lengths_only(value, expected):
-    assert status.send_options_label(value) == expected
+    assert status.send_options_label({"sendopts": value, "chaddr": "00:00:5e:00:01:fe"}) == expected
+
+
+def test_send_options_label_checks_against_the_identity_fields():
+    # The vendor class field sends 60, so 60 in Send Options too is refused by the
+    # daemon, and the status page says so.
+    rec = {"sendopts": "60:7361676d", "vendorclass": "acme", "chaddr": "00:00:5e:00:01:fe"}
+    assert status.send_options_label(rec) == "invalid"
+    assert status.send_options_label(dict(rec, vendorclass="")) == "60 (4 bytes)"
 
 
 @pytest.mark.parametrize("value, expected", [("", ""), ("119,6", "119, 6"), ("1,x", "invalid"), ("0", "invalid")])

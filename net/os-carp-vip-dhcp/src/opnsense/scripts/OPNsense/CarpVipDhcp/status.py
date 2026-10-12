@@ -19,7 +19,8 @@ import time
 import xml.etree.ElementTree as ET
 
 from keeperconf import CONFFILE, keeper_id, keeper_records, parse_request_codes, parse_send_options
-from leasekeeper.dhcpclient import _client_id_bytes, _fmt_client_id, _fmt_send_option
+from leasekeeper.codec import option_problem
+from leasekeeper.dhcpclient import _client_id_bytes, _fmt_client_id, _fmt_send_option, _identity_options
 from leasekeeper.ifprobe import carp_roles
 from leasekeeper.syscmd import ifconfig, run
 
@@ -168,14 +169,20 @@ def client_id_label(setting, chaddr):
         return "invalid"
 
 
-def send_options_label(setting):
-    """The keeper.conf sendopts field as option codes and byte counts, e.g.
+def send_options_label(rec):
+    """A keeper.conf record's Send Options as option codes and byte counts, e.g.
     "60 (5 bytes), 77 (44 bytes)": never the values, which may hold a credential.
-    "" when empty; "invalid" for what the daemon refuses too (same parser)."""
+    "" when there are none; "invalid" for exactly what the daemon refuses (the same
+    parser and the same check against the vendor class, client-id and hostname)."""
     try:
-        return ", ".join(_fmt_send_option(code, len(value)) for code, value in parse_send_options(setting))
+        send_opts = parse_send_options(rec.get("sendopts", ""))
+        id_opts = _identity_options(rec.get("vendorclass", ""), rec.get("clientid", ""),
+                                    rec.get("hostname", ""), rec.get("chaddr", ""))
     except ValueError:
         return "invalid"
+    if option_problem(id_opts, send_opts) is not None:
+        return "invalid"
+    return ", ".join(_fmt_send_option(code, len(value)) for code, value in send_opts)
 
 
 def request_options_label(setting):
@@ -223,7 +230,7 @@ def read_keepers(states, names, conffile=CONFFILE, run_dir=RUN_DIR):
             "follow_ip": rec.get("follow", "0") == "1",
             "arp_nudge": arp_nudge,
             "vlan_pcp": vlan_pcp_label(rec.get("vlanpcp", "")),
-            "send_options": send_options_label(rec.get("sendopts", "")),
+            "send_options": send_options_label(rec),
             "request_options": request_options_label(rec.get("reqopts", "")),
             "running": pid is not None,
             "pid": pid,

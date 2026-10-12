@@ -18,7 +18,7 @@ import os
 import time
 import xml.etree.ElementTree as ET
 
-from keeperconf import CONFFILE, keeper_id, keeper_records
+from keeperconf import CONFFILE, keeper_id, keeper_records, parse_request_codes, parse_send_options
 from leasekeeper.dhcpclient import _client_id_bytes, _fmt_client_id, _fmt_send_option
 from leasekeeper.ifprobe import carp_roles
 from leasekeeper.syscmd import ifconfig, run
@@ -169,17 +169,20 @@ def client_id_label(setting, chaddr):
 
 
 def send_options_label(setting):
-    """The keeper.conf sendopts field ("code:hex,...") as option codes and byte
-    counts, e.g. "60 (5 bytes), 77 (44 bytes)": never the values, which may hold
-    a credential. "" when empty; "invalid" when it cannot be read."""
-    if not setting:
-        return ""
+    """The keeper.conf sendopts field as option codes and byte counts, e.g.
+    "60 (5 bytes), 77 (44 bytes)": never the values, which may hold a credential.
+    "" when empty; "invalid" for what the daemon refuses too (same parser)."""
     try:
-        parts = []
-        for field in setting.split(","):
-            code, _sep, value = field.partition(":")
-            parts.append(_fmt_send_option(int(code), len(bytes.fromhex(value))))
-        return ", ".join(parts)
+        return ", ".join(_fmt_send_option(code, len(value)) for code, value in parse_send_options(setting))
+    except ValueError:
+        return "invalid"
+
+
+def request_options_label(setting):
+    """The keeper.conf reqopts field as "119, 6"; "" when empty, "invalid" for
+    what the daemon refuses too (same parser)."""
+    try:
+        return ", ".join(str(code) for code in parse_request_codes(setting))
     except ValueError:
         return "invalid"
 
@@ -221,7 +224,7 @@ def read_keepers(states, names, conffile=CONFFILE, run_dir=RUN_DIR):
             "arp_nudge": arp_nudge,
             "vlan_pcp": vlan_pcp_label(rec.get("vlanpcp", "")),
             "send_options": send_options_label(rec.get("sendopts", "")),
-            "request_options": rec.get("reqopts", "").replace(",", ", "),
+            "request_options": request_options_label(rec.get("reqopts", "")),
             "running": pid is not None,
             "pid": pid,
         }

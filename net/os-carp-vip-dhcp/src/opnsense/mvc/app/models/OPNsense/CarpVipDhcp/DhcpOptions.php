@@ -39,9 +39,8 @@ namespace OPNsense\CarpVipDhcp;
 /**
  * The DHCP Send Options and Request Options syntax of the interface page
  * (core's Dhcp4SendOptionsField / Dhcp4RequestOptionsField), turned into the
- * bytes the keeper sends. Plain PHP with no OPNsense dependency, so the model,
- * its validator and the config migration share one implementation and a
- * php script can test it in CI.
+ * bytes the keeper sends. Plain PHP with no OPNsense dependency: the model uses
+ * it to validate and to fill the *Encoded fields, and a php script tests it in CI.
  *
  * Send Options: one option per line, "name value". The value is text in double
  * quotes, or for a format-X option also colon-separated hex (01:00:5e). Only
@@ -51,7 +50,7 @@ namespace OPNsense\CarpVipDhcp;
 class DhcpOptions
 {
     /** The largest value one option can carry: its length field is one byte. */
-    public const MAX_OPTION_BYTES = 255;
+    private const MAX_OPTION_BYTES = 255;
 
     /**
      * Codes Send Options must not set: the DHCP protocol fields the keeper
@@ -59,7 +58,7 @@ class DhcpOptions
      * server identifier, parameter request list, maximum message size), the
      * relay agent option, pad/end, and the hostname (the Hostname field).
      */
-    public const RESERVED = [
+    private const RESERVED = [
         0 => 'pad',
         12 => 'host-name (option 12) is set by the Hostname field',
         50 => 'the keeper sets the requested address (option 50)',
@@ -74,10 +73,10 @@ class DhcpOptions
     ];
 
     /** Characters allowed in a value: core's set plus "/" and minus "\". */
-    public const VALUE_CHARS = '/^[a-zA-Z0-9 .,:_+\-\/]*$/D';
+    private const VALUE_CHARS = '/^[a-zA-Z0-9 .,:_+\-\/]*$/D';
 
     /** Colon-separated hex octets, one or two digits each, as dhclient reads them. */
-    public const HEX_VALUE = '/^[0-9a-fA-F]{1,2}(:[0-9a-fA-F]{1,2})*$/D';
+    private const HEX_VALUE = '/^[0-9a-fA-F]{1,2}(:[0-9a-fA-F]{1,2})*$/D';
 
     /** Option name => [code, dhclient format]; the code is the position in core's list. */
     private static $names = [
@@ -338,11 +337,11 @@ class DhcpOptions
     ];
 
     /**
-     * Parse Send Options text. $extraReserved maps more codes to the reason they
-     * are refused (for options another field of the keeper sets). Returns
+     * Parse Send Options text. $fieldOptions maps more codes to the reason they
+     * are refused (options another field of the keeper sets). Returns
      * ['options' => [[code, bytes], ...] in the order given, 'errors' => [message, ...]].
      */
-    public static function parseSendOptions($text, array $extraReserved = [])
+    public static function parseSendOptions($text, array $fieldOptions = [])
     {
         $options = [];
         $errors = [];
@@ -354,23 +353,22 @@ class DhcpOptions
             }
             $parts = preg_split('/\s+/', $line, 2);
             $name = $parts[0];
-            $value = $parts[1] ?? '';
             if (!isset(self::$names[$name])) {
-                $errors[] = sprintf("Unknown option name '%s'. Use the names from the interface page, or option-N.", $name);
+                $errors[] = self::unknownName($name);
                 continue;
             }
             list($code, $format) = self::$names[$name];
-            $reason = self::RESERVED[$code] ?? $extraReserved[$code] ?? null;
+            $reason = self::RESERVED[$code] ?? $fieldOptions[$code] ?? null;
             if ($reason !== null) {
                 $errors[] = sprintf('%s: %s.', $name, $reason);
                 continue;
             }
-            $bytes = self::valueBytes($name, $code, $format, $value, $errors);
-            if ($bytes === null) {
-                continue;
+            list($bytes, $error) = self::valueBytes($name, $code, $format, $parts[1] ?? '');
+            if ($error === null && isset($seen[$code])) {
+                $error = sprintf('Option %d (%s) is set more than once.', $code, $name);
             }
-            if (isset($seen[$code])) {
-                $errors[] = sprintf('Option %d (%s) is set more than once.', $code, $name);
+            if ($error !== null) {
+                $errors[] = $error;
                 continue;
             }
             $seen[$code] = true;
@@ -393,7 +391,7 @@ class DhcpOptions
                 continue;
             }
             if (!isset(self::$names[$line])) {
-                $errors[] = sprintf("Unknown option name '%s'. Use the names from the interface page, or option-N.", $line);
+                $errors[] = self::unknownName($line);
                 continue;
             }
             $code = self::$names[$line][0];
@@ -439,72 +437,69 @@ class DhcpOptions
         return $out;
     }
 
+    /** The message for a name that is not in the option table. */
+    private static function unknownName($name)
+    {
+        return sprintf("Unknown option name '%s'. Use the names from the interface page, or option-N.", $name);
+    }
+
     /**
-     * The bytes of one option value, or null with a message added to $errors.
-     * Text is one pair of double quotes around allowed characters; a format-X
-     * option also takes colon-separated hex. Other formats are refused.
+     * [bytes, null] for one option value, or [null, message]. Text is one pair of
+     * double quotes around allowed characters; a format-X option also takes
+     * colon-separated hex. Other formats are refused.
      */
-    private static function valueBytes($name, $code, $format, $value, array &$errors)
+    private static function valueBytes($name, $code, $format, $value)
     {
         if ($format !== 't' && $format !== 'X') {
-            $errors[] = sprintf("Option '%s' (format %s) is not supported in Send Options yet.", $name, $format);
-            return null;
+            return [null, sprintf("Option '%s' (format %s) is not supported in Send Options yet.", $name, $format)];
         }
         if ($value === '') {
-            $errors[] = sprintf('%s: no value.', $name);
-            return null;
+            return [null, sprintf('%s: no value.', $name)];
         }
         if (strpos($value, '\\') !== false) {
-            $errors[] = sprintf('%s: backslash is not supported in values yet.', $name);
-            return null;
+            return [null, sprintf('%s: backslash is not supported in values yet.', $name)];
         }
         $quoted = strlen($value) >= 2 && $value[0] === '"' && substr($value, -1) === '"';
         $inner = $quoted ? substr($value, 1, -1) : $value;
         if (strpos($inner, '"') !== false) {
-            $errors[] = sprintf('%s: a value has one pair of double quotes around the whole text.', $name);
-            return null;
+            return [null, sprintf('%s: a value has one pair of double quotes around the whole text.', $name)];
         }
         if (!preg_match(self::VALUE_CHARS, $inner)) {
-            $errors[] = sprintf(
+            return [null, sprintf(
                 '%s: character not supported yet. Allowed: letters, digits, space and . , : _ + - /',
                 $name
-            );
-            return null;
+            )];
         }
         if ($quoted) {
             $bytes = $inner;
         } elseif ($format === 't') {
-            $errors[] = sprintf(
+            return [null, sprintf(
                 'Option %d is %s, a text option: write %s "..." with the text in quotes. '
                 . 'Hex for text options is not supported yet.',
                 $code,
                 $name,
                 $name
-            );
-            return null;
+            )];
         } elseif (preg_match(self::HEX_VALUE, $inner)) {
             $bytes = '';
             foreach (explode(':', $inner) as $octet) {
                 $bytes .= chr(hexdec($octet));
             }
         } else {
-            $errors[] = sprintf('%s: the value is neither text in quotes nor colon-separated hex.', $name);
-            return null;
+            return [null, sprintf('%s: the value is neither text in quotes nor colon-separated hex.', $name)];
         }
         if ($bytes === '') {
-            $errors[] = sprintf('%s: no value.', $name);
-            return null;
+            return [null, sprintf('%s: no value.', $name)];
         }
         if (strlen($bytes) > self::MAX_OPTION_BYTES) {
-            $errors[] = sprintf(
+            return [null, sprintf(
                 'Option %d (%s) is %d bytes; one option holds at most %d.',
                 $code,
                 $name,
                 strlen($bytes),
                 self::MAX_OPTION_BYTES
-            );
-            return null;
+            )];
         }
-        return $bytes;
+        return [$bytes, null];
     }
 }

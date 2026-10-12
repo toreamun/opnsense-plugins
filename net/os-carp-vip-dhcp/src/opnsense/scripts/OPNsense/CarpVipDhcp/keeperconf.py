@@ -15,6 +15,30 @@ def keeper_id(request_ip):
     return re.sub(r"[^A-Za-z0-9]", "_", request_ip)
 
 
+def parse_send_options(raw):
+    """The sendopts field ("code:hex,code:hex", as the model writes it) ->
+    [(code, bytes), ...]; [] when empty. Raises ValueError on any field that is
+    not code:hex with a code of 1-254, so the daemon and the status page agree
+    on what is unusable."""
+    options = []
+    for field in raw.split(",") if raw else []:
+        code, sep, value = field.partition(":")
+        num = int(code)
+        if not sep or not 0 < num < 255:
+            raise ValueError(f"send option {field!r} is not code:hex")
+        options.append((num, bytes.fromhex(value)))
+    return options
+
+
+def parse_request_codes(raw):
+    """The reqopts field ("code,code") -> [code, ...]; [] when empty. Raises
+    ValueError on a code that is not 1-254."""
+    codes = [int(code) for code in raw.split(",")] if raw else []
+    if any(not 0 < code < 255 for code in codes):
+        raise ValueError(f"request options {raw!r} have a code outside 1-254")
+    return codes
+
+
 def keeper_records_text(text):
     """Yield each active (non-comment) keeper.conf line in `text` as a {key: value}
     dict -- the pure parser, with no file IO (keeper_records reads the file).

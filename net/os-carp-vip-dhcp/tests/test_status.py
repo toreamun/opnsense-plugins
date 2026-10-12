@@ -43,9 +43,17 @@ def test_parse_heartbeat_config_error():
     ("60:7361676d,90:" + "00" * 70, "60 (4 bytes), 90 (70 bytes)"),
     ("60:zz", "invalid"),
     ("x:01", "invalid"),
+    ("60", "invalid"),            # what the daemon refuses is shown as invalid too
+    ("300:01", "invalid"),
+    ("60:01,", "invalid"),
 ])
 def test_send_options_label_shows_codes_and_lengths_only(value, expected):
     assert status.send_options_label(value) == expected
+
+
+@pytest.mark.parametrize("value, expected", [("", ""), ("119,6", "119, 6"), ("1,x", "invalid"), ("0", "invalid")])
+def test_request_options_label(value, expected):
+    assert status.request_options_label(value) == expected
 
 
 def test_read_keepers_dhcp_options(tmp_path):

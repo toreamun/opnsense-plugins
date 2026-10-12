@@ -147,11 +147,7 @@ def request_list(request_codes=()):
     their order, then the codes the keeper itself needs (PARAM_REQ_LIST) that
     are not already there, so the server always returns the mask/router/timers
     the keeper acts on. With no Request Options it is PARAM_REQ_LIST."""
-    codes = []
-    for code in list(request_codes) + list(PARAM_REQ_LIST):
-        if code not in codes:
-            codes.append(code)
-    return codes
+    return list(dict.fromkeys([*request_codes, *PARAM_REQ_LIST]))
 
 
 def _dhcp_options(mtype, extra, id_opts, send_opts=(), prl=None):

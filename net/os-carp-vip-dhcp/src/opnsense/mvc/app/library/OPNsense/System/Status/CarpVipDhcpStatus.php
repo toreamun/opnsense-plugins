@@ -152,8 +152,7 @@ class CarpVipDhcpStatus extends AbstractStatus
         // error stops all DHCP, and without the VLAN priority the ISP may not
         // answer, so both come before the lease checks.
         if (strpos($content, ' cfgerr=1') !== false) {
-            return gettext('configuration error, the keeper sends no DHCP: open the keeper and save it '
-                . 'again, or upgrade this node if the settings came from a newer HA peer');
+            return gettext('configuration error, the keeper sends no DHCP (its log says why)');
         }
         if (preg_match('/\bpcperr=(\S+)/', $content, $m)) {
             return sprintf(

@@ -6,7 +6,7 @@ replies arrive via feed().
 import logging
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Callable
 
 from .constants import (
@@ -93,14 +93,14 @@ class Lease:  # pylint: disable=too-many-instance-attributes
 
 
 @dataclass(frozen=True)
-class RequestOptions:
+class ClientOptions:
     """What the client adds to its requests: the identity options (vendor class,
     client-id, hostname; see _identity_options), the operator's Send Options as
     raw (code, bytes) and the Request Options codes that lead the Parameter
     Request List (see wire.request_list)."""
-    identity: list
-    send: list = field(default_factory=list)
-    request_codes: list = field(default_factory=list)
+    id_opts: tuple
+    send_opts: tuple = ()
+    request_codes: tuple = ()
 
 
 @dataclass(frozen=True)
@@ -124,7 +124,7 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
     to feed(). Policy stays with the caller through the injected DhcpHooks
     (should_stop / ensure_sniffer / on_changed_address; see that type)."""
 
-    def __init__(self, capture, chaddr, eth_src, options: RequestOptions, *, hooks: DhcpHooks):
+    def __init__(self, capture, chaddr, eth_src, options: ClientOptions, *, hooks: DhcpHooks):
         self._capture = capture
         self.chaddr = chaddr
         self.chraw = mac2raw(chaddr)
@@ -134,10 +134,10 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
         # DISCOVER/REQUEST/RENEW/REBIND/RELEASE so the server sees a consistent
         # client identity: RFC 2131 sections 2 and 4.2 require a client that sends
         # a client-id to send the same one in all subsequent messages.
-        self._id_opts = list(options.identity)
+        self._id_opts = list(options.id_opts)
         # The operator's Send Options as raw (code, bytes): in DISCOVER, REQUEST,
         # RENEW and REBIND, not in RELEASE (RFC 2131 table 5, see release()).
-        self._send_opts = list(options.send)
+        self._send_opts = list(options.send_opts)
         # The Parameter Request List: Request Options first, then the keeper's own.
         self._prl = request_list(options.request_codes)
         self._should_stop = hooks.should_stop

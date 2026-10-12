@@ -36,14 +36,28 @@ use OPNsense\Base\Messages\Message;
  */
 class CarpVipDhcp extends BaseModel
 {
-    /**
-     * Codes Send Options refuse because another keeper field sends them. Both
-     * fields move into Send Options when the client-id becomes a choice.
-     */
+    /** Codes Send Options refuse because another keeper field sends them. */
     private const FIELD_OPTIONS = [
         60 => 'dhcp-class-identifier (option 60) is set by the DHCP vendor class field',
         61 => 'dhcp-client-identifier (option 61) is set by the DHCP client-id field',
     ];
+
+    /**
+     * What the encoded fields hold when the text does not parse: code 0, which
+     * the daemon refuses, so the keeper reports a configuration error and sends
+     * no DHCP instead of quietly leaving the options out (fail safe).
+     */
+    private const UNUSABLE_SEND = '0:00';
+    private const UNUSABLE_REQUEST = '0';
+
+    /** One keeper's parsed [Send Options, Request Options] (see DhcpOptions). */
+    private static function parsedOptions($keeper)
+    {
+        return [
+            DhcpOptions::parseSendOptions((string)$keeper->sendOptions, self::FIELD_OPTIONS),
+            DhcpOptions::parseRequestOptions((string)$keeper->requestOptions),
+        ];
+    }
 
     /**
      * The daemon is IPv4 DHCP only, so a keeper must reference an IPv4 CARP VIP.
@@ -55,11 +69,10 @@ class CarpVipDhcp extends BaseModel
         $messages = parent::performValidation($validateFullModel);
         foreach ($this->keepers->keeper->iterateItems() as $keeper) {
             $base = $keeper->__reference;
-            $send = DhcpOptions::parseSendOptions((string)$keeper->sendOptions, self::FIELD_OPTIONS);
+            list($send, $request) = self::parsedOptions($keeper);
             foreach ($send['errors'] as $error) {
                 $messages->appendMessage(new Message($error, $base . '.sendOptions'));
             }
-            $request = DhcpOptions::parseRequestOptions((string)$keeper->requestOptions);
             foreach ($request['errors'] as $error) {
                 $messages->appendMessage(new Message($error, $base . '.requestOptions'));
             }
@@ -140,20 +153,20 @@ class CarpVipDhcp extends BaseModel
     /**
      * Write the keeper.conf form of each keeper's Send Options and Request
      * Options into the derived *Encoded fields before saving, so every save path
-     * (the dialog, the API, HA sync of a saved config, a migration) stores what
-     * the template renders. Text that does not parse encodes to nothing; the
-     * validation that runs on save refuses it anyway.
+     * (the dialog, the API, any save with validation off) stores what the
+     * template renders; HA sync copies the saved fields. Text that does not parse
+     * is refused by the validation of a normal save; if it is saved anyway, the
+     * UNUSABLE_* marker makes the keeper report a configuration error.
      * {@inheritdoc}
      */
     public function serializeToConfig($validateFullModel = false, $disable_validation = false)
     {
         foreach ($this->keepers->keeper->iterateItems() as $keeper) {
-            $send = DhcpOptions::parseSendOptions((string)$keeper->sendOptions, self::FIELD_OPTIONS);
+            list($send, $request) = self::parsedOptions($keeper);
             $keeper->sendOptionsEncoded = $send['errors']
-                ? '' : DhcpOptions::encodeSendOptions($send['options']);
-            $request = DhcpOptions::parseRequestOptions((string)$keeper->requestOptions);
+                ? self::UNUSABLE_SEND : DhcpOptions::encodeSendOptions($send['options']);
             $keeper->requestOptionsEncoded = $request['errors']
-                ? '' : DhcpOptions::encodeRequestOptions($request['codes']);
+                ? self::UNUSABLE_REQUEST : DhcpOptions::encodeRequestOptions($request['codes']);
         }
         return parent::serializeToConfig($validateFullModel, $disable_validation);
     }

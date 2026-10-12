@@ -76,12 +76,20 @@ def test_send_options_summary_shows_codes_and_lengths_only(lk):
 def test_send_options_problem(lk):
     no_ids = []
     vendor = [(lk.DhcpOptName.VENDOR_CLASS_ID, "acme")]
-    assert lk.send_options_problem([SAGEM, TOKEN], no_ids) is None
-    assert "reserved option 53" in lk.send_options_problem([(53, b"\x01")], no_ids)
-    assert "twice" in lk.send_options_problem([TOKEN, TOKEN], no_ids)
-    assert "twice" in lk.send_options_problem([SAGEM], vendor)       # the vendor class field sends 60
-    assert "0 bytes" in lk.send_options_problem([(90, b"")], no_ids)
-    assert "256 bytes" in lk.send_options_problem([(90, b"x" * 256)], no_ids)
+    assert lk.send_options_problem(no_ids, [SAGEM, TOKEN]) is None
+    assert "reserved option 53" in lk.send_options_problem(no_ids, [(53, b"\x01")])
+    assert "twice" in lk.send_options_problem(no_ids, [TOKEN, TOKEN])
+    assert "twice" in lk.send_options_problem(vendor, [SAGEM])       # the vendor class field sends 60
+    assert "0 bytes" in lk.send_options_problem(no_ids, [(90, b"")])
+    assert "256 bytes" in lk.send_options_problem(no_ids, [(90, b"x" * 256)])
+
+
+def test_an_option_too_long_to_encode_is_a_config_error_not_a_crash(lk):
+    # A hand-edited keeper.conf can hold more than 255 bytes for one option, which
+    # cannot even be encoded: the keeper must start with a config error (daemon(8)
+    # would otherwise restart a crashing keeper in a loop).
+    keeper = _keeper(lk, send_opts=[(90, b"x" * 256)])
+    assert "256 bytes" in keeper._config_error
 
 
 def test_a_keeper_with_a_config_error_sends_no_dhcp(lk, tmp_path, caplog):

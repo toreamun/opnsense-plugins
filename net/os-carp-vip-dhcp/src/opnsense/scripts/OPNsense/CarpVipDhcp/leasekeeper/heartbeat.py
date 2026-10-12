@@ -10,7 +10,7 @@ must be added or changed there too.
     <epoch> MISMATCH got=<ip> want=<ip>
 """
 import logging
-from dataclasses import dataclass
+from typing import NamedTuple
 
 from .constants import LOGGER_NAME
 from .util import _atomic_write
@@ -18,19 +18,18 @@ from .util import _atomic_write
 LOG = logging.getLogger(LOGGER_NAME)
 
 
-@dataclass(frozen=True)
-class Heartbeat:  # pylint: disable=too-many-instance-attributes
+class Heartbeat(NamedTuple):
     """What one heartbeat line reports; heartbeat_line() renders it."""
     now: float
-    bound: "str | None"      # the held address, None while unbound
+    bound: str | None        # the held address, None while unbound
     lease: int
     t1: int
     t2: int
     src: str                 # where T1/T2 come from (server or derived)
-    master: "bool | None"    # the CARP role, None before the first probe
+    master: bool | None      # the CARP role, None before the first probe
     demote_ok: bool
-    nudge: "tuple | None"    # (last nudge epoch, last ARP reply epoch, gateway) when the nudge is on
-    pcperr: "str | None"     # why the VLAN priority could not be set
+    nudge: tuple | None      # (last nudge epoch, last ARP reply epoch, gateway) when the nudge is on
+    pcperr: str | None       # why the VLAN priority could not be set
     config_error: bool
 
 
@@ -48,7 +47,7 @@ def heartbeat_line(hb):
     pcperr: the VLAN priority could not be set, so frames go out without it.
     cfgerr=1: a configuration error stops all DHCP; the reason is in the log.
         The banner shows cfgerr and pcperr first, on both nodes."""
-    line = (f"{int(hb.now)} bound={hb.bound or '-'} lease={hb.lease} t1={hb.t1} t2={hb.t2} src={hb.src}")
+    line = f"{int(hb.now)} bound={hb.bound or '-'} lease={hb.lease} t1={hb.t1} t2={hb.t2} src={hb.src}"
     if hb.master is not None:
         line += f" master={1 if hb.master else 0}"
     line += f" demote_ok={1 if hb.demote_ok else 0}"

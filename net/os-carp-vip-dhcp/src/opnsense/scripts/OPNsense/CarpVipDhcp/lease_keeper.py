@@ -183,34 +183,14 @@ def _split_prefixes(raw):
     return tuple((raw or "").replace(",", " ").split())
 
 
-def _parse_send_options(raw):
-    """The keeper.conf sendopts field ("code:hex,code:hex", as the model writes it)
-    -> [(code, bytes), ...]. Raises ValueError on a field that is not code:hex
-    with a code of 1-254."""
-    options = []
-    for field in filter(None, (raw or "").split(",")):
-        code, sep, value = field.partition(":")
-        if not sep or not 0 < int(code) < 255:
-            raise ValueError(f"send option {field!r} is not code:hex")
-        options.append((int(code), bytes.fromhex(value)))
-    return options
-
-
-def _parse_request_codes(raw):
-    """The keeper.conf reqopts field ("code,code") -> [code, ...]. Raises
-    ValueError on a code that is not 1-254."""
-    codes = [int(code) for code in filter(None, (raw or "").split(","))]
-    if any(not 0 < code < 255 for code in codes):
-        raise ValueError(f"request options {raw!r} have a code outside 1-254")
-    return codes
-
-
 def _dhcp_option_settings(args):
     """(send options, request codes, configuration error or None) from the raw
-    --send-options/--request-options values. An unusable field is a configuration
-    error (the keeper runs but sends no DHCP), never a crash loop."""
+    --send-options/--request-options values (keeperconf parses them). An unusable
+    field is a configuration error (the keeper runs but sends no DHCP), never a
+    crash loop."""
     try:
-        return _parse_send_options(args.send_options), _parse_request_codes(args.request_options), None
+        return (keeperconf.parse_send_options(args.send_options),
+                keeperconf.parse_request_codes(args.request_options), None)
     except ValueError as e:
         return [], [], f"keeper.conf DHCP options unusable ({e})"
 

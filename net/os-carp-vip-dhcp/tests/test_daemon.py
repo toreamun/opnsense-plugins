@@ -46,7 +46,7 @@ def test_fs_safe(lk):
 def _client(lk, id_opts=None, on_changed=None):
     """A bare DhcpClient with stub hooks and a captured send list -- the
     protocol tests need no Keeper and no capture backend."""
-    c = lk.DhcpClient(None, CHADDR_STR, CHADDR_STR, lk.RequestOptions(id_opts or []),
+    c = lk.DhcpClient(None, CHADDR_STR, CHADDR_STR, lk.ClientOptions(tuple(id_opts or [])),
                       hooks=lk.DhcpHooks(
                           should_stop=lambda: False,
                           ensure_sniffer=lambda: None,

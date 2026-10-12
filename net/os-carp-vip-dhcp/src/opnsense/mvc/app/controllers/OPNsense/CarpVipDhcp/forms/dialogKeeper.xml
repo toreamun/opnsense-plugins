@@ -80,7 +80,7 @@
         <label>Send Options</label>
         <type>textbox</type>
         <advanced>true</advanced>
-        <help><![CDATA[Extra DHCP options some ISPs require, one per line as on the interface page: <b>name value</b>. Text in double quotes, or for an option-N also colon-separated hex. Example: <code>user-class "+FSVDSL_livebox.Internet.softathome.Livebox5"</code> or <code>option-90 00:00:00:00</code>. Sent in every request and renewal, not in a release. The vendor class (option 60) and client-id (option 61) have their own fields here, and the hostname (option 12) the Hostname field. Values are never shown outside this dialog.]]></help>
+        <help><![CDATA[Extra DHCP options some ISPs require, one per line as on the interface page: <b>name value</b>. Text in double quotes, or colon-separated hex for the options that take it (option-N and a few named ones). Example: <code>user-class "+FSVDSL_livebox.Internet.softathome.Livebox5"</code> or <code>option-90 00:00:00:00</code>. Sent in every request and renewal, not in a release. The vendor class (option 60) and client-id (option 61) have their own fields here, and the hostname (option 12) the Hostname field. Values are never shown outside this dialog.]]></help>
     </field>
     <field>
         <id>keeper.requestOptions</id>

@@ -109,7 +109,7 @@ def _encode_bootp_request(chaddr, xid, ciaddr, flags, options):
     return payload.ljust(BOOTP_MIN_PAYLOAD, b"\x00")
 
 
-def send_options_problem(send_opts, id_opts):
+def send_options_problem(id_opts, send_opts):
     """Why the operator's Send Options cannot go out as they are, or None: a
     reserved code, a code given twice, or a code another keeper field already
     sends (vendor class, client-id). The model refuses all of these on save, so
@@ -136,12 +136,16 @@ def request_size(id_opts, send_opts, request_codes):
 
 def dhcp_options_check(id_opts, send_opts, request_codes):
     """(configuration problem or None, largest request size): an unusable Send
-    Option (send_options_problem), or a request too large for one frame."""
+    Option (send_options_problem), or a request too large for one frame. The
+    size is only measured for usable options (an option over 255 bytes cannot
+    even be encoded) and is 0 otherwise."""
+    problem = send_options_problem(id_opts, send_opts)
+    if problem is not None:
+        return problem, 0
     size = request_size(id_opts, send_opts, request_codes)
-    problem = send_options_problem(send_opts, id_opts)
-    if problem is None and size > MAX_REQUEST_BYTES:
-        problem = f"the DHCP request is {size} bytes, more than one {MAX_REQUEST_BYTES}-byte frame"
-    return problem, size
+    if size > MAX_REQUEST_BYTES:
+        return f"the DHCP request is {size} bytes, more than one {MAX_REQUEST_BYTES}-byte frame", size
+    return None, size
 
 
 def _inet_checksum(data):

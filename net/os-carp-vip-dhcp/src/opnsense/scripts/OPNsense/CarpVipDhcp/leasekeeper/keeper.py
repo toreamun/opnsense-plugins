@@ -19,7 +19,7 @@ from .constants import (
     LINK_POLL_STEP, LOOP_ERROR_BACKOFF, Phase, REBIND_POLL_STEP, REDORA_MAX,
     REDORA_MIN, RFC2131_MIN_MESSAGE, SNIFFER_RETRY, SNIFFER_WARMUP)
 from .codec import dhcp_options_check
-from .dhcpclient import DhcpClient, DhcpHooks, RequestOptions, _fmt_client_id, _identity_options
+from .dhcpclient import ClientOptions, DhcpClient, DhcpHooks, _fmt_client_id, _identity_options
 from .heartbeat import Heartbeat, heartbeat_line, mismatch_line, write_heartbeat
 from .ifprobe import carrier_up, is_carp_master
 from .policy import ArpNudge, FollowHooks, FollowPolicy
@@ -153,7 +153,7 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         id_opts = _identity_options(vendor_class, client_id, hostname, self._cfg.chaddr)
         self._dhcp = DhcpClient(
             self._capture, self._cfg.chaddr, self._cfg.eth_src,
-            RequestOptions(id_opts, list(send_opts), list(request_codes)),
+            ClientOptions(tuple(id_opts), tuple(send_opts), tuple(request_codes)),
             hooks=DhcpHooks(
                 should_stop=lambda: self._signals.stopping,
                 ensure_sniffer=self._ensure_sniffer,
@@ -714,9 +714,12 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         ethsrc = f", eth-src {self._cfg.eth_src}" if self._cfg.eth_src != self._cfg.chaddr else ""
         # The VLAN priority only when set (Disabled and 0 send none of their own), and
         # the Send Options by code and length only (a value may hold a credential).
-        sendopts = self._dhcp.send_options_summary()
-        extras = (f", VLAN priority {self._cfg.vlan_pcp}" if self._cfg.vlan_pcp else "") + (
-            f", send options {sendopts}" if sendopts else "")
+        extras = ""
+        if self._cfg.vlan_pcp:
+            extras += f", VLAN priority {self._cfg.vlan_pcp}"
+        send_summary = self._dhcp.send_options_summary()
+        if send_summary:
+            extras += f", send options {send_summary}"
         # The client-id is the ISP-visible identity when the server keys on option 61,
         # so state it here instead of leaving it to a packet capture.
         LOG.info("lease-keeper %s up on %s (vhid %s, default-route %s): "

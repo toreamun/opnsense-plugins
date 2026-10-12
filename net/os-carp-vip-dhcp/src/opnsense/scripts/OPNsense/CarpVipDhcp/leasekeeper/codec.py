@@ -32,7 +32,11 @@ DHCP_MAGIC = b"\x63\x82\x53\x63"   # RFC 2131 options magic cookie
 BOOTP_HDR_LEN = 236          # fixed BOOTP header before the magic cookie
 BOOTP_MIN_PAYLOAD = 300      # RFC 1542 4.1 minimum BOOTP message; reference clients pad to it
 IPPROTO_UDP = 17
-IPV4_TTL = 64                # conventional default TTL (BSD/Linux send 64)
+# IP header TOS and TTL as FreeBSD dhclient sets them on every DHCP packet it sends,
+# broadcast and unicast alike (assemble_udp_ip_header in sbin/dhclient/packet.c), so
+# the keeper's frames match the native WAN DHCP client an ISP sees.
+IPV4_TOS = 0x10              # IPTOS_LOWDELAY
+IPV4_TTL = 128
 IP_HDR_LEN = 20             # fixed IPv4 header we build (no options)
 UDP_HDR_LEN = 8             # UDP header (src/dst port, length, checksum)
 
@@ -126,7 +130,7 @@ def _encode_ipv4_udp(src, dst, sport, dport, payload):
     udp_hdr = struct.pack(udp_fmt, sport, dport, udp_len, cksum)
     # IPv4 header, u8/u8/u16*3/u8/u8/u16 (BBHHHBBH): version/ihl, tos, total
     # length, id, flags/frag, ttl, proto, checksum (zeroed here, patched below).
-    ip_hdr = (struct.pack("!BBHHHBBH", 0x45, 0, IP_HDR_LEN + udp_len, 0, 0, IPV4_TTL, IPPROTO_UDP, 0)
+    ip_hdr = (struct.pack("!BBHHHBBH", 0x45, IPV4_TOS, IP_HDR_LEN + udp_len, 0, 0, IPV4_TTL, IPPROTO_UDP, 0)
               + _ip4(src) + _ip4(dst))
     ip_hdr = ip_hdr[:10] + _inet_checksum(ip_hdr).to_bytes(2, "big") + ip_hdr[12:]
     return ip_hdr + udp_hdr + payload

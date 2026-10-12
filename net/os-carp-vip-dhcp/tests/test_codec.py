@@ -92,6 +92,14 @@ def test_ipv4_and_udp_checksums_validate(lk):
     assert struct.unpack("!H", dgram[2:4])[0] == len(dgram)
 
 
+def test_ipv4_header_tos_and_ttl_match_dhclient(lk):
+    # FreeBSD dhclient sends every DHCP packet with TOS 0x10 (IPTOS_LOWDELAY) and
+    # TTL 128; the keeper's frames carry the same.
+    dgram = lk._encode_ipv4_udp("0.0.0.0", "255.255.255.255", 68, 67, b"payload")
+    assert dgram[1] == 0x10                              # TOS
+    assert dgram[8] == 128                               # TTL
+
+
 def test_inet_checksum_known_vector(lk):
     # The classic worked example (an IP header whose checksum field is zeroed).
     hdr = bytes.fromhex("45000073000040004011" + "0000" + "c0a80001c0a800c7")

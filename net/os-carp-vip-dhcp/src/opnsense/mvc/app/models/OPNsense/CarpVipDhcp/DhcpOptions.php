@@ -2,13 +2,6 @@
 
 /*
  * Copyright (C) 2026 Tore Amundsen
- * All rights reserved.
- *
- * The option table ($names) is copied from opnsense/core
- * src/opnsense/mvc/app/models/OPNsense/Interfaces/FieldTypes/Dhcp4SendOptionsField.php
- * at commit 05a5ab8f83a697cca893554e8ebd2c65764271e8, which lists the options of
- * FreeBSD dhclient (sbin/dhclient/tables.c):
- *
  * Copyright (C) 2026 Deciso B.V.
  * All rights reserved.
  *
@@ -77,7 +70,13 @@ class DhcpOptions
     /** Colon-separated hex octets, one or two digits each, as dhclient reads them. */
     private const HEX_VALUE = '/^[0-9a-fA-F]{1,2}(:[0-9a-fA-F]{1,2})*$/D';
 
-    /** Option name => [code, dhclient format]; the code is the position in core's list. */
+    /**
+     * Option name => [code, dhclient format]; the code is the position in core's
+     * list. Copied from opnsense/core (Deciso B.V., BSD-2, see the header)
+     * src/opnsense/mvc/app/models/OPNsense/Interfaces/FieldTypes/Dhcp4SendOptionsField.php
+     * at commit 05a5ab8f83a697cca893554e8ebd2c65764271e8, which lists the options
+     * of FreeBSD dhclient (sbin/dhclient/tables.c).
+     */
     private static $names = [
         'subnet-mask' => [1, 'I'],
         'time-offset' => [2, 'l'],

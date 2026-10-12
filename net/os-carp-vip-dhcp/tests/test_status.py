@@ -55,11 +55,12 @@ def test_send_options_label_shows_codes_and_lengths_only(value, expected):
 
 
 def test_send_options_label_checks_against_the_identity_fields():
-    # The vendor class field sends 60, so 60 in Send Options too is refused by the
-    # daemon, and the status page says so.
-    rec = {"sendopts": "60:7361676d", "vendorclass": "acme", "chaddr": "00:00:5e:00:01:fe"}
+    # Client identifier Default sends 61 itself, so 61 in Send Options too is refused
+    # by the daemon, and the status page says so; From Send Options takes it from there.
+    rec = {"sendopts": "61:0100005e000108", "cidmode": "default", "chaddr": "00:00:5e:00:01:fe"}
     assert status.send_options_label(rec) == "invalid"
-    assert status.send_options_label(dict(rec, vendorclass="")) == "60 (4 bytes)"
+    assert status.send_options_label(dict(rec, cidmode="options")) == "61 (7 bytes)"
+    assert status.send_options_label(dict(rec, cidmode="none")) == "invalid"   # the model refuses it too
 
 
 @pytest.mark.parametrize("value, expected", [("", ""), ("119,6", "119, 6"), ("1,x", "invalid"), ("0", "invalid")])
@@ -133,19 +134,28 @@ def test_read_keepers_arp_nudge_field(tmp_path):
     assert keepers[1]["arp_nudge"] == 0
 
 
-def test_client_id_label():
+@pytest.mark.parametrize("rec, expected", [
+    ({"cidmode": "default", "chaddr": "00:00:5e:00:01:fe"}, "type 1 + 00:00:5e:00:01:fe"),
+    ({"chaddr": "00:00:5e:00:01:fe"}, "type 1 + 00:00:5e:00:01:fe"),          # no key: the default
+    ({"cidmode": "none", "chaddr": "00:00:5e:00:01:fe"}, "none"),
+    ({"cidmode": "options", "sendopts": "61:6b65657065722d31"}, "text, 8 bytes"),   # value never shown
+    ({"cidmode": "options", "sendopts": "61:0100005e000108"}, "type 1 + 00:00:5e:00:01:08"),
+    ({"cidmode": "options", "sendopts": ""}, "invalid"),                        # no 61 to send
+    ({"cidmode": "none", "sendopts": "61:0100005e000108"}, "invalid"),          # the daemon refuses it
+    ({"cidmode": "options", "sendopts": "61:zz"}, "invalid"),                   # unparsable Send Options
+    ({"cidmode": "bogus"}, "invalid"),
+    ({"cidmode": "default", "chaddr": "zz:zz"}, "invalid"),                     # unencodable chaddr
+])
+def test_client_id_label(rec, expected):
     # The daemon's own encoder/formatter, so the page shows exactly what goes on the wire.
-    assert status.client_id_label("", "00:00:5e:00:01:fe") == "none"
-    assert status.client_id_label("mac", "00:00:5e:00:01:fe") == "type 1 + 00:00:5e:00:01:fe"
-    assert status.client_id_label("keeper-1", "00:00:5e:00:01:fe") == "text, 8 bytes"   # value never shown
-    assert status.client_id_label("mac", "zz:zz") == "invalid"    # unencodable chaddr, never the setting
+    assert status.client_id_label(rec) == expected
 
 
 def test_read_keepers_client_id_field(tmp_path):
     conf = tmp_path / "keeper.conf"
     conf.write_text(
-        "request=100.64.4.7|iface=eth0|chaddr=00:00:5e:00:01:fe|vhid=254|clientid=mac\n"
-        "request=100.64.4.8|iface=eth0|chaddr=00:00:5e:00:01:fd|vhid=253|clientid=\n")
+        "request=100.64.4.7|iface=eth0|chaddr=00:00:5e:00:01:fe|vhid=254|cidmode=default\n"
+        "request=100.64.4.8|iface=eth0|chaddr=00:00:5e:00:01:fd|vhid=253|cidmode=none\n")
     keepers = status.read_keepers({}, {}, conffile=str(conf), run_dir=str(tmp_path))
     assert keepers[0]["client_id"] == "type 1 + 00:00:5e:00:01:fe"
     assert keepers[1]["client_id"] == "none"

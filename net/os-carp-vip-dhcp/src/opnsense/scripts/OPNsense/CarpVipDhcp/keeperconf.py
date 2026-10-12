@@ -8,6 +8,10 @@ import re
 
 CONFFILE = "/usr/local/etc/carpvipdhcp/keeper.conf"
 
+# The Client identifier choices (keeper.conf cidmode), in the model's order.
+CLIENT_ID_MODES = ("default", "none", "options")
+_CLIENT_ID = 61
+
 
 def keeper_id(request_ip):
     """Filesystem-safe keeper id (mirrors the daemon's _fs_safe charset; the
@@ -31,6 +35,22 @@ def parse_send_options(raw):
         except ValueError:
             raise ValueError(f"send option {position} (code {code}) is not hex") from None
     return options
+
+
+def client_id_mode_problem(mode, send_opts):
+    """Why the Client identifier choice cannot go with these parsed Send Options,
+    or None: an unknown choice, From Send Options (options) without option 61, or
+    None (none) with one. Default sends its own 61, so a second one there is the
+    duplicate the option check refuses. The daemon and the status page both ask
+    this, as the model does on save."""
+    if mode not in CLIENT_ID_MODES:
+        return f"unknown Client identifier choice {mode!r}"
+    has_client_id = any(code == _CLIENT_ID for code, _value in send_opts)
+    if mode == "options" and not has_client_id:
+        return "Client identifier From Send Options, but no option 61 there"
+    if mode == "none" and has_client_id:
+        return "Client identifier None, but option 61 in Send Options"
+    return None
 
 
 def parse_request_codes(raw):

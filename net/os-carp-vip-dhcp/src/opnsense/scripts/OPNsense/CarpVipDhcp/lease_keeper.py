@@ -71,7 +71,7 @@ from logging.handlers import RotatingFileHandler
 
 import keeperconf
 from leasekeeper.capture_bpf import BpfCapture
-from leasekeeper.constants import LOGGER_NAME
+from leasekeeper.constants import CLIENT_ID_MAC, LOGGER_NAME
 from leasekeeper.keeper import Keeper, carp_master
 from leasekeeper.route import (
     BackupEgressConfig, BackupEgressForm, BackupEgressReconciler, DefaultRouteMode,
@@ -99,8 +99,7 @@ _CONF_VALUES = {
     "iface": "iface",
     "chaddr": "chaddr",
     "vhid": "vhid",
-    "vendorclass": "vendor_class",
-    "clientid": "client_id",
+    "cidmode": "client_id_mode",
     "hostname": "hostname",
     "arpnudge": "arp_nudge",
     "defaultroutemode": "default_route_mode",
@@ -184,15 +183,27 @@ def _split_prefixes(raw):
 
 
 def _dhcp_option_settings(args):
-    """(send options, request codes, configuration error or None) from the raw
-    --send-options/--request-options values (keeperconf parses them). An unusable
-    field is a configuration error (the keeper runs but sends no DHCP), never a
+    """(send options, request codes, client-id setting, configuration error or
+    None) from the raw --send-options/--request-options values (keeperconf parses
+    them) and the Client identifier choice (--client-id-mode, keeper.conf cidmode):
+    default sends type 1 + chaddr (CLIENT_ID_MAC), none sends no option 61, and
+    options takes it from Send Options. An explicit --client-id wins (manual runs,
+    an older supervisor's command line). An unusable field, an unknown choice,
+    options without a client-id line or none with one is a configuration error
+    (the keeper runs but sends no DHCP and never sends a wrong identity), never a
     crash loop."""
     try:
-        return (keeperconf.parse_send_options(args.send_options),
-                keeperconf.parse_request_codes(args.request_options), None)
+        send_opts = keeperconf.parse_send_options(args.send_options)
+        request_codes = keeperconf.parse_request_codes(args.request_options)
     except ValueError as e:
-        return [], [], f"keeper.conf DHCP options unusable ({e})"
+        return [], [], args.client_id, f"keeper.conf DHCP options unusable ({e})"
+    mode = args.client_id_mode
+    if args.client_id is not None or mode is None:
+        return send_opts, request_codes, args.client_id, None
+    problem = keeperconf.client_id_mode_problem(mode, send_opts)
+    if problem:
+        return send_opts, request_codes, None, problem
+    return send_opts, request_codes, CLIENT_ID_MAC if mode == "default" else None, None
 
 
 def _find_record(conf, keeper_id):
@@ -246,6 +257,9 @@ def _build_arg_parser():
     ap.add_argument("--follow", action="store_true")
     ap.add_argument("--vendor-class", default=None)
     ap.add_argument("--client-id", default=None)
+    ap.add_argument("--client-id-mode", default=None, metavar="default|none|options",
+                    help="the Client identifier choice (option 61): type 1 + chaddr, none, or "
+                         "the client-id in --send-options; --client-id wins")
     ap.add_argument("--hostname", default=None)
     ap.add_argument("--arp-nudge", type=int, default=0, metavar="SECS",
                     help="periodically broadcast an ARP request from the leased IP "
@@ -391,11 +405,11 @@ def main():
                 LOG.critical("invalid %s MAC address %r -- the lease keeper cannot start", label, mac)
                 return 2
 
-        send_opts, request_codes, config_error = _dhcp_option_settings(args)
+        send_opts, request_codes, client_id, config_error = _dhcp_option_settings(args)
         keeper = Keeper(args.iface, args.chaddr, args.request, args.eth_src,
                         hbfile=args.hbfile, release_on_exit=args.release_on_exit or args.once,
                         vhid=args.vhid, follow=args.follow,
-                        vendor_class=args.vendor_class, client_id=args.client_id, hostname=args.hostname,
+                        vendor_class=args.vendor_class, client_id=client_id, hostname=args.hostname,
                         arp_nudge=args.arp_nudge, arp_listen_promisc=args.arp_listen_promisc,
                         vlan_pcp=args.vlan_pcp,
                         send_opts=send_opts, request_codes=request_codes, config_error=config_error,

@@ -18,8 +18,10 @@ import os
 import time
 import xml.etree.ElementTree as ET
 
-from keeperconf import CONFFILE, keeper_id, keeper_records, parse_request_codes, parse_send_options
+from keeperconf import (CONFFILE, client_id_mode_problem, keeper_id, keeper_records, parse_request_codes,
+                        parse_send_options)
 from leasekeeper.codec import option_problem
+from leasekeeper.constants import CLIENT_ID_MAC, DhcpOpt
 from leasekeeper.dhcpclient import _client_id_bytes, _fmt_client_id, _fmt_send_option, _identity_options
 from leasekeeper.ifprobe import carp_roles
 from leasekeeper.syscmd import ifconfig, run
@@ -154,17 +156,29 @@ def iface_names():
     return names
 
 
-def client_id_label(setting, chaddr):
+def _client_id_setting(rec):
+    """The client-id setting the daemon takes from the record's Client identifier
+    choice (cidmode): CLIENT_ID_MAC for default, else none of its own (none sends
+    no option 61, options takes it from Send Options)."""
+    return CLIENT_ID_MAC if rec.get("cidmode", "default") == "default" else ""
+
+
+def client_id_label(rec):
     """The configured DHCP client-id (option 61), formatted as the daemon logs it and
     built with the daemon's own encoder, so it is exactly what a keeper started from
     this keeper.conf sends. A running keeper keeps the value it was started with
-    until it restarts; its startup log line shows that one. "none" when the field is
-    empty; "invalid" if it cannot be encoded (a malformed chaddr would stop the
-    daemon too). Never the setting itself, which may hold a credential."""
-    if not setting:
-        return _fmt_client_id(None)
+    until it restarts; its startup log line shows that one. "none" for None;
+    "invalid" for what the daemon refuses (the Client identifier choice against Send
+    Options, as keeperconf checks it, or a chaddr it cannot encode). Never the
+    value itself, which may hold a credential."""
+    mode = rec.get("cidmode", "default")
     try:
-        return _fmt_client_id(_client_id_bytes(setting, chaddr))
+        send_opts = parse_send_options(rec.get("sendopts", ""))
+        if client_id_mode_problem(mode, send_opts):
+            return "invalid"
+        if mode == "default":
+            return _fmt_client_id(_client_id_bytes(CLIENT_ID_MAC, rec.get("chaddr", "")))
+        return _fmt_client_id(dict(send_opts).get(DhcpOpt.CLIENT_ID))
     except ValueError:
         return "invalid"
 
@@ -173,14 +187,15 @@ def send_options_label(rec):
     """A keeper.conf record's Send Options as option codes and byte counts, e.g.
     "60 (5 bytes), 77 (44 bytes)": never the values, which may hold a credential.
     "" when there are none; "invalid" for exactly what the daemon refuses (the same
-    parser and the same check against the vendor class, client-id and hostname)."""
+    parser and the same checks against the Client identifier choice and hostname)."""
     try:
         send_opts = parse_send_options(rec.get("sendopts", ""))
-        id_opts = _identity_options(rec.get("vendorclass", ""), rec.get("clientid", ""),
+        id_opts = _identity_options("", _client_id_setting(rec),
                                     rec.get("hostname", ""), rec.get("chaddr", ""))
     except ValueError:
         return "invalid"
-    if option_problem(id_opts, send_opts) is not None:
+    if (client_id_mode_problem(rec.get("cidmode", "default"), send_opts) is not None
+            or option_problem(id_opts, send_opts) is not None):
         return "invalid"
     return ", ".join(_fmt_send_option(code, len(value)) for code, value in send_opts)
 
@@ -223,7 +238,7 @@ def read_keepers(states, names, conffile=CONFFILE, run_dir=RUN_DIR):
             "iface": iface,
             "iface_name": names.get(iface, iface),
             "chaddr": chaddr,
-            "client_id": client_id_label(rec.get("clientid", ""), chaddr),
+            "client_id": client_id_label(rec),
             "vhid": vhid,
             "carp_state": states.get(vhid) if vhid else None,
             "demote_on_lease_loss": rec.get("demote", "0") == "1",

@@ -36,11 +36,8 @@ use OPNsense\Base\Messages\Message;
  */
 class CarpVipDhcp extends BaseModel
 {
-    /** Codes Send Options refuse because another keeper field sends them. */
-    private const FIELD_OPTIONS = [
-        60 => 'dhcp-class-identifier (option 60) is set by the DHCP vendor class field',
-        61 => 'dhcp-client-identifier (option 61) is set by the DHCP client-id field',
-    ];
+    /** The option code of the DHCP client identifier. */
+    private const CLIENT_ID = 61;
 
     /**
      * What the encoded fields hold when the text does not parse: code 0, which
@@ -50,18 +47,27 @@ class CarpVipDhcp extends BaseModel
     private const UNUSABLE_SEND = '0:00';
     private const UNUSABLE_REQUEST = '0';
 
-    /** One keeper's parsed [Send Options, Request Options] (see DhcpOptions). */
+    /**
+     * One keeper's parsed [Send Options, Request Options] (see DhcpOptions). A
+     * dhcp-client-identifier line belongs in Send Options only when the Client
+     * identifier is From Send Options; otherwise the keeper sends its own 61 or
+     * none.
+     */
     private static function parsedOptions($keeper)
     {
+        $refused = (string)$keeper->clientIdentifier === 'options' ? [] : [
+            self::CLIENT_ID => 'dhcp-client-identifier (option 61) needs Client identifier set to From Send Options',
+        ];
         return [
-            DhcpOptions::parseSendOptions((string)$keeper->sendOptions, self::FIELD_OPTIONS),
+            DhcpOptions::parseSendOptions((string)$keeper->sendOptions, $refused),
             DhcpOptions::parseRequestOptions((string)$keeper->requestOptions),
         ];
     }
 
     /**
      * The daemon is IPv4 DHCP only, so a keeper must reference an IPv4 CARP VIP.
-     * Send Options and Request Options must parse (DhcpOptions).
+     * Send Options and Request Options must parse (DhcpOptions), and a Client
+     * identifier From Send Options needs its dhcp-client-identifier line there.
      * {@inheritdoc}
      */
     public function performValidation($validateFullModel = false)
@@ -75,6 +81,13 @@ class CarpVipDhcp extends BaseModel
             }
             foreach ($request['errors'] as $error) {
                 $messages->appendMessage(new Message($error, $base . '.requestOptions'));
+            }
+            $codes = array_column($send['options'], 0);
+            if ((string)$keeper->clientIdentifier === 'options' && !in_array(self::CLIENT_ID, $codes, true)) {
+                $messages->appendMessage(new Message(
+                    gettext('From Send Options needs a dhcp-client-identifier line in Send Options.'),
+                    $base . '.clientIdentifier'
+                ));
             }
         }
         foreach ($this->getFlatNodes() as $key => $node) {
@@ -95,9 +108,7 @@ class CarpVipDhcp extends BaseModel
 
         // Cross-keeper invariants. Each CARP VIP and each firewall alias may be
         // driven by at most one keeper (two keepers fighting over the same VIP
-        // or alias would flap it), and follow-mode is incompatible with
-        // lease-loss demotion: a following keeper adopts a new address instead
-        // of losing its lease, so it must never demote CARP on a change.
+        // or alias would flap it).
         $vipSeen = [];
         $aliasSeen = [];
         $enforceSeen = false;
@@ -122,13 +133,6 @@ class CarpVipDhcp extends BaseModel
                     ));
                 }
                 $aliasSeen[$alias] = true;
-            }
-            if ((string)$keeper->followIp === '1' && (string)$keeper->demoteOnLeaseLoss === '1') {
-                $messages->appendMessage(new Message(
-                    gettext('Follow mode and "demote on lease loss" are mutually exclusive: a '
-                        . 'following keeper adopts the new address instead of losing its lease.'),
-                    $base . '.demoteOnLeaseLoss'
-                ));
             }
             // At most one keeper may enforce the default route: there is a single
             // 0.0.0.0/0, so two enforcing keepers would install/withdraw it against

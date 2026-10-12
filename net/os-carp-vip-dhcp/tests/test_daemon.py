@@ -651,7 +651,7 @@ def test_main_once_closes_keeper_without_arming_wakeup_fd(monkeypatch):
 
 
 _CONF_LINE = ("request=100.64.4.7|iface=vtnet0|chaddr=00:00:5e:00:01:fe|demote=0|vhid=254|"
-              "follow=1|vendorclass=sagem|clientid=user@isp|hostname=fw1|arpnudge=120|"
+              "follow=1|cidmode=default|hostname=fw1|arpnudge=120|"
               "arplistenpromisc=0|defaultroutemode=enforce|backupegress=1|backupegressform=split|"
               "backupegressgateway=10.0.0.1|backupegressinterface=|backupegressprefixes=|vlanpcp=6")
 
@@ -699,7 +699,7 @@ def test_main_reads_its_settings_from_keeper_conf(monkeypatch, tmp_path):
     assert built["args"][:3] == ("vtnet0", "00:00:5e:00:01:fe", "100.64.4.7")
     k = built["kwargs"]
     assert (k["vhid"], k["follow"], k["arp_nudge"], k["arp_listen_promisc"]) == ("254", True, 120, False)
-    assert (k["vendor_class"], k["client_id"], k["hostname"]) == ("sagem", "user@isp", "fw1")
+    assert (k["vendor_class"], k["client_id"], k["hostname"]) == (None, "mac", "fw1")
     assert k["default_route_mode"] == "enforce"
     assert k["backup_egress"].enabled and k["backup_egress"].gateway == "10.0.0.1"
     assert k["backup_egress"].interface is None and k["backup_egress"].prefixes == ()
@@ -749,13 +749,13 @@ def test_main_command_line_wins_over_keeper_conf(monkeypatch, tmp_path):
     assert rc == 0
     assert built["kwargs"]["client_id"] == "other" and built["kwargs"]["arp_nudge"] == 30
     assert built["kwargs"]["vlan_pcp"] == 3
-    assert built["kwargs"]["vendor_class"] == "sagem"   # the rest still from the record
+    assert built["kwargs"]["hostname"] == "fw1"   # the rest still from the record
 
 
 def test_main_empty_and_zero_fields_mean_not_set(monkeypatch, tmp_path):
     # An empty value means "not set" (the option keeps its default) and a flag is on
     # only for "1".
-    line = "request=100.64.4.7|iface=vtnet0|chaddr=00:00:5e:00:01:fe|follow=0|clientid=|arpnudge="
+    line = "request=100.64.4.7|iface=vtnet0|chaddr=00:00:5e:00:01:fe|follow=0|cidmode=|arpnudge="
     rc, built = _conf_main(monkeypatch, tmp_path, line, "--keeper-id", "100_64_4_7")
     assert rc == 0
     k = built["kwargs"]
@@ -785,7 +785,7 @@ def test_daemon_reads_every_keeper_conf_key():
                             "templates", "OPNsense", "CarpVipDhcp", "keeper.conf")
     with open(template, encoding="utf-8") as f:
         emitted = set(re.findall(r"(\w+)=\{\{", f.read()))
-    assert {"request", "clientid", "demote"} <= emitted     # the regex itself still matches
+    assert {"request", "cidmode", "demote"} <= emitted      # the regex itself still matches
     assert set(lease_keeper._CONF_VALUES) | set(lease_keeper._CONF_FLAGS) | {"demote"} == emitted
 
 
@@ -1009,15 +1009,46 @@ def test_fmt_client_id(lk):
     assert lk._fmt_client_id(b"keeper-1") == "text, 8 bytes"   # value never shown
 
 
-def test_model_client_id_default_matches_the_daemon_keyword(lk):
-    # The GUI default for new keepers must be exactly the value the daemon treats as
-    # "type 1 + chaddr", or a new keeper would silently send the text instead.
+def test_model_client_identifier_choices_match_the_daemon():
+    # The model's Client identifier choices (and its default for new keepers) must be
+    # exactly the cidmode values the daemon knows, or a keeper would start with a
+    # configuration error instead of its identity.
+    import lease_keeper  # noqa: E402  # pylint: disable=import-outside-toplevel
     model = os.path.join(os.path.dirname(__file__), "..", "src", "opnsense", "mvc", "app",
                          "models", "OPNsense", "CarpVipDhcp", "CarpVipDhcp.xml")
     with open(model, encoding="utf-8") as f:
         text = f.read()
-    m = re.search(r'<clientId type="TextField">\s*<Default>([^<]*)</Default>', text)
-    assert m is not None and m.group(1) == lk.CLIENT_ID_MAC
+    field = re.search(r'<clientIdentifier type="OptionField">(.*?)</clientIdentifier>', text, re.S)
+    assert field is not None
+    default = re.search(r"<Default>([^<]*)</Default>", field.group(1))
+    assert default is not None and default.group(1) == "default"
+    choices = re.findall(r"<(\w+)>[^<]*</\1>", field.group(1).split("<OptionValues>")[1])
+    assert tuple(choices) == lease_keeper.keeperconf.CLIENT_ID_MODES
+
+
+@pytest.mark.parametrize("mode, sendopts, want", [         # want: (client-id, error)
+    ("default", "", ("mac", None)),                      # type 1 + chaddr, as "mac" was
+    ("none", "", (None, None)),
+    ("options", "61:0100005e000108", (None, None)),      # 61 comes from Send Options
+    ("options", "", (None, "no option 61 there")),        # fail safe: never a wrong identity
+    ("none", "61:0100005e000108", (None, "option 61 in Send Options")),   # as the model refuses
+    ("bogus", "", (None, "unknown Client identifier choice")),
+])
+def test_main_client_identifier_choice(monkeypatch, tmp_path, mode, sendopts, want):
+    want_client_id, want_error = want
+    line = _CONF_LINE.replace("cidmode=default", f"cidmode={mode}") + f"|sendopts={sendopts}"
+    rc, built = _conf_main(monkeypatch, tmp_path, line, "--keeper-id", "100_64_4_7")
+    assert rc == 0
+    assert built["kwargs"]["client_id"] == want_client_id
+    error = built["kwargs"]["config_error"]
+    assert (error is None) if want_error is None else (want_error in error)
+
+
+def test_main_explicit_client_id_wins_over_the_choice(monkeypatch, tmp_path):
+    # A manual run or an older supervisor's command line still sets the client-id.
+    line = _CONF_LINE.replace("cidmode=default", "cidmode=none")
+    rc, built = _conf_main(monkeypatch, tmp_path, line, "--keeper-id", "100_64_4_7", "--client-id=isp-login")
+    assert rc == 0 and built["kwargs"]["client_id"] == "isp-login"
 
 
 class _FakeCapture:

@@ -91,6 +91,23 @@ def test_parse_dhcp_options():
         keeperconf.parse_request_codes("1,abc")
 
 
+_CID = [(61, bytes.fromhex("0100005e000108"))]
+
+
+@pytest.mark.parametrize("mode, send_opts, want", [
+    ("default", [], None),
+    ("default", _CID, None),          # the duplicate is option_problem's to refuse
+    ("none", [], None),
+    ("none", _CID, "option 61 in Send Options"),
+    ("options", _CID, None),
+    ("options", [(60, b"acme")], "no option 61 there"),
+    ("bogus", [], "unknown Client identifier choice"),
+])
+def test_client_id_mode_problem(mode, send_opts, want):
+    problem = keeperconf.client_id_mode_problem(mode, send_opts)
+    assert (problem is None) if want is None else (want in problem)
+
+
 def _read_plugin_file(rel):
     with open(os.path.join(_PLUGIN_ROOT, rel), encoding="utf-8") as f:
         return f.read()

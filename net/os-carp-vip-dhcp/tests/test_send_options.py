@@ -73,15 +73,31 @@ def test_send_options_summary_shows_codes_and_lengths_only(lk):
 
 # ---- configuration errors ----
 
-def test_send_options_problem(lk):
+def test_option_problem(lk):
     no_ids = []
     vendor = [(lk.DhcpOptName.VENDOR_CLASS_ID, "acme")]
-    assert lk.send_options_problem(no_ids, [SAGEM, TOKEN]) is None
-    assert "reserved option 53" in lk.send_options_problem(no_ids, [(53, b"\x01")])
-    assert "twice" in lk.send_options_problem(no_ids, [TOKEN, TOKEN])
-    assert "twice" in lk.send_options_problem(vendor, [SAGEM])       # the vendor class field sends 60
-    assert "0 bytes" in lk.send_options_problem(no_ids, [(90, b"")])
-    assert "256 bytes" in lk.send_options_problem(no_ids, [(90, b"x" * 256)])
+    assert lk.option_problem(no_ids, [SAGEM, TOKEN]) is None
+    assert "reserved option 53" in lk.option_problem(no_ids, [(53, b"\x01")])
+    assert "twice" in lk.option_problem(no_ids, [TOKEN, TOKEN])
+    assert "twice" in lk.option_problem(vendor, [SAGEM])       # the vendor class field sends 60
+    assert "0 bytes" in lk.option_problem(no_ids, [(90, b"")])
+    assert "256 bytes" in lk.option_problem(no_ids, [(90, b"x" * 256)])
+    assert lk.option_problem(no_ids, [(57, b"\x05\xdc")]) is None    # 57 is not reserved
+
+
+def test_an_identity_option_too_long_to_encode_is_a_config_error_not_a_crash(lk):
+    # A hand-edited keeper.conf hostname over 255 bytes cannot be encoded either.
+    keeper = _keeper(lk, hostname="h" * 300)
+    assert "option 12 is 300 bytes" in keeper._config_error
+
+
+def test_release_carries_a_client_id_from_send_options(lk):
+    # RELEASE carries the client-id the requests used, whichever field it came from.
+    cid = (61, b"\x01\x00\x00\x5e\x00\x01\x08")
+    keeper = _keeper(lk, send_opts=[cid])
+    keeper._dhcp.release("100.64.4.7", "100.64.4.1")
+    assert (lk.DhcpOptName.CLIENT_ID, cid[1]) in _wire(keeper.sent[0].options)
+    assert keeper._dhcp.client_id == cid[1]
 
 
 def test_an_option_too_long_to_encode_is_a_config_error_not_a_crash(lk):

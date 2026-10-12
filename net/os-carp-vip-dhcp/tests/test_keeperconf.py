@@ -10,6 +10,8 @@ import importlib.util
 import os
 import re
 
+import pytest
+
 _PLUGIN_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 _SCRIPT_DIR = os.path.join(
     _PLUGIN_ROOT, "src", "opnsense", "scripts", "OPNsense", "CarpVipDhcp")
@@ -69,6 +71,24 @@ def test_lines_without_request_and_comments_are_skipped():
 def test_missing_file_yields_nothing(tmp_path):
     # the file-reading wrapper: an absent/unreadable file yields nothing.
     assert not list(keeperconf.keeper_records(str(tmp_path / "absent.conf")))
+
+
+@pytest.mark.parametrize("raw", ["300:73656372657431", "73656372657431", "60:zz73656372657431",
+                                 "60:01,secret:01"])
+def test_parse_send_options_errors_never_show_the_value(raw):
+    # The daemon logs this message; a Send Option value may hold a credential.
+    with pytest.raises(ValueError) as exc:
+        keeperconf.parse_send_options(raw)
+    assert "7365637265" not in str(exc.value) and "secret" not in str(exc.value)
+
+
+def test_parse_dhcp_options():
+    assert keeperconf.parse_send_options("") == []
+    assert keeperconf.parse_send_options("60:7361676d,90:01") == [(60, b"sagm"), (90, b"\x01")]
+    assert keeperconf.parse_request_codes("") == []
+    assert keeperconf.parse_request_codes("119,6") == [119, 6]
+    with pytest.raises(ValueError):
+        keeperconf.parse_request_codes("1,abc")
 
 
 def _read_plugin_file(rel):

@@ -19,24 +19,27 @@ def parse_send_options(raw):
     """The sendopts field ("code:hex,code:hex", as the model writes it) ->
     [(code, bytes), ...]; [] when empty. Raises ValueError on any field that is
     not code:hex with a code of 1-254, so the daemon and the status page agree
-    on what is unusable."""
+    on what is unusable. The message names the field by position or code only:
+    a value may hold a credential, and the daemon logs the message."""
     options = []
-    for field in raw.split(",") if raw else []:
+    for position, field in enumerate(raw.split(",") if raw else [], start=1):
         code, sep, value = field.partition(":")
-        num = int(code)
-        if not sep or not 0 < num < 255:
-            raise ValueError(f"send option {field!r} is not code:hex")
-        options.append((num, bytes.fromhex(value)))
+        if not sep or not code.isdigit() or not 0 < int(code) < 255:
+            raise ValueError(f"send option {position} is not code:hex with a code of 1-254")
+        try:
+            options.append((int(code), bytes.fromhex(value)))
+        except ValueError:
+            raise ValueError(f"send option {position} (code {code}) is not hex") from None
     return options
 
 
 def parse_request_codes(raw):
     """The reqopts field ("code,code") -> [code, ...]; [] when empty. Raises
     ValueError on a code that is not 1-254."""
-    codes = [int(code) for code in raw.split(",")] if raw else []
-    if any(not 0 < code < 255 for code in codes):
-        raise ValueError(f"request options {raw!r} have a code outside 1-254")
-    return codes
+    fields = raw.split(",") if raw else []
+    if any(not field.isdigit() or not 0 < int(field) < 255 for field in fields):
+        raise ValueError("request options hold a code that is not 1-254")
+    return [int(field) for field in fields]
 
 
 def keeper_records_text(text):

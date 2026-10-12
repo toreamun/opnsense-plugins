@@ -90,6 +90,7 @@ refuses('dhcp-class-identifier "sagem";', "remove 'send' and the ';'");
 refuses('vendor-class "sagem"', "Unknown option name 'vendor-class'");
 refuses('option-60 "sagem"', "Unknown option name 'option-60'");
 refuses('routers 10.0.0.1', "Option 'routers' (format IA) is not supported");
+refuses('dhcp-max-message-size 05:dc', "Option 'dhcp-max-message-size' (format S) is not supported");
 refuses('host-name "fw1"', 'set by the Hostname field');
 refuses('dhcp-message-type 03', 'the keeper sets the message type');
 refuses('dhcp-parameter-request-list 01:03', 'use Request Options');

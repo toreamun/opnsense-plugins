@@ -133,10 +133,10 @@ PARAM_REQ_LIST = [DhcpOpt.SUBNET_MASK, DhcpOpt.ROUTER, DhcpOpt.LEASE_TIME,
 
 # Option codes the operator's Send Options must not carry: pad/end, the
 # protocol fields the keeper sets itself (50 requested address, 51 lease time,
-# 52 overload, 53 message type, 54 server identifier, 55 request list, 57 maximum
-# message size), 82 (relay agent, not a client option) and 12 (the Hostname
-# field). Mirrors DhcpOptions::RESERVED in the model, which refuses them on save.
-RESERVED_SEND_CODES = frozenset({0, 12, 50, 51, 52, 53, 54, 55, 57, 82, 255})
+# 52 overload, 53 message type, 54 server identifier, 55 request list), 82 (relay
+# agent, not a client option) and 12 (the Hostname field). Mirrors
+# DhcpOptions::RESERVED in the model, which refuses them on save.
+RESERVED_SEND_CODES = frozenset({0, 12, 50, 51, 52, 53, 54, 55, 82, 255})
 
 # Request size (IP datagram bytes). Above MAX_REQUEST_BYTES (a standard Ethernet
 # MTU) the request cannot go out in one frame: a configuration error. Above

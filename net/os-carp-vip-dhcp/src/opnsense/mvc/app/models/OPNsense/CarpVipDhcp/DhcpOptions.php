@@ -55,7 +55,7 @@ class DhcpOptions
     /**
      * Codes Send Options must not set: the DHCP protocol fields the keeper
      * itself owns (requested address, lease time, overload, message type,
-     * server identifier, parameter request list, maximum message size), the
+     * server identifier, parameter request list), the
      * relay agent option, pad/end, and the hostname (the Hostname field).
      */
     private const RESERVED = [
@@ -67,7 +67,6 @@ class DhcpOptions
         53 => 'the keeper sets the message type (option 53)',
         54 => 'the keeper sets the server identifier (option 54)',
         55 => 'use Request Options for the parameter request list (option 55)',
-        57 => 'the keeper sets the maximum message size (option 57)',
         82 => 'the relay agent option (option 82) is for relays, not clients',
         255 => 'end',
     ];

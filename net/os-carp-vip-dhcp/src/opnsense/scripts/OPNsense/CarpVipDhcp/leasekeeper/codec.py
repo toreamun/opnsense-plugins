@@ -109,12 +109,19 @@ def _encode_bootp_request(chaddr, xid, ciaddr, flags, options):
     return payload.ljust(BOOTP_MIN_PAYLOAD, b"\x00")
 
 
-def send_options_problem(id_opts, send_opts):
-    """Why the operator's Send Options cannot go out as they are, or None: a
-    reserved code, a code given twice, or a code another keeper field already
-    sends (vendor class, client-id). The model refuses all of these on save, so
-    this only catches a hand-edited config or one synced from another version."""
-    seen = {_OPT_ENCODERS[name][0] for name, _value in id_opts}
+def option_problem(id_opts, send_opts):
+    """Why the keeper's request options cannot go out as they are, or None: an
+    identity option (vendor class, client-id, hostname) or a Send Option over 255
+    bytes, a reserved code, or a code given twice (also against an identity
+    option). The model refuses all of these on save, so this only catches a
+    hand-edited config or one synced from another version. Messages name codes
+    and sizes, never values."""
+    seen = set()
+    for name, value in id_opts:
+        code, encode = _OPT_ENCODERS[name]
+        if len(encode(value)) > 255:
+            return f"option {code} is {len(encode(value))} bytes (1-255)"
+        seen.add(code)
     for code, value in send_opts:
         if code in RESERVED_SEND_CODES:
             return f"Send Options carry reserved option {code}"
@@ -135,11 +142,11 @@ def request_size(id_opts, send_opts, request_codes):
 
 
 def dhcp_options_check(id_opts, send_opts, request_codes):
-    """(configuration problem or None, largest request size): an unusable Send
-    Option (send_options_problem), or a request too large for one frame. The
+    """(configuration problem or None, largest request size): an unusable request
+    option (option_problem), or a request too large for one frame. The
     size is only measured for usable options (an option over 255 bytes cannot
     even be encoded) and is 0 otherwise."""
-    problem = send_options_problem(id_opts, send_opts)
+    problem = option_problem(id_opts, send_opts)
     if problem is not None:
         return problem, 0
     size = request_size(id_opts, send_opts, request_codes)

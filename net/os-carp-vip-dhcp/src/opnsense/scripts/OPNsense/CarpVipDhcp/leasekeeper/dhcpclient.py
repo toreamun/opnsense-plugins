@@ -11,7 +11,7 @@ from typing import Callable
 
 from .constants import (
     LOGGER_NAME,
-    ACK, ATTEMPT_BACKOFF_CAP, BROADCAST_FLAG, CLIENT_ID_MAC, DEFAULT_LEASE, DhcpOptName,
+    ACK, ATTEMPT_BACKOFF_CAP, BROADCAST_FLAG, CLIENT_ID_MAC, DEFAULT_LEASE, DhcpOpt, DhcpOptName,
     DORA_ATTEMPTS, HTYPE_ETHERNET, IPV4_BROADCAST, MIN_LEASE, MIN_T1, NAK, OFFER, Phase,
     REBIND_MARGIN, REBOOT_ATTEMPTS, RENEW_ATTEMPTS, RENEW_TIMEOUT, REPLY_TIMEOUT,
     SEND_RETRY_DELAY, SendMsgType, T1_FACTOR, T2_FACTOR, TimingSource)
@@ -158,8 +158,12 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
 
     @property
     def client_id(self):
-        """The option 61 bytes this client sends, or None when it sends none."""
-        return next((v for n, v in self._id_opts if n == DhcpOptName.CLIENT_ID), None)
+        """The option 61 bytes this client sends, from the client-id field or else
+        from Send Options, or None when it sends none. RELEASE carries this one, so
+        it always matches the requests that obtained the lease."""
+        sources = [v for n, v in self._id_opts if n == DhcpOptName.CLIENT_ID]
+        sources += [v for code, v in self._send_opts if code == DhcpOpt.CLIENT_ID]
+        return next(iter(sources), None)
 
     def feed(self, rx):
         """Hand a first-party (xid-matched) DhcpReply to the waiting sequence.

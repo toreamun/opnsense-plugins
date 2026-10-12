@@ -1044,6 +1044,64 @@ def test_main_client_identifier_choice(monkeypatch, tmp_path, mode, sendopts, wa
     assert (error is None) if want_error is None else (want_error in error)
 
 
+def test_main_reads_an_unmigrated_record_as_before(monkeypatch, tmp_path):
+    # A keeper.conf rendered from a config not migrated to model 1.4.0 (or by the
+    # 1.17 template) keeps its identity: vendorclass and clientid as they were.
+    line = _CONF_LINE.replace("cidmode=default", "vendorclass=MSFT 5.0|clientid=mac")
+    rc, built = _conf_main(monkeypatch, tmp_path, line, "--keeper-id", "100_64_4_7")
+    assert rc == 0
+    k = built["kwargs"]
+    assert (k["vendor_class"], k["client_id"], k["config_error"]) == ("MSFT 5.0", "mac", None)
+    line = _CONF_LINE.replace("cidmode=default", "vendorclass=|clientid=")
+    rc, built = _conf_main(monkeypatch, tmp_path, line, "--keeper-id", "100_64_4_7")
+    assert rc == 0 and built["kwargs"]["client_id"] is None    # empty: no option 61, as in 1.17
+
+
+_AGREEMENT_RECORDS = [
+    "cidmode=default", "cidmode=none", "cidmode=options", "cidmode=bogus", "",
+    "cidmode=options|sendopts=61:4b65657065722d31", "cidmode=none|sendopts=61:4b65657065722d31",
+    "cidmode=default|sendopts=61:4b65657065722d31", "cidmode=default|sendopts=52:01",
+    "cidmode=default|sendopts=zz", "vendorclass=acme|clientid=mac", "vendorclass=|clientid=Keeper-1",
+    "vendorclass=acme|clientid=mac|sendopts=60:6162", "clientid=mac|sendopts=61:6162",
+]
+
+
+def _daemon_identity(kwargs):
+    """(configuration error or None, option 61 bytes or None) for a keeper the daemon
+    built: its own configuration error, else the option check it runs at start
+    (keeper.dhcp_options_check), and the 61 it then sends (as DhcpClient.client_id:
+    the identity field's, else the one in Send Options)."""
+    # pylint: disable=import-outside-toplevel
+    from leasekeeper.codec import option_problem
+    from leasekeeper.constants import DhcpOpt, DhcpOptName
+    from leasekeeper.dhcpclient import _identity_options
+    id_opts = _identity_options(kwargs["vendor_class"], kwargs["client_id"], kwargs["hostname"],
+                                "00:00:5e:00:01:fe")
+    problem = kwargs["config_error"] or option_problem(id_opts, kwargs["send_opts"])
+    sent = next((v for n, v in id_opts if n == DhcpOptName.CLIENT_ID), None) or next(
+        (v for code, v in kwargs["send_opts"] if code == DhcpOpt.CLIENT_ID), None)
+    return problem, sent
+
+
+@pytest.mark.parametrize("fields", _AGREEMENT_RECORDS)
+def test_status_page_agrees_with_the_daemon(monkeypatch, tmp_path, fields):
+    # The status page shows "invalid" for exactly what the daemon refuses, "none"
+    # when it sends no option 61, and otherwise the option 61 it sends.
+    import status  # noqa: E402  # pylint: disable=import-outside-toplevel
+    from leasekeeper.dhcpclient import _fmt_client_id  # pylint: disable=import-outside-toplevel
+    base = "request=100.64.4.7|iface=vtnet0|chaddr=00:00:5e:00:01:fe|vhid=254|hostname=fw1"
+    line = f"{base}|{fields}" if fields else base
+    rc, built = _conf_main(monkeypatch, tmp_path, line, "--keeper-id", "100_64_4_7")
+    assert rc == 0
+    rec = dict(field.split("=", 1) for field in line.split("|"))
+    problem, sent = _daemon_identity(built["kwargs"])
+    if problem is not None:
+        assert status.client_id_label(rec) == "invalid" and status.send_options_label(rec) == "invalid"
+    else:
+        assert status.client_id_label(rec) == _fmt_client_id(sent)
+        assert status.send_options_label(rec) != "invalid"
+
+
 def test_main_explicit_client_id_wins_over_the_choice(monkeypatch, tmp_path):
     # A manual run or an older supervisor's command line still sets the client-id.
     line = _CONF_LINE.replace("cidmode=default", "cidmode=none")

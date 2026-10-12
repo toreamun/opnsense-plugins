@@ -108,6 +108,22 @@ def test_client_id_mode_problem(mode, send_opts, want):
     assert (problem is None) if want is None else (want in problem)
 
 
+@pytest.mark.parametrize("args, want", [
+    (("", "acme", "mac", []), ("acme", "mac", None)),           # 1.17 form, as before
+    (("", "", "", []), (None, None, None)),                     # 1.17 empty: no option 61
+    (("default", "", "", []), (None, "mac", None)),
+    (("none", "", "", []), (None, None, None)),
+    (("options", "", "", _CID), (None, None, None)),            # 61 comes from Send Options
+    (("options", "", "", []), (None, None, "no option 61 there")),
+    (("bogus", "", "", []), (None, None, "unknown Client identifier choice")),
+    (("none", "", "isp-login", []), (None, "isp-login", None)),  # a client-id value wins
+])
+def test_identity_settings(args, want):
+    vendor_class, client_id, problem = keeperconf.identity_settings(*args)
+    assert (vendor_class, client_id) == want[:2]
+    assert (problem is None) if want[2] is None else (want[2] in problem)
+
+
 def _read_plugin_file(rel):
     with open(os.path.join(_PLUGIN_ROOT, rel), encoding="utf-8") as f:
         return f.read()

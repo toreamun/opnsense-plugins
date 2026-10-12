@@ -46,14 +46,20 @@ class M1_4_0 extends BaseModelMigration
             return;
         }
         $old = [];
+        $byPosition = [];
         foreach ($config->OPNsense->CarpVipDhcp->keepers->keeper as $keeper) {
             $old[(string)$keeper->attributes()->uuid] = $keeper;
+            $byPosition[] = $keeper;
         }
+        $position = 0;
         foreach ($model->keepers->keeper->iterateItems() as $uuid => $keeper) {
-            if (!isset($old[$uuid])) {
+            /* A stored keeper without a uuid gets a new one on load, in the same
+               order, so fall back to its position rather than lose its fields. */
+            $stored = $old[$uuid] ?? $byPosition[$position] ?? null;
+            $position++;
+            if ($stored === null) {
                 continue;
             }
-            $stored = $old[$uuid];
             $keeper->leasePolicy = LegacyKeeperFields::leasePolicy(
                 (string)$stored->followIp,
                 (string)$stored->demoteOnLeaseLoss

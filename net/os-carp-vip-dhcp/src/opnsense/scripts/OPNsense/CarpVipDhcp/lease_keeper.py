@@ -71,7 +71,7 @@ from logging.handlers import RotatingFileHandler
 
 import keeperconf
 from leasekeeper.capture_bpf import BpfCapture
-from leasekeeper.constants import CLIENT_ID_MAC, LOGGER_NAME
+from leasekeeper.constants import LOGGER_NAME
 from leasekeeper.keeper import Keeper, carp_master
 from leasekeeper.route import (
     BackupEgressConfig, BackupEgressForm, BackupEgressReconciler, DefaultRouteMode,
@@ -100,6 +100,8 @@ _CONF_VALUES = {
     "chaddr": "chaddr",
     "vhid": "vhid",
     "cidmode": "client_id_mode",
+    "vendorclass": "vendor_class",   # pre-1.18 form (unmigrated config); see keeperconf
+    "clientid": "client_id",
     "hostname": "hostname",
     "arpnudge": "arp_nudge",
     "defaultroutemode": "default_route_mode",
@@ -183,27 +185,21 @@ def _split_prefixes(raw):
 
 
 def _dhcp_option_settings(args):
-    """(send options, request codes, client-id setting, configuration error or
-    None) from the raw --send-options/--request-options values (keeperconf parses
-    them) and the Client identifier choice (--client-id-mode, keeper.conf cidmode):
-    default sends type 1 + chaddr (CLIENT_ID_MAC), none sends no option 61, and
-    options takes it from Send Options. An explicit --client-id wins (manual runs,
-    an older supervisor's command line). An unusable field, an unknown choice,
-    options without a client-id line or none with one is a configuration error
-    (the keeper runs but sends no DHCP and never sends a wrong identity), never a
-    crash loop."""
+    """(send options, request codes, vendor class, client-id setting,
+    configuration error or None) from the raw --send-options/--request-options
+    values (keeperconf parses them) and the identity options; keeperconf resolves
+    the identity, as the status page does. An unusable field, an unknown Client
+    identifier choice, or a choice that does not go with Send Options is a
+    configuration error (the keeper runs but sends no DHCP and never sends a wrong
+    identity), never a crash loop."""
     try:
         send_opts = keeperconf.parse_send_options(args.send_options)
         request_codes = keeperconf.parse_request_codes(args.request_options)
     except ValueError as e:
-        return [], [], args.client_id, f"keeper.conf DHCP options unusable ({e})"
-    mode = args.client_id_mode
-    if args.client_id is not None or mode is None:
-        return send_opts, request_codes, args.client_id, None
-    problem = keeperconf.client_id_mode_problem(mode, send_opts)
-    if problem:
-        return send_opts, request_codes, None, problem
-    return send_opts, request_codes, CLIENT_ID_MAC if mode == "default" else None, None
+        return [], [], None, None, f"keeper.conf DHCP options unusable ({e})"
+    vendor_class, client_id, problem = keeperconf.identity_settings(
+        args.client_id_mode, args.vendor_class, args.client_id, send_opts)
+    return send_opts, request_codes, vendor_class, client_id, problem
 
 
 def _find_record(conf, keeper_id):
@@ -405,11 +401,11 @@ def main():
                 LOG.critical("invalid %s MAC address %r -- the lease keeper cannot start", label, mac)
                 return 2
 
-        send_opts, request_codes, client_id, config_error = _dhcp_option_settings(args)
+        send_opts, request_codes, vendor_class, client_id, config_error = _dhcp_option_settings(args)
         keeper = Keeper(args.iface, args.chaddr, args.request, args.eth_src,
                         hbfile=args.hbfile, release_on_exit=args.release_on_exit or args.once,
                         vhid=args.vhid, follow=args.follow,
-                        vendor_class=args.vendor_class, client_id=client_id, hostname=args.hostname,
+                        vendor_class=vendor_class, client_id=client_id, hostname=args.hostname,
                         arp_nudge=args.arp_nudge, arp_listen_promisc=args.arp_listen_promisc,
                         vlan_pcp=args.vlan_pcp,
                         send_opts=send_opts, request_codes=request_codes, config_error=config_error,

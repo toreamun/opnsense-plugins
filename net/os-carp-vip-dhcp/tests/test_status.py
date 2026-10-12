@@ -136,7 +136,9 @@ def test_read_keepers_arp_nudge_field(tmp_path):
 
 @pytest.mark.parametrize("rec, expected", [
     ({"cidmode": "default", "chaddr": "00:00:5e:00:01:fe"}, "type 1 + 00:00:5e:00:01:fe"),
-    ({"chaddr": "00:00:5e:00:01:fe"}, "type 1 + 00:00:5e:00:01:fe"),          # no key: the default
+    ({"chaddr": "00:00:5e:00:01:fe"}, "none"),                                  # no cidmode: the 1.17 form
+    ({"clientid": "mac", "chaddr": "00:00:5e:00:01:fe"}, "type 1 + 00:00:5e:00:01:fe"),
+    ({"clientid": "Keeper-1", "vendorclass": "x"}, "text, 8 bytes"),
     ({"cidmode": "none", "chaddr": "00:00:5e:00:01:fe"}, "none"),
     ({"cidmode": "options", "sendopts": "61:6b65657065722d31"}, "text, 8 bytes"),   # value never shown
     ({"cidmode": "options", "sendopts": "61:0100005e000108"}, "type 1 + 00:00:5e:00:01:08"),

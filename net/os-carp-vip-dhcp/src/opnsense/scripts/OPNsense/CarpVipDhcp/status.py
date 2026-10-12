@@ -18,11 +18,11 @@ import os
 import time
 import xml.etree.ElementTree as ET
 
-from keeperconf import (CONFFILE, client_id_mode_problem, keeper_id, keeper_records, parse_request_codes,
+from keeperconf import (CONFFILE, identity_settings, keeper_id, keeper_records, parse_request_codes,
                         parse_send_options)
 from leasekeeper.codec import option_problem
-from leasekeeper.constants import CLIENT_ID_MAC, DhcpOpt
-from leasekeeper.dhcpclient import _client_id_bytes, _fmt_client_id, _fmt_send_option, _identity_options
+from leasekeeper.constants import DhcpOpt, DhcpOptName
+from leasekeeper.dhcpclient import _fmt_client_id, _fmt_send_option, _identity_options
 from leasekeeper.ifprobe import carp_roles
 from leasekeeper.syscmd import ifconfig, run
 
@@ -156,29 +156,33 @@ def iface_names():
     return names
 
 
-def _client_id_setting(rec):
-    """The client-id setting the daemon takes from the record's Client identifier
-    choice (cidmode): CLIENT_ID_MAC for default, else none of its own (none sends
-    no option 61, options takes it from Send Options)."""
-    return CLIENT_ID_MAC if rec.get("cidmode", "default") == "default" else ""
+def _dhcp_identity(rec):
+    """(client-id bytes or None, send options) for a keeper.conf record, built as
+    the daemon builds them (keeperconf resolves the identity for both). Raises
+    ValueError for exactly what the daemon refuses as a configuration error: an
+    unusable field, a Client identifier choice that does not go with Send
+    Options, or an option the identity fields send too."""
+    send_opts = parse_send_options(rec.get("sendopts", ""))
+    vendor_class, client_id, problem = identity_settings(
+        rec.get("cidmode", ""), rec.get("vendorclass", ""), rec.get("clientid", ""), send_opts)
+    if problem is not None:
+        raise ValueError(problem)
+    id_opts = _identity_options(vendor_class, client_id, rec.get("hostname", ""), rec.get("chaddr", ""))
+    if option_problem(id_opts, send_opts) is not None:
+        raise ValueError("unusable DHCP options")
+    sources = [v for n, v in id_opts if n == DhcpOptName.CLIENT_ID]
+    sources += [v for code, v in send_opts if code == DhcpOpt.CLIENT_ID]
+    return next(iter(sources), None), send_opts
 
 
 def client_id_label(rec):
-    """The configured DHCP client-id (option 61), formatted as the daemon logs it and
-    built with the daemon's own encoder, so it is exactly what a keeper started from
-    this keeper.conf sends. A running keeper keeps the value it was started with
-    until it restarts; its startup log line shows that one. "none" for None;
-    "invalid" for what the daemon refuses (the Client identifier choice against Send
-    Options, as keeperconf checks it, or a chaddr it cannot encode). Never the
-    value itself, which may hold a credential."""
-    mode = rec.get("cidmode", "default")
+    """The DHCP client-id (option 61) a keeper started from this keeper.conf record
+    sends, formatted as the daemon logs it. A running keeper keeps the value it was
+    started with until it restarts; its startup log line shows that one. "none"
+    when it sends none; "invalid" when the daemon refuses the record (it then
+    sends no DHCP at all). Never the value itself, which may hold a credential."""
     try:
-        send_opts = parse_send_options(rec.get("sendopts", ""))
-        if client_id_mode_problem(mode, send_opts):
-            return "invalid"
-        if mode == "default":
-            return _fmt_client_id(_client_id_bytes(CLIENT_ID_MAC, rec.get("chaddr", "")))
-        return _fmt_client_id(dict(send_opts).get(DhcpOpt.CLIENT_ID))
+        return _fmt_client_id(_dhcp_identity(rec)[0])
     except ValueError:
         return "invalid"
 
@@ -186,16 +190,10 @@ def client_id_label(rec):
 def send_options_label(rec):
     """A keeper.conf record's Send Options as option codes and byte counts, e.g.
     "60 (5 bytes), 77 (44 bytes)": never the values, which may hold a credential.
-    "" when there are none; "invalid" for exactly what the daemon refuses (the same
-    parser and the same checks against the Client identifier choice and hostname)."""
+    "" when there are none; "invalid" for exactly what the daemon refuses."""
     try:
-        send_opts = parse_send_options(rec.get("sendopts", ""))
-        id_opts = _identity_options("", _client_id_setting(rec),
-                                    rec.get("hostname", ""), rec.get("chaddr", ""))
+        send_opts = _dhcp_identity(rec)[1]
     except ValueError:
-        return "invalid"
-    if (client_id_mode_problem(rec.get("cidmode", "default"), send_opts) is not None
-            or option_problem(id_opts, send_opts) is not None):
         return "invalid"
     return ", ".join(_fmt_send_option(code, len(value)) for code, value in send_opts)
 

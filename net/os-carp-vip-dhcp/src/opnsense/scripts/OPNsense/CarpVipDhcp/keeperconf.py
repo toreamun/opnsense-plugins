@@ -6,11 +6,12 @@ needed.
 """
 import re
 
+from leasekeeper.constants import CLIENT_ID_MAC, DhcpOpt
+
 CONFFILE = "/usr/local/etc/carpvipdhcp/keeper.conf"
 
 # The Client identifier choices (keeper.conf cidmode), in the model's order.
 CLIENT_ID_MODES = ("default", "none", "options")
-_CLIENT_ID = 61
 
 
 def keeper_id(request_ip):
@@ -45,12 +46,30 @@ def client_id_mode_problem(mode, send_opts):
     this, as the model does on save."""
     if mode not in CLIENT_ID_MODES:
         return f"unknown Client identifier choice {mode!r}"
-    has_client_id = any(code == _CLIENT_ID for code, _value in send_opts)
+    has_client_id = any(code == DhcpOpt.CLIENT_ID for code, _value in send_opts)
     if mode == "options" and not has_client_id:
         return "Client identifier From Send Options, but no option 61 there"
     if mode == "none" and has_client_id:
         return "Client identifier None, but option 61 in Send Options"
     return None
+
+
+def identity_settings(cidmode, vendor_class, client_id, send_opts):
+    """(vendor class, client-id setting, configuration error or None) for one
+    keeper: the daemon (from its options) and the status page (from the record)
+    both resolve the DHCP identity here, so they agree. A record without a Client
+    identifier choice (cidmode), or with a client-id value, is the pre-1.18 form
+    (an unmigrated config, or a manual --client-id): vendorclass and clientid
+    mean what they meant then ("mac" = type 1 + chaddr, empty = no option 61).
+    Otherwise the choice decides: default gives "mac", none and options none of
+    its own (options sends the 61 in Send Options), and a choice that does not go
+    with Send Options is a configuration error (see client_id_mode_problem)."""
+    if not cidmode or client_id:
+        return vendor_class or None, client_id or None, None
+    problem = client_id_mode_problem(cidmode, send_opts)
+    if problem is None and cidmode == "default":
+        return vendor_class or None, CLIENT_ID_MAC, None
+    return vendor_class or None, None, problem
 
 
 def parse_request_codes(raw):

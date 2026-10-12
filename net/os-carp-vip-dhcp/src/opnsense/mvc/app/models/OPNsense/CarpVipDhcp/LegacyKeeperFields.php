@@ -27,8 +27,9 @@ namespace OPNsense\CarpVipDhcp;
 /**
  * How the keeper fields of model 1.3.0 map onto those of 1.4.0, for the
  * migration (Migrations/M1_4_0.php). Plain PHP with no OPNsense dependency, so a
- * php script tests it in CI. Every mapping keeps what goes on the wire byte for
- * byte: the same option 60 and 61, and the same follow / demote behaviour.
+ * php script tests it in CI. Every mapping keeps what goes on the wire: the
+ * same bytes in option 60 and 61 (only their place among the options can move),
+ * and the same follow / demote behaviour.
  */
 class LegacyKeeperFields
 {

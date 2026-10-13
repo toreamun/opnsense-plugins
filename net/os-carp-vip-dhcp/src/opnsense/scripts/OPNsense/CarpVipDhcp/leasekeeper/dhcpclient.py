@@ -136,7 +136,8 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
         # a client-id to send the same one in all subsequent messages.
         self._id_opts = list(options.id_opts)
         # The operator's Send Options as raw (code, bytes): in DISCOVER, REQUEST,
-        # RENEW and REBIND, not in RELEASE (RFC 2131 table 5, see release()).
+        # RENEW and REBIND; RELEASE carries only an option 61 among them (RFC 2131
+        # table 5, see release() and client_id).
         self._send_opts = list(options.send_opts)
         # The Parameter Request List: Request Options first, then the keeper's own.
         self._prl = request_list(options.request_codes)

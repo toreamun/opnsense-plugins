@@ -927,6 +927,17 @@ Most of these are edge cases - a WAN where the ISP isolates you per VLAN/port (t
   handing the VIP to the peer. To take a node out of rotation on purpose that may be
   what you want; to pause a keeper **without** a failover, disable the keeper - don't
   stop the service.
+- **When nodes reboot:** a reboot of one node is an ordinary failover. If it was the
+  master, the backup takes over within seconds and its keeper takes the lease; the
+  rebooting node comes back as backup and stays quiet. With preemption on, the preferred
+  master takes the role back once its `pfsync` demotion at boot is released, and the
+  role may change back and forth briefly while that settles. When **both** nodes boot at
+  once (a power cut), whichever comes up first finds no master, becomes master on its own
+  ("master timed out" in the system log) and holds the lease until the preferred master is
+  up; expect the same short settling then, and at most a few seconds of interruption. The
+  keepers follow CARP and need nothing from you. If the roles keep changing after that,
+  look at the link that carries the CARP advertisements between the nodes, not at the
+  plugin.
 - **SYNC-link failure while both WAN ports stay up:** CARP advertisements still cross the
   WAN segment, so **the master keeps its role - no spurious failover or ping-pong**
   (lab-confirmed: `pfsync` demotion penalizes only the *out-of-sync* node - a backup

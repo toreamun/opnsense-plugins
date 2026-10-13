@@ -71,7 +71,7 @@
         $("#clear_log").click(function () {
             stdDialogConfirm(
                 "{{ lang._('Clear log') }}",
-                "{{ lang._('Truncate all keeper log files? This cannot be undone.') }}",
+                "{{ lang._('Clear all keeper logs, including their rotated history? This cannot be undone.') }}",
                 "{{ lang._('Clear') }}",
                 "{{ lang._('Cancel') }}",
                 function () {

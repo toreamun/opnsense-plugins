@@ -137,12 +137,14 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         self._signals = _SignalFlags()
 
         # CARP-role state machine: owns was_master, the early-renew latch and the
-        # demote-on-lease-loss grace. The raw probe and the promotion side effects
-        # (nudge + route resync) are injected late-bound, so a test can still stub
+        # demote-on-lease-loss grace. The raw probe, the promotion side effects
+        # (nudge + route resync) and the role-change hook (publish the heartbeat at
+        # once) are injected late-bound, so a test can still stub
         # _probe_carp_master and the route/nudge collaborators need not exist yet.
         self._role = RoleWatcher(self._cfg.vhid,
                                  probe=self._probe_role,
-                                 on_promote=self._on_carp_promote)
+                                 on_promote=self._on_carp_promote,
+                                 on_change=self._hb)
 
         # Main-loop-only state (set by the loop itself, never by a handler):
         self._pulse = _RateLimit(LEASE_PULSE_INTERVAL)   # throttles the "lease healthy" INFO
@@ -286,7 +288,7 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         if self._nudge.interval:
             nudge = (self._nudge.last_nudge, self._nudge.last_reply, self._nudge_target())
         write_heartbeat(self._cfg.hbfile, heartbeat_line(Heartbeat(
-            now=now, bound=self._dhcp.binding.yiaddr, lease=self._dhcp.binding.lease_secs,
+            now=now, bound=self._held_address(), lease=self._dhcp.binding.lease_secs,
             t1=t1, t2=t2, src=src, master=self._role.was_master, demote_ok=self._demote_ok(now),
             nudge=nudge, pcperr=self._capture.vlan_pcp_error,
             config_error=self._config_error is not None)))
@@ -338,6 +340,15 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         default -- see route.DefaultRouteReconciler)."""
         self._arp_nudge(force=True, master=True)
         self._defroute.request_resync()
+
+    def _held_address(self):
+        """The lease address to report as held (heartbeat, log), or None on a confirmed
+        CARP backup. A backup sends no DHCP and does not learn the master's renewals,
+        so a binding kept from an earlier spell as master only ages: it stays as the
+        takeover hint (routes, nudge and renew on promotion), never reported as held."""
+        if self._role.was_master is False:
+            return None
+        return self._dhcp.binding.yiaddr
 
     def _hb_mismatch(self, got, want):
         # Write a clear marker into the heartbeat file so a supervisor/human sees the mismatch.
@@ -656,11 +667,11 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         the caller owns when (and whether) to renew. Pass an already-probed role to
         skip the ifconfig."""
         self._hb()
-        self._maybe_pulse()       # ~1/h "lease healthy" so a quiet keeper shows life
         self._follow.watchdog()   # re-drive a follow whose apply stalled
         # One CARP-role probe per tick, shared by the role poll, the route
         # reconcile (both via _role_tick) and the nudge below.
         master = self._role_tick(master)
+        self._maybe_pulse()       # ~1/h "lease healthy", after the role poll: silent on a backup
         self._arp_nudge(master=master)
 
     def _hold_lease(self, secs):
@@ -686,14 +697,14 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
     def _maybe_pulse(self):
         """A throttled (~1/h) 'lease healthy' INFO. A keeper holding a steady lease
         logs nothing at INFO between renews (routine renews are DEBUG), so this
-        periodic line shows it is alive without per-tick spam. Not master-gated: a
-        backup holds the same lease and is just as 'healthy'."""
-        binding = self._dhcp.binding
-        if not binding.yiaddr:
+        periodic line shows it is alive without per-tick spam. Silent on a backup,
+        which holds no lease (_held_address)."""
+        held = self._held_address()
+        if not held:
             return
         ok, _ = self._pulse.ready()
         if ok:
-            LOG.info("lease healthy: %s on %s (lease %ss)", binding.yiaddr, self._cfg.iface, binding.lease_secs)
+            LOG.info("lease healthy: %s on %s (lease %ss)", held, self._cfg.iface, self._dhcp.binding.lease_secs)
 
     def run(self):
         """The daemon main loop: capture up, then maintain the lease until
@@ -776,10 +787,11 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         source the shared CARP virtual MAC, move it to this node's switch port and
         flap the master's return path. So it just holds whatever binding it has and
         does the same steady upkeep as a master waiting out T1 (heartbeat, role
-        poll, default route + backup egress, follow convergence via the sleep's
-        check_observed), minus the renew. On promotion the sleep breaks and the
-        _maintain_step gate reopens: a backup already holding a lease (from the
-        master's exchanges) routes at once, a lease-less one after a single DORA.
+        poll, default route + backup egress, and follow convergence via the sleep's
+        check_observed, which needs a kept binding), minus the renew. On promotion the sleep breaks and the
+        _maintain_step gate reopens: a backup still keeping the binding from an
+        earlier spell as master (the takeover hint, not reported as held; see
+        _held_address) routes at once, a lease-less one after a single DORA.
         _maintain_step has already committed the backup role at its gate, so this
         tick's heartbeat reflects master=0/demote_ok=0."""
         self._maintenance_tick(master=False)

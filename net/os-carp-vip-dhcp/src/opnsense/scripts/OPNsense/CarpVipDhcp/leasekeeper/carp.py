@@ -3,7 +3,8 @@ owns the early-renew latch and the demote-on-lease-loss grace clock, and fires t
 promotion side effects through an injected hook. Kept in its own module so the role
 logic (which a planned enforce-mode fail-stop follow-up builds on) has one home, separate
 from the maintain loop that drives it. The raw ifconfig probe and the promotion side
-effects (ARP nudge + default-route resync) are injected, so this object stays pure
+effects (ARP nudge + default-route resync) and the role-change hook (the keeper's
+heartbeat) are injected, so this object stays pure
 role logic with no capture / route / nudge dependencies.
 """
 import logging
@@ -22,12 +23,15 @@ class RoleWatcher:
     are driven by `poll()`."""
 
     def __init__(self, vhid, probe: "Callable[[], bool | None]",
-                 on_promote: "Callable[[], None]"):
+                 on_promote: "Callable[[], None]", on_change: "Callable[[], None]"):
         self._vhid = vhid
         self._probe = probe            # the keeper's CARP-master probe (late-bound; None = probe failed)
         # Promotion side effects (force ARP nudge + request default-route resync). poll()
-        # calls it BEFORE committing was_master, so it must not raise (fire-and-forget).
+        # calls it BEFORE committing was_master, so a promotion whose side effects raise
+        # is seen (and retried) on the next poll. on_change runs after either transition,
+        # once the role is committed (the keeper publishes its heartbeat with it).
         self._on_promote = on_promote
+        self._on_change = on_change
         # None until the first definite probe (a vhid keeper is unknown until then); a
         # no-vhid keeper has no CARP role to watch and is the permanent sole master.
         self.was_master: "bool | None" = None if vhid else True
@@ -43,25 +47,29 @@ class RoleWatcher:
         (immediate ARP nudge + route resync): the failover -- or the link flap that
         re-elected CARP -- may just have disturbed the upstream gateway's ARP entry and
         the access node's DHCP-snooping binding, so neither should wait out its normal
-        timer. `master` lets the maintain loop pass the role it already probed this tick."""
+        timer. Either transition then fires on_change (the keeper publishes its heartbeat
+        at once). `master` lets the maintain loop pass the role it already probed this tick."""
         if not self._vhid:
             return
         if master is _UNSET:
             master = self._probe()
         if master is None:
             return
-        if self.was_master is None:
+        prev = self.was_master
+        if prev is None:
             # First definite role after an unknown initial probe (a transient ifconfig
             # failure at startup): announce it so the log does not stay stuck at
             # "unknown", but take no failover action -- this is the initial
             # determination, not a promotion or demotion.
             LOG.info("CARP role for vhid %s: %s", self._vhid, "MASTER" if master else "BACKUP")
-        elif master and self.was_master is False:
+            self.was_master = bool(master)
+            return
+        if master and prev is False:
             LOG.info("became CARP master for vhid %s -- immediate ARP nudge and early lease renew",
                      self._vhid)
             self._renew_asap = True
             self._on_promote()
-        elif not master and self.was_master:
+        elif not master and prev:
             # The symmetric event: without it, "why did the nudges stop?" needs ifconfig
             # instead of the log. A pending early-renew latch is left as-is:
             # renew_pending()/take_renew() gate on the role, so it goes inert now that
@@ -69,6 +77,8 @@ class RoleWatcher:
             # re-arms it -- no by-hand clear here to drift out of sync.
             LOG.info("lost CARP master for vhid %s -- ARP nudges pause on this node", self._vhid)
         self.was_master = bool(master)   # a definite role here: _UNSET was probed, None returned above
+        if self.was_master != prev:
+            self._on_change()
 
     def log_initial(self):
         """Announce the CARP role once at startup and seed was_master, so the role is in

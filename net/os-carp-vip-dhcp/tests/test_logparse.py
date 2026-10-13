@@ -1,8 +1,16 @@
 """Unit tests for logparse.py log-line parsing (comments over docstrings)."""
 # pylint: disable=missing-function-docstring
 import json
+import os
+import shutil
+import subprocess
+
+import pytest
 
 import logparse  # sys.path via conftest  # type: ignore
+
+_CLEAR_LOG_SH = os.path.join(os.path.dirname(__file__), "..", "src", "opnsense", "scripts",
+                             "OPNsense", "CarpVipDhcp", "clear_log.sh")
 
 
 def test_line_re_matches_standard_line():
@@ -74,3 +82,52 @@ def test_main_skips_unreadable_file(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(logparse, "keeper_meta", lambda: {})
     logparse.main()
     assert not json.loads(capsys.readouterr().out)
+
+
+def test_keeper_lines_spans_rotated_files_newest_first(tmp_path, monkeypatch):
+    # A log that has just rotated still shows its recent history: the current file,
+    # then .1 (newest rotated) and onwards, up to the cap; older files are not read.
+    log = tmp_path / "carpvipdhcp-1_2_3_4.log"
+    log.write_text("c1\nc2\n")
+    (tmp_path / "carpvipdhcp-1_2_3_4.log.1").write_text("r1a\nr1b\n")
+    (tmp_path / "carpvipdhcp-1_2_3_4.log.2").write_text("r2a\nr2b\n")
+    monkeypatch.setattr(logparse, "MAX_PER_KEEPER", 5)
+    assert logparse.keeper_lines(str(log)) == ["r2b", "r1a", "r1b", "c1", "c2"]
+
+
+def test_keeper_lines_skips_an_unreadable_rotated_file(tmp_path):
+    log = tmp_path / "carpvipdhcp-1_2_3_4.log"
+    log.write_text("now\n")
+    (tmp_path / "carpvipdhcp-1_2_3_4.log.1").mkdir()
+    (tmp_path / "carpvipdhcp-1_2_3_4.log.2").write_text("older\n")
+    assert logparse.keeper_lines(str(log)) == ["older", "now"]
+
+
+def test_main_shows_rotated_lines_once_per_keeper(tmp_path, monkeypatch, capsys):
+    # The rotated files belong to their keeper (not listed as keepers of their own)
+    # and their lines come out in the same newest-first feed.
+    (tmp_path / "carpvipdhcp-100_64_4_7.log").write_text("2026-07-06 12:00:00,100 INFO current\n")
+    (tmp_path / "carpvipdhcp-100_64_4_7.log.1").write_text("2026-07-06 11:00:00,100 INFO rotated\n")
+    monkeypatch.setattr(logparse, "LOG_GLOB", str(tmp_path / "carpvipdhcp-*.log"))
+    monkeypatch.setattr(logparse, "keeper_meta",
+                        lambda: {"100_64_4_7": {"ip": "100.64.4.7", "vhid": "254"}})
+    logparse.main()
+    records = json.loads(capsys.readouterr().out)
+    assert [r["message"] for r in records] == ["current", "rotated"]
+    assert {r["keeper"] for r in records} == {"100.64.4.7"}
+
+
+@pytest.mark.skipif(shutil.which("sh") is None and os.environ.get("CI") != "true",
+                    reason="no POSIX sh (dev box); clear_log.sh is checked under CI")
+def test_clear_log_truncates_the_current_file_and_removes_rotations(tmp_path):
+    # The running daemon keeps the current file open, so it must be truncated, never
+    # removed; its rotations go; anything else (an operator's copy) is left alone.
+    (tmp_path / "carpvipdhcp-1_2_3_4.log").write_text("current\n")
+    (tmp_path / "carpvipdhcp-1_2_3_4.log.1").write_text("rotated\n")
+    (tmp_path / "carpvipdhcp-1_2_3_4.log.2").write_text("rotated\n")
+    (tmp_path / "carpvipdhcp-1_2_3_4.log.1.bak").write_text("kept by hand\n")
+    subprocess.run(["sh", _CLEAR_LOG_SH], env={**os.environ, "CARPVIPDHCP_LOG_DIR": str(tmp_path)},
+                   check=True)
+    assert sorted(p.name for p in tmp_path.iterdir()) == [
+        "carpvipdhcp-1_2_3_4.log", "carpvipdhcp-1_2_3_4.log.1.bak"]
+    assert (tmp_path / "carpvipdhcp-1_2_3_4.log").read_text() == ""

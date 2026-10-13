@@ -1361,6 +1361,64 @@ def test_hb_master_token_reflects_carp_role(lk, tmp_path):
     assert " master=0" in hb.read_text()
 
 
+def test_role_watcher_retries_a_failed_promotion_and_reports_changes():
+    # A promotion whose side effects raise is not committed, so the next poll fires it
+    # again; on_change runs once per committed transition, never on the first role.
+    from leasekeeper.carp import RoleWatcher  # pylint: disable=import-outside-toplevel
+    calls = []
+
+    def promote():
+        calls.append("promote")
+        if calls.count("promote") == 1:
+            raise RuntimeError("side effect failed")
+
+    role = RoleWatcher(254, probe=lambda: None, on_promote=promote, on_change=lambda: calls.append("change"))
+    role.poll(False)                                  # first definite role
+    with pytest.raises(RuntimeError):
+        role.poll(True)
+    assert role.was_master is False                   # not committed, so retried
+    role.poll(True)
+    role.poll(True)                                   # no transition, no hook
+    role.poll(False)
+    assert calls == ["promote", "promote", "change", "change"]
+
+
+def _hb_fields(hb):
+    """The heartbeat's key=value tokens as a dict."""
+    return dict(tok.split("=", 1) for tok in hb.read_text().split()[1:] if "=" in tok)
+
+
+@pytest.mark.parametrize("was_master, bound", [(False, "-"), (True, "100.64.4.7"), (None, "100.64.4.7")])
+def test_hb_bound_only_off_a_backup(lk, tmp_path, was_master, bound):
+    # A backup keeps a binding from a spell as master as its takeover hint, but holds
+    # no lease (no renew, no learning the master's renewals), so it reports bound=-
+    # and the status page shows standby. A master, or a role not known yet, reports it.
+    hb = tmp_path / "hb"
+    keeper = _keeper(lk, vhid=254, hbfile=str(hb))
+    keeper._dhcp.binding.yiaddr = "100.64.4.7"
+    keeper._was_master = was_master
+    keeper._hb()
+    assert _hb_fields(hb)["bound"] == bound
+    assert keeper._dhcp.binding.yiaddr == "100.64.4.7"       # the hint itself is kept
+
+
+def test_hb_published_on_every_role_change(lk, monkeypatch, tmp_path):
+    # The field case through the role tick: a demotion and a promotion each publish
+    # the heartbeat at once (no waiting for the next refresh or renew), and the kept
+    # binding is reported again as soon as the node is master.
+    hb = tmp_path / "hb"
+    keeper = _keeper(lk, vhid=254, hbfile=str(hb))
+    monkeypatch.setattr(keeper, "_reconcile_default_route", lambda *a, **kw: None)
+    monkeypatch.setattr(keeper, "_arp_nudge", lambda *a, **kw: None)
+    keeper._dhcp.binding.yiaddr = "100.64.4.7"
+    keeper._role_tick(True)                          # initial role: nothing to publish
+    assert not hb.exists()
+    keeper._role_tick(False)
+    assert (_hb_fields(hb)["bound"], _hb_fields(hb)["master"]) == ("-", "0")
+    keeper._role_tick(True)
+    assert (_hb_fields(hb)["bound"], _hb_fields(hb)["master"]) == ("100.64.4.7", "1")
+
+
 def test_hb_no_master_token_before_first_probe(lk, tmp_path):
     # A vhid keeper's role is unknown until the first CARP probe; the token is then
     # omitted and the banner reads that as "not confirmed master", not judging arpok.
@@ -1915,7 +1973,7 @@ def test_backup_takes_passive_path_and_never_transmits(lk, monkeypatch):
     k._maintain_step()
     assert calls == ["passive"]
     calls.clear()
-    k._dhcp.binding.yiaddr = "100.64.4.7"          # bound backup (stale/observed lease)
+    k._dhcp.binding.yiaddr = "100.64.4.7"          # kept from a spell as master (the takeover hint)
     k._maintain_step()
     assert calls == ["passive"]
 
@@ -2578,6 +2636,18 @@ def test_lease_healthy_pulse_silent_when_unbound(lk, monkeypatch, caplog):
     with caplog.at_level("INFO", logger="lease-keeper"):
         k._maybe_pulse()
     assert not [r for r in caplog.records if "lease healthy" in r.getMessage()]
+
+
+@pytest.mark.parametrize("was_master, logged", [(False, False), (True, True), (None, True)])
+def test_lease_healthy_pulse_silent_on_a_backup(lk, monkeypatch, caplog, was_master, logged):
+    # A backup's binding is only the takeover hint, so it logs no "lease healthy".
+    k = _keeper(lk, vhid=254)
+    k._dhcp.binding.yiaddr = "100.64.4.7"
+    k._was_master = was_master
+    monkeypatch.setattr(lk.time, "monotonic", lambda: 5000.0)
+    with caplog.at_level("INFO", logger="lease-keeper"):
+        k._maybe_pulse()
+    assert bool([r for r in caplog.records if "lease healthy" in r.getMessage()]) is logged
 
 
 def test_parse_error_storm_collapses_to_one_debug_line(lk, monkeypatch, caplog):

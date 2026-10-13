@@ -83,7 +83,7 @@ class DiagnosticsController extends ApiControllerBase
     }
 
     /**
-     * Truncate the keeper log files (POST-only, state-changing).
+     * Clear the keeper logs and their rotated files (POST-only, state-changing).
      * @return array
      */
     public function clearLogAction()

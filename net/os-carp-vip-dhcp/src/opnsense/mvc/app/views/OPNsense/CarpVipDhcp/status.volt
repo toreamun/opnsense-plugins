@@ -87,7 +87,7 @@
                 + '">' + "{{ lang._('follow') }}" + '</span>';
         }
         let extra = (k.demote_on_lease_loss === true)
-            ? ' + ' + "{{ lang._('demote') }}" : '';
+            ? ' + ' + "{{ lang._('fail over') }}" : '';
         return '<span class="label label-default" title="'
             + "{{ lang._('Enforces the fixed reservation; a different address raises a mismatch') }}"
             + '">' + "{{ lang._('enforce') }}" + extra + '</span>';
@@ -99,6 +99,12 @@
         // already flags it), like the dashboard widget does.
         if (k.running !== true) {
             return '<span class="label label-default">' + "{{ lang._('not held') }}" + '</span>';
+        }
+        // A configuration error stops all DHCP; the keeper's log says why.
+        if (k.config_error === true) {
+            return '<span class="label label-danger" title="'
+                + "{{ lang._('The keeper sends no DHCP until its settings are fixed; its log says why.') }}"
+                + '">' + "{{ lang._('configuration error') }}" + '</span>';
         }
         if (k.mismatch === true) {
             return '<span class="label label-warning">'
@@ -202,6 +208,20 @@
         return line;
     }
 
+    function dhcpOptionsLines(k) {
+        // Codes and byte counts only: a value may hold a credential.
+        let lines = '';
+        if (k.send_options) {
+            lines += '<br><small class="text-muted">' + "{{ lang._('sends') }}" + ': '
+                + k.send_options + '</small>';
+        }
+        if (k.request_options) {
+            lines += '<br><small class="text-muted">' + "{{ lang._('requests') }}" + ': '
+                + k.request_options + '</small>';
+        }
+        return lines;
+    }
+
     function refreshStatus() {
         ajaxGet('/api/carpvipdhcp/diagnostics/status', {}, function (data) {
             if (data === undefined) {
@@ -229,8 +249,8 @@
                     + '<td>' + leaseTimeCell(k) + '</td>'
                     + '<td>' + nudgeCell(k) + '</td>'
                     + '<td>' + dash(k.chaddr)
-                    + '<br><small class="text-muted">' + "{{ lang._('client-id') }}" + ': '
-                    + dash(k.client_id) + '</small>' + vlanPcpLine(k, data.vlan_mtag_pcp) + '</td>'
+                    + '<br><small class="text-muted">' + "{{ lang._('client identifier') }}" + ': '
+                    + dash(k.client_id) + '</small>' + vlanPcpLine(k, data.vlan_mtag_pcp) + dhcpOptionsLines(k) + '</td>'
                     + '</tr>';
             });
             $('#keeper_rows').html(rows);

@@ -6,13 +6,79 @@ needed.
 """
 import re
 
+from leasekeeper.constants import CLIENT_ID_MAC, DhcpOpt
+
 CONFFILE = "/usr/local/etc/carpvipdhcp/keeper.conf"
+
+# The Client identifier choices (keeper.conf cidmode), in the model's order.
+CLIENT_ID_MODES = ("default", "none", "options")
 
 
 def keeper_id(request_ip):
     """Filesystem-safe keeper id (mirrors the daemon's _fs_safe charset; the
     two must stay in lockstep or the per-keeper file names diverge)."""
     return re.sub(r"[^A-Za-z0-9]", "_", request_ip)
+
+
+def parse_send_options(raw):
+    """The sendopts field ("code:hex,code:hex", as the model writes it) ->
+    [(code, bytes), ...]; [] when empty. Raises ValueError on any field that is
+    not code:hex with a code of 1-254, so the daemon and the status page agree
+    on what is unusable. The message names the field by position or code only:
+    a value may hold a credential, and the daemon logs the message."""
+    options = []
+    for position, field in enumerate(raw.split(",") if raw else [], start=1):
+        code, sep, value = field.partition(":")
+        if not sep or not code.isdigit() or not 0 < int(code) < 255:
+            raise ValueError(f"send option {position} is not code:hex with a code of 1-254")
+        try:
+            options.append((int(code), bytes.fromhex(value)))
+        except ValueError:
+            raise ValueError(f"send option {position} (code {code}) is not hex") from None
+    return options
+
+
+def client_id_mode_problem(mode, send_opts):
+    """Why the Client identifier choice cannot go with these parsed Send Options,
+    or None: an unknown choice, From Send Options (options) without option 61, or
+    None (none) with one. Default sends its own 61, so a second one there is the
+    duplicate the option check refuses. The daemon and the status page both ask
+    this, as the model does on save."""
+    if mode not in CLIENT_ID_MODES:
+        return f"unknown Client identifier choice {mode!r}"
+    has_client_id = any(code == DhcpOpt.CLIENT_ID for code, _value in send_opts)
+    if mode == "options" and not has_client_id:
+        return "Client identifier From Send Options, but no option 61 there"
+    if mode == "none" and has_client_id:
+        return "Client identifier None, but option 61 in Send Options"
+    return None
+
+
+def identity_settings(cidmode, vendor_class, client_id, send_opts):
+    """(vendor class, client-id setting, configuration error or None) for one
+    keeper: the daemon (from its options) and the status page (from the record)
+    both resolve the DHCP identity here, so they agree. A record without a Client
+    identifier choice (cidmode), or with a client-id value, is the pre-1.18 form
+    (an unmigrated config, or a manual --client-id): vendorclass and clientid
+    mean what they meant then ("mac" = type 1 + chaddr, empty = no option 61).
+    Otherwise the choice decides: default gives "mac", none and options none of
+    its own (options sends the 61 in Send Options), and a choice that does not go
+    with Send Options is a configuration error (see client_id_mode_problem)."""
+    if not cidmode or client_id:
+        return vendor_class or None, client_id or None, None
+    problem = client_id_mode_problem(cidmode, send_opts)
+    if problem is None and cidmode == "default":
+        return vendor_class or None, CLIENT_ID_MAC, None
+    return vendor_class or None, None, problem
+
+
+def parse_request_codes(raw):
+    """The reqopts field ("code,code") -> [code, ...]; [] when empty. Raises
+    ValueError on a code that is not 1-254."""
+    fields = raw.split(",") if raw else []
+    if any(not field.isdigit() or not 0 < int(field) < 255 for field in fields):
+        raise ValueError("request options hold a code that is not 1-254")
+    return [int(field) for field in fields]
 
 
 def keeper_records_text(text):

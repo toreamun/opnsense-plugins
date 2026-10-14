@@ -1,6 +1,6 @@
 <model>
     <mount>//OPNsense/CarpVipDhcp</mount>
-    <version>1.2.0</version>
+    <version>1.4.0</version>
     <description>CARP-VIP DHCP lease keeper</description>
     <items>
         <keepers>
@@ -28,15 +28,24 @@
                     <Required>N</Required>
                 </chaddrOverride>
 
-                <!-- Demote this node (hand the CARP VIP to the peer) if this keeper stops holding the correct lease. Default: off. -->
-                <demoteOnLeaseLoss type="BooleanField">
-                    <Default>0</Default>
-                </demoteOnLeaseLoss>
-
-                <!-- Dynamic DHCP: if the server hands out a DIFFERENT address, update the CARP VIP to match instead of alarming, so the VIP stays online. Default: on. Unset to enforce a fixed reservation (alarm on mismatch). -->
-                <followIp type="BooleanField">
-                    <Default>1</Default>
-                </followIp>
+                <!--
+                    What the keeper does with the address the server gives (like the
+                    interface's IPv4 Configuration Type). follow (default): a different
+                    address rewrites the CARP VIP to match, so the VIP stays online on a
+                    dynamic line. enforce: a fixed reservation; a different address
+                    raises a mismatch. failover: enforce, and demote this node (hand the
+                    VIP to the peer) when it stops holding the lease. The template turns
+                    it into the keeper.conf follow / demote keys.
+                -->
+                <leasePolicy type="OptionField">
+                    <Required>Y</Required>
+                    <Default>follow</Default>
+                    <OptionValues>
+                        <follow>Follow dynamic address</follow>
+                        <enforce>Enforce reservation</enforce>
+                        <failover>Enforce reservation and fail over on loss</failover>
+                    </OptionValues>
+                </leasePolicy>
 
                 <!--
                     Optional: name of a firewall Host alias the plugin creates and
@@ -78,33 +87,27 @@
                 </arpListenPromisc>
 
                 <!--
-                    Optional DHCP request options for ISPs that only lease when they
-                    see a specific vendor-class / client-id / hostname. Empty = the
-                    option is not sent. The masks forbid a pipe so the rendered
-                    keeper.conf line stays parseable.
-
-                    clientId "mac" sends option 61 as hardware type 1 + this keeper's
-                    chaddr, the same form a stock OPNsense WAN sends (FreeBSD dhclient
-                    default), so moving from a normal WAN DHCP on the virtual MAC to the
-                    keeper keeps the client identity the ISP already knows. It is the
-                    default for NEW keepers only: an existing keeper record stores the
-                    field (empty) in config.xml, and a stored value always wins over
-                    the model default, so upgrading does not change the identity of a
-                    keeper whose lease is already bound without option 61.
+                    The DHCP client identifier (option 61). default: hardware type 1 +
+                    the client MAC (the CARP virtual MAC, or chaddrOverride), what
+                    FreeBSD dhclient sends on a stock WAN, so moving from a normal WAN
+                    on the virtual MAC keeps the identity the ISP already knows. none:
+                    no option 61. options: the dhcp-client-identifier line in Send
+                    Options. Every keeper from an older version gets an explicit value
+                    in the 1.4.0 migration (Migrations/M1_4_0.php), so this default
+                    only applies to new keepers.
                 -->
-                <vendorClass type="TextField">
-                    <Mask>/^[A-Za-z0-9 ._\/+-]{0,64}$/u</Mask>
-                    <ValidationMessage>Vendor class: letters, digits, space and . _ / + - only (max 64).</ValidationMessage>
-                    <Required>N</Required>
-                </vendorClass>
-                <clientId type="TextField">
-                    <Default>mac</Default>
-                    <!-- RFC 2132 section 9.14: option 61 is at least 2 octets, so a
-                         1-character value would put an invalid option on the wire. -->
-                    <Mask>/^([A-Za-z0-9:._-]{2,128})?$/u</Mask>
-                    <ValidationMessage>Client-id: empty, or 2 to 128 of letters, digits and : . _ - only.</ValidationMessage>
-                    <Required>N</Required>
-                </clientId>
+                <clientIdentifier type="OptionField">
+                    <Required>Y</Required>
+                    <Default>default</Default>
+                    <OptionValues>
+                        <default>Default</default>
+                        <none>None</none>
+                        <options>From Send Options</options>
+                    </OptionValues>
+                </clientIdentifier>
+
+                <!-- Optional DHCP option 12 (hostname). Empty = not sent. The mask forbids
+                     a pipe so the rendered keeper.conf line stays parseable. -->
                 <hostname type="TextField">
                     <Mask>/^[A-Za-z0-9.-]{0,63}$/u</Mask>
                     <ValidationMessage>Hostname: letters, digits, dot and dash only (max 63).</ValidationMessage>
@@ -132,6 +135,28 @@
                         <pcp7 value="7">Network Control (7, highest)</pcp7>
                     </OptionValues>
                 </vlanPriority>
+
+                <!--
+                    Extra DHCP options to send and to request, in the syntax of the
+                    interface page (one per line: "name value" / "name"). Validated and
+                    turned into bytes by DhcpOptions (CarpVipDhcp.php); the derived
+                    *Encoded fields are what the template writes to keeper.conf
+                    ("code:hex,..." / "code,..."), set on every save.
+                -->
+                <sendOptions type="TextField">
+                    <Required>N</Required>
+                </sendOptions>
+                <requestOptions type="TextField">
+                    <Required>N</Required>
+                </requestOptions>
+                <sendOptionsEncoded type="TextField">
+                    <Mask>/^[0-9a-f:,]*$/</Mask>
+                    <Required>N</Required>
+                </sendOptionsEncoded>
+                <requestOptionsEncoded type="TextField">
+                    <Mask>/^[0-9,]*$/</Mask>
+                    <Required>N</Required>
+                </requestOptionsEncoded>
 
                 <!--
                     Own the IPv4 WAN default route as a function of CARP role and

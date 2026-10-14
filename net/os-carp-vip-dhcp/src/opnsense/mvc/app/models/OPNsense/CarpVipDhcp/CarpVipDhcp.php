@@ -36,13 +36,60 @@ use OPNsense\Base\Messages\Message;
  */
 class CarpVipDhcp extends BaseModel
 {
+    /** The option code of the DHCP client identifier. */
+    private const CLIENT_ID = 61;
+
+    /**
+     * What the encoded fields hold when the text does not parse: code 0, which
+     * the daemon refuses, so the keeper reports a configuration error and sends
+     * no DHCP instead of quietly leaving the options out (fail safe).
+     */
+    private const UNUSABLE_SEND = '0:00';
+    private const UNUSABLE_REQUEST = '0';
+
+    /**
+     * One keeper's parsed [Send Options, Request Options] (see DhcpOptions). A
+     * dhcp-client-identifier line belongs in Send Options only when the Client
+     * identifier is From Send Options; otherwise the keeper sends its own 61 or
+     * none.
+     */
+    private static function parsedOptions($keeper)
+    {
+        $refused = (string)$keeper->clientIdentifier === 'options' ? [] : [
+            self::CLIENT_ID => 'dhcp-client-identifier (option 61) needs Client identifier set to From Send Options',
+        ];
+        return [
+            DhcpOptions::parseSendOptions((string)$keeper->sendOptions, $refused),
+            DhcpOptions::parseRequestOptions((string)$keeper->requestOptions),
+        ];
+    }
+
     /**
      * The daemon is IPv4 DHCP only, so a keeper must reference an IPv4 CARP VIP.
+     * Send Options and Request Options must parse (DhcpOptions), and a Client
+     * identifier From Send Options needs its dhcp-client-identifier line there.
      * {@inheritdoc}
      */
     public function performValidation($validateFullModel = false)
     {
         $messages = parent::performValidation($validateFullModel);
+        foreach ($this->keepers->keeper->iterateItems() as $keeper) {
+            $base = $keeper->__reference;
+            list($send, $request) = self::parsedOptions($keeper);
+            foreach ($send['errors'] as $error) {
+                $messages->appendMessage(new Message($error, $base . '.sendOptions'));
+            }
+            foreach ($request['errors'] as $error) {
+                $messages->appendMessage(new Message($error, $base . '.requestOptions'));
+            }
+            $codes = array_column($send['options'], 0);
+            if ((string)$keeper->clientIdentifier === 'options' && !in_array(self::CLIENT_ID, $codes, true)) {
+                $messages->appendMessage(new Message(
+                    gettext('From Send Options needs a dhcp-client-identifier line in Send Options.'),
+                    $base . '.clientIdentifier'
+                ));
+            }
+        }
         foreach ($this->getFlatNodes() as $key => $node) {
             if (!$validateFullModel && !$node->isFieldChanged()) {
                 continue;
@@ -61,9 +108,7 @@ class CarpVipDhcp extends BaseModel
 
         // Cross-keeper invariants. Each CARP VIP and each firewall alias may be
         // driven by at most one keeper (two keepers fighting over the same VIP
-        // or alias would flap it), and follow-mode is incompatible with
-        // lease-loss demotion: a following keeper adopts a new address instead
-        // of losing its lease, so it must never demote CARP on a change.
+        // or alias would flap it).
         $vipSeen = [];
         $aliasSeen = [];
         $enforceSeen = false;
@@ -89,13 +134,6 @@ class CarpVipDhcp extends BaseModel
                 }
                 $aliasSeen[$alias] = true;
             }
-            if ((string)$keeper->followIp === '1' && (string)$keeper->demoteOnLeaseLoss === '1') {
-                $messages->appendMessage(new Message(
-                    gettext('Follow mode and "demote on lease loss" are mutually exclusive: a '
-                        . 'following keeper adopts the new address instead of losing its lease.'),
-                    $base . '.demoteOnLeaseLoss'
-                ));
-            }
             // At most one keeper may enforce the default route: there is a single
             // 0.0.0.0/0, so two enforcing keepers would install/withdraw it against
             // each other. Checked regardless of enabled (like the vip/alias
@@ -114,5 +152,26 @@ class CarpVipDhcp extends BaseModel
         }
 
         return $messages;
+    }
+
+    /**
+     * Write the keeper.conf form of each keeper's Send Options and Request
+     * Options into the derived *Encoded fields before saving, so every save path
+     * (the dialog, the API, any save with validation off) stores what the
+     * template renders; HA sync copies the saved fields. Text that does not parse
+     * is refused by the validation of a normal save; if it is saved anyway, the
+     * UNUSABLE_* marker makes the keeper report a configuration error.
+     * {@inheritdoc}
+     */
+    public function serializeToConfig($validateFullModel = false, $disable_validation = false)
+    {
+        foreach ($this->keepers->keeper->iterateItems() as $keeper) {
+            list($send, $request) = self::parsedOptions($keeper);
+            $keeper->sendOptionsEncoded = $send['errors']
+                ? self::UNUSABLE_SEND : DhcpOptions::encodeSendOptions($send['options']);
+            $keeper->requestOptionsEncoded = $request['errors']
+                ? self::UNUSABLE_REQUEST : DhcpOptions::encodeRequestOptions($request['codes']);
+        }
+        return parent::serializeToConfig($validateFullModel, $disable_validation);
     }
 }

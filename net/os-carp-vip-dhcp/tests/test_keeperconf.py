@@ -10,6 +10,8 @@ import importlib.util
 import os
 import re
 
+import pytest
+
 _PLUGIN_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 _SCRIPT_DIR = os.path.join(
     _PLUGIN_ROOT, "src", "opnsense", "scripts", "OPNsense", "CarpVipDhcp")
@@ -69,6 +71,57 @@ def test_lines_without_request_and_comments_are_skipped():
 def test_missing_file_yields_nothing(tmp_path):
     # the file-reading wrapper: an absent/unreadable file yields nothing.
     assert not list(keeperconf.keeper_records(str(tmp_path / "absent.conf")))
+
+
+@pytest.mark.parametrize("raw", ["300:73656372657431", "73656372657431", "60:zz73656372657431",
+                                 "60:01,secret:01"])
+def test_parse_send_options_errors_never_show_the_value(raw):
+    # The daemon logs this message; a Send Option value may hold a credential.
+    with pytest.raises(ValueError) as exc:
+        keeperconf.parse_send_options(raw)
+    assert "7365637265" not in str(exc.value) and "secret" not in str(exc.value)
+
+
+def test_parse_dhcp_options():
+    assert keeperconf.parse_send_options("") == []
+    assert keeperconf.parse_send_options("60:7361676d,90:01") == [(60, b"sagm"), (90, b"\x01")]
+    assert keeperconf.parse_request_codes("") == []
+    assert keeperconf.parse_request_codes("119,6") == [119, 6]
+    with pytest.raises(ValueError):
+        keeperconf.parse_request_codes("1,abc")
+
+
+_CID = [(61, bytes.fromhex("0100005e000108"))]
+
+
+@pytest.mark.parametrize("mode, send_opts, want", [
+    ("default", [], None),
+    ("default", _CID, None),          # the duplicate is option_problem's to refuse
+    ("none", [], None),
+    ("none", _CID, "option 61 in Send Options"),
+    ("options", _CID, None),
+    ("options", [(60, b"acme")], "no option 61 there"),
+    ("bogus", [], "unknown Client identifier choice"),
+])
+def test_client_id_mode_problem(mode, send_opts, want):
+    problem = keeperconf.client_id_mode_problem(mode, send_opts)
+    assert (problem is None) if want is None else (want in problem)
+
+
+@pytest.mark.parametrize("args, want", [
+    (("", "acme", "mac", []), ("acme", "mac", None)),           # 1.17 form, as before
+    (("", "", "", []), (None, None, None)),                     # 1.17 empty: no option 61
+    (("default", "", "", []), (None, "mac", None)),
+    (("none", "", "", []), (None, None, None)),
+    (("options", "", "", _CID), (None, None, None)),            # 61 comes from Send Options
+    (("options", "", "", []), (None, None, "no option 61 there")),
+    (("bogus", "", "", []), (None, None, "unknown Client identifier choice")),
+    (("none", "", "isp-login", []), (None, "isp-login", None)),  # a client-id value wins
+])
+def test_identity_settings(args, want):
+    vendor_class, client_id, problem = keeperconf.identity_settings(*args)
+    assert (vendor_class, client_id) == want[:2]
+    assert (problem is None) if want[2] is None else (want[2] in problem)
 
 
 def _read_plugin_file(rel):

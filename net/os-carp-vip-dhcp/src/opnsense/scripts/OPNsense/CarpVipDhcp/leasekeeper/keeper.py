@@ -16,16 +16,18 @@ from .carp import RoleWatcher
 from .constants import (
     LOGGER_NAME,
     ACK, BootpOp, HB_REFRESH, LEASE_PULSE_INTERVAL, LINK_KICK_DEBOUNCE,
-    LINK_POLL_STEP, LOOP_ERROR_BACKOFF, Phase, REBIND_POLL_STEP, REDORA_MAX, REDORA_MIN,
-    SNIFFER_RETRY, SNIFFER_WARMUP)
-from .dhcpclient import DhcpClient, DhcpHooks, _fmt_client_id, _identity_options
+    LINK_POLL_STEP, LOOP_ERROR_BACKOFF, Phase, REBIND_POLL_STEP, REDORA_MAX,
+    REDORA_MIN, RFC2131_MIN_MESSAGE, SNIFFER_RETRY, SNIFFER_WARMUP)
+from .codec import dhcp_options_check
+from .dhcpclient import ClientOptions, DhcpClient, DhcpHooks, _fmt_client_id, _identity_options
+from .heartbeat import Heartbeat, heartbeat_line, mismatch_line, write_heartbeat
 from .ifprobe import carrier_up, is_carp_master
 from .policy import ArpNudge, FollowHooks, FollowPolicy
 from .route import (BackupEgressReconciler, DefaultRouteMode, DefaultRouteReconciler,
                     withdraw_unless_master)
 from .signals import _SignalFlags
 from .syscmd import ifconfig, spawn
-from .util import _UNSET, _RateLimit, _atomic_write, _clock_at, _jittered, _sane_ipv4
+from .util import _UNSET, _RateLimit, _clock_at, _jittered, _sane_ipv4
 from .wire import _parse_reply
 
 LOG = logging.getLogger(LOGGER_NAME)
@@ -98,6 +100,7 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
                  hbfile=None, release_on_exit=False, vhid=None,
                  follow=False, vendor_class=None, client_id=None, hostname=None,
                  arp_nudge=0, arp_listen_promisc=False, vlan_pcp=0,
+                 send_opts=(), request_codes=(), config_error=None,
                  default_route_mode="off", backup_egress=None):
         # Fixed identity/config, immutable once set (see _Config).
         self._cfg = _Config(
@@ -149,13 +152,24 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         # DHCP client component: owns the lease state and the protocol sequences;
         # the keeper owns the capture (feeding it xid-matched replies) and the
         # policy hooks.
+        id_opts = _identity_options(vendor_class, client_id, hostname, self._cfg.chaddr)
         self._dhcp = DhcpClient(
             self._capture, self._cfg.chaddr, self._cfg.eth_src,
-            _identity_options(vendor_class, client_id, hostname, self._cfg.chaddr),
+            ClientOptions(tuple(id_opts), tuple(send_opts), tuple(request_codes)),
             hooks=DhcpHooks(
                 should_stop=lambda: self._signals.stopping,
                 ensure_sniffer=self._ensure_sniffer,
                 on_changed_address=self._on_changed_address))
+
+        # A configuration error stops all DHCP (_config_error_step); logged here.
+        problem, size = dhcp_options_check(id_opts, send_opts, request_codes)
+        self._config_error = config_error or problem
+        if self._config_error is not None:
+            LOG.error("configuration error: %s -- the keeper sends no DHCP until the keeper "
+                      "settings are fixed", self._config_error)
+        elif size > RFC2131_MIN_MESSAGE:
+            LOG.warning("the DHCP request is %d bytes, larger than the %d that RFC 2131 guarantees; "
+                        "most servers accept it", size, RFC2131_MIN_MESSAGE)
 
         # Follow/enforce policy component: owns the target address and the
         # follow bookkeeping; drives the client via adopt()/release()/expire().
@@ -266,48 +280,18 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
 
     # ---- heartbeat / status file ----
 
-    def _write_hb(self, content):
-        if not self._cfg.hbfile:
-            return
-        try:
-            _atomic_write(self._cfg.hbfile, content)
-        except OSError as e:
-            # The heartbeat drives CARP gating, so a write failure is worth surfacing.
-            LOG.warning("heartbeat write failed (%s): %s", self._cfg.hbfile, e)
-
     def _hb(self):
+        """Rewrite the heartbeat file from the current state (format: heartbeat.py)."""
         t1, t2, src = self._dhcp.timing()
-        # Publish nudge state so the status page can show it: nudge=<epoch of the
-        # last sent nudge, 0 = never>, arpok=<epoch of the gateway's last ARP reply,
-        # 0 = none seen> and the current target gateway (if known). status.py's
-        # _HB_TOKENS table is the reader -- keep those tokens in lockstep.
-        extra = ""
-        if self._nudge.interval:
-            extra = f" nudge={int(self._nudge.last_nudge)} arpok={int(self._nudge.last_reply)}"
-            gw = self._nudge_target()
-            if gw:
-                extra += f" gw={gw}"
-        # Publish the CARP role (omitted only for a vhid keeper before its first
-        # probe). Lease-holding is judged only on the master via this token: the
-        # status banner (a stale arpok, and a not-held lease, are faults only at
-        # master=1, since a passive backup nudges nothing and holds no lease) and
-        # the CARP eligibility hook (a passive backup is not demoted for being
-        # lease-less). status.py ignores the token (it derives the live role from
-        # ifconfig), so it is deliberately not in _HB_TOKENS.
         now = time.time()
-        role = "" if self._role.was_master is None else f" master={1 if self._role.was_master else 0}"
-        # demote_ok=1 tells the CARP eligibility hook (when demote=1) to demote this
-        # node: it is the master and has failed to hold the lease past the grace.
-        demote_ok = 1 if self._demote_ok(now) else 0
-        # pcperr=<errno name>: the VLAN priority could not be set, so the frames go
-        # out without it. Read by the system status banner (CarpVipDhcpStatus.php)
-        # and status.py's _HB_TOKENS.
-        pcperr = self._capture.vlan_pcp_error
-        if pcperr:
-            extra += f" pcperr={pcperr}"
-        self._write_hb(f"{int(now)} bound={self._held_address() or '-'} "
-                       f"lease={self._dhcp.binding.lease_secs} t1={t1} t2={t2} src={src}"
-                       f"{role} demote_ok={demote_ok}{extra}\n")
+        nudge = None
+        if self._nudge.interval:
+            nudge = (self._nudge.last_nudge, self._nudge.last_reply, self._nudge_target())
+        write_heartbeat(self._cfg.hbfile, heartbeat_line(Heartbeat(
+            now=now, bound=self._held_address(), lease=self._dhcp.binding.lease_secs,
+            t1=t1, t2=t2, src=src, master=self._role.was_master, demote_ok=self._demote_ok(now),
+            nudge=nudge, pcperr=self._capture.vlan_pcp_error,
+            config_error=self._config_error is not None)))
 
     # -- RoleWatcher compatibility surface ---------------------------------------
     # The maintain loop reaches the role state through self._role directly; these
@@ -368,7 +352,7 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
 
     def _hb_mismatch(self, got, want):
         # Write a clear marker into the heartbeat file so a supervisor/human sees the mismatch.
-        self._write_hb(f"{int(time.time())} MISMATCH got={got} want={want}\n")
+        write_heartbeat(self._cfg.hbfile, mismatch_line(time.time(), got, want))
 
     def _on_changed_address(self, got, rx, phase, release_on_enforce):
         """DhcpClient's changed-address hook -> the FollowPolicy decision. A
@@ -739,14 +723,20 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
 
         # eth-src matters for L2 debugging but only when it differs from the chaddr.
         ethsrc = f", eth-src {self._cfg.eth_src}" if self._cfg.eth_src != self._cfg.chaddr else ""
-        # The VLAN priority only when set (Disabled and 0 send none of their own).
-        pcp = f", VLAN priority {self._cfg.vlan_pcp}" if self._cfg.vlan_pcp else ""
+        # The VLAN priority only when set (Disabled and 0 send none of their own), and
+        # the Send Options by code and length only (a value may hold a credential).
+        extras = ""
+        if self._cfg.vlan_pcp:
+            extras += f", VLAN priority {self._cfg.vlan_pcp}"
+        send_summary = self._dhcp.send_options_summary()
+        if send_summary:
+            extras += f", send options {send_summary}"
         # The client-id is the ISP-visible identity when the server keys on option 61,
         # so state it here instead of leaving it to a packet capture.
         LOG.info("lease-keeper %s up on %s (vhid %s, default-route %s): "
                  "CARP MAC %s%s, client-id %s%s, requesting %s",
                  __version__, self._cfg.iface, self._cfg.vhid or "none", self._defroute.mode,
-                 self._cfg.chaddr, ethsrc, _fmt_client_id(self._dhcp.client_id), pcp,
+                 self._cfg.chaddr, ethsrc, _fmt_client_id(self._dhcp.client_id), extras,
                  self._follow.target or "any")
         self._role.log_initial()
         time.sleep(SNIFFER_WARMUP)
@@ -778,7 +768,10 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
     def claim_once(self):
         """--once mode: claim, report, release -- a wiring test, not service
         mode. Lives on the keeper so it uses the components directly instead of
-        the entry point reaching into private attributes."""
+        the entry point reaching into private attributes. A configuration error
+        (already logged) sends nothing."""
+        if self._config_error is not None:
+            return 2
         if not self._capture.start():
             return 3
         time.sleep(SNIFFER_WARMUP)
@@ -804,6 +797,14 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         self._maintenance_tick(master=False)
         self._sleep_interruptible(HB_REFRESH, poll_link=False)
 
+    def _config_error_step(self, role):
+        """A keeper with a configuration error sends no DHCP, on either node: it
+        keeps only its upkeep (the heartbeat with the cfgerr token, the CARP role,
+        the default route), so the banner shows the cause. It holds no lease, so a
+        master withdraws its default as on any lost lease."""
+        self._maintenance_tick(master=role)
+        self._sleep_interruptible(HB_REFRESH, poll_link=False)
+
     def _maintain_step(self):
         """One iteration of the maintain loop. Returns to run() (which loops again)
         on every state transition; any exception it raises is caught by run() and
@@ -826,6 +827,9 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         # keep publishing master=0 and could not fail-stop. Reuses the probed role (no
         # extra ifconfig); a None/unknown role is a no-op (the transmit fail-safe below).
         self._role.poll(role)
+        if self._config_error is not None:
+            self._config_error_step(role)
+            return
         if role is False:
             self._passive_backup_step()
             return

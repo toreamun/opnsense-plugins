@@ -99,7 +99,8 @@ _CONF_VALUES = {
     "iface": "iface",
     "chaddr": "chaddr",
     "vhid": "vhid",
-    "vendorclass": "vendor_class",
+    "cidmode": "client_id_mode",
+    "vendorclass": "vendor_class",   # pre-1.18 form (unmigrated config); see keeperconf
     "clientid": "client_id",
     "hostname": "hostname",
     "arpnudge": "arp_nudge",
@@ -109,6 +110,8 @@ _CONF_VALUES = {
     "backupegressinterface": "backup_egress_interface",
     "backupegressprefixes": "backup_egress_prefixes",
     "vlanpcp": "vlan_pcp",
+    "sendopts": "send_options",
+    "reqopts": "request_options",
 }
 _CONF_FLAGS = {
     "follow": "follow",
@@ -181,6 +184,24 @@ def _split_prefixes(raw):
     return tuple((raw or "").replace(",", " ").split())
 
 
+def _dhcp_option_settings(args):
+    """(send options, request codes, vendor class, client-id setting,
+    configuration error or None) from the raw --send-options/--request-options
+    values (keeperconf parses them) and the identity options; keeperconf resolves
+    the identity, as the status page does. An unusable field, an unknown Client
+    identifier choice, or a choice that does not go with Send Options is a
+    configuration error (the keeper runs but sends no DHCP and never sends a wrong
+    identity), never a crash loop."""
+    try:
+        send_opts = keeperconf.parse_send_options(args.send_options)
+        request_codes = keeperconf.parse_request_codes(args.request_options)
+    except ValueError as e:
+        return [], [], None, None, f"keeper.conf DHCP options unusable ({e})"
+    vendor_class, client_id, problem = keeperconf.identity_settings(
+        args.client_id_mode, args.vendor_class, args.client_id, send_opts)
+    return send_opts, request_codes, vendor_class, client_id, problem
+
+
 def _find_record(conf, keeper_id):
     """This keeper's keeper.conf record, or None when the file has no line for it."""
     for record in keeperconf.keeper_records(conf):
@@ -232,6 +253,9 @@ def _build_arg_parser():
     ap.add_argument("--follow", action="store_true")
     ap.add_argument("--vendor-class", default=None)
     ap.add_argument("--client-id", default=None)
+    ap.add_argument("--client-id-mode", default=None, metavar="default|none|options",
+                    help="the Client identifier choice (option 61): type 1 + chaddr, none, or "
+                         "the client-id in --send-options; --client-id wins")
     ap.add_argument("--hostname", default=None)
     ap.add_argument("--arp-nudge", type=int, default=0, metavar="SECS",
                     help="periodically broadcast an ARP request from the leased IP "
@@ -244,6 +268,11 @@ def _build_arg_parser():
     ap.add_argument("--vlan-pcp", type=int, choices=VLAN_PCP_VALUES, default=0, metavar="0-7",
                     help="802.1p priority on every frame the keeper sends (DHCP and ARP); "
                          "0 (default) sets none, so the VLAN device's own priority applies")
+    ap.add_argument("--send-options", default="", metavar="CODE:HEX,...",
+                    help="extra DHCP options to send, as keeper.conf holds them (the model "
+                         "turns the dialog's Send Options into this form)")
+    ap.add_argument("--request-options", default="", metavar="CODE,...",
+                    help="DHCP option codes to request before the keeper's own")
     # Accepted and ignored (bpf is the only backend): a daemon(8) supervisor started by
     # an older version may still carry --capture-backend on its command line, and its
     # next restart must run this script instead of exiting 2 and crash-looping.
@@ -372,12 +401,14 @@ def main():
                 LOG.critical("invalid %s MAC address %r -- the lease keeper cannot start", label, mac)
                 return 2
 
+        send_opts, request_codes, vendor_class, client_id, config_error = _dhcp_option_settings(args)
         keeper = Keeper(args.iface, args.chaddr, args.request, args.eth_src,
                         hbfile=args.hbfile, release_on_exit=args.release_on_exit or args.once,
                         vhid=args.vhid, follow=args.follow,
-                        vendor_class=args.vendor_class, client_id=args.client_id, hostname=args.hostname,
+                        vendor_class=vendor_class, client_id=client_id, hostname=args.hostname,
                         arp_nudge=args.arp_nudge, arp_listen_promisc=args.arp_listen_promisc,
                         vlan_pcp=args.vlan_pcp,
+                        send_opts=send_opts, request_codes=request_codes, config_error=config_error,
                         default_route_mode=args.default_route_mode,
                         backup_egress=backup_egress)
 

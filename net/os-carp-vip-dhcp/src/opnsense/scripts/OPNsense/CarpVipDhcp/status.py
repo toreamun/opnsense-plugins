@@ -10,7 +10,7 @@ pidfile and heartbeat file. Output:
 The heartbeat file is written by lease_keeper.py in one of two forms:
     <epoch> bound=<ip> lease=<seconds> t1=<seconds> t2=<seconds> src=<server|derived>
             [master=<0|1>] demote_ok=<0|1> [nudge=<epoch|0> arpok=<epoch|0> [gw=<ip>]]
-            [pcperr=<errno name>]
+            [pcperr=<errno name>] [cfgerr=1]
     <epoch> MISMATCH got=<ip> want=<ip>
 """
 import json
@@ -18,8 +18,11 @@ import os
 import time
 import xml.etree.ElementTree as ET
 
-from keeperconf import CONFFILE, keeper_id, keeper_records
-from leasekeeper.dhcpclient import _client_id_bytes, _fmt_client_id
+from keeperconf import (CONFFILE, identity_settings, keeper_id, keeper_records, parse_request_codes,
+                        parse_send_options)
+from leasekeeper.codec import option_problem
+from leasekeeper.constants import DhcpOpt, DhcpOptName
+from leasekeeper.dhcpclient import _fmt_client_id, _fmt_send_option, _identity_options
 from leasekeeper.ifprobe import carp_roles
 from leasekeeper.syscmd import ifconfig, run
 
@@ -69,7 +72,7 @@ def _epoch_pair(value):
 
 # Heartbeat token dispatch: token -> (result fields, value parser). The parser
 # returns one value per field. Tokens are data, not logic -- adding one is a
-# table row, in lockstep with what lease_keeper.py's _hb()/_hb_mismatch() emit.
+# table row, in lockstep with what leasekeeper/heartbeat.py writes.
 _HB_TOKENS = {
     "bound": (("bound",), lambda v: (None if v == "-" else v,)),
     "lease": (("lease",), lambda v: (_int_token(v),)),
@@ -80,6 +83,7 @@ _HB_TOKENS = {
     "arpok": (("arp_reply_epoch", "arp_reply_age"), _epoch_pair),
     "gw": (("gw",), lambda v: (v,)),
     "pcperr": (("vlan_pcp_error",), lambda v: (v,)),
+    "cfgerr": (("config_error",), lambda v: (v == "1",)),
     "got": (("mismatch_got",), lambda v: (v,)),
     "want": (("mismatch_want",), lambda v: (v,)),
 }
@@ -92,7 +96,8 @@ def parse_heartbeat_text(raw):
     result = {"bound": None, "lease": None, "t1": None, "t2": None, "timing_source": None,
               "mismatch": False, "mismatch_got": None, "mismatch_want": None,
               "hb_epoch": None, "hb_age": None, "nudge_epoch": None, "nudge_age": None, "gw": None,
-              "arp_reply_epoch": None, "arp_reply_age": None, "vlan_pcp_error": None}
+              "arp_reply_epoch": None, "arp_reply_age": None, "vlan_pcp_error": None,
+              "config_error": False}
     parts = raw.split()
     if not parts:
         return result
@@ -151,17 +156,53 @@ def iface_names():
     return names
 
 
-def client_id_label(setting, chaddr):
-    """The configured DHCP client-id (option 61), formatted as the daemon logs it and
-    built with the daemon's own encoder, so it is exactly what a keeper started from
-    this keeper.conf sends. A running keeper keeps the value it was started with
-    until it restarts; its startup log line shows that one. "none" when the field is
-    empty; "invalid" if it cannot be encoded (a malformed chaddr would stop the
-    daemon too). Never the setting itself, which may hold a credential."""
-    if not setting:
-        return _fmt_client_id(None)
+def _dhcp_identity(rec):
+    """(client-id bytes or None, send options) for a keeper.conf record, built as
+    the daemon builds them (keeperconf resolves the identity for both). Raises
+    ValueError for exactly what the daemon refuses as a configuration error: an
+    unusable field, a Client identifier choice that does not go with Send
+    Options, or an option the identity fields send too."""
+    send_opts = parse_send_options(rec.get("sendopts", ""))
+    vendor_class, client_id, problem = identity_settings(
+        rec.get("cidmode", ""), rec.get("vendorclass", ""), rec.get("clientid", ""), send_opts)
+    if problem is not None:
+        raise ValueError(problem)
+    id_opts = _identity_options(vendor_class, client_id, rec.get("hostname", ""), rec.get("chaddr", ""))
+    if option_problem(id_opts, send_opts) is not None:
+        raise ValueError("unusable DHCP options")
+    sources = [v for n, v in id_opts if n == DhcpOptName.CLIENT_ID]
+    sources += [v for code, v in send_opts if code == DhcpOpt.CLIENT_ID]
+    return next(iter(sources), None), send_opts
+
+
+def client_id_label(rec):
+    """The DHCP client-id (option 61) a keeper started from this keeper.conf record
+    sends, formatted as the daemon logs it. A running keeper keeps the value it was
+    started with until it restarts; its startup log line shows that one. "none"
+    when it sends none; "invalid" when the daemon refuses the record (it then
+    sends no DHCP at all). Never the value itself, which may hold a credential."""
     try:
-        return _fmt_client_id(_client_id_bytes(setting, chaddr))
+        return _fmt_client_id(_dhcp_identity(rec)[0])
+    except ValueError:
+        return "invalid"
+
+
+def send_options_label(rec):
+    """A keeper.conf record's Send Options as option codes and byte counts, e.g.
+    "60 (5 bytes), 77 (44 bytes)": never the values, which may hold a credential.
+    "" when there are none; "invalid" for exactly what the daemon refuses."""
+    try:
+        send_opts = _dhcp_identity(rec)[1]
+    except ValueError:
+        return "invalid"
+    return ", ".join(_fmt_send_option(code, len(value)) for code, value in send_opts)
+
+
+def request_options_label(setting):
+    """The keeper.conf reqopts field as "119, 6"; "" when empty, "invalid" for
+    what the daemon refuses too (same parser)."""
+    try:
+        return ", ".join(str(code) for code in parse_request_codes(setting))
     except ValueError:
         return "invalid"
 
@@ -195,13 +236,15 @@ def read_keepers(states, names, conffile=CONFFILE, run_dir=RUN_DIR):
             "iface": iface,
             "iface_name": names.get(iface, iface),
             "chaddr": chaddr,
-            "client_id": client_id_label(rec.get("clientid", ""), chaddr),
+            "client_id": client_id_label(rec),
             "vhid": vhid,
             "carp_state": states.get(vhid) if vhid else None,
             "demote_on_lease_loss": rec.get("demote", "0") == "1",
             "follow_ip": rec.get("follow", "0") == "1",
             "arp_nudge": arp_nudge,
             "vlan_pcp": vlan_pcp_label(rec.get("vlanpcp", "")),
+            "send_options": send_options_label(rec),
+            "request_options": request_options_label(rec.get("reqopts", "")),
             "running": pid is not None,
             "pid": pid,
         }

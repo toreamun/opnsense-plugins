@@ -38,7 +38,7 @@ _KEYS = ["request", "iface", "chaddr", "demote"]
 _FIXTURES = [
     # A full record (the keys the shell parser skips must not disturb the others).
     "request=185.41.66.101|iface=lagg1|chaddr=00:00:5e:00:01:c7|demote=0|vhid=199|"
-    "follow=1|vendorclass=|clientid=|hostname=|arpnudge=240|arplistenpromisc=0|"
+    "follow=1|cidmode=default|hostname=|arpnudge=240|arplistenpromisc=0|"
     "defaultroutemode=enforce|backupegress=1|backupegressform=split|"
     "backupegressgateway=10.0.0.1|backupegressinterface=em0|backupegressprefixes=",
     # Reordered, an unknown key, and a key missing.

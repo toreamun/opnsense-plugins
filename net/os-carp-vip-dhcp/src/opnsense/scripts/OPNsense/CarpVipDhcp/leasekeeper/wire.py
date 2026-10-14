@@ -142,12 +142,22 @@ def _parse_reply(frame) -> DhcpReply:
         subnet_mask=opts.get(DhcpOptName.SUBNET_MASK), giaddr=gi)
 
 
-def _dhcp_options(mtype, extra, id_opts):
-    """The DHCP option list for a message: type, our Parameter Request List
-    (so the server returns the mask/router/timers the keeper acts on), the
-    identity options, then the per-message extras."""
-    return ([(DhcpOptName.MESSAGE_TYPE, mtype), (DhcpOptName.PARAM_REQ_LIST, PARAM_REQ_LIST)]
-            + id_opts + extra + ["end"])
+def request_list(request_codes=()):
+    """The Parameter Request List (option 55): the operator's Request Options in
+    their order, then the codes the keeper itself needs (PARAM_REQ_LIST) that
+    are not already there, so the server always returns the mask/router/timers
+    the keeper acts on. With no Request Options it is PARAM_REQ_LIST."""
+    return list(dict.fromkeys([*request_codes, *PARAM_REQ_LIST]))
+
+
+def _dhcp_options(mtype, extra, id_opts, send_opts=(), prl=None):
+    """The DHCP option list for a message: type, the Parameter Request List
+    (see request_list; None is the keeper's own), the identity options, the
+    operator's Send Options as raw (code, bytes) tuples, then the per-message
+    extras."""
+    prl = PARAM_REQ_LIST if prl is None else prl
+    return ([(DhcpOptName.MESSAGE_TYPE, mtype), (DhcpOptName.PARAM_REQ_LIST, prl)]
+            + id_opts + list(send_opts) + extra + ["end"])
 
 
 def _deliver(handler, frame):

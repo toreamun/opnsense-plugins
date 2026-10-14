@@ -34,16 +34,6 @@
             row.toggle(show && (advancedOn || row.attr("data-advanced") !== "true"));
         }
 
-        // CARP failover on lease loss applies only to a fixed reservation, so it is
-        // mutually exclusive with "Follow dynamic DHCP address" (a follower adopts a new
-        // address instead of losing the lease). Clear it while following so no stale value
-        // lingers to trip the model's mutual-exclusivity check on a now-hidden field.
-        let following = $("#keeper\\.followIp").is(":checked");
-        if (following) {
-            $("#keeper\\.demoteOnLeaseLoss").prop("checked", false);
-        }
-        toggleRow("demoteOnLeaseLoss", !following);
-
         // Backup egress needs "Own default route by CARP role" on observe/enforce; its
         // sub-fields need the feature enabled, and the prefix list needs the prefixes form.
         let routeOwned = $("#keeper\\.defaultRouteMode").val() !== "off";
@@ -74,7 +64,7 @@
         // Re-evaluate when the dialog opens (values are mapped in without firing change),
         // when any trigger field changes, and after the advanced-mode toggle (deferred so
         // it runs once the framework has shown/hidden the advanced rows).
-        let cvdTriggers = "#keeper\\.followIp, #keeper\\.defaultRouteMode, #keeper\\.backupEgress, "
+        let cvdTriggers = "#keeper\\.defaultRouteMode, #keeper\\.backupEgress, "
             + "#keeper\\.backupEgressForm, #keeper\\.arpNudgeInterval";
         $("#DialogKeeper").on("shown.bs.modal", function () { setTimeout(cvdToggleConditionalFields, 0); });
         $(cvdTriggers).on("change", cvdToggleConditionalFields);
@@ -91,9 +81,8 @@
             <tr>
                 <th data-column-id="enabled" data-width="6em" data-type="boolean" data-formatter="rowtoggle">{{ lang._('Enabled') }}</th>
                 <th data-column-id="carpVip" data-width="15em" data-type="string">{{ lang._('CARP virtual IP') }}</th>
-                <th data-column-id="followIp" data-width="7em" data-type="boolean" data-formatter="boolean">{{ lang._('Follow IP') }}</th>
+                <th data-column-id="leasePolicy" data-width="18em" data-type="string">{{ lang._('IPv4 lease policy') }}</th>
                 <th data-column-id="aliasName" data-width="10em" data-type="string">{{ lang._('Sync alias') }}</th>
-                <th data-column-id="demoteOnLeaseLoss" data-width="9em" data-type="boolean" data-formatter="boolean">{{ lang._('CARP failover') }}</th>
                 <th data-column-id="description" data-type="string">{{ lang._('Description') }}</th>
                 <th data-column-id="uuid" data-type="string" data-identifier="true" data-visible="false">{{ lang._('ID') }}</th>
                 <th data-column-id="commands" data-width="7em" data-formatter="commands" data-sortable="false">{{ lang._('Commands') }}</th>

@@ -1865,7 +1865,7 @@ def test_follow_update_repoints_the_gateway_in_the_gateways_model():
     assert "$repoint($config['gateways']['gateway_item'])" in code
     # an explicit monitor address on the old gateway moves with it, and a gateway that
     # is already on the new address (a retry, HA sync) still gets routing reapplied
-    assert "['monitor'] = $new_gw" in code
+    assert code.count("['monitor'] = $new_gw") == 2   # on a repoint, and on an already-moved gateway
     assert "if ($gw_changed || $gw_current) {" in code
 
 

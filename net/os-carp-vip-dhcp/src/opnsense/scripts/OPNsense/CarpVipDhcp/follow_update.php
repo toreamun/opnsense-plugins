@@ -164,6 +164,11 @@ $repoint = function (array &$items) use ($old_vip_iface, $old_gw, $new_gw, &$gw_
             $gw_changed = true;
         } elseif (($gw['gateway'] ?? '') === $new_gw) {
             $gw_current = true;
+            // The gateway may have been corrected by hand without its monitor.
+            if (($gw['monitor'] ?? '') === $old_gw) {
+                $items[$gidx]['monitor'] = $new_gw;
+                $gw_changed = true;
+            }
         }
     }
 };
@@ -202,7 +207,9 @@ if (!$vip_changed && !$keeper_changed && !$gw_changed) {
     }
     fwrite(STDERR, "already at {$new_ip}; re-applying derived state (idempotent retry)\n");
 } else {
-    if (!$vip_changed) {
+    // Only a keeper change without a VIP change means a missing VIP (a gateway-only
+    // change on an already-moved VIP is fine).
+    if ($keeper_changed && !$vip_changed) {
         // A keeper referenced old_ip but no CARP VIP has that subnet. keeper.conf is
         // rendered by resolving the keeper's carpVip against a matching VIP, so
         // without a VIP the keeper is dropped from the render (lease-keeping stops).

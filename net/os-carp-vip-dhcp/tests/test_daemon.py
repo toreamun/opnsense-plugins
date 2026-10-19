@@ -2152,6 +2152,32 @@ def test_follow_with_a_refused_gateway_still_moves_the_address(lk, tmp_path):
     assert keeper.fired == ["100.64.5.60"] and keeper._follow._attempt.gw_args == []
 
 
+def test_an_ack_without_the_options_cannot_confirm(lk, tmp_path):
+    # The binding keeps the last mask and router when an ACK omits them; the check uses
+    # the current ACK's own options, so an ACK without them confirms nothing.
+    k = _keeper(lk, vhid=254, follow=True, vip_bits=24, wan_gateway="100.64.4.1")
+    k._follow._state_file = str(tmp_path / "follow_state")
+    calls = []
+    k._follow._dispatch = lambda old, new, args: calls.append((old, new, list(args)))
+    k._arp_nudge = lambda *a, **kw: None
+    rx = _reply(lk, lk.ACK, "100.64.4.7", router="100.64.4.1", mask="255.255.248.0")
+    k._dhcp._absorb_reply(rx, 1800, fresh_bind=True)
+    k._dhcp.binding.yiaddr = "100.64.4.7"
+    k._on_lease_extended(lk.Phase.RENEW, k._lease_facts())   # /21: a candidate
+    k._dhcp._absorb_reply(_reply(lk, lk.ACK, "100.64.4.7"), 1800)   # no opt 1 or 3
+    assert k._dhcp.binding.mask_bits == 21                   # retained...
+    k._on_lease_extended(lk.Phase.RENEW, k._lease_facts())
+    assert calls == []                                       # ...but it confirms nothing
+
+
+def test_prefix_change_that_makes_the_gateway_the_broadcast_address_is_refused(lk, tmp_path):
+    # VIP /23 with its gateway at .255 of the lower /24: a /24 lease would make that
+    # gateway the broadcast address, so the prefix change is refused.
+    keeper = _net_keeper(lk, tmp_path, vip_bits=23, wan_gateway="100.64.4.255")
+    _confirmed(keeper, "RENEW", 24, "100.64.4.255")
+    assert keeper.fired == []
+
+
 def test_a_same_address_peer_ack_never_changes_the_network(lk, tmp_path):
     # A sniffed packet must not rewrite the configuration: a peer ACK for our own
     # address with another mask is neither recorded nor acted on (a backup corrects
@@ -2200,7 +2226,8 @@ def test_renew_with_new_mask_logs_it_and_checks_the_network(lk, tmp_path, caplog
     keeper._dhcp.binding.lease_router = "100.64.4.1"
     keeper._dhcp.binding.mask_bits = 24
     prior = keeper._lease_facts()
-    keeper._dhcp.binding.mask_bits = 21
+    keeper._dhcp.binding.mask_bits = keeper._dhcp.binding.ack_bits = 21
+    keeper._dhcp.binding.ack_router = "100.64.4.1"
     with caplog.at_level("INFO", logger="lease-keeper"):
         keeper._on_lease_extended(lk.Phase.RENEW, prior)
     assert seen == [(lk.Phase.RENEW, 21, "100.64.4.1")]
@@ -2566,6 +2593,7 @@ def test_acquire_with_a_changed_network_keeps_the_confirm_renew(lk, monkeypatch,
     def _acquire(*_a, **_kw):
         k._dhcp.binding.yiaddr, k._dhcp.binding.mask_bits = "100.64.4.7", 21
         k._dhcp.binding.lease_router = "100.64.4.1"
+        k._dhcp.binding.ack_bits, k._dhcp.binding.ack_router = 21, "100.64.4.1"
         return True
     monkeypatch.setattr(k._dhcp, "acquire", _acquire)
     k._acquire_step()
@@ -2581,6 +2609,7 @@ def test_confirm_renew_makes_the_hold_loop_renew_at_once(lk, monkeypatch, tmp_pa
     k._role.was_master = True
     k._dhcp.binding.yiaddr, k._dhcp.binding.mask_bits = "100.64.4.7", 21
     k._dhcp.binding.lease_router = "100.64.4.1"
+    k._dhcp.binding.ack_bits, k._dhcp.binding.ack_router = 21, "100.64.4.1"
     calls = []
     k._follow._dispatch = lambda old, new, args: calls.append((old, new, list(args)))
     monkeypatch.setattr(k, "_arp_nudge", lambda *a, **kw: None)

@@ -292,9 +292,10 @@ $want_fields = ["request={$new_ip}"];
 if ($new_bits !== null) {
     $want_fields[] = "vipbits={$new_bits}";
 }
-// A moved gateway: a stale render still names the old one (a fresh one names the
-// new gateway, or none when the interface has several).
-$stale_fields = $gw_changed ? ["wangw={$old_gw}"] : [];
+// A moved gateway (now, or by an earlier run this one retries): a stale render
+// still names the old one (a fresh one names the new gateway, or none when the
+// interface has several).
+$stale_fields = ($gw_changed || $gw_current) ? ["wangw={$old_gw}"] : [];
 $rendered_ok = false;
 for ($i = 0; $i < 10; $i++) {
     exec('/usr/local/sbin/configctl template reload OPNsense/CarpVipDhcp 2>&1');

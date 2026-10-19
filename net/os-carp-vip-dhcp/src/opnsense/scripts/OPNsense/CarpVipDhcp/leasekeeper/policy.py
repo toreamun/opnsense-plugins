@@ -330,8 +330,10 @@ class FollowPolicy:  # pylint: disable=too-many-instance-attributes
             problem = f"the gateway {gateway} would be outside the lease's subnet {address}/{bits}"
         elif move_bits and lease_bits is not None and lease_bits < MIN_VIP_BITS:
             problem = f"the subnet mask /{lease_bits} is implausibly wide (below /{MIN_VIP_BITS})"
-        elif move_gw and not _usable_gateway(router, address, bits):
-            problem = f"the new gateway {router} is not a usable router for {address}"
+        elif (move_gw or move_bits) and gateway and not _usable_gateway(gateway, address, bits):
+            # Also for a prefix-only change: the kept gateway may become the new
+            # subnet's network or broadcast address.
+            problem = f"the gateway {gateway} is not a usable router for {address}/{bits}"
         if problem:
             return ref_gw, False, lease_bits, False, problem
         return ref_gw, move_gw, lease_bits, move_bits, None

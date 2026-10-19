@@ -524,7 +524,7 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
                      _clock_at(binding.lease_secs), suffix)
         self._hb()
         self._arp_nudge(force=True)
-        self._follow.check_network(phase, binding.mask_bits, binding.lease_router)
+        self._follow.check_network(phase, binding.ack_bits, binding.ack_router)
 
     def _on_lease_revoked(self, phase):
         """A RENEW or REBIND (the Phase) drew a DHCPNAK: renew() has already
@@ -984,7 +984,7 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
             # A fresh DORA supersedes a pending "renew asap" (e.g. a promotion that landed while
             # unbound): clear it first; the network check may re-arm it to confirm a change.
             self._role.cancel_renew()
-            self._follow.check_network(Phase.DORA, binding.mask_bits, binding.lease_router)
+            self._follow.check_network(Phase.DORA, binding.ack_bits, binding.ack_router)
             self.redora_wait = REDORA_MIN
             # Owning the default is the loop-head reconcile on the next _maintain_step
             # entry (now bound): _acquire_step returns straight to run(), which

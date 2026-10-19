@@ -2167,7 +2167,7 @@ def test_an_ack_without_the_options_cannot_confirm(lk, tmp_path):
     k._dhcp._absorb_reply(_reply(lk, lk.ACK, "100.64.4.7"), 1800)   # no opt 1 or 3
     assert k._dhcp.binding.mask_bits == 21                   # retained...
     k._on_lease_extended(lk.Phase.RENEW, k._lease_facts())
-    assert calls == []                                       # ...but it confirms nothing
+    assert not calls                                           # ...but it confirms nothing
 
 
 def test_prefix_change_that_makes_the_gateway_the_broadcast_address_is_refused(lk, tmp_path):
@@ -2616,7 +2616,7 @@ def test_confirm_renew_makes_the_hold_loop_renew_at_once(lk, monkeypatch, tmp_pa
     slept = []
     monkeypatch.setattr(k, "_sleep_interruptible", lambda secs: slept.append(secs) or True)
     k._on_lease_extended(lk.Phase.RENEW, k._lease_facts())   # first sighting: renew asked
-    assert calls == [] and k._hold_lease(3600) is True and slept == []
+    assert not calls and k._hold_lease(3600) is True and not slept
     k._on_lease_extended(lk.Phase.RENEW, k._lease_facts())   # the early renew's answer
     assert calls == [("100.64.4.7", "100.64.4.7", ["-", "-", "21"])]
 

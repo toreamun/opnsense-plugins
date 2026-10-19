@@ -76,6 +76,30 @@ def _mask_to_bits(mask):
         return None
 
 
+def _in_subnet(ip, address, bits):
+    """True when `ip` lies in the IPv4 subnet `address`/`bits`; False for anything
+    malformed."""
+    try:
+        return ipaddress.ip_address(ip) in ipaddress.ip_network(f"{address}/{bits}", strict=False)
+    except ValueError:
+        return False
+
+
+def _usable_gateway(router, address, bits):
+    """True when `router` can be the gateway of `address`/`bits`: a sane host
+    address that is not `address` itself, nor (below /31) the subnet's network or
+    broadcast address. `bits` may be None (no mask known): then only the first two."""
+    if not _sane_ipv4(router) or router == address:
+        return False
+    if not bits or bits >= 31:
+        return True
+    try:
+        net = ipaddress.ip_network(f"{address}/{bits}", strict=False)
+    except ValueError:
+        return False
+    return ipaddress.ip_address(router) not in (net.network_address, net.broadcast_address)
+
+
 def _sane_ipv4(ip):
     """True for a plausible host IPv4 lease address (rejects 0.0.0.0, multicast,
     reserved, loopback and link-local) -- used to avoid rewriting the CARP VIP

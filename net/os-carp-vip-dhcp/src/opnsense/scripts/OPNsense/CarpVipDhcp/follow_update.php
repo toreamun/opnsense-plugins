@@ -5,17 +5,22 @@
  * follow_update.php <old_ip> <new_ip> [<old_gw> <new_gw> <new_bits>]
  *
  * Triggered by a follow-mode keeper daemon when the ISP hands out a different
- * address. Rewrites the CARP VIP (whose current subnet is <old_ip>) and every
- * keeper that references it to <new_ip>, then re-applies the VIP and restarts
- * the keepers. Both HA nodes run this independently and converge on the same
- * address because they share the same chaddr (one ISP lease per chaddr).
+ * address, or the same address with a different subnet mask or router. Rewrites
+ * the CARP VIP (whose current subnet is <old_ip>) and every keeper that
+ * references it to <new_ip>, then re-applies the VIP and restarts the keepers.
+ * Both HA nodes run this independently and converge on the same address because
+ * they share the same chaddr (one ISP lease per chaddr).
  *
- * On a cross-subnet renumber the daemon also passes the old/new gateway and the
- * new prefix length: the VIP's subnet_bits and the WAN gateway are updated too
- * and routing is reapplied, so outbound keeps working (parity with a plain DHCP
- * interface). Same-subnet moves omit those args and touch only the address.
+ * The daemon also passes the old/new gateway when the lease's router differs
+ * from the configured gateway (or, with no single configured gateway, from the
+ * previous lease's router, on an address follow only), and the new prefix length when the lease's subnet
+ * mask differs from the VIP's prefix: the WAN gateway and the VIP's subnet_bits
+ * are updated too and routing is reapplied, so outbound keeps working (parity
+ * with a plain DHCP interface). "-" (or an empty string) marks a part that does
+ * not change; old_ip == new_ip with a new prefix or gateway is a network-only
+ * update. Without those args only the address moves.
  *
- * After the move the registered newwanip plugin hooks run for the VIP's
+ * After an address move (not a prefix- or gateway-only update) the newwanip hooks run for the VIP's
  * interface (dynamic DNS, VPN endpoints, ...), completing the parity: those
  * consumers learn about the new address just as they would after a native
  * lease change. "newwanip" is a historical name: the chain is per-interface
@@ -43,30 +48,34 @@ foreach ([$old_ip, $new_ip] as $ip) {
         exit(1);
     }
 }
-if ($old_ip === $new_ip) {
-    exit(0);
-}
-
-// Optional cross-subnet args (all three together): the ISP moved us to a
-// different subnet, so also repoint the VIP prefix + the WAN gateway. The
-// configd action always passes 5 params and pads a same-subnet call with empty
-// strings, so an empty old_gw means address-only, not a cross-subnet move.
-$old_gw = $new_gw = null;
-$new_bits = null;
-if ($argc >= 6 && $argv[3] !== '') {
-    $old_gw = $argv[3];
-    $new_gw = $argv[4];
-    $new_bits = (int)$argv[5];
+// Optional network args: the gateway to repoint (old_gw + new_gw together) and
+// the VIP's new prefix length. The configd action always passes 5 params and
+// pads a shorter call with empty strings; the daemon sends "-" for a part that
+// does not change (configctl drops an empty argument). Both mean "unchanged".
+$arg = function ($i) use ($argc, $argv) {
+    return ($argc > $i && $argv[$i] !== '' && $argv[$i] !== '-') ? $argv[$i] : null;
+};
+$old_gw = $arg(3);
+$new_gw = $arg(4);
+if ($old_gw !== null || $new_gw !== null) {
     foreach ([$old_gw, $new_gw] as $g) {
-        if (!filter_var($g, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
-            fwrite(STDERR, "invalid gateway argument: {$g}\n");
+        if ($g === null || !filter_var($g, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
+            fwrite(STDERR, "invalid gateway argument: " . ($g ?? '(missing)') . "\n");
             exit(1);
         }
     }
-    if ($new_bits < 1 || $new_bits > 32) {
-        fwrite(STDERR, "invalid prefix bits: {$argv[5]}\n");
+}
+$bits_arg = $arg(5);
+$new_bits = null;
+if ($bits_arg !== null) {
+    $new_bits = (int)$bits_arg;
+    if ((string)$new_bits !== $bits_arg || $new_bits < 1 || $new_bits > 32) {
+        fwrite(STDERR, "invalid prefix bits: {$bits_arg}\n");
         exit(1);
     }
+}
+if ($old_ip === $new_ip && $new_gw === null && $new_bits === null) {
+    exit(0);
 }
 
 // Single-writer per node. Two follow_update runs racing on the same node (a
@@ -93,17 +102,34 @@ $old_vip_iface = '';
 if (isset($config['virtualip']['vip']['mode'])) {
     $config['virtualip']['vip'] = [$config['virtualip']['vip']];
 }
+$bits_changed = false;
 
 // 1. Rewrite the CARP VIP whose current subnet is old_ip.
 if (isset($config['virtualip']['vip']) && is_array($config['virtualip']['vip'])) {
     foreach ($config['virtualip']['vip'] as $idx => $vip) {
         if (($vip['mode'] ?? '') === 'carp' && ($vip['subnet'] ?? '') === $old_ip) {
-            $config['virtualip']['vip'][$idx]['subnet'] = $new_ip;
-            if ($new_bits !== null) {
-                $config['virtualip']['vip'][$idx]['subnet_bits'] = $new_bits;
-            }
             $old_vip_iface = $vip['interface'] ?? '';
-            $vip_changed = true;
+            // Mark a change only when there is one: a gateway-only update must not
+            // re-add the CARP address (a prefix change does, and costs a CARP failover).
+            if ($old_ip !== $new_ip) {
+                $config['virtualip']['vip'][$idx]['subnet'] = $new_ip;
+                $vip_changed = true;
+            }
+            if ($new_bits !== null && (string)($vip['subnet_bits'] ?? '') !== (string)$new_bits) {
+                $config['virtualip']['vip'][$idx]['subnet_bits'] = $new_bits;
+                $vip_changed = true;
+                $bits_changed = true;
+            }
+        }
+    }
+}
+// A retry (or the peer) may already have moved the VIP: find its interface by the
+// new address, so the gateway below is still repointed.
+if ($old_vip_iface === '') {
+    foreach ($config['virtualip']['vip'] ?? [] as $vip) {
+        if (($vip['mode'] ?? '') === 'carp' && ($vip['subnet'] ?? '') === $new_ip) {
+            $old_vip_iface = $vip['interface'] ?? '';
+            break;
         }
     }
 }
@@ -117,29 +143,19 @@ if (isset($config['OPNsense']['CarpVipDhcp']['keepers']['keeper'])) {
         $config['OPNsense']['CarpVipDhcp']['keepers']['keeper'] = [$keepers];
     }
     foreach ($config['OPNsense']['CarpVipDhcp']['keepers']['keeper'] as $k => $entry) {
-        if (($entry['carpVip'] ?? '') === $old_ip) {
+        if ($old_ip !== $new_ip && ($entry['carpVip'] ?? '') === $old_ip) {
             $config['OPNsense']['CarpVipDhcp']['keepers']['keeper'][$k]['carpVip'] = $new_ip;
             $keeper_changed = true;
         }
     }
 }
 
-// 2b. Cross-subnet: repoint the WAN gateway on the VIP's interface (the entry
-// whose current gateway is old_gw) to the new gateway. Current OPNsense keeps the
+// 2b. Repoint the WAN gateway on the VIP's interface (the enabled IPv4 entry whose
+// current gateway is old_gw) to the new gateway. Current OPNsense keeps the
 // gateways in its Gateways model (OPNsense/Gateways/gateway_item); an older
 // configuration keeps them in the legacy gateways/gateway_item list. Look in both.
 // A single entry deserializes as one associative array (the same quirk as the
 // VIPs and keepers above), so normalize each to a list first.
-// A retry (or the peer) may already have moved the VIP: find its interface by the
-// new address, so the gateway is still repointed and routing reapplied.
-if ($old_vip_iface === '') {
-    foreach ($config['virtualip']['vip'] ?? [] as $vip) {
-        if (($vip['mode'] ?? '') === 'carp' && ($vip['subnet'] ?? '') === $new_ip) {
-            $old_vip_iface = $vip['interface'] ?? '';
-            break;
-        }
-    }
-}
 // An explicit monitor address equal to the old gateway moves with it, or dpinger
 // keeps probing the dead address and marks the gateway down. A gateway already on
 // new_gw (a retry, or HA sync got there first) still needs routing reapplied below.
@@ -152,7 +168,7 @@ $repoint = function (array &$items) use ($old_vip_iface, $old_gw, $new_gw, &$gw_
     foreach ($items as $gidx => $gw) {
         if (
             !is_array($gw) || ($gw['interface'] ?? '') !== $old_vip_iface
-            || ($gw['ipprotocol'] ?? 'inet') !== 'inet'
+            || ($gw['ipprotocol'] ?? 'inet') !== 'inet' || ($gw['disabled'] ?? '0') === '1'
         ) {
             continue;
         }
@@ -181,7 +197,13 @@ if ($new_gw !== null && $old_vip_iface !== '') {
         $repoint($config['gateways']['gateway_item']);
     }
     if (!$gw_changed && !$gw_current) {
-        fwrite(STDERR, "warning: no IPv4 gateway on {$old_vip_iface} with address {$old_gw} to repoint\n");
+        fwrite(STDERR, "warning: no enabled IPv4 gateway on {$old_vip_iface} with address {$old_gw} to repoint\n");
+        // A network-only update (same address, no new prefix) has nothing else to do,
+        // and restarting the keepers would only bring one that sees the same mismatch
+        // and asks again: stop here.
+        if ($old_ip === $new_ip && !$bits_changed) {
+            exit(1);
+        }
     }
 }
 
@@ -241,7 +263,7 @@ if ($old_vip_iface !== '' && $old_ip !== $new_ip) {
     }
 }
 
-// Cross-subnet: the WAN gateway moved, so reapply routing (reconfigure_vips
+// The WAN gateway moved, so reapply routing (reconfigure_vips
 // re-adds the VIP but does not touch the default route). The config change above
 // is what persists; this reapply installs the new default route. Also when the
 // gateway was already moved (a retry, or HA sync): its routing may not be applied.
@@ -259,12 +281,20 @@ if ($gw_changed || $gw_current) {
     plugins_configure('monitor');
 }
 
-// Re-render keeper.conf, then WAIT until it actually reflects new_ip before
-// restarting. configd caches config.xml, so right after write_config the
-// template can still render the OLD address (sub-second mtime race). Restarting
-// on a stale render would rebind the daemon to old_ip -> follow fires again ->
-// restart loop. Reload+verify (crossing the mtime second) before restarting.
+// Re-render keeper.conf, then WAIT until it actually reflects new_ip (and the new
+// prefix) before restarting. configd caches config.xml, so right after
+// write_config the template can still render the OLD values (sub-second mtime
+// race). Restarting on a stale render would rebind the daemon to old_ip, or let
+// it see the old prefix again, so the follow fires again and the restart loops.
+// Reload+verify (crossing the mtime second) before restarting.
 $keeperconf = '/usr/local/etc/carpvipdhcp/keeper.conf';
+$want_fields = ["request={$new_ip}"];
+if ($new_bits !== null) {
+    $want_fields[] = "vipbits={$new_bits}";
+}
+// A moved gateway: a stale render still names the old one (a fresh one names the
+// new gateway, or none when the interface has several).
+$stale_fields = $gw_changed ? ["wangw={$old_gw}"] : [];
 $rendered_ok = false;
 for ($i = 0; $i < 10; $i++) {
     exec('/usr/local/sbin/configctl template reload OPNsense/CarpVipDhcp 2>&1');
@@ -272,20 +302,19 @@ for ($i = 0; $i < 10; $i++) {
     if ($conf !== false) {
         foreach (explode("\n", $conf) as $line) {
             // keeper.conf is pipe-separated key=value fields in no fixed order;
-            // match the request= field by name (exact, so 1.2.3.4 does not match
-            // 1.2.3.40).
-            foreach (explode('|', $line) as $field) {
-                if ($field === "request={$new_ip}") {
-                    $rendered_ok = true;
-                    break 3;
-                }
+            // match each field by name (exact, so 1.2.3.4 does not match 1.2.3.40).
+            $fields = explode('|', $line);
+            if (count(array_diff($want_fields, $fields)) === 0
+                    && count(array_intersect($stale_fields, $fields)) === 0) {
+                $rendered_ok = true;
+                break 2;
             }
         }
     }
     sleep(1);
 }
 if (!$rendered_ok) {
-    fwrite(STDERR, "keeper.conf never reflected {$new_ip} after reload; not restarting\n");
+    fwrite(STDERR, "keeper.conf never reflected " . implode(' ', $want_fields) . " after reload; not restarting\n");
     exit(1);
 }
 
@@ -333,8 +362,9 @@ if ($rc !== 0) {
 // Parity with a native address change: run the newwanip hooks for the VIP's
 // interface now that the VIP, routing, keepers and alias all agree (see the
 // header for why this is the hook chain and not rc.newwanip). Non-fatal: the
-// address has followed either way.
-if ($old_vip_iface !== '') {
+// address has followed either way. Only when the address changed: a prefix or
+// gateway update leaves dynamic DNS and VPN endpoints as they are.
+if ($old_vip_iface !== '' && $old_ip !== $new_ip) {
     // Marker BEFORE the hooks: a hook that hangs or gets the action killed
     // must not hide that the chain was reached.
     // The stable 'carpvipdhcp' ident is a greppable contract (the lab
@@ -347,7 +377,10 @@ if ($old_vip_iface !== '') {
 }
 
 $msg = "updated CARP VIP {$old_ip} -> {$new_ip}";
+if ($bits_changed) {
+    $msg .= " (prefix /{$new_bits})";
+}
 if ($gw_changed) {
-    $msg .= " and WAN gateway {$old_gw} -> {$new_gw} (/{$new_bits})";
+    $msg .= " and WAN gateway {$old_gw} -> {$new_gw}";
 }
 echo "{$msg}\n";

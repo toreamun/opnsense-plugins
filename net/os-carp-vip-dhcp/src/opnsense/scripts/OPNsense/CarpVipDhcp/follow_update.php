@@ -125,18 +125,57 @@ if (isset($config['OPNsense']['CarpVipDhcp']['keepers']['keeper'])) {
 }
 
 // 2b. Cross-subnet: repoint the WAN gateway on the VIP's interface (the entry
-// whose current gateway is old_gw) to the new gateway.
-$gw_changed = false;
-if ($new_gw !== null && $old_vip_iface !== ''
-        && isset($config['gateways']['gateway_item']) && is_array($config['gateways']['gateway_item'])) {
-    foreach ($config['gateways']['gateway_item'] as $gidx => $gw) {
-        if (($gw['interface'] ?? '') === $old_vip_iface && ($gw['gateway'] ?? '') === $old_gw
-                && ($gw['ipprotocol'] ?? 'inet') === 'inet') {
-            $config['gateways']['gateway_item'][$gidx]['gateway'] = $new_gw;
-            $gw_changed = true;
+// whose current gateway is old_gw) to the new gateway. Current OPNsense keeps the
+// gateways in its Gateways model (OPNsense/Gateways/gateway_item); an older
+// configuration keeps them in the legacy gateways/gateway_item list. Look in both.
+// A single entry deserializes as one associative array (the same quirk as the
+// VIPs and keepers above), so normalize each to a list first.
+// A retry (or the peer) may already have moved the VIP: find its interface by the
+// new address, so the gateway is still repointed and routing reapplied.
+if ($old_vip_iface === '') {
+    foreach ($config['virtualip']['vip'] ?? [] as $vip) {
+        if (($vip['mode'] ?? '') === 'carp' && ($vip['subnet'] ?? '') === $new_ip) {
+            $old_vip_iface = $vip['interface'] ?? '';
+            break;
         }
     }
-    if (!$gw_changed) {
+}
+// An explicit monitor address equal to the old gateway moves with it, or dpinger
+// keeps probing the dead address and marks the gateway down. A gateway already on
+// new_gw (a retry, or HA sync got there first) still needs routing reapplied below.
+$gw_changed = false;
+$gw_current = false;
+$repoint = function (array &$items) use ($old_vip_iface, $old_gw, $new_gw, &$gw_changed, &$gw_current) {
+    if (isset($items['@attributes']) || isset($items['gateway']) || isset($items['interface'])) {
+        $items = [$items];
+    }
+    foreach ($items as $gidx => $gw) {
+        if (
+            !is_array($gw) || ($gw['interface'] ?? '') !== $old_vip_iface
+            || ($gw['ipprotocol'] ?? 'inet') !== 'inet'
+        ) {
+            continue;
+        }
+        if (($gw['gateway'] ?? '') === $old_gw) {
+            $items[$gidx]['gateway'] = $new_gw;
+            if (($gw['monitor'] ?? '') === $old_gw) {
+                $items[$gidx]['monitor'] = $new_gw;
+            }
+            $gw_changed = true;
+        } elseif (($gw['gateway'] ?? '') === $new_gw) {
+            $gw_current = true;
+        }
+    }
+};
+if ($new_gw !== null && $old_vip_iface !== '') {
+    if (isset($config['OPNsense']['Gateways']['gateway_item'])
+            && is_array($config['OPNsense']['Gateways']['gateway_item'])) {
+        $repoint($config['OPNsense']['Gateways']['gateway_item']);
+    }
+    if (isset($config['gateways']['gateway_item']) && is_array($config['gateways']['gateway_item'])) {
+        $repoint($config['gateways']['gateway_item']);
+    }
+    if (!$gw_changed && !$gw_current) {
         fwrite(STDERR, "warning: no IPv4 gateway on {$old_vip_iface} with address {$old_gw} to repoint\n");
     }
 }
@@ -197,8 +236,9 @@ if ($old_vip_iface !== '' && $old_ip !== $new_ip) {
 
 // Cross-subnet: the WAN gateway moved, so reapply routing (reconfigure_vips
 // re-adds the VIP but does not touch the default route). The config change above
-// is what persists; this reapply installs the new default route.
-if ($gw_changed) {
+// is what persists; this reapply installs the new default route. Also when the
+// gateway was already moved (a retry, or HA sync): its routing may not be applied.
+if ($gw_changed || $gw_current) {
     require_once("system.inc");
     if (function_exists('system_routing_configure')) {
         system_routing_configure();

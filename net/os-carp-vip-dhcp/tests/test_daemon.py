@@ -1851,6 +1851,24 @@ def test_follow_no_gateway_change_no_extra_args(lk, tmp_path):
     assert keeper._follow._attempt.gw_args == []
 
 
+def test_follow_update_repoints_the_gateway_in_the_gateways_model():
+    """OPNsense 24.x and later keep the gateways in the Gateways model
+    (OPNsense/Gateways/gateway_item), not in the legacy gateways/gateway_item list:
+    a cross-subnet follow must repoint the gateway there (it did not, so the move was
+    only a warning in the configd log), and still handle a legacy configuration."""
+    php = os.path.join(
+        os.path.dirname(__file__), "..", "src", "opnsense", "scripts",
+        "OPNsense", "CarpVipDhcp", "follow_update.php")
+    with open(php, encoding="utf-8") as fh:
+        code = re.sub(r"/\*.*?\*/|//[^\n]*", "", fh.read(), flags=re.S)
+    assert "$repoint($config['OPNsense']['Gateways']['gateway_item'])" in code
+    assert "$repoint($config['gateways']['gateway_item'])" in code
+    # an explicit monitor address on the old gateway moves with it, and a gateway that
+    # is already on the new address (a retry, HA sync) still gets routing reapplied
+    assert "['monitor'] = $new_gw" in code
+    assert "if ($gw_changed || $gw_current) {" in code
+
+
 def test_follow_update_fires_newwanip_hooks():
     """A follow must run the newwanip plugin hooks for the VIP's interface
     (dynamic DNS, VPN endpoints learn the new address -- the parity promise),

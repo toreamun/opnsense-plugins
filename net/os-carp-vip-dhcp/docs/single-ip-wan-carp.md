@@ -123,10 +123,10 @@ The facts that drive the design:
    identity. The ISP
    never *routes* it; the CARP advertisements are link-local multicast (`224.0.0.18`)
    that stays on the WAN segment. (The ISP's on-segment access gear does still see the
-   *master's* physical MAC as the source of its traffic, plus the virtual MAC, which CARP
-   advertisements, ARP for the VIP and the keeper's DHCP use; the backup stays silent on
-   the WAN until it takes over, when that physical MAC flips to it. See [section 9](#s9)
-   for the strict one-MAC-per-port case.)
+   *master's* physical MAC as the source of its traffic and of its ARP replies for the
+   VIP, plus the virtual MAC, which CARP advertisements and the keeper's DHCP use; the
+   backup stays silent on the WAN until it takes over, when that physical MAC flips to it.
+   See [section 9](#s9) for the strict one-MAC-per-port case.)
    Because that range is not RFC 1918, the outbound `internal to VIP` SNAT catch-all never
    matches the node IP as a *source*, so it needs no no-NAT-for-CARP carve-out - one rule
    fewer ([IP and CARP plan](#s6-1)). (Egress still leaves via the VIP: that SNAT's *target* is set
@@ -443,11 +443,11 @@ the keeper) only need doing once.
    version or later; during a rolling upgrade a not-yet-upgraded backup still sources the
    MAC, so upgrade the node that is currently CARP **backup** first.) Leave **Client MAC
    override (chaddr)** blank: the keeper uses the CARP virtual MAC
-   automatically, which is what the lease and the ISP binding need: CARP answers ARP for
-   the VIP from that MAC. Only set it for an ISP reservation on a fixed *different* MAC,
-   and never to this node's own NIC MAC (that binds the lease to one MAC while CARP still
-   answers ARP for the VIP from the CARP MAC, so an IP-source-guard ISP blackholes the
-   gateway).
+   automatically, which is what the lease and the ISP binding need: CARP's ARP replies
+   name that MAC as the VIP's address. Only set it for an ISP reservation on a fixed
+   *different* MAC, and never to this node's own NIC MAC (that binds the lease to one MAC
+   while CARP's ARP replies still name the CARP MAC for the VIP, so an IP-source-guard ISP
+   blackholes the gateway).
 
    **Keep the client identity the ISP already knows.** Some ISPs identify a DHCP client by
    option 61 (Client Identifier), not by the MAC. A normal OPNsense WAN sends option 61 as

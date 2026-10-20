@@ -13,17 +13,18 @@ been tested with a real ISP that checks the MAC. Use it at your own risk.
 
 The keeper holds the lease on the CARP virtual MAC (`00:00:5e:00:01:<vhid>`, the vhid in
 hex), so the ISP binds the leased address to that MAC. FreeBSD CARP, however, sends traffic
-from a CARP VIP with the interface's **own** MAC. Only CARP's own packets (advertisements, and
-ARP for the VIP) and the keeper's DHCP and ARP packets leave from the virtual MAC. That is how
-FreeBSD CARP works for any VIP, static or DHCP; there is no CARP option to change it.
+from a CARP VIP with the interface's **own** MAC. Only CARP advertisements and the keeper's
+own DHCP and ARP packets are sent from the virtual MAC. CARP's ARP replies for the VIP name
+the virtual MAC as the sender inside the ARP packet, so the gateway maps the VIP to it, but
+the frame itself comes from the node's own MAC. That is how FreeBSD CARP works for any VIP,
+static or DHCP; there is no CARP option to change it.
 
 An ISP that binds IP to MAC therefore drops everything the master sends from the VIP. Traffic
 towards the VIP may still arrive (the ISP sends it to the virtual MAC, which the master
 answers).
 
-The plugin still gets and keeps the lease on the virtual MAC across a failover. Making the
-master send from it is left to you, because changing a NIC's MAC on every CARP transition is
-risky in ways a lease keeper cannot control (see the risks below).
+Making the master send from the virtual MAC is left to you, because changing a NIC's MAC on
+every CARP transition is risky in ways a lease keeper cannot control (see the risks below).
 
 ## How to recognise it
 
@@ -60,54 +61,80 @@ supported**: test it on your hardware before you rely on it.
   WAN is bound to its own MAC and breaks while that node is master. Use the workaround only
   when the nodes' own WAN addresses are static, for example the private node IPs of the
   [single-IP setup](single-ip-wan-carp.md). Untested otherwise.
-- **On a NIC, OPNsense sets the MAC back** whenever it configures the WAN interface: an
-  apply on the interface page, a boot, and every link-up event. With the MAC field empty it
-  puts back the NIC's own MAC, and no CARP event follows to swap it again, so the master is
-  left on its own MAC and its traffic is dropped. Run the script every minute as well (see
-  [Re-run it every minute](#re-run-it-every-minute)). A VLAN interface keeps the MAC the
-  script gave it: OPNsense does not reset a VLAN's MAC.
-- **Changing a MAC can reset the NIC.** On some drivers a MAC change resets the NIC and drops
-  the link for seconds. The link-up then makes OPNsense set the MAC back (above), and if
-  CARP fails over meanwhile, the other node swaps its MAC and the two can keep failing over.
-  If you see repeated CARP transitions after installing, remove the script. On the test
-  bench (virtio NIC) and in one user's VLAN in a virtual machine the change was instant.
-- **lagg and shared VLAN parents:** a MAC change on a lagg can renegotiate LACP; on a VLAN,
-  check that other VLANs on the same parent are not affected on your NIC.
-- **Both nodes on the virtual MAC:** at a failover the old master gives the MAC up and the
-  new master takes it. On the test bench the overlap was 1 to 2 ms with the `00-` name, and
-  about 6 s with a later name. If the script fails on the node that loses master, the overlap
-  lasts until the script runs again, and traffic for the master goes astray. If both nodes
-  become master at once (they lose each other's CARP advertisements), both send from the
-  virtual MAC until one returns to backup.
 - **One CARP VIP per WAN interface.** An interface has one MAC, so the script handles one
   vhid. Traffic from a second CARP VIP on the same interface would leave from the first one's
   virtual MAC.
+- **On a NIC, OPNsense sets the MAC back** whenever it configures the WAN interface: an
+  apply on the interface page, a boot, and every link-up event. With the MAC field empty it
+  puts back the NIC's own MAC. An apply re-adds the CARP VIP, so CARP events follow and the
+  script runs again (on the test bench this ended with the right MAC); a link-up event is
+  not known to do that, so the master can be left on its own MAC with its traffic dropped
+  until the script runs again. That is why the install below also runs it every minute. A
+  VLAN interface keeps the MAC the script gave it: OPNsense does not reset a VLAN's MAC.
+- **Changing a MAC can reset the NIC.** On some drivers a MAC change resets the NIC and drops
+  the link for seconds. On such a NIC the workaround cannot hold the virtual MAC at all: the
+  link-up makes OPNsense set the MAC back (above), the next run changes it again, and with
+  the every-minute run that is a link flap every minute, with CARP failing over each time.
+  If you see repeated CARP transitions or link changes after installing, remove the script
+  and the cron job. On the test bench (virtio NIC) the change was instant, and a user on a
+  VLAN in a virtual machine reported that traffic came back at once after swapping by hand.
+- **Both nodes on the virtual MAC:** at a failover the old master gives the MAC up and the
+  new master takes it. On the test bench the overlap was a few milliseconds with the `00-`
+  name (about 150 ms in one run), and about 6 s with a later name. If the script fails on the node that loses master, the overlap
+  lasts until the script runs again, and traffic for the master goes astray. If both nodes
+  become master at once (they lose each other's CARP advertisements), both send from the
+  virtual MAC until one returns to backup.
+- **lagg and shared VLAN parents:** a MAC change on a lagg can renegotiate LACP, and on a
+  lagg (or a VLAN on one) set `OWN_MAC` by hand: `ifconfig` shows `hwaddr 00:00:00:00:00:00`
+  for a lagg, so the script cannot detect the own MAC there and refuses to act. On a VLAN,
+  check that other VLANs on the same parent are not affected on your NIC.
 - **IPv6 and other protocols** on the WAN also leave from the virtual MAC on the master. The
   IPv6 link-local address keeps the node's own MAC embedded in it. Untested beyond IPv4.
 
 ### Install
 
-First, on **both** nodes, leave the **MAC address** field of the WAN interface empty
-(Interfaces, WAN) and apply. OPNsense applies that field whenever it configures the
-interface, so a virtual MAC set there would come back on the backup too. On a VLAN, clearing
-the field does not change the MAC that is set now: check with `ifconfig <WAN_IF>`, and if it
-still shows the virtual MAC, set the own MAC back by hand (`ifconfig <WAN_IF> ether <own MAC>`,
-the parent interface's MAC for a VLAN) or reboot.
+On **both** nodes:
 
-Then, on **both** nodes, as root, create `/usr/local/etc/rc.syshook.d/carp/00-carp-vmac` with
-the content below and make it executable (`chmod 755`). Keep the `00-` prefix (see
-[What has been tested](#what-has-been-tested)). Set:
+1. Leave the **MAC address** field of the WAN interface empty (Interfaces, WAN) and apply.
+   OPNsense applies that field whenever it configures the interface, so a virtual MAC set
+   there would come back on the backup too. On a VLAN, clearing the field does not change
+   the MAC that is set now: check with `ifconfig <WAN_IF>`, and if it still shows the
+   virtual MAC, set the own MAC back by hand (`ifconfig <WAN_IF> ether <own MAC>`, the parent
+   interface's MAC for a VLAN) or reboot.
+2. As root, create `/usr/local/etc/rc.syshook.d/carp/00-carp-vmac` with the content below
+   and make it executable (`chmod 755`). Keep the `00-` prefix: OPNsense runs these hooks
+   in name order, and with a later name both nodes sent from the virtual MAC for about 6 s
+   on the test bench. Keep only that one file of yours in the directory: OPNsense runs every
+   file in it, a backup copy too. Set:
+   - `WAN_IF`: the interface the CARP VIP is on, as `ifconfig` names it.
+   - `VHID`: the vhid of that CARP VIP.
+   - `OWN_MAC`: this node's own MAC on that interface (it differs per node). Leave it empty
+     to let the script detect it: on a VLAN it takes the parent interface's MAC, and empty
+     is the safest choice there. If it cannot tell the own MAC from the virtual one, it logs
+     that and does nothing. If you set it (needed on a lagg), read it with `ifconfig` while
+     the interface still has its own MAC.
+3. Run the script once by hand.
+4. Run it every minute too. On a NIC this is needed (OPNsense sets the MAC back, see the
+   risks); on a VLAN it is optional, but it bounds how long a missed or failed change lasts
+   (a failed change is not retried until the next run). The script does nothing when the
+   MAC is already right. Create
+   `/usr/local/opnsense/service/conf/actions.d/actions_carpvmac.conf`:
 
-- `WAN_IF`: the interface the CARP VIP is on, as `ifconfig` names it.
-- `VHID`: the vhid of that CARP VIP.
-- `OWN_MAC`: this node's own MAC on that interface. It differs per node. If you leave it
-  empty, the script detects it (for a VLAN, the parent interface's MAC), and refuses to act
-  (with a log line) when it cannot tell the own MAC from the virtual one. On a VLAN, leaving
-  it empty is the safest choice. If you set it, read it with `ifconfig` while the interface
-  still has its own MAC.
+   ```ini
+   [run]
+   command:/usr/local/etc/rc.syshook.d/carp/00-carp-vmac
+   parameters:
+   type:script
+   message:checking the CARP virtual MAC on the WAN
+   description:Check the CARP virtual MAC on the WAN
+   ```
 
-The file is not synced by HA, and a reinstall or a configuration restore does not bring it
-back: create it again after either. Then run it once by hand on each node.
+   Run `service configd restart`, then `configctl carpvmac run` to check that it works.
+   Then, in System, Settings, Cron, add a job with minute `*` (every minute) and the
+   command **Check the CARP virtual MAC on the WAN**.
+
+Neither file is synced by HA, and a reinstall or a configuration restore does not bring them
+back: create them again after either.
 
 ```sh
 #!/bin/sh
@@ -129,7 +156,7 @@ log() { logger -t carp-vmac "$*"; }
 # One run at a time: several CARP events can arrive together.
 if [ -z "${CARP_VMAC_LOCKED}" ]; then
     CARP_VMAC_LOCKED=1 lockf -k -t 30 /var/run/carp-vmac.lock /bin/sh "$0" "$@" ||
-        log "another run held the lock for 30 s; nothing changed"
+        log "could not run (lock held for 30 s, or the run failed: exit $?); nothing changed"
     exit 0
 fi
 
@@ -150,30 +177,34 @@ if ! ifconfig "${WAN_IF}" | grep -q "carp: [A-Z]* vhid ${VHID} "; then
 fi
 VMAC=$(printf '00:00:5e:00:01:%02x' "${VHID}")
 
+# The first word of the line: an interface description may contain these words.
+mac_line() { ifconfig "$1" | awk -v k="$2" '$1 == k {print $2; exit}'; }
+
 own_mac() {
     [ -n "${OWN_MAC}" ] && { echo "${OWN_MAC}"; return; }
     # A VLAN takes the MAC of its parent interface. A NIC whose MAC was changed
     # lists its burnt-in address as hwaddr; without hwaddr, ether is its own.
-    ifc="${WAN_IF}"
     parent=$(ifconfig "${WAN_IF}" | sed -n 's/.*parent interface: \([^ ]*\).*/\1/p')
-    [ -n "${parent}" ] && ifc="${parent}"
-    mac=$(ifconfig "${ifc}" | awk '/hwaddr/ {print $2; exit}')
-    [ -z "${mac}" ] && mac=$(ifconfig "${ifc}" | awk '/ether/ {print $2; exit}')
+    ifc="${parent:-${WAN_IF}}"
+    mac=$(mac_line "${ifc}" hwaddr)
+    [ -z "${mac}" ] && mac=$(mac_line "${ifc}" ether)
     echo "${mac}"
 }
 
 # Set the MAC, then read the role again: it may have changed meanwhile.
 for _ in 1 2 3; do
-    current=$(ifconfig "${WAN_IF}" | awk '/ether/ {print $2; exit}')
+    current=$(mac_line "${WAN_IF}" ether)
     if ifconfig "${WAN_IF}" | grep -q "carp: MASTER vhid ${VHID} "; then
         want="${VMAC}"
     else
         want=$(own_mac)
-        if [ -z "${want}" ] || [ "${want}" = "${VMAC}" ]; then
-            # Do not "restore" the virtual MAC on a node that is not master.
-            log "cannot tell the own MAC of ${WAN_IF}; set OWN_MAC in $0"
-            exit 0
-        fi
+        case "${want}" in
+            '' | "${VMAC}" | 00:00:00:00:00:00)
+                # Do not "restore" the virtual MAC (or a lagg's all-zero hwaddr)
+                # on a node that is not master.
+                log "cannot tell the own MAC of ${WAN_IF}; set OWN_MAC in $0"
+                exit 0 ;;
+        esac
     fi
     [ "${current}" = "${want}" ] && exit 0
     if ! ifconfig "${WAN_IF}" ether "${want}"; then
@@ -185,43 +216,19 @@ log "the CARP role kept changing; the next run sets the MAC"
 exit 0
 ```
 
-A failed change is not retried until the next run.
-
-### Re-run it every minute
-
-Needed on a NIC (OPNsense sets the MAC back, see the risks); on a VLAN it is optional, but it
-also bounds how long a missed or failed change lasts. The script does nothing when the MAC is
-already right. On **both** nodes:
-
-1. Create `/usr/local/opnsense/service/conf/actions.d/actions_carpvmac.conf`:
-
-   ```ini
-   [run]
-   command:/usr/local/etc/rc.syshook.d/carp/00-carp-vmac
-   parameters:
-   type:script
-   message:checking the CARP virtual MAC on the WAN
-   description:Check the CARP virtual MAC on the WAN
-   ```
-
-2. Run `service configd restart`, then `configctl carpvmac run` to check that it works.
-3. In System, Settings, Cron, add a job with minute `*` (every minute) and the command
-   **Check the CARP virtual MAC on the WAN**.
-
-Like the script, the action file is not synced by HA and does not survive a reinstall.
-
 ### Check it
 
 - On the master, `ifconfig <WAN_IF>` shows the virtual MAC as `ether`; on the backup, its own.
 - Traffic through the VIP works on the master.
 - Fail over (for example with CARP maintenance mode on the master) and check both again.
-- Watch the system log for `carp-vmac` lines, and for CARP transitions that you did not cause.
-  Not every change reached the log on the test bench, so trust `ifconfig` over the log.
+- Watch the system log for `carp-vmac` lines, and for CARP transitions or link changes that
+  you did not cause. Not every change reached the log on the test bench, so trust `ifconfig`
+  over the log. The cron job writes its "checking" line to the configd log every minute.
 
 ### Remove it
 
-Delete the script (and the action file and cron job, if you added them) on both nodes, then
-set each WAN interface back to its own MAC (`ifconfig <WAN_IF> ether <own MAC>`, or reboot).
+Delete the script, the action file and the cron job on both nodes, then set each WAN
+interface back to its own MAC (`ifconfig <WAN_IF> ether <own MAC>`, or reboot).
 
 ## What has been tested
 
@@ -231,17 +238,20 @@ NIC and frames captured per node, so each frame is attributed to the node that s
 - The master sends all its WAN traffic from the virtual MAC and the backup only from its own
   MAC; traffic from the VIP works on the master.
 - Failover in both directions: the old master's last frame from the virtual MAC and the new
-  master's first came within 1 to 2 ms of each other. Changing the MAC caused no CARP
-  transitions of its own.
+  master's first came within 1 to 5 ms of each other in most runs, and about 150 ms in
+  one. Changing the MAC caused no CARP transitions of its own.
 - A reboot of the master, and OPNsense reconfiguring the WAN interface (which itself caused a
   failover), ended with the right MAC on each node.
 - `configctl interface reconfigure wan` on a virtio NIC set the MAC back to the NIC's own; a
   VLAN interface showed no `hwaddr` after a MAC change, so OPNsense leaves its MAC as it is.
+  On OPNsense 26.7 a lagg shows `hwaddr 00:00:00:00:00:00`.
 - With the master's MAC set back by hand and no CARP event, `configctl carpvmac run` (the
   action the cron job runs) gave it the virtual MAC again. The cron job itself was not run.
 - With the script named `60-carp-vmac` instead of `00-carp-vmac`, the swap came about 6 s
   late, and both nodes sent from the virtual MAC for that long.
-- Three runs started at once on each node finished cleanly (they are serialised).
+- Three runs started at once on each node finished cleanly (they are serialised). An invalid
+  `VHID` or `OWN_MAC`, an upper-case `OWN_MAC`, an all-zero `OWN_MAC` and an interface
+  description containing the word "ether" changed nothing they should not.
 
 Not tested: physical NICs, a real link-up event, lagg, the CARP swap on a VLAN interface (a
 user on a VLAN in a virtual machine reported that swapping the MAC by hand works at once),

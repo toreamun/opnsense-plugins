@@ -74,7 +74,7 @@ supported**: test it on your hardware before you rely on it.
 - **lagg and shared VLAN parents:** a MAC change on a lagg can renegotiate LACP; on a VLAN,
   check that other VLANs on the same parent are not affected on your NIC.
 - **Both nodes on the virtual MAC:** at a failover the old master gives the MAC up and the
-  new master takes it. On the test bench the overlap was about 1 ms with the `00-` name, and
+  new master takes it. On the test bench the overlap was 1 to 2 ms with the `00-` name, and
   about 6 s with a later name. If the script fails on the node that loses master, the overlap
   lasts until the script runs again, and traffic for the master goes astray. If both nodes
   become master at once (they lose each other's CARP advertisements), both send from the
@@ -231,12 +231,14 @@ NIC and frames captured per node, so each frame is attributed to the node that s
 - The master sends all its WAN traffic from the virtual MAC and the backup only from its own
   MAC; traffic from the VIP works on the master.
 - Failover in both directions: the old master's last frame from the virtual MAC and the new
-  master's first came within about 1 ms of each other. Changing the MAC caused no CARP
+  master's first came within 1 to 2 ms of each other. Changing the MAC caused no CARP
   transitions of its own.
 - A reboot of the master, and OPNsense reconfiguring the WAN interface (which itself caused a
   failover), ended with the right MAC on each node.
 - `configctl interface reconfigure wan` on a virtio NIC set the MAC back to the NIC's own; a
   VLAN interface showed no `hwaddr` after a MAC change, so OPNsense leaves its MAC as it is.
+- With the master's MAC set back by hand and no CARP event, `configctl carpvmac run` (the
+  action the cron job runs) gave it the virtual MAC again. The cron job itself was not run.
 - With the script named `60-carp-vmac` instead of `00-carp-vmac`, the swap came about 6 s
   late, and both nodes sent from the virtual MAC for that long.
 - Three runs started at once on each node finished cleanly (they are serialised).

@@ -183,12 +183,16 @@ mac_line() { ifconfig "$1" | awk -v k="$2" '$1 == k {print $2; exit}'; }
 
 own_mac() {
     [ -n "${OWN_MAC}" ] && { echo "${OWN_MAC}"; return; }
-    # A VLAN takes the MAC of its parent interface. A NIC whose MAC was changed
-    # lists its burnt-in address as hwaddr; without hwaddr, ether is its own.
+    # A VLAN has the MAC its parent interface has now (a MAC set on the parent
+    # in OPNsense included). A NIC whose MAC was changed lists its burnt-in
+    # address as hwaddr; without hwaddr, ether is its own.
     parent=$(ifconfig "${WAN_IF}" | sed -n 's/.*parent interface: \([^ ]*\).*/\1/p')
-    ifc="${parent:-${WAN_IF}}"
-    mac=$(mac_line "${ifc}" hwaddr)
-    [ -z "${mac}" ] && mac=$(mac_line "${ifc}" ether)
+    if [ -n "${parent}" ]; then
+        mac_line "${parent}" ether
+        return
+    fi
+    mac=$(mac_line "${WAN_IF}" hwaddr)
+    [ -z "${mac}" ] && mac=$(mac_line "${WAN_IF}" ether)
     echo "${mac}"
 }
 

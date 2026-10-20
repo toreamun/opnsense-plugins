@@ -20,8 +20,8 @@ the frame itself comes from the node's own MAC. That is how FreeBSD CARP works f
 static or DHCP; there is no CARP option to change it.
 
 An ISP that binds IP to MAC therefore drops everything the master sends from the VIP. Traffic
-towards the VIP may still arrive (the ISP sends it to the virtual MAC, which the master
-answers).
+towards the VIP still arrives (the ISP sends it to the virtual MAC, which the master
+receives), but the master's replies are dropped like everything else it sends from the VIP.
 
 Making the master send from the virtual MAC is left to you, because changing a NIC's MAC on
 every CARP transition is risky in ways a lease keeper cannot control (see the risks below).
@@ -29,8 +29,8 @@ every CARP transition is risky in ways a lease keeper cannot control (see the ri
 ## How to recognise it
 
 - The keeper reports the lease as held, on both the Status page and in the log.
-- Pings and other traffic **to** the VIP from outside may work, but nothing **from** the VIP
-  gets an answer: no internet through the VIP.
+- Packets **to** the VIP arrive (a WAN capture shows them), but nothing **from** the VIP
+  gets through, not even the replies to a ping from outside: no internet through the VIP.
 - A packet capture on the WAN shows your outgoing packets with the right source IP but the
   node's own MAC, and no replies.
 - Setting the virtual MAC on the master's WAN interface by hand makes traffic work at once.
@@ -84,10 +84,11 @@ supported**: test it on your hardware before you rely on it.
   lasts until the script runs again, and traffic for the master goes astray. If both nodes
   become master at once (they lose each other's CARP advertisements), both send from the
   virtual MAC until one returns to backup.
-- **lagg and shared VLAN parents:** a MAC change on a lagg can renegotiate LACP, and on a
-  lagg (or a VLAN on one) set `OWN_MAC` by hand: `ifconfig` shows `hwaddr 00:00:00:00:00:00`
-  for a lagg, so the script cannot detect the own MAC there and refuses to act. On a VLAN,
-  check that other VLANs on the same parent are not affected on your NIC.
+- **lagg and shared VLAN parents:** a MAC change on a lagg can renegotiate LACP. With the
+  VIP on the lagg itself, set `OWN_MAC` by hand: `ifconfig` shows `hwaddr 00:00:00:00:00:00`
+  for a lagg, so the script cannot detect the own MAC there and refuses to act. A VLAN on a
+  lagg takes the lagg's current MAC and needs no `OWN_MAC`. On a VLAN, check that other
+  VLANs on the same parent are not affected on your NIC.
 - **IPv6 and other protocols** on the WAN also leave from the virtual MAC on the master. The
   IPv6 link-local address keeps the node's own MAC embedded in it. Untested beyond IPv4.
 
@@ -109,10 +110,10 @@ On **both** nodes:
    - `WAN_IF`: the interface the CARP VIP is on, as `ifconfig` names it.
    - `VHID`: the vhid of that CARP VIP.
    - `OWN_MAC`: this node's own MAC on that interface (it differs per node). Leave it empty
-     to let the script detect it: on a VLAN it takes the parent interface's MAC, and empty
-     is the safest choice there. If it cannot tell the own MAC from the virtual one, it logs
-     that and does nothing. If you set it (needed on a lagg), read it with `ifconfig` while
-     the interface still has its own MAC.
+     to let the script detect it: on a VLAN it takes the parent interface's current MAC,
+     and empty is the safest choice there. If it cannot tell the own MAC from the virtual
+     one, it logs that and does nothing. If you set it (needed on a lagg), read it with
+     `ifconfig` while the interface still has its own MAC.
 3. Run the script once by hand.
 4. Run it every minute too. On a NIC this is needed (OPNsense sets the MAC back, see the
    risks); on a VLAN it is optional, but it bounds how long a missed or failed change lasts

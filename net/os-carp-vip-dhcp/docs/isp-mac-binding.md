@@ -79,14 +79,15 @@ supported**: test it on your hardware before you rely on it.
   and the cron job. On the test bench (virtio NIC) the change was instant, and a user on a
   VLAN in a virtual machine reported that traffic came back at once after swapping by hand.
 - **Both nodes on the virtual MAC:** at a failover the old master gives the MAC up and the
-  new master takes it. On the test bench the overlap was a few milliseconds with the `00-`
-  name (about 150 ms in one run), and about 6 s with a later name. If the script fails on the node that loses master, the overlap
+  new master takes it. On the test bench the overlap was between a few milliseconds and
+  about 150 ms with the `00-` name, and about 6 s with a later name. If the script fails on the node that loses master, the overlap
   lasts until the script runs again, and traffic for the master goes astray. If both nodes
   become master at once (they lose each other's CARP advertisements), both send from the
   virtual MAC until one returns to backup.
 - **lagg and shared VLAN parents:** a MAC change on a lagg can renegotiate LACP. With the
   VIP on the lagg itself, set `OWN_MAC` by hand: `ifconfig` shows `hwaddr 00:00:00:00:00:00`
-  for a lagg, so the script cannot detect the own MAC there and refuses to act. A VLAN on a
+  for a lagg, so the script cannot detect the own MAC there and refuses to act in either
+  role (the master then stays on its own MAC until `OWN_MAC` is set). A VLAN on a
   lagg takes the lagg's current MAC and needs no `OWN_MAC`. On a VLAN, check that other
   VLANs on the same parent are not affected on your NIC.
 - **IPv6 and other protocols** on the WAN also leave from the virtual MAC on the master. The
@@ -112,7 +113,8 @@ On **both** nodes:
    - `OWN_MAC`: this node's own MAC on that interface (it differs per node). Leave it empty
      to let the script detect it: on a VLAN it takes the parent interface's current MAC,
      and empty is the safest choice there. If it cannot tell the own MAC from the virtual
-     one, it logs that and does nothing. If you set it (needed on a lagg), read it with
+     one, it logs that and does nothing, as master too, so a node never adopts the virtual
+     MAC without a known way back. If you set it (needed on a lagg), read it with
      `ifconfig` while the interface still has its own MAC.
 3. Run the script once by hand.
 4. Run it every minute too. On a NIC this is needed (OPNsense sets the MAC back, see the
@@ -196,20 +198,21 @@ own_mac() {
     echo "${mac}"
 }
 
+# Never change the MAC without a known way back, in either role: a lagg's
+# all-zero hwaddr, or an interface already on the virtual MAC with no parent.
+own=$(own_mac)
+case "${own}" in
+    '' | "${VMAC}" | 00:00:00:00:00:00)
+        log "cannot tell the own MAC of ${WAN_IF}; set OWN_MAC in $0"; exit 0 ;;
+esac
+
 # Set the MAC, then read the role again: it may have changed meanwhile.
 for _ in 1 2 3; do
     current=$(mac_line "${WAN_IF}" ether)
     if ifconfig "${WAN_IF}" | grep -q "carp: MASTER vhid ${VHID} "; then
         want="${VMAC}"
     else
-        want=$(own_mac)
-        case "${want}" in
-            '' | "${VMAC}" | 00:00:00:00:00:00)
-                # Do not "restore" the virtual MAC (or a lagg's all-zero hwaddr)
-                # on a node that is not master.
-                log "cannot tell the own MAC of ${WAN_IF}; set OWN_MAC in $0"
-                exit 0 ;;
-        esac
+        want="${own}"
     fi
     [ "${current}" = "${want}" ] && exit 0
     if ! ifconfig "${WAN_IF}" ether "${want}"; then
@@ -243,8 +246,8 @@ NIC and frames captured per node, so each frame is attributed to the node that s
 - The master sends all its WAN traffic from the virtual MAC and the backup only from its own
   MAC; traffic from the VIP works on the master.
 - Failover in both directions: the old master's last frame from the virtual MAC and the new
-  master's first came within 1 to 5 ms of each other in most runs, and about 150 ms in
-  one. Changing the MAC caused no CARP transitions of its own.
+  master's first came between a few milliseconds and about 150 ms apart, over several
+  runs. Changing the MAC caused no CARP transitions of its own.
 - A reboot of the master, and OPNsense reconfiguring the WAN interface (which itself caused a
   failover), ended with the right MAC on each node.
 - `configctl interface reconfigure wan` on a virtio NIC set the MAC back to the NIC's own; a
@@ -255,8 +258,9 @@ NIC and frames captured per node, so each frame is attributed to the node that s
 - With the script named `60-carp-vmac` instead of `00-carp-vmac`, the swap came about 6 s
   late, and both nodes sent from the virtual MAC for that long.
 - Three runs started at once on each node finished cleanly (they are serialised). An invalid
-  `VHID` or `OWN_MAC`, an upper-case `OWN_MAC`, an all-zero `OWN_MAC` and an interface
-  description containing the word "ether" changed nothing they should not.
+  `VHID` or `OWN_MAC`, an upper-case `OWN_MAC`, an all-zero `OWN_MAC` (on the backup and on
+  the master) and an interface description containing the word "ether" changed nothing
+  they should not.
 
 Not tested: physical NICs, a real link-up event, lagg, the CARP swap on a VLAN interface (a
 user on a VLAN in a virtual machine reported that swapping the MAC by hand works at once),

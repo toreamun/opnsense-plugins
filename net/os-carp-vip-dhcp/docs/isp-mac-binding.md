@@ -6,6 +6,10 @@ it is also what carrier gear calls strict IP Source Guard (IP + MAC). On such a 
 plugin keeps the lease alive, but **traffic from the CARP VIP does not work** out of the box.
 Most ISPs do not do this; if traffic works through the VIP today, you are not affected.
 
+A different kind of line shows the same symptom but needs the opposite fix: one that allows
+only **one MAC per port** (cable modems with MaxCPE=1). That case is covered in
+[Lines that allow only one MAC per port](#lines-that-allow-only-one-mac-per-port-cable-maxcpe1).
+
 The unsupported workaround below made traffic and failover work on a test bench; it has not
 been tested with a real ISP that checks the MAC. Use it at your own risk.
 
@@ -37,10 +41,14 @@ every CARP transition is risky in ways a lease keeper cannot control (see the ri
 
 ## Do not set the virtual MAC on both nodes
 
-Setting the virtual MAC as the WAN MAC on **both** nodes (Interfaces, WAN, MAC address) looks
-like the simple fix, but every frame the backup sends on the WAN (gateway monitoring, ARP)
-then teaches the switch that the virtual MAC is on the backup's port. Traffic for the master
-goes to the backup until the master sends again. Do not do this.
+This applies to a line that binds the lease to a MAC. On such a line the backup's own MAC is
+harmless (it has another address), so there is no reason to share the virtual MAC, and
+sharing it costs: setting the virtual MAC as the WAN MAC on **both** nodes (Interfaces, WAN,
+MAC address) looks like the simple fix, but every frame the backup sends on the WAN (gateway
+monitoring, ARP) then teaches the switch that the virtual MAC is on the backup's port.
+Traffic for the master goes to the backup until the master sends again. Do not do this on a
+line that binds IP to MAC. (A line that allows only one MAC per port is the opposite case:
+see the next section.)
 
 Setting it on the **primary only** works while the primary is master. After a failover the
 backup has no internet through the VIP, and the primary, now backup but still on the virtual
@@ -48,10 +56,40 @@ MAC, pulls the virtual MAC to its own switch port whenever it sends. Unicast DHC
 the new master can then go astray. If you keep the virtual MAC on the primary, clear it
 whenever the primary is backup, for example during maintenance.
 
+## Lines that allow only one MAC per port (cable, MaxCPE=1)
+
+Some lines, typically cable, allow a single device MAC on the subscriber port: the DOCSIS
+modem learns the first CPE MAC it sees after it registers, never replaces or ages it out,
+and discards frames from any other MAC until it is reset
+([issue #106](https://github.com/toreamun/opnsense-plugins/issues/106)). The lease works
+(the keeper's DHCP comes from the virtual MAC), but the master's traffic, which leaves from
+its own MAC, is dropped; and a frame from the backup's own MAC is a second MAC too. On such a
+line the rule is the opposite of the section above: **both nodes must present the same MAC**,
+so that there is never a second one.
+
+- Set the CARP virtual MAC (`00:00:5e:00:01:<vhid in hex>`) as the **MAC address** of the
+  WAN interface on **both** nodes (Interfaces, WAN). OPNsense applies it on every configure,
+  boot and link-up, so it stays.
+- Run plugin version 1.14 or later: the backup then sends no DHCP on the WAN until it becomes
+  master, so the shared MAC is quiet from the backup's side.
+- Keep the backup quiet otherwise: disable gateway monitoring on the WAN gateway (or accept
+  that each monitor packet from the backup briefly moves the shared MAC to the backup's
+  switch port, until the master's next frame, at most a second with CARP advertisements), and
+  leave IPv6 off on the WAN unless you need it.
+- After a modem reboot the first MAC it learns wins. With the same MAC on both nodes that is
+  always the right one.
+- Do not use the MAC swap script below on such a line: while a node is backup it would send
+  from its own MAC, which is exactly what the modem must never see.
+
+Reported working through real failovers on two cable lines (#106). Open question: unicast
+CARP (a `peer` address) sends the master's advertisements to the backup's MAC, which with the
+shared MAC is the master's own; multicast CARP (the default) is what the reports used.
+
 ## Workaround: swap the MAC on CARP transitions (unsupported)
 
-A small script, run by OPNsense on every CARP transition, gives the WAN interface the virtual
-MAC while the node is master and its own MAC otherwise. It is **not part of the plugin and not
+For a line that binds IP to MAC only (not for one MAC per port, see above). A small script,
+run by OPNsense on every CARP transition, gives the WAN interface the virtual MAC while the
+node is master and its own MAC otherwise. It is **not part of the plugin and not
 supported**: test it on your hardware before you rely on it.
 
 ### Risks you take on

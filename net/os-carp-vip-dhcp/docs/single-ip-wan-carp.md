@@ -126,7 +126,8 @@ The facts that drive the design:
    *master's* physical MAC as the source of its traffic and of its ARP replies for the
    VIP, plus the virtual MAC, which CARP advertisements and the keeper's DHCP use; the
    backup stays silent on the WAN until it takes over, when that physical MAC flips to it.
-   See [section 9](#s9) for the strict one-MAC-per-port case.)
+   See [ISPs that check the source MAC](isp-mac-binding.md) for lines that bind the lease
+   to a MAC or allow only one MAC per port.)
    Because that range is not RFC 1918, the outbound `internal to VIP` SNAT catch-all never
    matches the node IP as a *source*, so it needs no no-NAT-for-CARP carve-out - one rule
    fewer ([IP and CARP plan](#s6-1)). (Egress still leaves via the VIP: that SNAT's *target* is set

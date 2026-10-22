@@ -309,8 +309,8 @@ def test_check_link_returned_debounce(lk, monkeypatch):
     assert k._check_link_returned() is False  # debounced (now - kick_at = 0 < LINK_KICK_DEBOUNCE)
 
 
-def _follow_keeper(lk, tmp_path):
-    keeper = _keeper(lk, follow=True)
+def _follow_keeper(lk, tmp_path, **kw):
+    keeper = _keeper(lk, follow=True, **kw)
     keeper._follow._state_file = str(tmp_path / "follow_state")
     keeper._dhcp.binding.server = "100.64.4.1"
     keeper._dhcp.binding.yiaddr = "100.64.4.7"
@@ -740,6 +740,30 @@ def test_main_vlan_priority_from_keeper_conf(monkeypatch, tmp_path, caplog, case
     rc, built = _conf_main(monkeypatch, tmp_path, line, "--keeper-id", "100_64_4_7")
     assert rc == 0 and built["kwargs"]["vlan_pcp"] == expected
     assert ("invalid VLAN priority" in caplog.text) == warns
+
+
+@pytest.mark.parametrize("case", [
+    ("vipbits=21|wangw=100.64.4.1", 21, "100.64.4.1", False),
+    ("vipbits=|wangw=", None, None, False),            # no VIP prefix / no single gateway
+    ("", None, None, False),                           # an older template without the keys
+    ("vipbits=33|wangw=100.64.4.1", None, "100.64.4.1", True),
+    ("vipbits=x|wangw=", None, None, True)])
+def test_main_vip_network_from_keeper_conf(monkeypatch, tmp_path, caplog, case):
+    # case = (fields, vip_bits, wan_gateway, whether it warns). An invalid prefix
+    # (only via a hand-edited config.xml) is dropped with a warning: the prefix is then
+    # not followed, instead of argparse exiting into a crash loop.
+    fields, bits, gateway, warns = case
+    line = _CONF_LINE + (f"|{fields}" if fields else "")
+    rc, built = _conf_main(monkeypatch, tmp_path, line, "--keeper-id", "100_64_4_7")
+    assert rc == 0
+    assert built["kwargs"]["vip_bits"] == bits and built["kwargs"]["wan_gateway"] == gateway
+    assert ("invalid VIP prefix length" in caplog.text) == warns
+
+
+def test_keeper_hands_the_vip_network_to_the_follow_policy(lk):
+    # An empty wangw reaches the policy as "no configured gateway".
+    assert _keeper(lk, follow=True, vip_bits=24, wan_gateway="")._follow._net == lk.NetConfig(24, None)
+    assert _keeper(lk, follow=True)._follow._net == lk.NetConfig()
 
 
 def test_main_command_line_wins_over_keeper_conf(monkeypatch, tmp_path):
@@ -1869,6 +1893,371 @@ def test_follow_update_repoints_the_gateway_in_the_gateways_model():
     assert "if ($gw_changed || $gw_current) {" in code
 
 
+# ---- the lease's prefix and gateway against the configured ones (issue #122) ----
+
+def _net_keeper(lk, tmp_path, vip_bits=24, wan_gateway="100.64.4.1"):
+    """A following keeper that knows the VIP's configured prefix and gateway (through
+    the real Keeper -> NetConfig wiring)."""
+    return _follow_keeper(lk, tmp_path, vip_bits=vip_bits, wan_gateway=wan_gateway)
+
+
+def _confirmed(keeper, phase, bits, router):
+    """The same lease twice: the first shows the change (and asks for an early renew),
+    the second -- the renew's answer -- confirms it."""
+    keeper._follow.check_network(phase, bits, router)
+    keeper._follow.check_network(phase, bits, router)
+
+
+def test_network_change_is_confirmed_by_an_early_renew_first(lk, tmp_path):
+    keeper = _net_keeper(lk, tmp_path)
+    renews = []
+    keeper._follow._renew = lambda: renews.append(1)
+    keeper._follow.check_network("RENEW", 21, "100.64.4.1")
+    assert keeper.fired == [] and renews == [1]          # nothing changed yet; renew asked
+    keeper._follow.check_network("RENEW", 21, "100.64.4.1")
+    assert keeper.fired == ["100.64.4.7"] and renews == [1]
+
+
+def test_alternating_server_answers_never_confirm(lk, tmp_path):
+    # A server that alternates its mask (two DHCP servers, a broken one) must not fail
+    # CARP over at every renew: a disagreeing answer replaces the candidate, and only
+    # the first sighting asks for an early renew.
+    keeper = _net_keeper(lk, tmp_path)
+    renews = []
+    keeper._follow._renew = lambda: renews.append(1)
+    for bits in (21, 22, 21, 22, 21):
+        keeper._follow.check_network("RENEW", bits, "100.64.4.1")
+    assert keeper.fired == [] and renews == [1]
+
+
+def test_a_throttled_confirmation_is_applied_by_the_next_lease(lk, tmp_path):
+    # A confirmed change that meets the throttle (a follow just happened) keeps its
+    # candidate, so the next lease applies it without asking for another renew.
+    keeper = _net_keeper(lk, tmp_path)
+    renews = []
+    keeper._follow._renew = lambda: renews.append(1)
+    keeper._follow._record_follow()
+    _confirmed(keeper, "RENEW", 21, "100.64.4.1")              # confirmed, but throttled
+    assert keeper.fired == [] and renews == [1]
+    with open(keeper._follow._state_file, "w", encoding="utf-8") as f:
+        f.write(str(int(time.time()) - lk.MIN_FOLLOW_INTERVAL - 1))
+    keeper._follow.check_network("RENEW", 21, "100.64.4.1")   # the next lease
+    assert keeper.fired == ["100.64.4.7"] and renews == [1]
+
+
+def test_a_clean_lease_drops_the_candidate(lk, tmp_path):
+    keeper = _net_keeper(lk, tmp_path)
+    keeper._follow.check_network("RENEW", 21, "100.64.4.1")   # candidate
+    keeper._follow.check_network("RENEW", 24, "100.64.4.1")   # the server went back
+    keeper._follow.check_network("RENEW", 21, "100.64.4.1")   # a new first sighting
+    assert keeper.fired == []
+
+
+def test_keeper_wires_the_confirm_renew_to_the_role_watcher(lk):
+    keeper = _keeper(lk, follow=True)
+    keeper._follow._renew()
+    assert keeper._role._renew_asap is True
+
+
+def test_follow_new_address_same_router_new_mask_moves_the_prefix(lk, tmp_path):
+    # #122 case 2: the address moves, the router stays, the mask changes: the prefix
+    # must follow even though the gateway does not.
+    keeper = _net_keeper(lk, tmp_path)
+    keeper._dhcp.binding.router = "100.64.4.1"
+    assert keeper._follow.on_changed_address(
+        "100.64.4.60", _ack_gw(lk, "100.64.4.60", "100.64.4.1", mask="255.255.248.0"),
+        "DORA", True) is True
+    assert keeper._follow._attempt.gw_args == ["-", "-", "21"]
+
+
+def test_follow_without_old_router_uses_the_configured_gateway(lk, tmp_path):
+    # #122 case 4: a node with no previous lease (a promoted backup, or right after a
+    # restart) still moves the gateway, against the configured one.
+    keeper = _net_keeper(lk, tmp_path)
+    keeper._dhcp.binding.router = None
+    keeper._follow.on_changed_address(
+        "100.64.5.60", _ack_gw(lk, "100.64.5.60", "100.64.5.1", mask="255.255.255.0"),
+        "DORA", True)
+    assert keeper._follow._attempt.gw_args == ["100.64.4.1", "100.64.5.1", "24"]
+
+
+def test_follow_configured_gateway_wins_over_the_old_router(lk, tmp_path):
+    # The configuration is what follow_update changes, so it is the reference.
+    keeper = _net_keeper(lk, tmp_path, wan_gateway="100.64.4.254")
+    keeper._dhcp.binding.router = "100.64.4.1"
+    keeper._follow.on_changed_address(
+        "100.64.4.60", _ack_gw(lk, "100.64.4.60", "100.64.4.1", mask="255.255.255.0"),
+        "DORA", True)
+    assert keeper._follow._attempt.gw_args == ["100.64.4.254", "100.64.4.1", "24"]
+
+
+def test_follow_without_configured_network_keeps_the_old_rule(lk, tmp_path):
+    # No vipbits/wangw (an older template, or several gateways): the gateway moves
+    # only from the previous lease's router, and a mask alone changes nothing.
+    keeper = _follow_keeper(lk, tmp_path)
+    keeper._dhcp.binding.router = "100.64.4.1"
+    keeper._follow.on_changed_address(
+        "100.64.4.60", _ack_gw(lk, "100.64.4.60", "100.64.4.1", mask="255.255.248.0"),
+        "DORA", True)
+    assert keeper._follow._attempt.gw_args == []
+
+
+def test_check_network_renew_with_a_new_mask_corrects_the_prefix(lk, tmp_path, caplog):
+    # #122 case 1: same address, the renew brings another mask: correct the prefix
+    # without moving the address.
+    keeper = _net_keeper(lk, tmp_path)
+    with caplog.at_level("WARNING", logger="lease-keeper"):
+        _confirmed(keeper, "RENEW", 21, "100.64.4.1")
+    assert keeper.fired == ["100.64.4.7"]
+    assert keeper._follow._attempt.gw_args == ["-", "-", "21"]
+    assert keeper._follow._attempt.follow_from == "100.64.4.7"
+    assert any("VIP prefix /24 -> /21" in r.getMessage() for r in caplog.records)
+
+
+def test_check_network_renew_with_a_new_router_moves_the_gateway(lk, tmp_path):
+    keeper = _net_keeper(lk, tmp_path)
+    _confirmed(keeper, "RENEW", 24, "100.64.4.254")
+    assert keeper._follow._attempt.gw_args == ["100.64.4.1", "100.64.4.254", "24"]
+
+
+def test_check_network_steady_lease_does_nothing(lk, tmp_path):
+    keeper = _net_keeper(lk, tmp_path)
+    _confirmed(keeper, "RENEW", 24, "100.64.4.1")
+    _confirmed(keeper, "RENEW", None, None)   # an ACK without opt 1/3
+    assert keeper.fired == []
+
+
+def test_check_network_gateway_without_mask_is_left_alone(lk, tmp_path, caplog):
+    keeper = _net_keeper(lk, tmp_path)
+    with caplog.at_level("ERROR", logger="lease-keeper"):
+        keeper._follow.check_network("RENEW", None, "100.64.5.1")
+    assert keeper.fired == []
+    assert any("carried no subnet mask" in r.getMessage() for r in caplog.records)
+
+
+def test_check_network_only_in_follow_mode(lk, tmp_path):
+    keeper = _net_keeper(lk, tmp_path)
+    keeper._follow.follow = False
+    _confirmed(keeper, "RENEW", 21, "100.64.4.1")
+    assert keeper.fired == []
+
+
+def test_check_network_leaves_an_in_flight_follow_alone(lk, tmp_path):
+    # Right after a follow at DORA the configuration still has the old prefix; the
+    # follow already carries the network args, so the check must not overwrite the
+    # attempt (its watchdog retry needs the original old address).
+    keeper = _net_keeper(lk, tmp_path)
+    keeper._follow._attempt.followed_ip = "100.64.4.60"
+    keeper._follow._attempt.follow_from = "100.64.4.7"
+    _confirmed(keeper, "DORA", 21, "100.64.4.1")
+    assert keeper.fired == []
+    assert keeper._follow._attempt.follow_from == "100.64.4.7"
+
+
+def test_check_network_is_throttled_like_a_follow(lk, tmp_path):
+    keeper = _net_keeper(lk, tmp_path)
+    keeper._follow._record_follow()            # a follow just happened
+    _confirmed(keeper, "RENEW", 21, "100.64.4.1")
+    assert keeper.fired == []
+
+
+def test_host_vip_prefix_is_never_changed(lk, tmp_path):
+    # A /32 VIP is deliberate (the nodes reach the gateway through their own
+    # addresses): a different lease mask leaves it alone.
+    keeper = _net_keeper(lk, tmp_path, vip_bits=32)
+    _confirmed(keeper, "RENEW", 24, "100.64.4.1")
+    assert keeper.fired == []
+
+
+def test_host_vip_gateway_still_moves_without_touching_the_prefix(lk, tmp_path):
+    keeper = _net_keeper(lk, tmp_path, vip_bits=32)
+    _confirmed(keeper, "RENEW", None, "100.64.4.254")   # no mask needed for /32
+    assert keeper._follow._attempt.gw_args == ["100.64.4.1", "100.64.4.254", "-"]
+
+
+def _peer_ack_net(lk, yiaddr, mask, router, server="100.64.4.1"):
+    """A peer ACK (different xid) on our chaddr that carries a mask and a router."""
+    return _dhcp_frame(lk, 0x22222222, [("message-type", lk.ACK), ("server_id", server),
+                                        ("lease_time", 1800), ("subnet_mask", mask),
+                                        ("router", router), "end"], yiaddr=yiaddr)
+
+
+def _dispatch_keeper(lk, tmp_path, fail=False):
+    """A network keeper with the real _follow_update; the configd dispatch is recorded
+    (or raises), so the once-per-change latch and the throttle are exercised."""
+    keeper = _keeper(lk, follow=True)
+    keeper._follow._state_file = str(tmp_path / "follow_state")
+    keeper._dhcp.binding.server = "100.64.4.1"
+    keeper._dhcp.binding.yiaddr = "100.64.4.7"
+    keeper._follow._net = lk.NetConfig(24, "100.64.4.1")
+    keeper.calls = []
+
+    def _dispatch(old, new, args):
+        keeper.calls.append((old, new, list(args)))
+        if fail:
+            raise OSError("no configctl")
+    keeper._follow._dispatch = _dispatch
+    return keeper
+
+
+def test_network_update_is_dispatched_once_and_arms_the_throttle(lk, tmp_path):
+    keeper = _dispatch_keeper(lk, tmp_path)
+    _confirmed(keeper, "RENEW", 21, "100.64.4.1")
+    _confirmed(keeper, "RENEW", 21, "100.64.4.1")             # the next renews, same change
+    assert keeper.calls == [("100.64.4.7", "100.64.4.7", ["-", "-", "21"])]
+    assert time.time() - keeper._follow._last_follow_time() < 5
+
+
+def test_failed_network_dispatch_does_not_arm_the_throttle(lk, tmp_path):
+    keeper = _dispatch_keeper(lk, tmp_path, fail=True)
+    _confirmed(keeper, "RENEW", 21, "100.64.4.1")
+    assert len(keeper.calls) == 1                          # the dispatch was attempted...
+    assert keeper._follow._attempt.followed_ip is None    # ...and not latched
+    assert keeper._follow._last_follow_time() == 0.0      # the next lease may try again
+
+
+def test_network_update_redrives_are_capped(lk, tmp_path, caplog):
+    # A network-only update that never lands (e.g. the gateway is not in the config)
+    # is re-driven a few times, then dropped so a later lease can ask again.
+    keeper = _dispatch_keeper(lk, tmp_path)
+    _confirmed(keeper, "RENEW", 21, "100.64.4.1")
+    with caplog.at_level("WARNING", logger="lease-keeper"):
+        for _ in range(lk.NET_REDRIVE_LIMIT + 1):
+            keeper._follow._attempt.fired_at -= lk.FOLLOW_RETRY_DEADLINE + 1
+            keeper._follow.watchdog()
+    assert len(keeper.calls) == 1 + lk.NET_REDRIVE_LIMIT
+    assert keeper._follow._attempt.followed_ip is None
+    assert any("giving up" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.parametrize("router", ["100.64.4.7", "100.64.4.0", "100.64.4.255", "0.0.0.0"],
+                         ids=["the-vip-itself", "network", "broadcast", "unspecified"])
+def test_unusable_gateway_is_refused(lk, tmp_path, router):
+    keeper = _net_keeper(lk, tmp_path)
+    _confirmed(keeper, "RENEW", 24, router)
+    assert keeper.fired == []
+
+
+@pytest.mark.parametrize("mask,fires", [("254.0.0.0", False), ("255.0.0.0", True)], ids=["/7", "/8"])
+def test_min_vip_bits_boundary(lk, tmp_path, mask, fires):
+    keeper = _net_keeper(lk, tmp_path, wan_gateway="100.0.0.1")
+    _confirmed(keeper, "RENEW", lk._mask_to_bits(mask), "100.0.0.1")
+    assert (keeper.fired == ["100.64.4.7"]) == fires
+
+
+def test_follow_with_a_refused_gateway_still_moves_the_address(lk, tmp_path):
+    keeper = _net_keeper(lk, tmp_path)
+    assert keeper._follow.on_changed_address(
+        "100.64.5.60", _ack_gw(lk, "100.64.5.60", "192.0.2.1", mask="255.255.255.0"), "DORA", True)
+    assert keeper.fired == ["100.64.5.60"] and keeper._follow._attempt.gw_args == []
+
+
+def test_an_ack_without_the_options_cannot_confirm(lk, tmp_path):
+    # The binding keeps the last mask and router when an ACK omits them; the check uses
+    # the current ACK's own options, so an ACK without them confirms nothing.
+    k = _keeper(lk, vhid=254, follow=True, vip_bits=24, wan_gateway="100.64.4.1")
+    k._follow._state_file = str(tmp_path / "follow_state")
+    calls = []
+    k._follow._dispatch = lambda old, new, args: calls.append((old, new, list(args)))
+    k._arp_nudge = lambda *a, **kw: None
+    rx = _reply(lk, lk.ACK, "100.64.4.7", router="100.64.4.1", mask="255.255.248.0")
+    k._dhcp._absorb_reply(rx, 1800, fresh_bind=True)
+    k._dhcp.binding.yiaddr = "100.64.4.7"
+    k._on_lease_extended(lk.Phase.RENEW, k._lease_facts())   # /21: a candidate
+    k._dhcp._absorb_reply(_reply(lk, lk.ACK, "100.64.4.7"), 1800)   # no opt 1 or 3
+    assert k._dhcp.binding.mask_bits == 21                   # retained...
+    k._on_lease_extended(lk.Phase.RENEW, k._lease_facts())
+    assert not calls                                           # ...but it confirms nothing
+
+
+def test_prefix_change_that_makes_the_gateway_the_broadcast_address_is_refused(lk, tmp_path):
+    # VIP /23 with its gateway at .255 of the lower /24: a /24 lease would make that
+    # gateway the broadcast address, so the prefix change is refused.
+    keeper = _net_keeper(lk, tmp_path, vip_bits=23, wan_gateway="100.64.4.255")
+    _confirmed(keeper, "RENEW", 24, "100.64.4.255")
+    assert keeper.fired == []
+
+
+def test_a_same_address_peer_ack_never_changes_the_network(lk, tmp_path):
+    # A sniffed packet must not rewrite the configuration: a peer ACK for our own
+    # address with another mask is neither recorded nor acted on (a backup corrects
+    # its network from its own lease when it is promoted).
+    keeper = _net_keeper(lk, tmp_path)
+    keeper._dhcp.xid = 0x11111111
+    keeper._on_dhcp_reply(_peer_ack_net(lk, "100.64.4.7", "255.255.248.0", "100.64.4.1"))
+    assert keeper._follow._observed is None and not _woken(keeper)
+    keeper._follow.observe(_ack_gw(lk, "100.64.4.7", "100.64.4.254", mask="255.255.248.0"))
+    keeper._follow.check_observed()
+    assert keeper.fired == []
+
+
+@pytest.mark.parametrize("mask", ["128.0.0.0", "255.255.255.252"],
+                         ids=["implausibly-wide", "gateway-off-link"])
+def test_implausible_prefix_change_is_refused(lk, tmp_path, mask):
+    # A forged or broken ACK must not set the VIP to /1 (a connected route over half of
+    # IPv4) or to a mask that leaves the gateway off-link.
+    keeper = _net_keeper(lk, tmp_path)
+    _confirmed(keeper, "RENEW", lk._mask_to_bits(mask), "100.64.4.1")
+    assert keeper.fired == []
+
+
+def test_gateway_outside_the_lease_subnet_is_refused(lk, tmp_path, caplog):
+    keeper = _net_keeper(lk, tmp_path)
+    with caplog.at_level("ERROR", logger="lease-keeper"):
+        _confirmed(keeper, "RENEW", 24, "192.0.2.1")
+    assert keeper.fired == []
+    assert any("outside the lease's subnet" in r.getMessage() for r in caplog.records)
+
+
+def test_refused_network_change_is_logged_rate_limited(lk, tmp_path, caplog):
+    keeper = _net_keeper(lk, tmp_path)
+    with caplog.at_level("ERROR", logger="lease-keeper"):
+        for _ in range(3):
+            keeper._follow.check_network("RENEW", None, "100.64.5.1")
+    assert sum("carried no subnet mask" in r.getMessage() for r in caplog.records) == 1
+
+
+def test_renew_with_new_mask_logs_it_and_checks_the_network(lk, tmp_path, caplog):
+    # The keeper wiring: a renew that changes the mask is logged as a change (it used
+    # to be silent) and handed to the network check.
+    keeper = _net_keeper(lk, tmp_path)
+    seen = []
+    keeper._follow.check_network = lambda phase, bits, router: seen.append((phase, bits, router))
+    keeper._dhcp.binding.lease_router = "100.64.4.1"
+    keeper._dhcp.binding.mask_bits = 24
+    prior = keeper._lease_facts()
+    keeper._dhcp.binding.mask_bits = keeper._dhcp.binding.ack_bits = 21
+    keeper._dhcp.binding.ack_router = "100.64.4.1"
+    with caplog.at_level("INFO", logger="lease-keeper"):
+        keeper._on_lease_extended(lk.Phase.RENEW, prior)
+    assert seen == [(lk.Phase.RENEW, 21, "100.64.4.1")]
+    assert any("mask /24->/21" in r.getMessage() for r in caplog.records)
+
+
+def test_unchanged_marker_agrees_between_daemon_and_follow_update(lk):
+    """The daemon marks an unchanged part of the gateway/prefix tail with NO_CHANGE
+    and follow_update.php must read it (and an empty string) as unchanged: the two
+    sides have no common source, and a mismatch would turn "-" into a bad gateway."""
+    php = os.path.join(
+        os.path.dirname(__file__), "..", "src", "opnsense", "scripts",
+        "OPNsense", "CarpVipDhcp", "follow_update.php")
+    with open(php, encoding="utf-8") as fh:
+        code = re.sub(r"/\*.*?\*/|//[^\n]*", "", fh.read(), flags=re.S)
+    assert lk.NO_CHANGE == "-"
+    assert "$argv[$i] !== '' && $argv[$i] !== '-'" in code
+
+
+def test_dispatch_sends_no_empty_arguments(lk, monkeypatch):
+    # configctl drops an empty argument, which would shift the prefix into the
+    # gateway's place; an unchanged part travels as "-".
+    keeper = _keeper(lk, follow=True)
+    cmds = []
+    monkeypatch.setattr(f"{type(keeper).__module__}.spawn", cmds.append)
+    keeper._dispatch_follow_update("100.64.4.7", "100.64.4.7", ["-", "-", "21"])
+    assert all(arg != "" for arg in cmds[0])
+    assert cmds[0][-3:] == ["-", "-", "21"]
+
+
 def test_follow_update_fires_newwanip_hooks():
     """A follow must run the newwanip plugin hooks for the VIP's interface
     (dynamic DNS, VPN endpoints learn the new address -- the parity promise),
@@ -2188,6 +2577,48 @@ def test_acquire_clears_renew_asap(lk, monkeypatch):
     monkeypatch.setattr(k, "_arp_nudge", lambda *a, **kw: None)
     k._acquire_step()
     assert k._renew_asap is False
+
+
+def test_acquire_with_a_changed_network_keeps_the_confirm_renew(lk, monkeypatch, tmp_path):
+    # The DORA path clears a pending renew first and only then checks the network, so a
+    # lease whose network differs leaves the confirming early renew armed (swapping the
+    # two lines would silently drop the confirmation).
+    k = _keeper(lk, vhid=254, follow=True, vip_bits=24, wan_gateway="100.64.4.1")
+    k._follow._state_file = str(tmp_path / "follow_state")
+    k._renew_asap = True
+    monkeypatch.setattr(k, "_ensure_sniffer", lambda: None)
+    monkeypatch.setattr(k, "_iface_link_up", lambda: True)
+    monkeypatch.setattr(k, "_arp_nudge", lambda *a, **kw: None)
+
+    def _acquire(*_a, **_kw):
+        k._dhcp.binding.yiaddr, k._dhcp.binding.mask_bits = "100.64.4.7", 21
+        k._dhcp.binding.lease_router = "100.64.4.1"
+        k._dhcp.binding.ack_bits, k._dhcp.binding.ack_router = 21, "100.64.4.1"
+        return True
+    monkeypatch.setattr(k._dhcp, "acquire", _acquire)
+    k._acquire_step()
+    assert k._renew_asap is True
+    assert k._follow._net_candidate == ("100.64.4.7", 21, "100.64.4.1")
+
+
+def test_confirm_renew_makes_the_hold_loop_renew_at_once(lk, monkeypatch, tmp_path):
+    # End to end through the keeper: a renew that shows a new mask arms the early renew,
+    # the hold loop returns at once (no wait for T1), and the next lease confirms.
+    k = _keeper(lk, vhid=254, follow=True, vip_bits=24, wan_gateway="100.64.4.1")
+    k._follow._state_file = str(tmp_path / "follow_state")
+    k._role.was_master = True
+    k._dhcp.binding.yiaddr, k._dhcp.binding.mask_bits = "100.64.4.7", 21
+    k._dhcp.binding.lease_router = "100.64.4.1"
+    k._dhcp.binding.ack_bits, k._dhcp.binding.ack_router = 21, "100.64.4.1"
+    calls = []
+    k._follow._dispatch = lambda old, new, args: calls.append((old, new, list(args)))
+    monkeypatch.setattr(k, "_arp_nudge", lambda *a, **kw: None)
+    slept = []
+    monkeypatch.setattr(k, "_sleep_interruptible", lambda secs: slept.append(secs) or True)
+    k._on_lease_extended(lk.Phase.RENEW, k._lease_facts())   # first sighting: renew asked
+    assert not calls and k._hold_lease(3600) is True and not slept
+    k._on_lease_extended(lk.Phase.RENEW, k._lease_facts())   # the early renew's answer
+    assert calls == [("100.64.4.7", "100.64.4.7", ["-", "-", "21"])]
 
 
 def test_demotion_makes_renew_asap_inert(lk):

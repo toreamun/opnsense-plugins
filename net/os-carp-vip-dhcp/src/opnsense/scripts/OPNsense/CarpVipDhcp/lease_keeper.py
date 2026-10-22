@@ -112,6 +112,8 @@ _CONF_VALUES = {
     "vlanpcp": "vlan_pcp",
     "sendopts": "send_options",
     "reqopts": "request_options",
+    "vipbits": "vip_bits",
+    "wangw": "wan_gateway",
 }
 _CONF_FLAGS = {
     "follow": "follow",
@@ -125,6 +127,7 @@ VLAN_PCP_VALUES = range(8)
 _CONF_INTS = {
     "arp_nudge": ("ARP nudge interval", None, "the nudge stays off"),
     "vlan_pcp": ("VLAN priority", VLAN_PCP_VALUES, "no VLAN priority is set"),
+    "vip_bits": ("VIP prefix length", range(1, 33), "the prefix is not followed"),
 }
 
 
@@ -273,6 +276,12 @@ def _build_arg_parser():
                          "turns the dialog's Send Options into this form)")
     ap.add_argument("--request-options", default="", metavar="CODE,...",
                     help="DHCP option codes to request before the keeper's own")
+    ap.add_argument("--vip-bits", type=int, default=None, metavar="1-32",
+                    help="the CARP VIP's configured prefix length; a following keeper "
+                         "corrects it when the lease's subnet mask differs")
+    ap.add_argument("--wan-gateway", default=None, metavar="IP",
+                    help="the one IPv4 gateway configured on the VIP's interface; a "
+                         "following keeper moves it when the lease's router differs")
     # Accepted and ignored (bpf is the only backend): a daemon(8) supervisor started by
     # an older version may still carry --capture-backend on its command line, and its
     # next restart must run this script instead of exiting 2 and crash-looping.
@@ -410,7 +419,8 @@ def main():
                         vlan_pcp=args.vlan_pcp,
                         send_opts=send_opts, request_codes=request_codes, config_error=config_error,
                         default_route_mode=args.default_route_mode,
-                        backup_egress=backup_egress)
+                        backup_egress=backup_egress,
+                        vip_bits=args.vip_bits, wan_gateway=args.wan_gateway)
 
         # The Keeper is constructed, so its wake socketpair is now open: guarantee
         # keeper.close() on EVERY path from here -- the --once return, a normal run,

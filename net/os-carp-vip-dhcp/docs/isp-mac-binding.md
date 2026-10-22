@@ -67,6 +67,11 @@ its own MAC, is dropped; and a frame from the backup's own MAC is a second MAC t
 line the rule is the opposite of the section above: **both nodes must present the same MAC**,
 so that there is never a second one.
 
+- The nodes' own WAN addresses must be static, as in the
+  [single-IP setup](single-ip-wan-carp.md) (its private node addresses). A WAN set to DHCP
+  would run OPNsense's own DHCP client from the shared MAC on both nodes: two clients
+  competing for the one lease, and the backup's DHCP frames moving the shared MAC to its
+  switch port. Switch the WAN to static first.
 - Set the CARP virtual MAC (`00:00:5e:00:01:<vhid in hex>`) as the **MAC address** of the
   WAN interface on **both** nodes (Interfaces, WAN). OPNsense applies it on every configure,
   boot and link-up, so it stays.
@@ -81,9 +86,11 @@ so that there is never a second one.
 - Do not use the MAC swap script below on such a line: while a node is backup it would send
   from its own MAC, which is exactly what the modem must never see.
 
-Reported working through real failovers on two cable lines (#106). Open question: unicast
-CARP (a `peer` address) sends the master's advertisements to the backup's MAC, which with the
-shared MAC is the master's own; multicast CARP (the default) is what the reports used.
+Reported working on two cable lines (#106): the first report documents traffic through a
+real failover, the second confirms traffic on a running pair. Neither says which CARP mode
+is in use (multicast is the default). Open question: unicast CARP (a `peer` address) sends
+the master's advertisements to the backup's MAC, which with the shared MAC is the master's
+own; untested.
 
 ## Workaround: swap the MAC on CARP transitions (unsupported)
 

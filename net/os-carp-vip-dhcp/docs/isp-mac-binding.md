@@ -86,11 +86,26 @@ so that there is never a second one.
 - Do not use the MAC swap script below on such a line: while a node is backup it would send
   from its own MAC, which is exactly what the modem must never see.
 
-Reported working on two cable lines (#106): the first report documents traffic through a
-real failover, the second confirms traffic on a running pair. Neither says which CARP mode
-is in use (multicast is the default). Open question: unicast CARP (a `peer` address) sends
-the master's advertisements to the backup's MAC, which with the shared MAC is the master's
-own; untested.
+### What was observed
+
+The first report (a Comcast/Xfinity cable line with MaxCPE=1, by @mumblepins, whose
+write-up this section is based on) compared three WAN configurations on the same line:
+
+| WAN configuration | Source MACs on the port | Lease | Replies |
+|---|---|---|---|
+| CARP VIP, interface on its own MAC | virtual (DHCP) and own (traffic) | yes | no |
+| Plain DHCP, no VIP, own MAC | own only | yes | yes |
+| CARP VIP, interface set to the virtual MAC | virtual only | yes | yes |
+
+Nothing in the first case tells you why: no NAK, no ICMP, no log line, just no replies.
+With the virtual MAC on both nodes the line also held through a live failover: the switch
+relearned the shared MAC on the new master's port and a TCP connection in progress to an
+external host continued. That run was not instrumented for MAC table churn or sustained
+load, so a brief flap is not ruled out, only not seen. The second report (another cable
+line) confirms traffic on a running pair. Neither says which CARP mode is in use
+(multicast is the default). Open question: unicast CARP (a `peer` address) sends the
+master's advertisements to the backup's MAC, which with the shared MAC is the master's own;
+untested.
 
 ## Workaround: swap the MAC on CARP transitions (unsupported)
 

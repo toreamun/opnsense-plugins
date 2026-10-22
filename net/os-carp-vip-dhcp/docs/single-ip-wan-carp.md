@@ -326,6 +326,12 @@ are examples, substitute your own.*
 >   untouched. (OPNsense's `dhclient` has **no `-r`/release** flag; for a maximally clean
 >   test free the current lease with a `DHCPRELEASE` sent another way.) See [section 9](#s9)
 >   *DHCP behaviour* and [section 10](#s10).
+>
+> **Both checks test the lease only, not forwarding.** A line that allows only one MAC per
+> port (cable, MaxCPE=1) passes them, because a single MAC is on the wire during the test,
+> and breaks only once the VIP and real traffic are up: normal lease, interface up, nothing
+> replies. If that happens to you, see
+> [lines that allow only one MAC per port](isp-mac-binding.md#lines-that-allow-only-one-mac-per-port-cable-maxcpe1).
 
 <a id="s6-1"></a>
 

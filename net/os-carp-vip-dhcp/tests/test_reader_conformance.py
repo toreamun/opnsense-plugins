@@ -33,7 +33,7 @@ _UNDER_CI = os.environ.get("CI") == "true"
 
 # The keeper.conf keys carpvipdhcp_parse_line extracts (each into the shell
 # variable of the same name); the daemon reads the other keys itself.
-_KEYS = ["request", "iface", "chaddr", "demote"]
+_KEYS = ["request", "iface", "chaddr", "demote", "vhid"]
 
 _FIXTURES = [
     # A full record (the keys the shell parser skips must not disturb the others).

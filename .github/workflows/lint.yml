@@ -91,6 +91,7 @@ jobs:
             'net/*/src/etc/rc.d/*' \
             'net/*/src/etc/rc.carp_service_status.d/*' \
             'net/*/src/etc/rc.syshook.d/start/*' \
+            'net/*/src/etc/rc.syshook.d/carp/*' \
             'net/*/src/opnsense/scripts/**/*.sh')
           echo "$files"
           shellcheck -s sh -e SC1091,SC2034 $files

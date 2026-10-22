@@ -24,15 +24,16 @@ LOG = logging.getLogger(LOGGER_NAME)
 SUBPROC_TIMEOUT = 5
 
 
-def run(cmd, *, timeout=SUBPROC_TIMEOUT, quiet=False):
+def run(cmd, *, timeout=SUBPROC_TIMEOUT, quiet=False, stdin=None):
     """Run argv `cmd`, capturing output, bounded by `timeout`; return the
     CompletedProcess, or None if it could not be executed at all. A launch
     failure is logged at WARNING unless `quiet` -- the per-tick ifconfig probes
     keep their own throttled, warn-once error policy and want silence here.
-    text=True (implied by errors= but stated) so stdout/stderr are str."""
+    `stdin` (str or None) is written to the command's standard input. text=True
+    (implied by errors= but stated) so stdout/stderr are str."""
     try:
         return subprocess.run(cmd, capture_output=True, text=True, errors="replace",
-                              timeout=timeout, check=False)
+                              timeout=timeout, check=False, input=stdin)
     except (OSError, subprocess.SubprocessError) as e:
         if not quiet:
             LOG.warning("command failed to run (%s): %s", " ".join(cmd), e)

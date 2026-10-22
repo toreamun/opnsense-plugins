@@ -46,12 +46,12 @@ def lk():
     import subprocess  # pylint: disable=import-outside-toplevel
     import time  # pylint: disable=import-outside-toplevel
     from leasekeeper import (  # pylint: disable=import-outside-toplevel
-        capture, capture_bpf, codec, constants, dhcpclient, heartbeat,
+        capture, capture_bpf, carp, codec, constants, dhcpclient, heartbeat,
         keeper, policy, route, util, wire)
 
     ns = types.SimpleNamespace()
     _flatten(ns, (constants, util, wire, codec, capture,
-                  capture_bpf, dhcpclient, heartbeat, policy, route, keeper))
+                  capture_bpf, carp, dhcpclient, heartbeat, policy, route, keeper))
     ns.subprocess = subprocess
     ns.time = time
     return ns

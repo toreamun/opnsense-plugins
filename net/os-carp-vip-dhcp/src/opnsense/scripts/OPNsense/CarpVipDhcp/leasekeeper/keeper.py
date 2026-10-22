@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from . import __version__
 from .capture import Capture
 from .capture_bpf import BpfCapture
-from .carp import RoleWatcher
+from .carp import RoleWatcher, _carp_master
 from .constants import (
     LOGGER_NAME,
     ACK, BootpOp, HB_REFRESH, LEASE_PULSE_INTERVAL, LINK_KICK_DEBOUNCE,
@@ -21,7 +21,7 @@ from .constants import (
 from .codec import dhcp_options_check
 from .dhcpclient import ClientOptions, DhcpClient, DhcpHooks, _fmt_client_id, _identity_options
 from .heartbeat import Heartbeat, heartbeat_line, mismatch_line, write_heartbeat
-from .ifprobe import carrier_up, is_carp_master
+from .ifprobe import carrier_up
 from .policy import ArpNudge, FollowHooks, FollowPolicy, NetConfig
 from .route import (BackupEgressReconciler, DefaultRouteMode, DefaultRouteReconciler,
                     withdraw_unless_master)
@@ -35,25 +35,6 @@ LOG = logging.getLogger(LOGGER_NAME)
 # _UNSET (shared, from util) marks "CARP-master value not supplied": the maintain
 # loop probes the role once per tick and shares it, but None is a valid probe
 # result, so the sentinel means "probe it now".
-
-
-def _carp_master(ifconfig_text, vhid):
-    """CARP-master decision from ifconfig text: True/False for the vhid, None when
-    the text is missing (probe failed), True when no vhid (nothing to gate on).
-    Parsing lives in ifprobe.is_carp_master; this adds only the keeper policy that
-    a keeper with no vhid has nothing to gate on."""
-    if not vhid:
-        return True
-    return is_carp_master(ifconfig_text, vhid)
-
-
-def carp_master(iface, vhid):
-    """CARP-master role for `vhid` on `iface` (True/False, None on probe failure).
-    Standalone -- no Keeper -- so the daemon entry point can gate its startup
-    fail-stop default withdraw on the role before the Keeper / capture backend
-    exist; the Keeper's per-tick probe (_probe_carp_master) shares the same
-    ifprobe parse through _carp_master."""
-    return _carp_master(ifconfig(iface), vhid)
 
 
 @dataclass(frozen=True)
@@ -816,9 +797,10 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         # transmit flow only when DEFINITELY the backup: a probe glitch (None) falls
         # back to the last known role, and a still-unknown role transmits (fail-safe,
         # so a real master never stops renewing). no-vhid probes True and transmits.
-        role = self._probe_carp_master()
-        if role is None:
-            role = self._role.was_master
+        # `probed` is the raw reading (None on a glitch); `role` substitutes the last
+        # known role for it.
+        probed = self._probe_carp_master()
+        role = probed if probed is not None else self._role.was_master
         # Commit the role before dispatching, so a transition first seen at THIS gate
         # (a missed or coalesced SIGUSR2) is acted on now instead of being lost until
         # the node next binds. self._role.poll fires the promotion side effects (the

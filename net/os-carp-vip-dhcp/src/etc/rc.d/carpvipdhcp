@@ -112,7 +112,7 @@ carpvipdhcp_stop()
     # One keeper only (svc_id set, e.g. a Services per-row Stop)? Stop just it.
     if [ -n "${svc_id}" ]; then
         carpvipdhcp_stop_id "${svc_id}"
-        echo "Stopped keeper ${svc_id}."
+        echo "Stopped keeper ${svc_id}${carpvipdhcp_restarting:+ (for restart)}."
         return
     fi
     # Stop every keeper daemon, including strays whose pidfile was lost across an
@@ -128,13 +128,15 @@ carpvipdhcp_stop()
         _signal_keepers -KILL
     fi
     rm -f "${run_dir}"/carpvipdhcp-*.pid "${run_dir}"/carpvipdhcp-*.child.pid
-    echo "Stopped ${stopped} keeper(s)."
+    echo "Stopped ${stopped} keeper(s)${carpvipdhcp_restarting:+ (for restart)}."
 }
 
 carpvipdhcp_restart()
 {
     # Both stop and start already honour svc_id (one keeper vs. all), so there is
-    # no need to re-branch here.
+    # no need to re-branch here. carpvipdhcp_restarting makes stop's message say
+    # the stop is part of a restart.
+    carpvipdhcp_restarting=1
     carpvipdhcp_stop
     carpvipdhcp_start
 }

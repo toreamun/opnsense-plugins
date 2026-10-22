@@ -126,7 +126,8 @@ The facts that drive the design:
    *master's* physical MAC as the source of its traffic and of its ARP replies for the
    VIP, plus the virtual MAC, which CARP advertisements and the keeper's DHCP use; the
    backup stays silent on the WAN until it takes over, when that physical MAC flips to it.
-   See [section 9](#s9) for the strict one-MAC-per-port case.)
+   See [ISPs that check the source MAC](isp-mac-binding.md) for lines that bind the lease
+   to a MAC or allow only one MAC per port.)
    Because that range is not RFC 1918, the outbound `internal to VIP` SNAT catch-all never
    matches the node IP as a *source*, so it needs no no-NAT-for-CARP carve-out - one rule
    fewer ([IP and CARP plan](#s6-1)). (Egress still leaves via the VIP: that SNAT's *target* is set
@@ -325,6 +326,16 @@ are examples, substitute your own.*
 >   untouched. (OPNsense's `dhclient` has **no `-r`/release** flag; for a maximally clean
 >   test free the current lease with a `DHCPRELEASE` sent another way.) See [section 9](#s9)
 >   *DHCP behaviour* and [section 10](#s10).
+>
+> **Both checks test the lease only, not forwarding, and a line that allows only one MAC per
+> port (cable, MaxCPE=1) can mislead them either way.** Such a modem keeps the first CPE MAC
+> it learns until it is reset. The throwaway probe is a second MAC on the wire, so it may get
+> silence that looks like lease binding when the line is in fact workable; and the GUI check
+> may only pull the lease after a modem reset, because the modem still holds the interface's
+> real MAC. Conversely, a check that passes proves nothing about forwarding: once the VIP and
+> real traffic are up, the interface's own MAC is a second MAC too, and the line breaks with
+> a normal lease, the interface up and nothing replying. For that kind of line, see
+> [lines that allow only one MAC per port](isp-mac-binding.md#lines-that-allow-only-one-mac-per-port-cable-maxcpe1).
 
 <a id="s6-1"></a>
 

@@ -10,17 +10,17 @@
 # keeper.conf is one keeper per line: pipe-separated KEY=VALUE fields in no fixed
 # order (rendered by the configd template).
 
-# carpvipdhcp_parse_line <line>: parse one record into the keeper field variables
-# the shell callers use (request, iface, chaddr, demote). The daemon reads the rest
-# of its record itself (lease_keeper.py --conf), so settings such as the DHCP
-# client-id are not handled here. All four are reset first, then each field is
-# dispatched by key -- any other key is ignored and a missing key keeps the empty
-# reset. Peels one field at a time with parameter expansion, so there are no
-# IFS/glob side effects. Values may contain '=' (split on the first only). The
-# caller reads the variables above after the call.
+# carpvipdhcp_parse_line <line>: parse one record into the shell field variables
+# (request, iface, chaddr, demote, vhid). The daemon reads the rest of its record
+# itself (lease_keeper.py --conf), so settings such as the DHCP client-id are not
+# handled here. All of them are reset first, then each field is dispatched by key:
+# any other key is ignored and a missing key keeps the empty reset. Peels one field
+# at a time with parameter expansion, so there are no IFS/glob side effects. Values
+# may contain '=' (split on the first only). The caller reads the variables above
+# after the call.
 carpvipdhcp_parse_line()
 {
-    request='' iface='' chaddr='' demote=''
+    request='' iface='' chaddr='' demote='' vhid=''
     # Namespaced scratch temporaries (POSIX sh has no `local`), unset at the end so
     # sourcing this parser does not leak them into the caller's environment.
     _kc_rec="$1"
@@ -32,6 +32,7 @@ carpvipdhcp_parse_line()
             iface=*) iface="${_kc_field#*=}" ;;
             chaddr=*) chaddr="${_kc_field#*=}" ;;
             demote=*) demote="${_kc_field#*=}" ;;
+            vhid=*) vhid="${_kc_field#*=}" ;;
         esac
     done
     unset _kc_rec _kc_field

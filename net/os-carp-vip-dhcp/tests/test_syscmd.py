@@ -25,6 +25,20 @@ def test_run_returns_completedprocess_on_success(monkeypatch):
     assert res is not None and res.returncode == 0 and res.stdout == "ok"
 
 
+def test_run_passes_stdin_through(monkeypatch):
+    # `stdin` reaches subprocess.run as `input`; without it nothing is written.
+    seen = {}
+
+    def capture(_cmd, **kw):
+        seen.update(kw)
+        return _cp(0, "")
+    monkeypatch.setattr(syscmd.subprocess, "run", capture)
+    syscmd.run(["/bin/cat"], stdin="line\n")
+    assert seen["input"] == "line\n"
+    syscmd.run(["/bin/true"])
+    assert seen["input"] is None
+
+
 def test_run_returns_completedprocess_on_nonzero(monkeypatch):
     # A non-zero exit is NOT a launch failure: the caller still gets the object
     # so it can read the code and output.

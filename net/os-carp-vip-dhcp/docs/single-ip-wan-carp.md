@@ -327,10 +327,14 @@ are examples, substitute your own.*
 >   test free the current lease with a `DHCPRELEASE` sent another way.) See [section 9](#s9)
 >   *DHCP behaviour* and [section 10](#s10).
 >
-> **Both checks test the lease only, not forwarding.** A line that allows only one MAC per
-> port (cable, MaxCPE=1) passes them, because a single MAC is on the wire during the test,
-> and breaks only once the VIP and real traffic are up: normal lease, interface up, nothing
-> replies. If that happens to you, see
+> **Both checks test the lease only, not forwarding, and a line that allows only one MAC per
+> port (cable, MaxCPE=1) can mislead them either way.** Such a modem keeps the first CPE MAC
+> it learns until it is reset. The throwaway probe is a second MAC on the wire, so it may get
+> silence that looks like lease binding when the line is in fact workable; and the GUI check
+> may only pull the lease after a modem reset, because the modem still holds the interface's
+> real MAC. Conversely, a check that passes proves nothing about forwarding: once the VIP and
+> real traffic are up, the interface's own MAC is a second MAC too, and the line breaks with
+> a normal lease, the interface up and nothing replying. For that kind of line, see
 > [lines that allow only one MAC per port](isp-mac-binding.md#lines-that-allow-only-one-mac-per-port-cable-maxcpe1).
 
 <a id="s6-1"></a>

@@ -7,7 +7,7 @@ plugin keeps the lease alive, but **traffic from the CARP VIP does not work** ou
 Most ISPs do not do this; if traffic works through the VIP today, you are not affected.
 
 A different kind of line shows the same symptom but needs the opposite fix: one that allows
-only **one MAC per port** (cable modems with MaxCPE=1). That case is covered in
+only **one MAC per port** (cable modems with MaxCPE=1, some fiber lines). That case is covered in
 [Lines that allow only one MAC per port](#lines-that-allow-only-one-mac-per-port-cable-maxcpe1).
 
 The unsupported workaround below made traffic and failover work on a test bench; it has not
@@ -58,9 +58,10 @@ whenever the primary is backup, for example during maintenance.
 
 ## Lines that allow only one MAC per port (cable, MaxCPE=1)
 
-Some lines, typically cable, allow a single device MAC on the subscriber port: the DOCSIS
-modem learns the first CPE MAC it sees after it registers, never replaces or ages it out,
-and discards frames from any other MAC until it is reset
+Some lines allow a single device MAC on the subscriber port. On cable, the DOCSIS modem
+learns the first CPE MAC it sees after it registers, never replaces or ages it out, and
+discards frames from any other MAC until it is reset; some fiber lines enforce the same
+rule in the ISP's gear or the ONT
 ([issue #106](https://github.com/toreamun/opnsense-plugins/issues/106)). The lease works
 (the keeper's DHCP comes from the virtual MAC), but the master's traffic, which leaves from
 its own MAC, is dropped; and a frame from the backup's own MAC is a second MAC too. On such a
@@ -101,11 +102,12 @@ Nothing in the first case tells you why: no NAK, no ICMP, no log line, just no r
 With the virtual MAC on both nodes the line also held through a live failover: the switch
 relearned the shared MAC on the new master's port and a TCP connection in progress to an
 external host continued. That run was not instrumented for MAC table churn or sustained
-load, so a brief flap is not ruled out, only not seen. The second report (another cable
-line) confirms traffic on a running pair. Neither says which CARP mode is in use
-(multicast is the default). Open question: unicast CARP (a `peer` address) sends the
-master's advertisements to the backup's MAC, which with the shared MAC is the master's own;
-untested.
+load, so a brief flap is not ruled out, only not seen. The second report (a fiber line, both
+nodes on one switch together with the ONT, multicast CARP, plugin 1.18.0) confirms traffic,
+failover and failback with nothing to reset on the ISP side: only the switch relearns the
+shared MAC. The backup there sends nothing on the WAN but an occasional ARP for the
+gateway. Open question: unicast CARP (a `peer` address) sends the master's advertisements
+to the backup's MAC, which with the shared MAC is the master's own; untested.
 
 ## Workaround: swap the MAC on CARP transitions (unsupported)
 

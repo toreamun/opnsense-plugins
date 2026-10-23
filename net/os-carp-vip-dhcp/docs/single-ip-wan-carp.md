@@ -328,8 +328,8 @@ are examples, substitute your own.*
 >   *DHCP behaviour* and [section 10](#s10).
 >
 > **Both checks test the lease only, not forwarding, and a line that allows only one MAC per
-> port (cable, MaxCPE=1) can mislead them either way.** Such a modem keeps the first CPE MAC
-> it learns until it is reset. The throwaway probe is a second MAC on the wire, so it may get
+> port (cable with MaxCPE=1, some fiber lines) can mislead them either way.** Such a line keeps
+> the first CPE MAC it learns until it is reset. The throwaway probe is a second MAC on the wire, so it may get
 > silence that looks like lease binding when the line is in fact workable; and the GUI check
 > may only pull the lease after a modem reset, because the modem still holds the interface's
 > real MAC. Conversely, a check that passes proves nothing about forwarding: once the VIP and

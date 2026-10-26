@@ -148,8 +148,8 @@ follow the plugin rewrites the VIP and re-applies it **add-before-remove**, so t
 never loses its address on that node. Point Source NAT and any address-dependent rule
 at the plugin-managed **firewall Host alias** rather than a hardcoded IP - the plugin
 updates the alias content live on a follow, so rules track the address without a ruleset
-reload. *(A CARP advertisement's HMAC covers the VIP prefixes, so during a follow the two
-nodes briefly advertise different prefixes; if they adopted the new address more than ~3 s
+reload. *(A CARP advertisement's HMAC covers the VIP addresses (not their prefix length), so during a
+follow the two nodes briefly advertise different addresses; if they adopted the new address more than ~3 s
 apart the backup could stop validating the master's adverts and promote - a transient
 **dual-master** (lab-confirmed). The keeper closes this: it passively observes the peer's
 DHCP ACK on the shared chaddr and follows within the same exchange, so both nodes converge
@@ -362,9 +362,16 @@ are examples, substitute your own.*
 > illustrative; the real mask is the ISP's. With the lease policy **Follow dynamic address**, the plugin follows a
 > changed lease, including a cross-subnet renumber: it adopts the new address and, from
 > the DHCP ACK's subnet mask and gateway, updates the VIP prefix and the WAN gateway too,
-> so outbound keeps working (the same as a plain DHCP interface). If the ACK carries no
-> subnet mask it can only move the address, and logs a warning to fix the prefix and
-> gateway by hand.
+> so outbound keeps working (the same as a plain DHCP interface). It also does this when
+> only the mask or the gateway changes and the address stays, after an immediate second
+> renew has confirmed the difference. The gateway it moves is the
+> one IPv4 gateway on the VIP's interface; with several (or another keeper's VIP on the
+> interface) the gateway moves only with a change of address, and only the previous
+> lease's router. A new gateway must lie inside the lease's subnet (when the lease has a mask). A VIP set to `/32`
+> keeps its prefix (in this single-IP design the VIP needs the ISP's mask, so do not use
+> `/32` here). If the ACK carries no subnet mask it leaves the prefix and gateway
+> alone, and logs a warning to fix them by hand. Changing the VIP prefix re-adds the CARP
+> address, which costs a short CARP failover (a few seconds on the test bench).
 
 > **Why link-local for the node IPs.** Link-local (`169.254.0.0/16`,
 > [RFC 3927](https://datatracker.ietf.org/doc/html/rfc3927)) is valid only on the local
@@ -450,7 +457,9 @@ the keeper) only need doing once.
    sources the virtual MAC: the backup stays passive (it holds no lease of its own and
    transmits no DHCP) until it is promoted, so the two nodes never flap the virtual MAC on
    the shared WAN switch. On failover the new master acquires the lease at once and nudges
-   the gateway, so failover stays CARP-speed. (This holds once **both** nodes run this
+   the gateway, so failover stays CARP-speed (except the first failover after the ISP
+   changed the subnet mask, or after an upgrade that corrected the master's prefix: the new master then corrects its VIP prefix, which re-adds the
+   CARP address, a few seconds more). (This holds once **both** nodes run this
    version or later; during a rolling upgrade a not-yet-upgraded backup still sources the
    MAC, so upgrade the node that is currently CARP **backup** first.) Leave **Client MAC
    override (chaddr)** blank: the keeper uses the CARP virtual MAC
@@ -529,7 +538,7 @@ the keeper) only need doing once.
    >    (named `<WANIF>_DHCP`). It can linger, still flagged as the default gateway but now
    >    with an empty address, so no IPv4 default route installs. Delete it under
    >    _System ‣ Gateways_ after the cutover.
-   > 2. On OPNsense 26.7 and later, gateways live in an MVC model that the legacy config is
+   > 2. Since OPNsense 24.1, gateways live in an MVC model that the legacy config is
    >    migrated into **once**; afterwards the model is authoritative. Create `WAN_ISP`
    >    through the GUI so it lands in the model. A gateway written only into the legacy
    >    `<gateways>` section afterwards (by hand, or via a restored/templated config) is not
@@ -900,11 +909,16 @@ Most of these are edge cases - a WAN where the ISP isolates you per VLAN/port (t
   in hex, or the chaddr override if one is set). Going back is the same with **None**.
 - **Follow tracks an ISP renumber, including cross-subnet:** the keeper rewrites the CARP
   VIP to the new address (after checking it is sane, in the same routability class, and
-  from the expected server). A **same-subnet** change is seamless; on a **cross-subnet**
-  move it also updates the VIP prefix and the WAN gateway from the DHCP ACK and reapplies
-  routing, so outbound keeps working - parity with a plain DHCP interface. The one gap: if
-  the ACK carries **no subnet mask**, it can only move the address and logs a warning to
-  fix the prefix and gateway by hand. (**Enforce reservation** pins the address and does none of this.)
+  from the expected server). It also compares every lease's subnet mask and gateway with
+  the VIP's prefix and the WAN gateway, also when the address stays the same, and updates
+  them and reapplies routing when they differ, so outbound keeps working - parity with a
+  plain DHCP interface. The gateway it moves is the one IPv4 gateway on the VIP's
+  interface (with several, or another keeper's VIP on the interface, only the previous
+  lease's router, and only with a change of address); a new gateway must lie inside the
+  lease's subnet. A VIP set to `/32` keeps its prefix. A change of prefix costs a short CARP failover, because the CARP address is
+  re-added. The one gap:
+  if the ACK carries **no subnet mask**, it leaves the prefix and gateway alone and logs a
+  warning to fix them by hand. (**Enforce reservation** pins the address and does none of this.)
 - **Identical client identifier across nodes:** if the server keys on option 61 (Client
   Identifier) instead of `chaddr` and the two nodes present different ones, they can get
   *different* addresses. With **Default** both nodes derive it from the same virtual MAC; a

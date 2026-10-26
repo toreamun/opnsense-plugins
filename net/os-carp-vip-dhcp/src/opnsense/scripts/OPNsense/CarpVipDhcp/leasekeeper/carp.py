@@ -19,8 +19,8 @@ LOG = logging.getLogger(LOGGER_NAME)
 class RoleWatcher:
     """Owns this keeper's CARP-role state: `was_master` (True/False, or None until the
     first definite probe), the early-renew latch (`renew_pending`/`take_renew`/
-    `cancel_renew`), and the unbound-as-master grace clock (`demote_ok`). Transitions
-    are driven by `poll()`."""
+    `request_renew`/`cancel_renew`), and the unbound-as-master grace clock
+    (`demote_ok`). Transitions are driven by `poll()`."""
 
     def __init__(self, vhid, probe: "Callable[[], bool | None]",
                  on_promote: "Callable[[], None]", on_change: "Callable[[], None]"):
@@ -109,6 +109,12 @@ class RoleWatcher:
             self._renew_asap = False
             return True
         return False
+
+    def request_renew(self):
+        """Arm the early renew (as a promotion does): the hold loop renews at once, e.g.
+        to confirm a lease whose network differs from the configuration. Inert on a
+        confirmed backup, like the promotion latch (see renew_pending())."""
+        self._renew_asap = True
 
     def cancel_renew(self):
         """Drop a pending early renew: a fresh DORA supersedes it (the node just bound,

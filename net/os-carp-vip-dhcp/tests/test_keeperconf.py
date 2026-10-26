@@ -150,10 +150,11 @@ def test_keeper_conf_key_names_agree_across_readers():
     def py_get_keys(rel):                   # Python readers: `rec.get("key"...)`
         return set(re.findall(r'rec\.get\("(\w+)"', _read_plugin_file(rel)))
 
-    def php_field_keys(rel):                # PHP readers: `$field` tested against "key="
-        # Anchor to the $field comparison so a heartbeat literal like 'bound='
-        # elsewhere in the file is not mistaken for a keeper.conf key.
-        return set(re.findall(r'\$field\b[^;\n]*?["\'](\w+)=', _read_plugin_file(rel)))
+    def php_field_keys(rel):                # PHP readers: `$field` / `$want_fields` / `$stale_fields`
+        # Anchor to the field comparison (or the lists of wanted/stale fields) so a
+        # heartbeat literal like 'bound=' elsewhere in the file is not mistaken for a key.
+        return set(re.findall(r'\$(?:field|want_fields|stale_fields)\b[^;\n]*?["\'](\w+)=',
+                              _read_plugin_file(rel)))
 
     readers = {
         # The rc.d service and the CARP status hook both source this one parser.

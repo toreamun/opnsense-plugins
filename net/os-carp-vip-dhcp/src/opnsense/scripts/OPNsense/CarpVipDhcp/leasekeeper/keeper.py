@@ -22,7 +22,7 @@ from .codec import dhcp_options_check
 from .dhcpclient import ClientOptions, DhcpClient, DhcpHooks, _fmt_client_id, _identity_options
 from .heartbeat import Heartbeat, heartbeat_line, mismatch_line, write_heartbeat
 from .ifprobe import carrier_up, is_carp_master
-from .policy import ArpNudge, FollowHooks, FollowPolicy
+from .policy import ArpNudge, FollowHooks, FollowPolicy, NetConfig
 from .route import (BackupEgressReconciler, DefaultRouteMode, DefaultRouteReconciler,
                     withdraw_unless_master)
 from .signals import _SignalFlags
@@ -101,7 +101,7 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
                  follow=False, vendor_class=None, client_id=None, hostname=None,
                  arp_nudge=0, arp_listen_promisc=False, vlan_pcp=0,
                  send_opts=(), request_codes=(), config_error=None,
-                 default_route_mode="off", backup_egress=None):
+                 default_route_mode="off", backup_egress=None, vip_bits=None, wan_gateway=None):
         # Fixed identity/config, immutable once set (see _Config).
         self._cfg = _Config(
             iface=iface,
@@ -174,9 +174,10 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         # Follow/enforce policy component: owns the target address and the
         # follow bookkeeping; drives the client via adopt()/release()/expire().
         self._follow = FollowPolicy(
-            request_ip, follow, self._cfg.chaddr, self._dhcp,
-            hooks=FollowHooks(hb_mismatch=self._hb_mismatch,
-                              dispatch=self._dispatch_follow_update))
+            request_ip, follow, self._dhcp,
+            hooks=FollowHooks(hb_mismatch=self._hb_mismatch, dispatch=self._dispatch_follow_update,
+                              renew=self._role.request_renew),
+            net=NetConfig(vip_bits, wan_gateway or None))
 
         # Default-route ownership component (opt-in via defaultRouteMode): owns
         # the IPv4 default route as a function of (CARP role, lease-held, lease
@@ -366,7 +367,7 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         in the decision module. Fire-and-forget: the resulting service restart
         replaces this daemon with one bound to the new address."""
         cmd = ["/usr/local/sbin/configctl", "-d", "carpvipdhcp", "follow_update", old_ip, new_ip]
-        cmd += gw_args   # cross-subnet: [old_gw, new_gw, bits]; empty on a same-subnet move
+        cmd += gw_args   # [old_gw, new_gw, bits], "-" = unchanged part; empty = address only
         # Fire-and-forget via syscmd.spawn: this configctl triggers a service restart
         # that replaces this very daemon, so we must not wait on it. spawn does NOT
         # swallow a launch failure -- it raises, so FollowPolicy catches it, leaves the
@@ -481,24 +482,25 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
 
     def _lease_facts(self):
         """The lease facts a renew might meaningfully change (captured before
-        renewing, for the changed-vs-steady RENEW log): the opt-3 gateway and the
-        server T1/T2. The lease length is deliberately excluded -- many servers
-        jitter option 51 by a second or two each renew, which is not an operationally
-        meaningful change and would otherwise force every renew to INFO."""
+        renewing, for the changed-vs-steady RENEW log): the opt-3 gateway, the opt-1 prefix
+        and the server T1/T2. The lease length is deliberately excluded -- many servers jitter
+        option 51 by a second or two each renew, which would force every renew to INFO."""
         binding = self._dhcp.binding
-        return (binding.lease_router, binding.t1_server, binding.t2_server)
+        return (binding.lease_router, binding.mask_bits, binding.t1_server, binding.t2_server)
 
     def _lease_changes(self, prior):
         """A short 'what changed' summary of the current binding against `prior`, or
         '' when nothing an operator cares about moved (the routine steady renew).
-        Keyed on the gateway (routing) and the server-provided T1/T2, not the jittery
+        Keyed on the gateway and prefix (routing) and the server T1/T2, not the jittery
         lease length; see _lease_facts. The current lease length is still shown in
         the renew line itself, just not treated as a change."""
-        old_gw, old_t1, old_t2 = prior
+        old_gw, old_bits, old_t1, old_t2 = prior
         binding = self._dhcp.binding
         parts = []
         if binding.lease_router != old_gw:
             parts.append(f"gw {old_gw or 'none'}->{binding.lease_router or 'none'}")
+        if binding.mask_bits != old_bits:
+            parts.append(f"mask /{old_bits or '?'}->/{binding.mask_bits or '?'}")
         if (binding.t1_server, binding.t2_server) != (old_t1, old_t2):
             parts.append("renew timers changed")
         return ", ".join(parts)
@@ -507,7 +509,7 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         """A RENEW or REBIND (the Phase) landed a fresh lease: refresh the heartbeat
         and force an ARP nudge. A steady RENEW that changed nothing logs at DEBUG so
         a short lease does not fill the log between events; a RENEW that changed the
-        gateway or renew timers -- and every REBIND (recovery from a failed renew is
+        gateway, prefix or renew timers -- and every REBIND (recovery from a failed renew is
         notable) -- logs at INFO stating what changed. The default route is
         reconciled by the loop-head reconcile on the next _maintain_step entry (a
         renewed lease can carry a new option-3 gateway), so it is not repeated here."""
@@ -522,6 +524,7 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
                      _clock_at(binding.lease_secs), suffix)
         self._hb()
         self._arp_nudge(force=True)
+        self._follow.check_network(phase, binding.ack_bits, binding.ack_router)
 
     def _on_lease_revoked(self, phase):
         """A RENEW or REBIND (the Phase) drew a DHCPNAK: renew() has already
@@ -882,17 +885,12 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         binding = self._dhcp.binding
         # Maintain: wait until T1, then RENEW; bail early on stop.
         t1, t2, src = self._dhcp.timing()
-        # The renew/rebind plan is verbose and identical every cycle for a stable
-        # lease, so log it at DEBUG -- the default (INFO) log stays clean and
-        # "RENEW ok" already carries the lease + expiry. Raise the keeper's log
-        # level to see it.
+        # DEBUG: the plan repeats every cycle for a stable lease ("RENEW ok" carries it at INFO).
         LOG.debug("DHCP lease %ds; renew at T1=%ds (~%s), rebind by T2=%ds (~%s) (timing source: %s)",
                   binding.lease_secs, t1, _clock_at(t1), t2, _clock_at(t2), src)
         if not self._hold_lease(t1):
             return
-        # A demotion to backup during the T1 wait must not renew now: that transmit
-        # would move the shared vMAC and flap the segment. _hold_lease kept the role
-        # fresh; the next _maintain_step handles this node passively.
+        # Demoted during the wait: a renew now would move the shared vMAC; stay passive.
         if self._role.was_master is False:
             return
         prior = self._lease_facts()   # snapshot to report what a renew changed
@@ -983,10 +981,10 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
                      f"/{binding.mask_bits}" if binding.mask_bits else "none")
             self._hb()
             self._arp_nudge(force=True)
-            # A fresh DORA is a new lease, so a pending "renew asap" (e.g. from a
-            # promotion that landed while unbound) is moot: clear it so the bound
-            # path does not immediately renew the lease we just acquired.
+            # A fresh DORA supersedes a pending "renew asap" (e.g. a promotion that landed while
+            # unbound): clear it first; the network check may re-arm it to confirm a change.
             self._role.cancel_renew()
+            self._follow.check_network(Phase.DORA, binding.ack_bits, binding.ack_router)
             self.redora_wait = REDORA_MIN
             # Owning the default is the loop-head reconcile on the next _maintain_step
             # entry (now bound): _acquire_step returns straight to run(), which

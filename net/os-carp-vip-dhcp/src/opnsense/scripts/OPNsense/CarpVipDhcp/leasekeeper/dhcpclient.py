@@ -90,6 +90,11 @@ class Lease:  # pylint: disable=too-many-instance-attributes
     # lease in hand did not itself supply a router, so a new lease that omits it is
     # never routed via the previous lease's (possibly wrong-subnet) gateway.
     lease_router: str | None = None
+    # The mask (opt 1) and router (opt 3) of the LAST ACK only, None when that ACK
+    # omitted them: the network check compares these, so an ACK without the options
+    # cannot confirm a change the retained fields above still carry.
+    ack_bits: int | None = None
+    ack_router: str | None = None
 
 
 @dataclass(frozen=True)
@@ -225,6 +230,7 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
         self.binding.t1_server, self.binding.t2_server = rx.t1, rx.t2
         self.binding.router = rx.router or self.binding.router
         self.binding.mask_bits = _mask_to_bits(rx.subnet_mask) or self.binding.mask_bits
+        self.binding.ack_bits, self.binding.ack_router = _mask_to_bits(rx.subnet_mask), rx.router
         # lease_router tracks the CURRENT lease's own gateway (see the field). A
         # fresh bind takes it verbatim from this ACK (None if the ACK omits opt 3,
         # so no default is installed via a stale gateway); a renew of the same

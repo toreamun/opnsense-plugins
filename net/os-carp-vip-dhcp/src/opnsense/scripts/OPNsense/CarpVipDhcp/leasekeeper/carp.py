@@ -5,12 +5,16 @@ logic (which a planned enforce-mode fail-stop follow-up builds on) has one home,
 from the maintain loop that drives it. The raw ifconfig probe and the promotion side
 effects (ARP nudge + default-route resync) and the role-change hook (the keeper's
 heartbeat) are injected, so this object stays pure
-role logic with no capture / route / nudge dependencies.
+role logic with no capture / route / nudge dependencies. The module also holds the
+CARP-master decision helpers (_carp_master on ifconfig text; carp_master runs the
+ifconfig probe itself, while RoleWatcher still has it injected).
 """
 import logging
 from typing import Callable
 
 from .constants import DEMOTE_GRACE, LOGGER_NAME
+from .ifprobe import is_carp_master
+from .syscmd import ifconfig
 from .util import _UNSET
 
 LOG = logging.getLogger(LOGGER_NAME)
@@ -138,3 +142,21 @@ class RoleWatcher:
             return now - self._unbound_master_since > DEMOTE_GRACE
         self._unbound_master_since = None
         return False
+
+
+def _carp_master(ifconfig_text, vhid):
+    """CARP-master decision from ifconfig text: True/False for the vhid, None when
+    the text is missing (probe failed), True when no vhid (nothing to gate on).
+    Parsing lives in ifprobe.is_carp_master; this adds only the keeper policy that
+    a keeper with no vhid has nothing to gate on."""
+    if not vhid:
+        return True
+    return is_carp_master(ifconfig_text, vhid)
+
+
+def carp_master(iface, vhid):
+    """CARP-master role for `vhid` on `iface` (True/False, None on probe failure).
+    Needs no Keeper, so the daemon entry point can gate its startup default
+    withdraw on the role before the Keeper exists. Keeper._probe_carp_master
+    uses the same _carp_master decision."""
+    return _carp_master(ifconfig(iface), vhid)

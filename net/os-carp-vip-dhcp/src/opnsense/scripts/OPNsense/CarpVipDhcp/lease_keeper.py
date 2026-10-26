@@ -71,8 +71,9 @@ from logging.handlers import RotatingFileHandler
 
 import keeperconf
 from leasekeeper.capture_bpf import BpfCapture
+from leasekeeper.carp import carp_master
 from leasekeeper.constants import LOGGER_NAME
-from leasekeeper.keeper import Keeper, carp_master
+from leasekeeper.keeper import Keeper
 from leasekeeper.route import (
     BackupEgressConfig, BackupEgressForm, BackupEgressReconciler, DefaultRouteMode,
     DefaultRouteReconciler, withdraw_unless_master)

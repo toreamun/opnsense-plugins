@@ -202,6 +202,11 @@ T1_FACTOR = 0.5            # renew at this fraction of the lease (RFC default)
 T2_FACTOR = 0.875          # rebind by this fraction of the lease (RFC default)
 MIN_T1 = 30                # floor for the renew timer (very short leases)
 MIN_LEASE = 2 * MIN_T1     # floor for an accepted lease time, so a tiny (even hostile) opt-51 can't spin renews
+# A lease shorter than this (the server's own option 51, before the MIN_LEASE floor) is
+# temporary and ignored: a cable modem hands out such a stop-gap lease while it starts.
+# Configurable per keeper (minlease); 0 turns it off.
+MIN_LEASE_TIME_DEFAULT = 60
+MIN_LEASE_TIME_MAX = 3600
 REBIND_MARGIN = 15         # ensure T2 is at least this far past T1
 
 # Wire constants (BOOTP flags, Ethernet/IPv4 broadcast, DHCP ports).

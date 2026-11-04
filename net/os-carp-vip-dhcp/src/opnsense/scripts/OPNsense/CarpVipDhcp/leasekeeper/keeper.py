@@ -82,7 +82,8 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
                  follow=False, vendor_class=None, client_id=None, hostname=None,
                  arp_nudge=0, arp_listen_promisc=False, vlan_pcp=0,
                  send_opts=(), request_codes=(), config_error=None,
-                 default_route_mode="off", backup_egress=None, vip_bits=None, wan_gateway=None):
+                 default_route_mode="off", backup_egress=None, vip_bits=None, wan_gateway=None,
+                 min_lease_time=0):
         # Fixed identity/config, immutable once set (see _Config).
         self._cfg = _Config(
             iface=iface,
@@ -136,7 +137,8 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         id_opts = _identity_options(vendor_class, client_id, hostname, self._cfg.chaddr)
         self._dhcp = DhcpClient(
             self._capture, self._cfg.chaddr, self._cfg.eth_src,
-            ClientOptions(tuple(id_opts), tuple(send_opts), tuple(request_codes)),
+            ClientOptions(tuple(id_opts), tuple(send_opts), tuple(request_codes),
+                          min_lease_time=min_lease_time),
             hooks=DhcpHooks(
                 should_stop=lambda: self._signals.stopping,
                 ensure_sniffer=self._ensure_sniffer,
@@ -255,8 +257,10 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         # main-loop wake for an obviously-bogus peer ACK; it is NOT the
         # authoritative check. FollowPolicy re-validates plausibility (plus
         # class / expected-server / throttle) when it consumes the observation.
+        # A temporary lease (a cable modem's own, see DhcpClient.is_temporary) is no
+        # observation, as it is no answer to our own exchanges.
         if (rx.mtype == ACK and rx.yiaddr and rx.yiaddr != self._dhcp.binding.yiaddr
-                and _sane_ipv4(rx.yiaddr)):
+                and _sane_ipv4(rx.yiaddr) and not self._dhcp.is_temporary(rx)):
             self._follow.observe(rx)
             self._wake_loop()   # wake the maintain-loop sleep now, don't wait for the tick
 

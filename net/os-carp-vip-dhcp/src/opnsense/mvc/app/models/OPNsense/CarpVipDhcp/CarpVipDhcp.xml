@@ -1,6 +1,6 @@
 <model>
     <mount>//OPNsense/CarpVipDhcp</mount>
-    <version>1.4.0</version>
+    <version>1.4.1</version>
     <description>CARP-VIP DHCP lease keeper</description>
     <items>
         <keepers>
@@ -105,6 +105,22 @@
                         <options>From Send Options</options>
                     </OptionValues>
                 </clientIdentifier>
+
+                <!--
+                    A lease shorter than this (seconds, the server's own lease time) is
+                    temporary and ignored: it never moves the VIP or becomes the VIP's
+                    lease. A cable modem hands out such a stop-gap lease (192.168.100.x,
+                    tens of seconds) while it starts. 0 turns it off. A missing value
+                    (a config from before model 1.4.1) renders empty and the daemon's
+                    default applies.
+                -->
+                <minLeaseTime type="IntegerField">
+                    <Default>60</Default>
+                    <MinimumValue>0</MinimumValue>
+                    <MaximumValue>3600</MaximumValue>
+                    <ValidationMessage>Ignore leases shorter than must be 0 (off) to 3600 seconds.</ValidationMessage>
+                    <Required>N</Required>
+                </minLeaseTime>
 
                 <!-- Optional DHCP option 12 (hostname). Empty = not sent. The mask forbids
                      a pipe so the rendered keeper.conf line stays parseable. -->

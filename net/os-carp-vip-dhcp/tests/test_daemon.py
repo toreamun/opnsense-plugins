@@ -8,6 +8,7 @@ import os
 import re
 import select
 import struct
+import threading
 import time
 import types
 
@@ -43,10 +44,11 @@ def test_fs_safe(lk):
     assert lk._fs_safe("100.64.4.7") == "100_64_4_7"
 
 
-def _client(lk, id_opts=None, on_changed=None):
+def _client(lk, id_opts=None, on_changed=None, min_lease_time=0):
     """A bare DhcpClient with stub hooks and a captured send list -- the
     protocol tests need no Keeper and no capture backend."""
-    c = lk.DhcpClient(None, CHADDR_STR, CHADDR_STR, lk.ClientOptions(tuple(id_opts or [])),
+    c = lk.DhcpClient(None, CHADDR_STR, CHADDR_STR,
+                      lk.ClientOptions(tuple(id_opts or []), min_lease_time=min_lease_time),
                       hooks=lk.DhcpHooks(
                           should_stop=lambda: False,
                           ensure_sniffer=lambda: None,
@@ -3277,3 +3279,206 @@ def test_renew_lease_length_change_stays_debug(lk, caplog):
     renew = [r for r in caplog.records if "RENEW ok" in r.getMessage()]
     assert [r.levelname for r in renew] == ["DEBUG"]
     assert "->" not in renew[0].getMessage()             # no spurious [lease ...] delta
+
+
+# ---- temporary leases (#132): a lease shorter than the minimum is no answer ----
+
+_BOOTSTRAP = {"server": "192.168.100.1", "lease": 30, "router": "192.168.100.1",
+              "mask": "255.255.255.0"}   # a cable modem's own lease while it starts
+
+
+@pytest.mark.parametrize("lease, minimum, temporary", [
+    (30, 60, True),      # the modem's bootstrap lease
+    (59, 60, True),
+    (60, 60, False),     # exactly the minimum is a real lease
+    (300, 60, False),
+    (None, 60, False),   # no option 51: the server did not say, so not temporary
+    (30, 0, False),      # 0 turns the rule off
+])
+def test_temporary_lease_is_judged_on_the_server_value(lk, lease, minimum, temporary):
+    # The server's own option 51, not the MIN_LEASE floor (a 30 s offer is floored to
+    # 60 s once absorbed, so the floored value could never be "shorter than 60").
+    c = _client(lk, min_lease_time=minimum)
+    rx = _reply(lk, lk.OFFER, "192.168.100.10", **{**_BOOTSTRAP, "lease": lease})
+    c.feed(rx)
+    got = c._wait_for_dhcp_reply(lk.OFFER, 0.2, "DORA")
+    assert got is (None if temporary else rx)
+
+
+def test_temporary_lease_never_touches_the_binding_and_a_nak_still_counts(lk):
+    c = _client(lk, min_lease_time=60)
+    c.feed(_reply(lk, lk.ACK, "192.168.100.10", **_BOOTSTRAP))
+    assert c._wait_for_dhcp_reply(lk.ACK, 0.2, "DORA") is None
+    assert c.binding.yiaddr is None and c.binding.server is None   # 192.168.100.1 never kept
+    c.feed(_reply(lk, lk.NAK, server="100.64.4.1", lease=None))
+    assert c._wait_for_dhcp_reply(lk.ACK, 0.2, "DORA").mtype == lk.NAK   # a NAK is still an answer
+
+
+def test_temporary_lease_is_logged_once_until_a_real_lease(lk, caplog):
+    c = _client(lk, min_lease_time=60)
+    temp = _reply(lk, lk.OFFER, "192.168.100.10", **_BOOTSTRAP)
+    with caplog.at_level("INFO", logger="lease-keeper"):
+        for _ in range(3):
+            c.feed(temp)
+            c._wait_for_dhcp_reply(lk.OFFER, 0.1, "DORA")
+        assert caplog.text.count("ignoring a temporary lease") == 1
+        assert "192.168.100.10 from 192.168.100.1 for 30s" in caplog.text
+        c._absorb_reply(_reply(lk, lk.ACK, "100.64.4.7", lease=1800), lk.DEFAULT_LEASE)
+        c.feed(temp)
+        c._wait_for_dhcp_reply(lk.OFFER, 0.1, "DORA")
+    assert caplog.text.count("ignoring a temporary lease") == 2   # a new episode logs again
+
+
+def _answering_client(lk, monkeypatch, answers, **kw):
+    """A client whose every send is answered at once by the next reply in `answers`
+    (None = silence), through the real _wait_for_dhcp_reply; timeouts and backoff
+    shortened so a full DORA runs in well under a second."""
+    monkeypatch.setattr("leasekeeper.dhcpclient.REPLY_TIMEOUT", 0.05)
+    monkeypatch.setattr("leasekeeper.dhcpclient.RENEW_TIMEOUT", 0.05)
+    monkeypatch.setattr(lk.time, "sleep", lambda *_a, **_k: None)
+    c = _client(lk, **kw)
+    replies = iter(answers)
+
+    def send(mtype, extra, ciaddr="0.0.0.0"):
+        c.sent.append((mtype, extra, ciaddr))
+        rx = next(replies, None)
+        if rx is not None:
+            c.feed(rx)
+    c._send_dhcp = send
+    return c
+
+
+_REAL = {"server": "100.64.4.1", "lease": 1800, "router": "100.64.4.1", "mask": "255.255.255.0"}
+
+
+def _temp_ack(lk):
+    return _reply(lk, lk.ACK, "192.168.100.10", **_BOOTSTRAP)
+
+
+def test_dora_with_only_temporary_offers_keeps_nothing(lk, monkeypatch):
+    # The modem answers every DISCOVER with its bootstrap lease: nothing is kept, the
+    # acquire just fails (and the keeper retries later).
+    temp = _reply(lk, lk.OFFER, "192.168.100.10", **_BOOTSTRAP)
+    c = _answering_client(lk, monkeypatch, [temp] * 10, min_lease_time=60)
+    assert c.dora("192.168.1.50") is False
+    assert c.binding.yiaddr is None and c.binding.server is None
+
+
+def test_a_temporary_ack_to_the_request_is_never_followed(lk, monkeypatch):
+    # A real OFFER, then the modem ACKs the REQUEST with its own lease: without the rule
+    # that different address goes to on_changed_address (the #132 follow).
+    changed = []
+    c = _answering_client(lk, monkeypatch,
+                          [_reply(lk, lk.OFFER, "100.64.4.7", **_REAL)] + [_temp_ack(lk)] * 20,
+                          min_lease_time=60, on_changed=lambda *a: changed.append(a) or True)
+    assert c.dora("100.64.4.7") is False
+    assert not changed
+    assert c.binding.yiaddr is None and c.binding.server == "100.64.4.1"   # the offerer, not the modem
+
+
+@pytest.mark.parametrize("rebind", [False, True])
+def test_a_temporary_ack_for_another_address_at_renewal_is_never_followed(lk, monkeypatch, rebind):
+    changed = []
+    c = _answering_client(lk, monkeypatch, [_temp_ack(lk)] * 5, min_lease_time=60,
+                          on_changed=lambda *a: changed.append(a) or True)
+    c.adopt(_reply(lk, lk.ACK, "100.64.4.7", **_REAL))
+    assert c.renew(rebind=rebind) is False
+    assert not changed
+    assert c.binding.yiaddr == "100.64.4.7" and c.binding.lease_secs == 1800
+    assert c.binding.server == "100.64.4.1"
+
+
+def test_init_reboot_skips_temporary_acks_and_binds_the_real_lease(lk, monkeypatch):
+    # Power cut: firewall and modem start together. INIT-REBOOT gets only the modem's
+    # ACKs (one per attempt), falls back to DISCOVER, and binds the ISP's lease.
+    changed = []
+    c = _answering_client(lk, monkeypatch, [_temp_ack(lk)] * lk.REBOOT_ATTEMPTS + [
+        _reply(lk, lk.OFFER, "100.64.4.7", **_REAL), _reply(lk, lk.ACK, "100.64.4.7", **_REAL)],
+        min_lease_time=60, on_changed=lambda *a: changed.append(a) or True)
+    assert c.acquire("100.64.4.7") is True
+    assert not changed
+    assert c.binding.yiaddr == "100.64.4.7" and c.binding.server == "100.64.4.1"
+
+
+def test_init_reboot_with_only_temporary_acks_keeps_nothing(lk, monkeypatch):
+    changed = []
+    c = _answering_client(lk, monkeypatch, [_temp_ack(lk)] * 20, min_lease_time=60,
+                          on_changed=lambda *a: changed.append(a) or True)
+    assert c.acquire("100.64.4.7") is False
+    assert not changed
+    assert c.binding.yiaddr is None and c.binding.server is None
+
+
+def test_a_temporary_reply_never_replaces_a_real_one_waiting_to_be_read(lk):
+    # The ISP answers first and the modem right after, both before the waiting thread
+    # reads the reply: the real answer must still be the one returned.
+    c = _client(lk, min_lease_time=60)
+    real = _reply(lk, lk.OFFER, "100.64.4.7", **_REAL)
+    c.feed(real)
+    c.feed(_reply(lk, lk.OFFER, "192.168.100.10", **_BOOTSTRAP))
+    assert c._wait_for_dhcp_reply(lk.OFFER, 0.5, "DORA") is real
+
+
+def test_a_real_lease_later_in_the_same_wait_is_taken(lk):
+    c = _client(lk, min_lease_time=60)
+    c.feed(_reply(lk, lk.OFFER, "192.168.100.10", **_BOOTSTRAP))
+    real = _reply(lk, lk.OFFER, "100.64.4.7", **_REAL)
+    timer = threading.Timer(0.05, c.feed, [real])
+    timer.start()
+    try:
+        assert c._wait_for_dhcp_reply(lk.OFFER, 2.0, "DORA") is real
+    finally:
+        timer.cancel()
+
+
+@pytest.mark.parametrize("minimum, observed", [(60, False), (0, True)])
+def test_a_temporary_peer_ack_is_no_observation(lk, tmp_path, minimum, observed):
+    # The peer's exchange on our shared chaddr: the modem's lease is not recorded for a
+    # follow (0 = rule off: it is, as before).
+    keeper = _follow_keeper(lk, tmp_path, min_lease_time=minimum)
+    keeper._dhcp.xid = 0x11111111
+    keeper._on_dhcp_reply(_dhcp_frame(lk, 0x22222222, [
+        ("message-type", lk.ACK), ("server_id", "192.168.100.1"), ("lease_time", 30), "end"],
+        yiaddr="192.168.100.10"))
+    assert (keeper._follow._observed is not None) is observed
+    assert _woken(keeper) is observed
+
+
+def test_dora_binds_the_real_lease_after_a_temporary_one(lk, monkeypatch):
+    c = _answering_client(lk, monkeypatch, [
+        _reply(lk, lk.OFFER, "192.168.100.10", **_BOOTSTRAP),   # DISCOVER 1: the modem
+        _reply(lk, lk.OFFER, "100.64.4.7", **_REAL),            # DISCOVER 2: the ISP
+        _reply(lk, lk.ACK, "100.64.4.7", **_REAL),              # REQUEST
+    ], min_lease_time=60)
+    assert c.dora("100.64.4.7") is True
+    assert c.binding.yiaddr == "100.64.4.7" and c.binding.server == "100.64.4.1"
+
+
+def test_a_temporary_ack_to_a_renew_keeps_the_held_lease(lk, monkeypatch):
+    c = _answering_client(lk, monkeypatch, [_reply(lk, lk.ACK, "100.64.4.7", server="100.64.4.1",
+                                                   lease=30)] * 3, min_lease_time=60)
+    c.adopt(_reply(lk, lk.ACK, "100.64.4.7", server="100.64.4.1", lease=1800))
+    assert c.renew() is False                          # treated as no answer...
+    assert c.binding.yiaddr == "100.64.4.7" and c.binding.lease_secs == 1800   # ...the lease stands
+
+
+def test_keeper_passes_the_minimum_lease_time_to_its_client(lk):
+    assert _keeper(lk)._dhcp._min_lease_time == 0                       # library default: off
+    assert _keeper(lk, min_lease_time=60)._dhcp._min_lease_time == 60
+
+
+@pytest.mark.parametrize("case", [
+    ("|minlease=30", 30, False),
+    ("|minlease=0", 0, False),
+    ("", 60, False),                 # an older template without the key: the default
+    ("|minlease=", 60, False),       # empty = not set
+    ("|minlease=5000", 60, True),    # out of range (only via a hand-edited config.xml)
+    ("|minlease=-5", 60, True),
+    ("|minlease=soon", 60, True)])
+def test_main_min_lease_time_from_keeper_conf(monkeypatch, tmp_path, caplog, case):
+    # case = (fields, the minimum the keeper gets, whether it warns).
+    fields, expected, warns = case
+    rc, built = _conf_main(monkeypatch, tmp_path, _CONF_LINE + fields, "--keeper-id", "100_64_4_7")
+    assert rc == 0 and built["kwargs"]["min_lease_time"] == expected
+    assert ("invalid minimum lease time" in caplog.text) == warns
+    assert ("the default of 60s applies" in caplog.text) == warns

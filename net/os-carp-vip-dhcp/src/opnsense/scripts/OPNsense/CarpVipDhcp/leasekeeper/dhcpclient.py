@@ -102,10 +102,13 @@ class ClientOptions:
     """What the client adds to its requests: the identity options (vendor class,
     client-id, hostname; see _identity_options), the operator's Send Options as
     raw (code, bytes) and the Request Options codes that lead the Parameter
-    Request List (see wire.request_list)."""
+    Request List (see wire.request_list). Also what it accepts: min_lease_time, the
+    shortest lease (the server's option 51) it takes as an answer; a shorter one is
+    temporary and dropped (see DhcpClient.feed and is_temporary). 0 = off."""
     id_opts: tuple
     send_opts: tuple = ()
     request_codes: tuple = ()
+    min_lease_time: int = 0
 
 
 @dataclass(frozen=True)
@@ -150,6 +153,9 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
         self._ensure_sniffer = hooks.ensure_sniffer
         self._on_changed = hooks.on_changed_address
 
+        self._min_lease_time = options.min_lease_time   # 0 = off; see is_temporary
+        self._temporary_logged = False   # logged once until a real lease is absorbed
+
         self.xid = _new_xid()
         self.binding = Lease()         # the held (or last-held) DHCP binding
         self._tried_reboot = False     # the first acquire tries INIT-REBOOT before a full DISCOVER
@@ -173,9 +179,13 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
 
     def feed(self, rx):
         """Hand a first-party (xid-matched) DhcpReply to the waiting sequence.
-        Called on the sniffer thread; a lone ref-assign plus the event set."""
-        self._rx = rx
+        Called on the sniffer thread; a lone ref-assign plus the event set. A
+        temporary lease (see is_temporary) is no answer and is dropped here, so it
+        never replaces a real answer still waiting to be read."""
         LOG.debug("DHCP reply: %s", _fmt_reply(rx))
+        if self.is_temporary(rx):
+            return
+        self._rx = rx
         self._reply_ready.set()
 
     def _send_dhcp(self, mtype, extra, ciaddr="0.0.0.0"):
@@ -218,6 +228,22 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
                 return rx
         return None
 
+    def is_temporary(self, rx):
+        """True when rx offers a lease shorter than the minimum lease time: a stop-gap
+        lease (a cable modem hands one out from 192.168.100.1 while it starts), which
+        must never move the VIP or become the VIP's lease. Judged on the server's own
+        option 51, before the MIN_LEASE floor; a NAK, or a reply without option 51,
+        is not temporary. Logged once until a real lease is absorbed."""
+        if (rx.mtype == NAK or not self._min_lease_time or rx.lease is None
+                or rx.lease >= self._min_lease_time):
+            return False
+        if not self._temporary_logged:
+            self._temporary_logged = True
+            LOG.info("ignoring a temporary lease: %s from %s for %ss, shorter than the "
+                     "minimum of %ss (Ignore leases shorter than) -- waiting for a real lease",
+                     rx.yiaddr, rx.server_id or "unknown", rx.lease, self._min_lease_time)
+        return True
+
     def _absorb_reply(self, rx, default_lease, fresh_bind=False):
         """Adopt lease timing, gateway (opt 3) and subnet mask (opt 1) from an ACK
         -- the one place that knows which DhcpReply fields carry lease state.
@@ -226,6 +252,7 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
         MIN_LEASE so a server (or a spoofed ACK) offering a 1-second lease cannot
         drive the renew loop into a tight broadcast/CPU spin. fresh_bind: this ACK
         is a new binding (a DORA/adopt), not a renew of the held lease."""
+        self._temporary_logged = False   # a real lease: log the next temporary one again
         self.binding.lease_secs = max(rx.lease or default_lease, MIN_LEASE)
         self.binding.t1_server, self.binding.t2_server = rx.t1, rx.t2
         self.binding.router = rx.router or self.binding.router

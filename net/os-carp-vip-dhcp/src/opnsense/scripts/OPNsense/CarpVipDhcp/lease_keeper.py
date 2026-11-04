@@ -72,7 +72,7 @@ from logging.handlers import RotatingFileHandler
 import keeperconf
 from leasekeeper.capture_bpf import BpfCapture
 from leasekeeper.carp import carp_master
-from leasekeeper.constants import LOGGER_NAME
+from leasekeeper.constants import LOGGER_NAME, MIN_LEASE_TIME_DEFAULT, MIN_LEASE_TIME_MAX
 from leasekeeper.keeper import Keeper
 from leasekeeper.route import (
     BackupEgressConfig, BackupEgressForm, BackupEgressReconciler, DefaultRouteMode,
@@ -115,6 +115,7 @@ _CONF_VALUES = {
     "reqopts": "request_options",
     "vipbits": "vip_bits",
     "wangw": "wan_gateway",
+    "minlease": "min_lease_time",
 }
 _CONF_FLAGS = {
     "follow": "follow",
@@ -129,6 +130,8 @@ _CONF_INTS = {
     "arp_nudge": ("ARP nudge interval", None, "the nudge stays off"),
     "vlan_pcp": ("VLAN priority", VLAN_PCP_VALUES, "no VLAN priority is set"),
     "vip_bits": ("VIP prefix length", range(1, 33), "the prefix is not followed"),
+    "min_lease_time": ("minimum lease time", range(0, MIN_LEASE_TIME_MAX + 1),
+                       f"the default of {MIN_LEASE_TIME_DEFAULT}s applies"),
 }
 
 
@@ -219,7 +222,7 @@ def _record_defaults(record):
     line still wins. An empty field means "not set" in keeper.conf and leaves the
     parser default; a flag field turns the flag on only when it is "1". An integer
     field (_CONF_INTS) that is not a number or is out of range (only reachable via a
-    hand-edited config.xml) is dropped with a warning, so its option keeps the off
+    hand-edited config.xml) is dropped with a warning, so its option keeps its
     default instead of argparse exiting 2 into a daemon(8) -r crash loop."""
     defaults = {dest: record[key] for key, dest in _CONF_VALUES.items() if record.get(key)}
     defaults.update({dest: True for key, dest in _CONF_FLAGS.items() if record.get(key) == "1"})
@@ -277,6 +280,10 @@ def _build_arg_parser():
                          "turns the dialog's Send Options into this form)")
     ap.add_argument("--request-options", default="", metavar="CODE,...",
                     help="DHCP option codes to request before the keeper's own")
+    ap.add_argument("--min-lease-time", type=int, default=MIN_LEASE_TIME_DEFAULT,
+                    metavar=f"0-{MIN_LEASE_TIME_MAX}",
+                    help="ignore a lease shorter than this many seconds (a stop-gap lease, "
+                         "such as a cable modem's own while it starts); 0 = off")
     ap.add_argument("--vip-bits", type=int, default=None, metavar="1-32",
                     help="the CARP VIP's configured prefix length; a following keeper "
                          "corrects it when the lease's subnet mask differs")
@@ -421,7 +428,8 @@ def main():
                         send_opts=send_opts, request_codes=request_codes, config_error=config_error,
                         default_route_mode=args.default_route_mode,
                         backup_egress=backup_egress,
-                        vip_bits=args.vip_bits, wan_gateway=args.wan_gateway)
+                        vip_bits=args.vip_bits, wan_gateway=args.wan_gateway,
+                        min_lease_time=args.min_lease_time)
 
         # The Keeper is constructed, so its wake socketpair is now open: guarantee
         # keeper.close() on EVERY path from here -- the --once return, a normal run,

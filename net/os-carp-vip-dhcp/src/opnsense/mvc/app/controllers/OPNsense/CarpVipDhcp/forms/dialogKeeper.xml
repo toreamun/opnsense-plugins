@@ -57,6 +57,13 @@
         <help><![CDATA[DHCP option 61, the client identity some ISPs use instead of the MAC address. <b>Default</b>: hardware type 1 + the client MAC (the CARP virtual MAC, or the override above), the same as a normal OPNsense WAN with an empty Hostname field. Both HA nodes send the same identity by design. <b>None</b>: no option 61 is sent; keepers upgraded from a version that sent none keep this. <b>From Send Options</b>: the <code>dhcp-client-identifier</code> line in Send Options (text in quotes, or colon-separated hex). Changing this changes the identity the ISP sees, so an ISP that uses option 61 may refuse the keeper until the old lease runs out, or give a new address. Only if normal WAN DHCP still runs on the same interface next to the keeper, the two must have different identities.]]></help>
     </field>
     <field>
+        <id>keeper.minLeaseTime</id>
+        <label>Ignore leases shorter than (seconds)</label>
+        <type>text</type>
+        <advanced>true</advanced>
+        <help><![CDATA[A lease shorter than this is treated as temporary and ignored: it never moves the VIP or becomes the VIP's lease, and the keeper keeps asking for a real one. This covers devices that hand out a stop-gap lease while they start, such as a cable modem's own 30-second lease from 192.168.100.1. Default 60; 0 turns this off. Set it lower only if your ISP really hands out leases shorter than a minute.]]></help>
+    </field>
+    <field>
         <id>keeper.vlanPriority</id>
         <label>Use VLAN priority</label>
         <type>dropdown</type>

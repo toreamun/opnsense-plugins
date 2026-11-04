@@ -73,9 +73,9 @@ def test_parsers_read_the_real_ngctl_text():
     # getconfig prints decimal values in its own field order and drops zero fields.
     assert vm._parse_config(GETCONFIG) == WANTED
     assert vm._parse_config("Args:\t{ count=0 }") is None
-    assert vm._parse_stats(GETSTATS) == (5, 5, 0)
-    assert vm._parse_stats("Args:\t{}") == (0, 0, 0)
-    assert vm._parse_stats("Args:\t{ Received=9 Patched=7 Dropped=2 }") == (9, 7, 2)
+    assert vm._parse_dropped(GETSTATS) == 0
+    assert vm._parse_dropped("Args:\t{}") == 0
+    assert vm._parse_dropped("Args:\t{ Received=9 Patched=7 Dropped=2 }") == 2
 
 
 @pytest.mark.parametrize("vhid, ops", [
@@ -127,6 +127,7 @@ def test_off_at_startup_removes_only_a_leftover_without_probing(ng):
     probed = []
     _egress(enabled=False).teardown_unless_master(lambda: probed.append(1), leftover=True)
     assert ng.verbs() == ["show"] and not probed           # one show, no node: nothing else
+    assert [c[0] for c in ng.calls] == ["/sbin/kldstat", "/usr/sbin/ngctl"]
     ng.add_patch(NODE, "vtnet0", config=WANTED)
     ng.calls.clear()
     _egress(enabled=False).teardown_unless_master(lambda: probed.append(1), leftover=True)
@@ -270,6 +271,8 @@ def test_an_interface_without_an_ether_node_is_refused(ng):
 
 @pytest.mark.parametrize("chaddr, vhid, state", [
     (VMAC, None, "refused:no-vhid"),
+    (VMAC, "soon", "refused:bad-vhid"),        # a hand-edited keeper.conf: no crash, refused
+    (VMAC, "300", "refused:bad-vhid"),
     ("02:11:22:33:44:55", VHID, "refused:mac-override"),
     ("not-a-mac", VHID, "refused:bad-mac")])
 def test_a_config_the_option_cannot_serve_is_refused_and_torn_down(ng, chaddr, vhid, state):
@@ -435,3 +438,75 @@ def test_an_unnamed_leftover_on_the_hooks_is_scrubbed(ng, caplog, role):
     assert "<unnamed>" not in ng.nodes
     assert _built(ng) is role and e.status() == ("built" if role else "native")
     assert sum("unnamed patch node" in r.getMessage() for r in _warnings(caplog)) == 1
+
+
+# ---- review findings (2026-11-05) ----
+
+def test_a_bad_vhid_never_raises_even_when_off(ng):
+    for vhid in ("soon", "-1", "0x95", "999"):
+        e = _egress(enabled=False, vhid=vhid)
+        e.teardown_unless_master(lambda: True, leftover=True)   # main()'s startup call
+        assert e.status() is None
+    assert not ng.mutations()
+
+
+def test_a_shared_interface_is_refused_and_its_node_left_alone_when_off(ng):
+    ng.add_patch(NODE, "vtnet0", config=WANTED)             # another keeper's live rewrite
+    off = vm.VmacEgress("vtnet0", VMAC, VHID, enabled=False, shared_iface=True)
+    off.teardown_unless_master(lambda: True, leftover=True)
+    assert _built(ng) and not ng.calls                       # not even a kldstat
+    on = vm.VmacEgress("vtnet0", VMAC, VHID, enabled=True, shared_iface=True)
+    on.reconcile(True)
+    assert on.status() == "refused:shared-iface"
+
+
+def test_the_off_sweep_runs_no_ngctl_without_ng_patch(lk, monkeypatch):
+    fake = FakeNgctl(knobs=NgKnobs(patch_unloaded=True))
+    monkeypatch.setattr(lk.subprocess, "run", fake.run)
+    _egress(enabled=False).teardown_unless_master(lambda: True, leftover=True)
+    assert [c[0] for c in fake.calls] == ["/sbin/kldstat"]   # ngctl could load ng_socket
+
+
+def test_a_transient_ngctl_error_never_rebuilds_a_working_graph(ng, caplog):
+    e = _egress()
+    e.reconcile(True)
+    ng.knobs.show_fails = True
+    with caplog.at_level(logging.WARNING, logger="lease-keeper"):
+        e.reconcile(True)
+        e.reconcile(True)
+    assert len(ng.builds()) == 1 and not [c for c in ng.calls if c[1:2] == ["shutdown"]]
+    assert e.status() == "unavailable:ngctl" and len(_warnings(caplog)) == 1
+    ng.knobs.show_fails = False
+    e.reconcile(True)
+    assert _built(ng) and e.status() == "built" and len(ng.builds()) == 1
+
+
+def test_a_lying_shutdown_warns_once_per_episode(lk, monkeypatch, caplog):
+    fake = FakeNgctl(knobs=NgKnobs(shutdown_lies=True))
+    monkeypatch.setattr(lk.subprocess, "run", fake.run)
+    monkeypatch.setattr(vm, "_dhclient_running", lambda _iface: False)
+    fake.add_patch(NODE, "vtnet0", config=WANTED)
+    e = _egress()
+    with caplog.at_level(logging.WARNING, logger="lease-keeper"):
+        for _ in range(4):
+            e.reconcile(False)
+    assert sum("still present after shutdown" in r.getMessage() for r in _warnings(caplog)) == 1
+
+
+def test_a_failed_build_logs_one_error_and_nothing_else(lk, monkeypatch, caplog):
+    fake = FakeNgctl(knobs=NgKnobs(fail_after=2))
+    monkeypatch.setattr(lk.subprocess, "run", fake.run)
+    monkeypatch.setattr(vm, "_dhclient_running", lambda _iface: False)
+    e = _egress()
+    with caplog.at_level(logging.WARNING, logger="lease-keeper"):
+        e.reconcile(True)
+        e.reconcile(None)                                    # an UNKNOWN blip in between
+        e.reconcile(True)
+    assert [r.levelno for r in _warnings(caplog)] == [logging.ERROR]
+    assert "send msg: File exists" in caplog.text            # ngctl's own text is in the line
+
+
+def test_dhclient_running_survives_a_huge_pid(tmp_path, monkeypatch):
+    monkeypatch.setattr(vm, "_DHCLIENT_PID", str(tmp_path / "dhclient.{}.pid"))
+    (tmp_path / "dhclient.vtnet0.pid").write_text("99999999999999999999999\n")
+    assert vm._dhclient_running("vtnet0") is False

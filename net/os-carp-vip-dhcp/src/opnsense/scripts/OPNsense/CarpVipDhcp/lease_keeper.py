@@ -219,6 +219,26 @@ def _find_record(conf, keeper_id):
     return None
 
 
+def _macs_valid(args):
+    """True when the chaddr and eth-src (when given) are MAC addresses; logs the first
+    invalid one (the keeper cannot start)."""
+    for label, mac in (("chaddr", args.chaddr), ("eth-src", args.eth_src)):
+        if mac and not MAC_RE.match(mac):
+            LOG.critical("invalid %s MAC address %r -- the lease keeper cannot start", label, mac)
+            return False
+    return True
+
+
+def _iface_shared(args):
+    """True when another keeper.conf record names this keeper's interface: its CARP VIP
+    would send from this keeper's lease MAC too, and the interface has room for one
+    source-MAC rewrite (vmac.py). Without --conf there is no other record to see."""
+    if not args.conf:
+        return False
+    return any(r.get("iface") == args.iface and keeperconf.keeper_id(r["request"]) != args.keeper_id
+               for r in keeperconf.keeper_records(args.conf))
+
+
 def _record_defaults(record):
     """Parser defaults from a keeper.conf record, so an option given on the command
     line still wins. An empty field means "not set" in keeper.conf and leaves the
@@ -390,6 +410,9 @@ def main():
         # Built before the fail-stop so the startup reconciler can clean the backup-egress
         # routes this feature manages when it is enabled (else a node coming up as master
         # with a stale /1 a crashed predecessor left would loop its egress).
+        # The source-MAC rewrite (vmac.py), shared by the fail-stop below and the Keeper.
+        vmac = VmacEgress(args.iface, args.chaddr, args.vhid, enabled=args.vmac_egress,
+                          shared_iface=_iface_shared(args))
         backup_egress = BackupEgressConfig(
             enabled=args.backup_egress,
             form=args.backup_egress_form,
@@ -411,10 +434,9 @@ def main():
                 DefaultRouteReconciler(args.default_route_mode),
                 BackupEgressReconciler(args.default_route_mode, backup_egress=backup_egress),
                 lambda: carp_master(args.iface, args.vhid))
-            # Same rule for the source-MAC rewrite (vmac.py): a crashed predecessor's graph
-            # is kept only on a confirmed master; off, only a leftover node is removed.
-            VmacEgress(args.iface, args.chaddr, args.vhid, enabled=args.vmac_egress).teardown_unless_master(
-                lambda: carp_master(args.iface, args.vhid), leftover=True)
+            # Same rule for the source-MAC rewrite: a crashed predecessor's graph is kept
+            # only on a confirmed master; off, only a leftover node of ours is removed.
+            vmac.teardown_unless_master(lambda: carp_master(args.iface, args.vhid), leftover=True)
 
         # Fail fast (with a logged reason) if the raw /dev/bpf backend cannot run
         # on this host (e.g. fcntl missing off FreeBSD).
@@ -423,10 +445,8 @@ def main():
             LOG.critical("capture backend cannot run: %s -- the lease keeper cannot start", reason)
             return 3
 
-        for label, mac in (("chaddr", args.chaddr), ("eth-src", args.eth_src)):
-            if mac and not MAC_RE.match(mac):
-                LOG.critical("invalid %s MAC address %r -- the lease keeper cannot start", label, mac)
-                return 2
+        if not _macs_valid(args):
+            return 2
 
         send_opts, request_codes, vendor_class, client_id, config_error = _dhcp_option_settings(args)
         keeper = Keeper(args.iface, args.chaddr, args.request, args.eth_src,
@@ -439,7 +459,7 @@ def main():
                         default_route_mode=args.default_route_mode,
                         backup_egress=backup_egress,
                         vip_bits=args.vip_bits, wan_gateway=args.wan_gateway,
-                        min_lease_time=args.min_lease_time, vmac_egress=args.vmac_egress)
+                        min_lease_time=args.min_lease_time, vmac=vmac)
 
         # The Keeper is constructed, so its wake socketpair is now open: guarantee
         # keeper.close() on EVERY path from here -- the --once return, a normal run,

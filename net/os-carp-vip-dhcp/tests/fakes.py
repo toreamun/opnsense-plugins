@@ -127,12 +127,15 @@ class NgKnobs:
     """Failure knobs for FakeNgctl. missing: every command could not run (None).
     kldload_fails: kldload exits 1. lying: `-f -` exits 0 and changes nothing.
     fail_after: `-f -` applies its first N lines, then exits 1. shutdown_lies:
-    shutdown exits 0 and leaves the node."""
+    shutdown exits 0 and leaves the node. patch_unloaded: kldstat finds no ng_patch.
+    show_fails: `show` of an existing node exits 1 with another error (not ENOENT)."""
     missing: bool = False
     kldload_fails: bool = False
     lying: bool = False
     fail_after: "int | None" = None
     shutdown_lies: bool = False
+    patch_unloaded: bool = False
+    show_fails: bool = False
 
 
 @dataclass
@@ -153,7 +156,9 @@ class FakeNgctl:
     """In-memory stand-in for /usr/sbin/ngctl + /sbin/kldload (monkeypatched onto
     subprocess.run), printing what the real tools print on FreeBSD 15 (captured on the
     bench, 2026-11-04). `nodes` holds the ether node of each interface and any patch
-    node; `calls` logs every argv (with the stdin script appended for `-f -`)."""
+    node; `calls` logs every argv (with the stdin script appended for `-f -`). It keeps
+    its own copies of the names and texts (`<unnamed>`, the hook mapping) on purpose,
+    so it stays an independent oracle for vmac.py rather than echoing it."""
 
     def __init__(self, ifaces=("vtnet0",), knobs=None):
         self.nodes = {i.replace(".", "_"): NgNode("ether") for i in ifaces}
@@ -178,6 +183,10 @@ class FakeNgctl:
         """The calls that change the graph or load modules (an inert path runs none)."""
         return [c for c in self.calls if c[1:2] in (["-f"], ["shutdown"]) or c[0].endswith("kldload")]
 
+    def builds(self):
+        """The `-f -` build sessions run."""
+        return [c for c in self.calls if c[1:2] == ["-f"]]
+
     def verbs(self):
         """The ngctl verbs called, in order (msg calls as msg:<what>)."""
         return [c[1] if c[1] != "msg" else f"msg:{c[3]}" for c in self.calls if c[0].endswith("ngctl")]
@@ -191,6 +200,8 @@ class FakeNgctl:
             return None
         if cmd[0].endswith("kldload"):
             return _ng_reply(1 if self.knobs.kldload_fails else 0, "", "kldload: can't load")
+        if cmd[0].endswith("kldstat"):
+            return _ng_reply(1 if self.knobs.patch_unloaded else 0, "")
         handlers = {"show": lambda a: self._show(a[0].rstrip(":")),
                     "msg": lambda a: self._msg(a[0].rstrip(":"), a[1]),
                     "shutdown": lambda a: self._shutdown(a[0].rstrip(":")),
@@ -202,6 +213,8 @@ class FakeNgctl:
         node = self.nodes.get(name)
         if node is None:
             return _ng_reply(71, "", _NG_MISSING)
+        if self.knobs.show_fails and node.type == "patch":
+            return _ng_reply(1, "", "ngctl: send msg: No buffer space available")
         out = f"  Name: {name:<15} Type: {node.type:<15} ID: 0000000d   Num hooks: {len(node.hooks)}\n"
         if node.hooks:
             out += ("  Local hook      Peer name       Peer type    Peer ID         Peer hook      \n"

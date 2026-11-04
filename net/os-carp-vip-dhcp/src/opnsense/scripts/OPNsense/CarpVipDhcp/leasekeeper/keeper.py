@@ -84,7 +84,7 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
                  arp_nudge=0, arp_listen_promisc=False, vlan_pcp=0,
                  send_opts=(), request_codes=(), config_error=None,
                  default_route_mode="off", backup_egress=None, vip_bits=None, wan_gateway=None,
-                 min_lease_time=0, vmac_egress=False):
+                 min_lease_time=0, vmac=None):
         # Fixed identity/config, immutable once set (see _Config).
         self._cfg = _Config(
             iface=iface,
@@ -176,8 +176,8 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         mode = DefaultRouteMode.coerce(default_route_mode)
         self._defroute = DefaultRouteReconciler(mode)
         self._backup = BackupEgressReconciler(mode, backup_egress=backup_egress)
-        # Source-MAC rewrite while master (experimental; vmac.py). Inert when off.
-        self._vmac = VmacEgress(iface, self._cfg.chaddr, self._cfg.vhid, enabled=vmac_egress)
+        # Source-MAC rewrite while master (experimental; vmac.py), built by main(). Inert when off.
+        self._vmac = vmac if vmac is not None else VmacEgress(iface, self._cfg.chaddr, self._cfg.vhid)
 
         self.redora_wait = REDORA_MIN
         # Link-return fast path (only while UNBOUND): a carrier down->up edge
@@ -462,10 +462,12 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         REBIND loop never spawn two ifconfigs or let the poll and the reconcile
         drift apart. Returns the probed role for any further per-tick use (the ARP
         nudge). Pass an already-probed role to skip the ifconfig."""
-        if master is _UNSET:
+        probed = master is _UNSET
+        if probed:
             master = self._probe_carp_master()
         self._role.poll(master)
-        self._vmac.reconcile(master)
+        if probed:   # a role passed in is the gate's substitute; the gate reconciled the raw probe
+            self._vmac.reconcile(master)
         self._reconcile_default_route(master)
         return master
 

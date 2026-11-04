@@ -18,7 +18,12 @@ fail-closed rule route.py uses for the default route.
 
 Inert when off: a disabled VmacEgress runs no command from reconcile() or at keeper
 shutdown and reports no status; only main()'s startup call removes a leftover node of
-ours (one `ngctl show`), which is how a graph goes away after the option was switched off.
+ours (one `kldstat`, and one `ngctl show` when ng_patch is loaded at all), which is how
+a graph goes away after the option was switched off.
+
+One interface has one upper hook, so one rewrite: a keeper whose interface also carries
+another keeper's CARP VIP refuses the option (that VIP would send from this MAC too), and
+an off keeper there leaves the node alone at startup (it may be the other keeper's).
 
 Concurrency: main loop thread only (Keeper._role_tick, the _maintain_step gate, the
 process boundaries). Never kldload or build from the capture thread or a signal handler.
@@ -29,6 +34,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from enum import StrEnum
+from typing import NamedTuple
 
 from .constants import LOGGER_NAME, RECONCILE_HEARTBEAT_INTERVAL
 from .route import DEFAULT_UNREADABLE_ROLE_STRIKES, _UnreadableRole, _log_at
@@ -39,13 +45,16 @@ LOG = logging.getLogger(LOGGER_NAME)
 
 NGCTL = "/usr/sbin/ngctl"
 KLDLOAD = "/sbin/kldload"
+KLDSTAT = "/sbin/kldstat"
 _MODULES = ("ng_ether", "ng_patch")
 _NODE_PREFIX = "vmac_"
 _NODE_NAME_MAX = 31                       # NG_NODESIZ (32) less the terminating NUL
 _DHCLIENT_PID = "/var/run/dhclient.{}.pid"
 _HOOK_IN = "in"                           # patch hook fed by the ether node's upper
 _HOOK_OUT = "out"                         # patch hook that feeds the ether node's lower
+_ETHER_HOOKS = ("upper", "lower")         # the ether node's hooks the graph takes
 _UNNAMED = "<unnamed>"                    # how ngctl show names a peer without a name
+_ENOENT = "No such file or directory"     # ngctl's text (exit 71) for a node that is not there
 
 
 class VmacState(StrEnum):
@@ -56,8 +65,10 @@ class VmacState(StrEnum):
     NATIVE = "native"
     UNKNOWN = "unknown"
     NO_VHID = "refused:no-vhid"
+    BAD_VHID = "refused:bad-vhid"
     MAC_OVERRIDE = "refused:mac-override"
     BAD_MAC = "refused:bad-mac"
+    SHARED_IFACE = "refused:shared-iface"
     DHCP_WAN = "refused:dhcp-wan"
     NO_ETHER_NODE = "refused:no-ether-node"
     HOOKS_TAKEN = "refused:hooks-taken"
@@ -68,11 +79,14 @@ class VmacState(StrEnum):
     NGCTL = "unavailable:ngctl"
 
 
-# What each state means for the operator, appended to the WARNING that enters it.
+# What each state means for the operator, appended to the line that enters it.
 _WHY = {
     VmacState.NO_VHID: "the keeper has no CARP vhid, so there is no master to gate on",
+    VmacState.BAD_VHID: "the CARP vhid is not a number from 1 to 255",
     VmacState.MAC_OVERRIDE: "a Client MAC override is set (not supported with this option)",
     VmacState.BAD_MAC: "the lease MAC is not a valid MAC address",
+    VmacState.SHARED_IFACE: "another keeper's CARP VIP is on this interface; it would send from "
+                            "this MAC too, and an interface has room for one rewrite",
     VmacState.DHCP_WAN: "a DHCP client runs on the interface; the node's own traffic would "
                         "also leave from the lease MAC (the option needs a static WAN address)",
     VmacState.NO_ETHER_NODE: "the interface has no netgraph ether node (not an Ethernet interface)",
@@ -80,22 +94,39 @@ _WHY = {
     VmacState.FOREIGN_NODE: "a node of another type already uses the name",
     VmacState.KLDLOAD: "the kernel modules ng_ether and ng_patch could not load",
     VmacState.BUILD: "the netgraph build failed",
-    VmacState.READBACK: "the built graph did not read back as wanted",
+    VmacState.READBACK: "the built graph did not read back as wanted; removed",
     VmacState.NGCTL: "ngctl could not run",
 }
 _HEALTHY = (VmacState.BUILT, VmacState.NATIVE)
+_ERRORS = (VmacState.BUILD, VmacState.READBACK)   # logged at ERROR, the rest at WARNING
 
 
 class _Presence(StrEnum):
     """What `ngctl show vmac_<e>:` found. ABSENT is the quiet backup's steady state;
     HALF is any patch node of ours that is not exactly the wanted graph (one hook, a
     wrong peer, a wrong config); FOREIGN is a node of another type under our name;
-    UNREADABLE means ngctl could not run (no action either way)."""
+    UNREADABLE means ngctl could not run or failed otherwise (no action either way)."""
     ABSENT = "absent"
     BUILT = "built"
     HALF = "half"
     FOREIGN = "foreign"
     UNREADABLE = "unreadable"
+
+
+_OURS = (_Presence.BUILT, _Presence.HALF)   # a patch node of ours that a teardown removes
+
+
+class _Peer(NamedTuple):
+    """One hook row of `ngctl show`: the node across the hook."""
+    name: str
+    type: str
+    hook: str
+
+
+class _Shown(NamedTuple):
+    """`ngctl show` parsed: the node's type and {local hook: _Peer}."""
+    type: str
+    hooks: dict
 
 
 def ether_node(iface):
@@ -146,9 +177,9 @@ _FIELD_RE = re.compile(r"(\w+)=(0x[0-9A-Fa-f]+|-?\d+)")
 
 
 def _parse_show(text):
-    """`ngctl show` text -> (type, {local hook: (peer name, peer type, peer hook)}), or
-    None without a Name/Type header. Hook rows follow the dashed separator line and have
-    five columns (local, peer name, peer type, peer id, peer hook)."""
+    """`ngctl show` text -> _Shown, or None without a Name/Type header. Hook rows follow
+    the dashed separator line and have five columns (local, peer name, peer type, peer
+    id, peer hook)."""
     header = _HEADER_RE.search(text or "")
     if header is None:
         return None
@@ -159,8 +190,8 @@ def _parse_show(text):
             continue
         parts = line.split()
         if rows and len(parts) == 5:
-            hooks[parts[0]] = (parts[1], parts[2], parts[4])
-    return header.group(2), hooks
+            hooks[parts[0]] = _Peer(parts[1], parts[2], parts[4])
+    return _Shown(header.group(2), hooks)
 
 
 def _fields(text):
@@ -179,14 +210,25 @@ def _parse_config(text):
     return head.get("count", 0), head.get("csum_flags", 0), head.get("relative_offset", 0), tuple(ops)
 
 
-def _parse_stats(text):
-    """getstats text -> (received, patched, dropped); an empty `Args: {}` is zeros."""
-    f = _fields(text or "")
-    return f.get("Received", 0), f.get("Patched", 0), f.get("Dropped", 0)
+def _parse_dropped(text):
+    """The Dropped counter of getstats text (a zero counter is not printed)."""
+    return _fields(text or "").get("Dropped", 0)
 
 
 def _ngctl(*args, stdin=None):
     return run([NGCTL, *args], quiet=True, stdin=stdin)
+
+
+def _enoent(res):
+    """True when an ngctl result failed because the node is not there."""
+    return res.returncode != 0 and _ENOENT in (res.stderr or "") + (res.stdout or "")
+
+
+def _patch_module_loaded():
+    """True when ng_patch is in the kernel, so a patch node of ours can exist at all.
+    Asked with kldstat, which changes nothing (an ngctl call can load ng_socket)."""
+    res = run([KLDSTAT, "-q", "-m", "ng_patch"], quiet=True)
+    return res is not None and res.returncode == 0
 
 
 def _dhclient_running(iface):
@@ -198,60 +240,75 @@ def _dhclient_running(iface):
         os.kill(pid, 0)
     except PermissionError:
         return True        # the process exists (we may not signal it)
-    except (OSError, ValueError):
+    except (OSError, ValueError, OverflowError):
         return False
     return True
 
 
+def _static_refusal(chaddr, vhid, shared_iface):
+    """Why the configuration itself rules the option out, or None."""
+    if not vhid:
+        return VmacState.NO_VHID
+    try:
+        vmac = carp_vmac(vhid)
+    except ValueError:
+        return VmacState.BAD_VHID
+    if not 1 <= int(vhid) <= 255:
+        return VmacState.BAD_VHID
+    if not MAC_RE.match(chaddr):
+        return VmacState.BAD_MAC
+    if chaddr.replace("-", ":") != vmac:
+        # D4: a Client MAC override is refused. Rewriting to the CARP virtual MAC would
+        # send the VIP's traffic from a MAC the ISP never leased to; rewriting to the
+        # override would make CARP's ARP replies carry the virtual MAC inside and the
+        # override outside (gear with dynamic ARP inspection may drop them) and send the
+        # CARP advertisements from the override. If ever needed: rewrite to the override
+        # after a bench round that checks both.
+        return VmacState.MAC_OVERRIDE
+    return VmacState.SHARED_IFACE if shared_iface else None
+
+
 @dataclass(frozen=True)
 class _Target:
-    """The fixed wiring: interface, node names, the rewrite MAC and any reason the
-    configuration itself rules the feature out (no vhid, an override, a bad MAC)."""
+    """The fixed wiring: interface, node names, the rewrite MAC, whether another keeper
+    shares the interface, and any reason the configuration rules the option out."""
     iface: str
     ether: str
     node: str
     mac: str
+    shared_iface: bool
     static_refusal: "VmacState | None"
 
 
 @dataclass
+class _Gates:
+    """Warn-once flags, each re-armed when its condition clears (like route._WarnGates)."""
+    half: bool = False        # our node was not the wanted graph (re-armed once built)
+    dropped: bool = False     # ng_patch Dropped rose while built (re-armed on a rebuild)
+    teardown: bool = False    # a shutdown left the node (re-armed by a successful one)
+
+
+@dataclass
 class _Runtime:
-    """Main-loop state: the current token, the last state logged (so an UNKNOWN blip
-    does not re-log the state it returns to), the module load latch, the episode gates
-    ("half", "dropped") of the warn-once lines, the last Dropped count, who holds the
-    interface's hooks when refused for that, and whether an interrupted build's unnamed
-    node was found on them (scrubbed on this tick)."""
+    """Main-loop state of one VmacEgress."""
     state: VmacState = VmacState.NATIVE
-    logged: "VmacState | None" = None
-    modules_loaded: bool = False
-    warned: set = field(default_factory=set)
-    dropped: int = 0
-    hooks_owner: str = ""
-    leftover: bool = False
+    logged: "VmacState | None" = None     # the last state logged: an UNKNOWN blip does not re-log
+    modules_loaded: bool = False          # kldload succeeded once (then latched)
+    gates: _Gates = field(default_factory=_Gates)
+    dropped: int = 0                      # the last Dropped count seen while built
+    hooks_owner: str = ""                 # who holds the hooks, for the refused:hooks-taken line
+    leftover: bool = False                # an interrupted build's unnamed node is on the hooks
 
 
 class VmacEgress:
     """The source-MAC rewrite for one keeper (see the module docstring). reconcile() is
     level-triggered and idempotent; status() is the heartbeat token (None when off)."""
 
-    def __init__(self, iface, chaddr, vhid, *, enabled=False):
+    def __init__(self, iface, chaddr, vhid, *, enabled=False, shared_iface=False):
         mac = (chaddr or "").lower()
-        if not vhid:
-            refusal = VmacState.NO_VHID
-        elif not MAC_RE.match(mac):
-            refusal = VmacState.BAD_MAC
-        elif mac.replace("-", ":") != carp_vmac(vhid):
-            # D4: a Client MAC override is refused. Rewriting to the CARP virtual MAC would
-            # send the VIP's traffic from a MAC the ISP never leased to; rewriting to the
-            # override would make CARP's ARP replies carry the virtual MAC inside and the
-            # override outside (gear with dynamic ARP inspection may drop them) and send
-            # the CARP advertisements from the override. If ever needed: rewrite to the
-            # override after a bench round that checks both.
-            refusal = VmacState.MAC_OVERRIDE
-        else:
-            refusal = None
         self.enabled = enabled
-        self._t = _Target(iface, ether_node(iface), vmac_node(iface), mac, refusal)
+        self._t = _Target(iface, ether_node(iface), vmac_node(iface), mac, shared_iface,
+                          _static_refusal(mac, vhid, shared_iface))
         self._run = _Runtime()
         self._unreadable = _UnreadableRole(DEFAULT_UNREADABLE_ROLE_STRIKES)
         self._heartbeat = _RateLimit(RECONCILE_HEARTBEAT_INTERVAL)
@@ -288,7 +345,7 @@ class VmacEgress:
                         "build left on %s", self._t.iface, self._t.ether)
             self._scrub()
         if not is_master or refusal is not None:
-            if presence is not _Presence.ABSENT:
+            if presence in _OURS:
                 self._teardown("not master" if refusal is None else str(refusal))
             self._set_state(refusal or VmacState.NATIVE)
             return
@@ -296,7 +353,8 @@ class VmacEgress:
             self._confirm_built()
             return
         if presence is _Presence.HALF:
-            if self._take_warning("half"):
+            if not self._run.gates.half:
+                self._run.gates.half = True
                 LOG.warning("vmac egress on %s: %s is not the wanted graph -- rebuilding",
                             self._t.iface, self._t.node)
             self._teardown("half-built")
@@ -306,20 +364,20 @@ class VmacEgress:
         """Process-boundary twin of route.withdraw_unless_master (keeper start in main()
         and keeper shutdown): keep the graph only on a confirmed master, tear it down on
         False or None. Off, it does nothing unless `leftover` (main()'s startup call):
-        then it removes a leftover node of ours without probing the role, which is how
-        the graph goes away after the option was switched off. So an off keeper runs one
-        `ngctl show` per start and nothing else.
+        then it removes a leftover node of ours without probing the role (how the graph
+        goes away after the option was switched off), skipped when ng_patch is not loaded
+        or another keeper shares the interface (the node may be that keeper's).
 
         Trade-off (as for the default route): a keeper stopped for good while its node
         is still master keeps the rewrite with nothing managing it, until the next CARP
         event (the syshook) or rc.d stop. Telling a stop from a restart here would need a
         fragile signal, and a restart must not open a window of own-MAC frames."""
-        if not self.enabled and not leftover:
+        if not self.enabled:
+            if not leftover or self._t.shared_iface or not _patch_module_loaded():
+                return
+        elif probe() is True:
             return
-        if self.enabled and probe() is True:
-            return
-        presence = self._present()
-        if presence in (_Presence.BUILT, _Presence.HALF):
+        if self._present() in _OURS:
             self._teardown("not master at a keeper start or stop" if self.enabled else "option off")
 
     # ---- states ----
@@ -330,7 +388,7 @@ class VmacEgress:
         self._run.state = VmacState.UNKNOWN
         if not self._unreadable.record():
             return
-        if self._present() in (_Presence.BUILT, _Presence.HALF):
+        if self._present() in _OURS:
             if self._unreadable.take_warning():
                 LOG.warning("vmac egress on %s: CARP role unreadable for %d probes -- removing "
                             "the source MAC rewrite (fail closed)", self._t.iface, self._unreadable.strikes)
@@ -358,32 +416,26 @@ class VmacEgress:
         is a leftover of an interrupted build (ours: mkpeer ran, `name` did not), marked
         for the scrub, never a reason to refuse."""
         res = _ngctl("show", f"{self._t.ether}:")
-        if res is None:
+        if res is None or (res.returncode != 0 and not _enoent(res)):
             return VmacState.NGCTL
         shown = _parse_show(res.stdout) if res.returncode == 0 else None
         if shown is None:
             return VmacState.NO_ETHER_NODE
-        for hook in ("upper", "lower"):
-            peer = shown[1].get(hook)
-            if peer is None or peer[0] == self._t.node:
+        for hook in _ETHER_HOOKS:
+            peer = shown.hooks.get(hook)
+            if peer is None or peer.name == self._t.node:
                 continue
-            if peer[0] == _UNNAMED and peer[1] == "patch":
+            if peer.name == _UNNAMED and peer.type == "patch":
                 self._run.leftover = True
                 continue
-            self._run.hooks_owner = f"{peer[0]} ({peer[1]})"
+            self._run.hooks_owner = f"{peer.name} ({peer.type})"
             return VmacState.HOOKS_TAKEN
         return None
 
-    def _take_warning(self, gate):
-        """True the first time `gate` is taken in its episode (re-armed on a rebuild)."""
-        if gate in self._run.warned:
-            return False
-        self._run.warned.add(gate)
-        return True
-
     def _set_state(self, state, detail=""):
-        """Record the token; log a change of state once (WARNING into a problem, INFO
-        into a healthy state), the unchanged repeat at DEBUG on the heartbeat."""
+        """Record the token; log a change of state once (ERROR for a failed build or
+        read-back, WARNING into another problem, INFO into a healthy state), the
+        unchanged repeat at DEBUG on the heartbeat."""
         self._run.state = state
         changed = state != self._run.logged
         self._run.logged = state
@@ -397,62 +449,59 @@ class VmacEgress:
             # NetFlow capture is the one known holder (ng_netflow on the same hooks).
             detail = (f"{self._run.hooks_owner}; if that is NetFlow capture, disable it on this "
                       "interface or leave this option off")
-        LOG.warning("vmac egress on %s not active (%s): %s %s", self._t.iface, state,
-                    _WHY.get(state, ""), detail)
+        log = LOG.error if state in _ERRORS else LOG.warning
+        log("vmac egress on %s not active (%s): %s %s", self._t.iface, state, _WHY.get(state, ""), detail)
 
     # ---- graph operations ----
 
     def _present(self):
         """Classify our node (see _Presence). BUILT needs exactly the two wanted hook
-        rows and a getconfig equal to the wanted ops."""
+        rows and a getconfig equal to the wanted ops. Only "no such node" is ABSENT: any
+        other ngctl failure is UNREADABLE, so a transient error never triggers a build
+        over a working graph."""
         res = _ngctl("show", f"{self._t.node}:")
         if res is None:
             return _Presence.UNREADABLE
         if res.returncode != 0:
-            return _Presence.ABSENT
+            return _Presence.ABSENT if _enoent(res) else _Presence.UNREADABLE
         shown = _parse_show(res.stdout)
-        if shown is None or shown[0] != "patch":
+        if shown is None or shown.type != "patch":
             return _Presence.FOREIGN
-        want = {_HOOK_IN: (self._t.ether, "ether", "upper"), _HOOK_OUT: (self._t.ether, "ether", "lower")}
-        if shown[1] != want or self._t.static_refusal is not None:
+        want = {_HOOK_IN: _Peer(self._t.ether, "ether", "upper"),
+                _HOOK_OUT: _Peer(self._t.ether, "ether", "lower")}
+        if shown.hooks != want or self._t.static_refusal is not None:
             return _Presence.HALF   # (a refused config is never "built": it is torn down)
         return self._config_presence()
 
     def _config_presence(self):
-        """BUILT when getconfig equals the wanted ops, HALF otherwise (a stale config,
-        such as an earlier lease MAC), UNREADABLE when ngctl could not run."""
+        """BUILT when getconfig equals the wanted ops, HALF when it differs (a stale
+        config, such as an earlier lease MAC), UNREADABLE when ngctl failed."""
         cfg = _ngctl("msg", f"{self._t.node}:", "getconfig")
-        if cfg is None:
+        if cfg is None or cfg.returncode != 0:
             return _Presence.UNREADABLE
         wanted = (2, 0, 0, tuple(sorted(_patch_ops(self._t.mac))))
-        ok = cfg.returncode == 0 and _parse_config(cfg.stdout) == wanted
-        return _Presence.BUILT if ok else _Presence.HALF
+        return _Presence.BUILT if _parse_config(cfg.stdout) == wanted else _Presence.HALF
 
     def _build(self):
-        """Build in one session, read back, and shut the node down at once on any
-        failure (never leave a one-hook node). A build that could not run at all is left
-        for the next tick to read back."""
+        """Build in one session, read back, and scrub at once on any failure (never leave
+        a one-hook node). A build that could not run at all is left for the next tick to
+        read back."""
         res = _ngctl("-f", "-", stdin=_build_script(self._t.iface, self._t.mac))
         if res is None:
             return
         if res.returncode != 0:
             self._scrub()
-            if self._run.state is not VmacState.BUILD:
-                LOG.error("vmac egress on %s: build failed: %s", self._t.iface,
-                          (res.stderr or res.stdout or "").strip() or f"exit {res.returncode}")
-            self._set_state(VmacState.BUILD)
+            self._set_state(VmacState.BUILD, (res.stderr or res.stdout or "").strip()
+                            or f"exit {res.returncode}")
             return
         if self._present() is not _Presence.BUILT:
             self._scrub()
-            if self._run.state is not VmacState.READBACK:
-                LOG.error("vmac egress on %s: the graph did not read back as built -- removed",
-                          self._t.iface)
             self._set_state(VmacState.READBACK)
             return
         LOG.info("vmac egress on %s: built %s (in -> %s.upper, out -> %s.lower), source MAC %s",
                  self._t.iface, self._t.node, self._t.ether, self._t.ether, self._t.mac)
         self._run.dropped = 0
-        self._run.warned.clear()
+        self._run.gates = _Gates()
         auto = _ngctl("msg", f"{self._t.ether}:", "getautosrc")
         if auto is not None:
             LOG.debug("vmac egress on %s: %s getautosrc: %s (want 0)", self._t.iface,
@@ -468,31 +517,33 @@ class VmacEgress:
         _ngctl("shutdown", f"{self._t.node}:")
         res = _ngctl("show", f"{self._t.ether}:")
         shown = _parse_show(res.stdout) if res is not None and res.returncode == 0 else None
-        for hook in ("upper", "lower"):
-            peer = shown[1].get(hook) if shown else None
-            if peer is not None and peer[1] == "patch" and peer[0] in (_UNNAMED, self._t.node):
+        for hook in _ETHER_HOOKS:
+            peer = shown.hooks.get(hook) if shown else None
+            if peer is not None and peer.type == "patch" and peer.name in (_UNNAMED, self._t.node):
                 _ngctl("shutdown", f"{self._t.ether}:{hook}")
 
     def _confirm_built(self):
         """A built graph: confirm, and warn once when Dropped rises (memory pressure in
         ng_patch, not a half-built graph: do not rebuild)."""
-        self._run.warned.discard("half")
+        self._run.gates.half = False
         stats = _ngctl("msg", f"{self._t.node}:", "getstats")
         if stats is not None and stats.returncode == 0:
-            dropped = _parse_stats(stats.stdout)[2]
-            if dropped > self._run.dropped and self._take_warning("dropped"):
+            dropped = _parse_dropped(stats.stdout)
+            if dropped > self._run.dropped and not self._run.gates.dropped:
+                self._run.gates.dropped = True
                 LOG.warning("vmac egress on %s: ng_patch dropped %d frames (memory pressure); "
                             "the graph is kept", self._t.iface, dropped)
             self._run.dropped = dropped
         self._set_state(VmacState.BUILT)
 
     def _teardown(self, reason):
-        """Shut our node down and confirm it is gone. Always safe to retry; a node still
-        present is retried on the next tick."""
+        """Shut our node down and confirm it is gone. Always safe to retry: a node still
+        present is retried on the next tick, warned once until a shutdown works."""
         _ngctl("shutdown", f"{self._t.node}:")
         if self._present() is _Presence.ABSENT:
+            self._run.gates.teardown = False
             LOG.info("vmac egress on %s: removed %s (%s)", self._t.iface, self._t.node, reason)
-            return True
-        LOG.warning("vmac egress on %s: %s still present after shutdown (%s) -- retrying next tick",
-                    self._t.iface, self._t.node, reason)
-        return False
+        elif not self._run.gates.teardown:
+            self._run.gates.teardown = True
+            LOG.warning("vmac egress on %s: %s still present after shutdown (%s) -- retrying "
+                        "every tick", self._t.iface, self._t.node, reason)

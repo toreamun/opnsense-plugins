@@ -679,7 +679,7 @@ def _spy_main(monkeypatch, *argv, iface_args=False):
 
     class _SpyVmac:   # the startup teardown_unless_master: no ngctl
         def __init__(self, *a, **k):
-            built["vmac"] = {"args": a, "kwargs": k}
+            built["vmac"] = {"args": a, "kwargs": k, "self": self}
 
         def teardown_unless_master(self, probe, **k):
             built["vmac"]["teardown"] = (probe, k)
@@ -3514,24 +3514,28 @@ class _RecordingVmac:
         return "built"
 
 
-def test_keeper_builds_its_vmac_egress_from_its_identity(lk):
-    k = _keeper(lk, vhid=254, vmac_egress=True)
-    assert k._vmac.enabled and k._vmac._t.iface == "eth0" and k._vmac._t.mac == CHADDR_STR
-    assert k._vmac._t.static_refusal is None                 # the CARP vMAC of vhid 254
+def test_keeper_takes_its_vmac_egress_and_defaults_to_an_inert_one(lk):
+    given = lk.VmacEgress("eth0", CHADDR_STR, "254", enabled=True)
+    assert _keeper(lk, vhid=254, vmac=given)._vmac is given
+    assert given._t.static_refusal is None                    # the CARP vMAC of vhid 254
     off = _keeper(lk, vhid=254)
     assert off._vmac.enabled is False and off._vmac.status() is None
 
 
-def test_role_tick_reconciles_the_rewrite_after_the_role_poll(lk):
+def test_role_tick_reconciles_the_rewrite_on_its_own_probe_only(lk):
     keeper = _keeper(lk, vhid=254)
     order = []
     keeper._vmac = _RecordingVmac(order)
+    probes = iter([True, None])
+    keeper._probe_carp_master = lambda: next(probes)
     keeper._role.poll = lambda m=None: order.append(("poll", m))
     keeper._reconcile_default_route = lambda *a, **k: order.append(("route",))
-    keeper._role_tick(master=True)
-    keeper._role_tick(master=None)
+    keeper._role_tick()
+    keeper._role_tick()
+    keeper._role_tick(master=True)     # a role passed in: the gate already reconciled
     assert order == [("poll", True), ("vmac", True), ("route",),
-                     ("poll", None), ("vmac", None), ("route",)]
+                     ("poll", None), ("vmac", None), ("route",),
+                     ("poll", True), ("route",)]
 
 
 def test_maintain_gate_reconciles_on_the_raw_probe_before_a_blocking_acquire(lk, monkeypatch):
@@ -3547,6 +3551,24 @@ def test_maintain_gate_reconciles_on_the_raw_probe_before_a_blocking_acquire(lk,
     monkeypatch.setattr(keeper, "_reconcile_default_route", lambda *a, **kw: None)
     keeper._maintain_step()
     assert order[0] == ("vmac", None) and ("acquire",) in order
+
+
+@pytest.mark.parametrize("step", ["config_error", "passive_backup"])
+def test_a_substituted_role_never_reaches_the_rewrite(lk, monkeypatch, step):
+    # The config-error and passive-backup steps tick with the gate's SUBSTITUTED role
+    # (was_master). The rewrite must see only the raw None from the gate, or a master
+    # with a config error would build on an unknown role and never collect its strikes.
+    keeper = _keeper(lk, vhid=254)
+    keeper._was_master = step == "config_error"
+    if step == "config_error":
+        keeper._config_error = "bad option"
+    order = []
+    keeper._vmac = _RecordingVmac(order)
+    monkeypatch.setattr(keeper, "_probe_carp_master", lambda: None)
+    monkeypatch.setattr(keeper, "_sleep_interruptible", lambda *a, **k: None)
+    monkeypatch.setattr(keeper, "_reconcile_default_route", lambda *a, **kw: None)
+    keeper._maintain_step()
+    assert order == [("vmac", None)]
 
 
 @pytest.mark.parametrize("master", [True, False, None])
@@ -3586,10 +3608,19 @@ def test_heartbeat_line_renders_the_vmac_token(lk):
 @pytest.mark.parametrize("fields, enabled", [("|vmacegress=1", True), ("|vmacegress=0", False), ("", False)])
 def test_main_vmac_egress_from_keeper_conf_and_the_startup_sweep(monkeypatch, tmp_path, fields, enabled):
     rc, built = _conf_main(monkeypatch, tmp_path, _CONF_LINE + fields, "--keeper-id", "100_64_4_7")
-    assert rc == 0 and built["kwargs"]["vmac_egress"] is enabled
-    # The startup fail-stop builds a throwaway VmacEgress on the same identity and runs
-    # the leftover sweep (kept on a master; off removes only a leftover node).
+    assert rc == 0
+    # One VmacEgress on the keeper's identity: the startup fail-stop runs its leftover
+    # sweep (kept on a master; off removes only a leftover node), then the Keeper gets it.
     assert built["vmac"]["args"] == ("vtnet0", "00:00:5e:00:01:fe", "254")
-    assert built["vmac"]["kwargs"] == {"enabled": enabled}
+    assert built["vmac"]["kwargs"] == {"enabled": enabled, "shared_iface": False}
+    assert built["kwargs"]["vmac"] is built["vmac"]["self"]
     _probe, kw = built["vmac"]["teardown"]
     assert kw == {"leftover": True}
+
+
+def test_main_sees_another_keeper_on_the_same_interface(monkeypatch, tmp_path):
+    other = _CONF_LINE.replace("request=100.64.4.7", "request=100.64.9.9").replace("vhid=254", "vhid=7")
+    elsewhere = other.replace("iface=vtnet0", "iface=vtnet1")
+    for lines, shared in (([_CONF_LINE], False), ([_CONF_LINE, other], True), ([_CONF_LINE, elsewhere], False)):
+        rc, built = _conf_main(monkeypatch, tmp_path, "\n".join(lines) + "\n", "--keeper-id", "100_64_4_7")
+        assert rc == 0 and built["vmac"]["kwargs"]["shared_iface"] is shared

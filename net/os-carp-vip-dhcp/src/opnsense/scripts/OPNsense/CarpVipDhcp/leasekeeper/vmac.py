@@ -76,6 +76,7 @@ class VmacState(StrEnum):
     KLDLOAD = "failed:kldload"
     BUILD = "failed:build"
     READBACK = "failed:readback"
+    TEARDOWN = "failed:teardown"
     NGCTL = "unavailable:ngctl"
 
 
@@ -95,10 +96,11 @@ _WHY = {
     VmacState.KLDLOAD: "the kernel modules ng_ether and ng_patch could not load",
     VmacState.BUILD: "the netgraph build failed",
     VmacState.READBACK: "the built graph did not read back as wanted; removed",
+    VmacState.TEARDOWN: "the rewrite could not be removed and may still be active; retrying every tick",
     VmacState.NGCTL: "ngctl could not run",
 }
 _HEALTHY = (VmacState.BUILT, VmacState.NATIVE)
-_ERRORS = (VmacState.BUILD, VmacState.READBACK)   # logged at ERROR, the rest at WARNING
+_ERRORS = (VmacState.BUILD, VmacState.READBACK, VmacState.TEARDOWN)   # ERROR, the rest WARNING
 
 
 class _Presence(StrEnum):
@@ -331,24 +333,40 @@ class VmacEgress:
             return
         self._unreadable.reset()
         presence = self._present()
-        if presence is _Presence.UNREADABLE:
-            self._set_state(VmacState.NGCTL)
-            return
-        if presence is _Presence.FOREIGN:
-            self._set_state(VmacState.FOREIGN_NODE, f"({self._t.node}: never touched)")
+        if presence in (_Presence.UNREADABLE, _Presence.FOREIGN):
+            if presence is _Presence.UNREADABLE:
+                self._set_state(VmacState.NGCTL)
+            else:
+                self._set_state(VmacState.FOREIGN_NODE, f"({self._t.node}: never touched)")
             return
         refusal = self._refusal(presence)
-        if self._run.leftover:
-            # On either role: left on upper, an unnamed patch node returns every frame.
-            self._run.leftover = False
-            LOG.warning("vmac egress on %s: removing an unnamed patch node an interrupted "
-                        "build left on %s", self._t.iface, self._t.ether)
-            self._scrub()
-        if not is_master or refusal is not None:
-            if presence in _OURS:
-                self._teardown("not master" if refusal is None else str(refusal))
-            self._set_state(refusal or VmacState.NATIVE)
+        if not self._clear_leftover():
+            self._set_state(VmacState.TEARDOWN)
+        elif not is_master or refusal is not None:
+            self._stand_down(presence, refusal)
+        else:
+            self._converge(presence)
+
+    def _clear_leftover(self):
+        """Remove an interrupted build's unnamed node found on the hooks (on either role:
+        left on upper it returns every frame). True when there was none or it is gone."""
+        if not self._run.leftover:
+            return True
+        self._run.leftover = False
+        LOG.warning("vmac egress on %s: removing an unnamed patch node an interrupted "
+                    "build left on %s", self._t.iface, self._t.ether)
+        return self._teardown("an interrupted build's leftover")
+
+    def _stand_down(self, presence, refusal):
+        """Not master, or refused: no rewrite. A teardown that could not be confirmed is
+        reported as such, never as native (the node may still be rewriting)."""
+        if presence in _OURS and not self._teardown("not master" if refusal is None else str(refusal)):
+            self._set_state(VmacState.TEARDOWN)   # never "native" while it may still rewrite
             return
+        self._set_state(refusal or VmacState.NATIVE)
+
+    def _converge(self, presence):
+        """Master, not refused: confirm a built graph, else (re)build it."""
         if presence is _Presence.BUILT:
             self._confirm_built()
             return
@@ -377,7 +395,7 @@ class VmacEgress:
                 return
         elif probe() is True:
             return
-        if self._present() in _OURS:
+        if self._present() in _OURS or self._unnamed_on_hooks():
             self._teardown("not master at a keeper start or stop" if self.enabled else "option off")
 
     # ---- states ----
@@ -388,7 +406,7 @@ class VmacEgress:
         self._run.state = VmacState.UNKNOWN
         if not self._unreadable.record():
             return
-        if self._present() in _OURS:
+        if self._present() in _OURS or self._unnamed_on_hooks():
             if self._unreadable.take_warning():
                 LOG.warning("vmac egress on %s: CARP role unreadable for %d probes -- removing "
                             "the source MAC rewrite (fail closed)", self._t.iface, self._unreadable.strikes)
@@ -484,15 +502,15 @@ class VmacEgress:
 
     def _build(self):
         """Build in one session, read back, and scrub at once on any failure (never leave
-        a one-hook node). A build that could not run at all is left for the next tick to
-        read back."""
+        a one-hook node). A build that did not finish (ngctl timed out or could not run:
+        run() returns None for both) may have attached the node to upper already, so it
+        is scrubbed too."""
         res = _ngctl("-f", "-", stdin=_build_script(self._t.iface, self._t.mac))
-        if res is None:
-            return
-        if res.returncode != 0:
+        if res is None or res.returncode != 0:
             self._scrub()
-            self._set_state(VmacState.BUILD, (res.stderr or res.stdout or "").strip()
-                            or f"exit {res.returncode}")
+            detail = ("ngctl did not finish" if res is None
+                      else (res.stderr or res.stdout or "").strip() or f"exit {res.returncode}")
+            self._set_state(VmacState.BUILD, detail)
             return
         if self._present() is not _Presence.BUILT:
             self._scrub()
@@ -515,12 +533,23 @@ class VmacEgress:
         self-demoting state). Only a patch node that is ours or unnamed is touched: the
         hooks were checked free before the build, so nothing else can be there."""
         _ngctl("shutdown", f"{self._t.node}:")
+        for hook in self._patch_peers():
+            _ngctl("shutdown", f"{self._t.ether}:{hook}")
+
+    def _patch_peers(self):
+        """{hook: peer name} of the interface's hooks held by a patch node that is ours
+        or unnamed (an interrupted build's): what a scrub may shut down. Empty when the
+        ether node is unreadable."""
         res = _ngctl("show", f"{self._t.ether}:")
         shown = _parse_show(res.stdout) if res is not None and res.returncode == 0 else None
-        for hook in _ETHER_HOOKS:
-            peer = shown.hooks.get(hook) if shown else None
-            if peer is not None and peer.type == "patch" and peer.name in (_UNNAMED, self._t.node):
-                _ngctl("shutdown", f"{self._t.ether}:{hook}")
+        peers = {hook: shown.hooks.get(hook) for hook in _ETHER_HOOKS} if shown else {}
+        return {hook: peer.name for hook, peer in peers.items()
+                if peer is not None and peer.type == "patch" and peer.name in (_UNNAMED, self._t.node)}
+
+    def _unnamed_on_hooks(self):
+        """True when an unnamed patch node sits on the interface's hooks (an interrupted
+        build in this or an earlier process): `ngctl show` of our name cannot see it."""
+        return _UNNAMED in self._patch_peers().values()
 
     def _confirm_built(self):
         """A built graph: confirm, and warn once when Dropped rises (memory pressure in
@@ -537,13 +566,16 @@ class VmacEgress:
         self._set_state(VmacState.BUILT)
 
     def _teardown(self, reason):
-        """Shut our node down and confirm it is gone. Always safe to retry: a node still
-        present is retried on the next tick, warned once until a shutdown works."""
-        _ngctl("shutdown", f"{self._t.node}:")
-        if self._present() is _Presence.ABSENT:
+        """Remove the rewrite (our node and any unnamed patch node on the hooks) and
+        confirm both are gone; True when confirmed. Always safe to retry: a node still
+        present is retried on the next tick, warned once until a teardown works."""
+        self._scrub()
+        if self._present() is _Presence.ABSENT and not self._patch_peers():
             self._run.gates.teardown = False
             LOG.info("vmac egress on %s: removed %s (%s)", self._t.iface, self._t.node, reason)
-        elif not self._run.gates.teardown:
+            return True
+        if not self._run.gates.teardown:
             self._run.gates.teardown = True
             LOG.warning("vmac egress on %s: %s still present after shutdown (%s) -- retrying "
                         "every tick", self._t.iface, self._t.node, reason)
+        return False

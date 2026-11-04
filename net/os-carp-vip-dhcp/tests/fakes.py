@@ -125,17 +125,18 @@ class FakeRoute:  # pylint: disable=too-many-instance-attributes
 @dataclass
 class NgKnobs:
     """Failure knobs for FakeNgctl. missing: every command could not run (None).
-    kldload_fails: kldload exits 1. lying: `-f -` exits 0 and changes nothing.
-    fail_after: `-f -` applies its first N lines, then exits 1. shutdown_lies:
-    shutdown exits 0 and leaves the node. patch_unloaded: kldstat finds no ng_patch.
-    show_fails: `show` of an existing node exits 1 with another error (not ENOENT)."""
+    kldload_fails: kldload exits 1. patch_unloaded: kldstat finds no ng_patch.
+    show_fails: `show` of an existing patch node exits 1 with another error (not
+    ENOENT). shutdown_lies: shutdown exits 0 and leaves the node. script: how the next
+    `-f -` build session behaves: "" normally, "lying" (exit 0, nothing changes),
+    "fail:N" (applies its first N lines, then exits 1), "hang:N" (applies its first N
+    lines, then does not finish: run() returns None, as for a timeout; once)."""
     missing: bool = False
     kldload_fails: bool = False
-    lying: bool = False
-    fail_after: "int | None" = None
-    shutdown_lies: bool = False
     patch_unloaded: bool = False
     show_fails: bool = False
+    shutdown_lies: bool = False
+    script: str = ""
 
 
 @dataclass
@@ -254,13 +255,19 @@ class FakeNgctl:
         return _ng_reply(0, "")
 
     def _script(self, script):
-        if self.knobs.lying:
+        mode, _, count = self.knobs.script.partition(":")
+        if mode == "lying":
             return _ng_reply(0, "")
+        if mode == "hang":                         # once: the next build runs normally
+            self.knobs.script = f"fail:{count}"
+            self._script(script)
+            self.knobs.script = ""
+            return None
         apply = {"mkpeer": self._mkpeer, "name": self._name, "connect": self._connect,
                  "msg": self._setconfig}
         for n, line in enumerate(script.strip().splitlines()):
             words = line.split()
-            if self.knobs.fail_after is not None and n >= self.knobs.fail_after:
+            if mode == "fail" and n >= int(count):
                 return _ng_reply(1, "", f"ngctl: line {n + 1}: send msg: File exists")
             if not apply.get(words[0], lambda _w: False)(words):
                 return _ng_reply(1, "", f"ngctl: line {n + 1}: {line}: failed")

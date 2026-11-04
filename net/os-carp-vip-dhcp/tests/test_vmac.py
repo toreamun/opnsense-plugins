@@ -126,8 +126,9 @@ def test_off_is_inert(ng):
 def test_off_at_startup_removes_only_a_leftover_without_probing(ng):
     probed = []
     _egress(enabled=False).teardown_unless_master(lambda: probed.append(1), leftover=True)
-    assert ng.verbs() == ["show"] and not probed           # one show, no node: nothing else
-    assert [c[0] for c in ng.calls] == ["/sbin/kldstat", "/usr/sbin/ngctl"]
+    # kldstat, then our name and the interface's hooks (an unnamed leftover): no mutation.
+    assert ng.verbs() == ["show", "show"] and not ng.mutations() and not probed
+    assert ng.calls[0][0] == "/sbin/kldstat"
     ng.add_patch(NODE, "vtnet0", config=WANTED)
     ng.calls.clear()
     _egress(enabled=False).teardown_unless_master(lambda: probed.append(1), leftover=True)
@@ -353,7 +354,7 @@ def test_kldload_failure_is_refused_and_retried(lk, monkeypatch, caplog):
 
 @pytest.mark.parametrize("fail_after", [1, 2, 3])
 def test_a_build_failing_midway_leaves_no_node(lk, monkeypatch, caplog, fail_after):
-    fake = FakeNgctl(knobs=NgKnobs(fail_after=fail_after))
+    fake = FakeNgctl(knobs=NgKnobs(script=f"fail:{fail_after}"))
     monkeypatch.setattr(lk.subprocess, "run", fake.run)
     monkeypatch.setattr(vm, "_dhclient_running", lambda _iface: False)
     e = _egress()
@@ -367,9 +368,9 @@ def test_a_build_failing_midway_leaves_no_node(lk, monkeypatch, caplog, fail_aft
 
 
 def test_an_interrupted_build_does_not_leave_the_unnamed_node(lk, monkeypatch):
-    # fail_after=1: mkpeer ran, `name` did not. Shutting our name down cannot reach the
+    # script="fail:1": mkpeer ran, `name` did not. Shutting our name down cannot reach the
     # unnamed node; left on upper it returns every frame (the self-demoting state).
-    fake = FakeNgctl(knobs=NgKnobs(fail_after=1))
+    fake = FakeNgctl(knobs=NgKnobs(script=f"fail:{1}"))
     monkeypatch.setattr(lk.subprocess, "run", fake.run)
     monkeypatch.setattr(vm, "_dhclient_running", lambda _iface: False)
     _egress().reconcile(True)
@@ -377,7 +378,7 @@ def test_an_interrupted_build_does_not_leave_the_unnamed_node(lk, monkeypatch):
 
 
 def test_a_lying_build_is_caught_by_the_readback(lk, monkeypatch, caplog):
-    fake = FakeNgctl(knobs=NgKnobs(lying=True))
+    fake = FakeNgctl(knobs=NgKnobs(script="lying"))
     monkeypatch.setattr(lk.subprocess, "run", fake.run)
     monkeypatch.setattr(vm, "_dhclient_running", lambda _iface: False)
     e = _egress()
@@ -395,9 +396,12 @@ def test_a_lying_shutdown_is_reported_and_retried(lk, monkeypatch, caplog):
     e = _egress()
     with caplog.at_level(logging.WARNING, logger="lease-keeper"):
         e.reconcile(False)
+        first = sum(c[1:2] == ["shutdown"] for c in fake.calls)
         e.reconcile(False)
-    assert sum(c[1:2] == ["shutdown"] for c in fake.calls) == 2      # retried
+    assert sum(c[1:2] == ["shutdown"] for c in fake.calls) > first >= 1   # retried
     assert "still present after shutdown" in caplog.text
+    # The node is still there: the token must not say native (the backup may be rewriting).
+    assert NODE in fake.nodes and e.status() == "failed:teardown"
 
 
 def test_dropped_rising_warns_once_and_keeps_the_graph(ng, caplog):
@@ -494,7 +498,7 @@ def test_a_lying_shutdown_warns_once_per_episode(lk, monkeypatch, caplog):
 
 
 def test_a_failed_build_logs_one_error_and_nothing_else(lk, monkeypatch, caplog):
-    fake = FakeNgctl(knobs=NgKnobs(fail_after=2))
+    fake = FakeNgctl(knobs=NgKnobs(script=f"fail:{2}"))
     monkeypatch.setattr(lk.subprocess, "run", fake.run)
     monkeypatch.setattr(vm, "_dhclient_running", lambda _iface: False)
     e = _egress()
@@ -510,3 +514,52 @@ def test_dhclient_running_survives_a_huge_pid(tmp_path, monkeypatch):
     monkeypatch.setattr(vm, "_DHCLIENT_PID", str(tmp_path / "dhclient.{}.pid"))
     (tmp_path / "dhclient.vtnet0.pid").write_text("99999999999999999999999\n")
     assert vm._dhclient_running("vtnet0") is False
+
+
+# ---- PR #135 review (Copilot) ----
+
+def _unnamed_on_upper(ng):
+    ng.nodes["<unnamed>"] = ng.nodes["vtnet0"].__class__("patch")
+    ng.link("<unnamed>", "in", "vtnet0", "upper")
+
+
+@pytest.mark.parametrize("enabled, role", [(False, None), (True, False), (True, None)],
+                         ids=["off-sweep", "on-not-master", "on-unknown"])
+def test_the_process_boundary_removes_an_unnamed_leftover(ng, enabled, role):
+    # A keeper killed between mkpeer and name: `show vmac_<e>:` reads absent, but the
+    # unnamed node on upper returns every frame. The boundary must still remove it.
+    _unnamed_on_upper(ng)
+    _egress(enabled=enabled).teardown_unless_master(lambda: role, leftover=True)
+    assert "<unnamed>" not in ng.nodes and ng.nodes["vtnet0"].hooks == {}
+
+
+def test_the_unknown_role_strikes_remove_an_unnamed_leftover(ng):
+    _unnamed_on_upper(ng)
+    e = _egress()
+    for _ in range(3):
+        e.reconcile(None)
+    assert "<unnamed>" not in ng.nodes and ng.nodes["vtnet0"].hooks == {}
+
+
+def test_a_failed_teardown_on_a_master_refusal_is_not_native(lk, monkeypatch):
+    fake = FakeNgctl(knobs=NgKnobs(shutdown_lies=True))
+    monkeypatch.setattr(lk.subprocess, "run", fake.run)
+    monkeypatch.setattr(vm, "_dhclient_running", lambda _iface: True)   # refused on a master
+    fake.add_patch(NODE, "vtnet0", config=WANTED)
+    e = _egress()
+    e.reconcile(True)
+    assert e.status() == "failed:teardown"
+
+
+@pytest.mark.parametrize("hangs_after", [1, 2, 3])
+def test_a_build_that_does_not_finish_is_scrubbed_at_once(lk, monkeypatch, caplog, hangs_after):
+    fake = FakeNgctl(knobs=NgKnobs(script=f"hang:{hangs_after}"))
+    monkeypatch.setattr(lk.subprocess, "run", fake.run)
+    monkeypatch.setattr(vm, "_dhclient_running", lambda _iface: False)
+    e = _egress()
+    with caplog.at_level(logging.ERROR, logger="lease-keeper"):
+        e.reconcile(True)
+    assert set(fake.nodes) == {"vtnet0"} and fake.nodes["vtnet0"].hooks == {}
+    assert e.status() == "failed:build" and "ngctl did not finish" in caplog.text
+    e.reconcile(True)                                       # the next tick builds
+    assert _built(fake) and e.status() == "built"

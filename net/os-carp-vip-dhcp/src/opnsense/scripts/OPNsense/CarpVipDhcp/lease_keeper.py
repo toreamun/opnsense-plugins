@@ -78,6 +78,7 @@ from leasekeeper.route import (
     BackupEgressConfig, BackupEgressForm, BackupEgressReconciler, DefaultRouteMode,
     DefaultRouteReconciler, withdraw_unless_master)
 from leasekeeper.util import MAC_RE
+from leasekeeper.vmac import VmacEgress
 
 LOG = logging.getLogger(LOGGER_NAME)
 
@@ -121,6 +122,7 @@ _CONF_FLAGS = {
     "follow": "follow",
     "arplistenpromisc": "arp_listen_promisc",
     "backupegress": "backup_egress",
+    "vmacegress": "vmac_egress",
 }
 # The 802.1p priorities (PCP); 0 sets none of its own.
 VLAN_PCP_VALUES = range(8)
@@ -305,6 +307,10 @@ def _build_arg_parser():
     ap.add_argument("--backup-egress", action="store_true",
                     help="while CARP backup, route this node's own internet traffic to the "
                          "master (needs default-route-mode observe/enforce); see backup-egress docs")
+    ap.add_argument("--vmac-egress", action="store_true",
+                    help="experimental: while CARP master, rewrite the source MAC of every frame "
+                         "the WAN interface sends to the keeper's lease MAC (netgraph ng_ether "
+                         "and ng_patch); see docs/isp-mac-binding.md")
     ap.add_argument("--backup-egress-form", default=BackupEgressForm.SPLIT.value,
                     help="split (0.0.0.0/1+128.0.0.0/1, the default) or prefixes")
     ap.add_argument("--backup-egress-gateway", default=None,
@@ -405,6 +411,10 @@ def main():
                 DefaultRouteReconciler(args.default_route_mode),
                 BackupEgressReconciler(args.default_route_mode, backup_egress=backup_egress),
                 lambda: carp_master(args.iface, args.vhid))
+            # Same rule for the source-MAC rewrite (vmac.py): a crashed predecessor's graph
+            # is kept only on a confirmed master; off, only a leftover node is removed.
+            VmacEgress(args.iface, args.chaddr, args.vhid, enabled=args.vmac_egress).teardown_unless_master(
+                lambda: carp_master(args.iface, args.vhid), leftover=True)
 
         # Fail fast (with a logged reason) if the raw /dev/bpf backend cannot run
         # on this host (e.g. fcntl missing off FreeBSD).
@@ -429,7 +439,7 @@ def main():
                         default_route_mode=args.default_route_mode,
                         backup_egress=backup_egress,
                         vip_bits=args.vip_bits, wan_gateway=args.wan_gateway,
-                        min_lease_time=args.min_lease_time)
+                        min_lease_time=args.min_lease_time, vmac_egress=args.vmac_egress)
 
         # The Keeper is constructed, so its wake socketpair is now open: guarantee
         # keeper.close() on EVERY path from here -- the --once return, a normal run,

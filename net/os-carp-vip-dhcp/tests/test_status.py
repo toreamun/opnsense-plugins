@@ -37,6 +37,19 @@ def test_parse_heartbeat_config_error():
     assert status.parse_heartbeat_text(text.replace(" cfgerr=1", ""))["config_error"] is False
 
 
+@pytest.mark.parametrize("token, state, reason", [
+    (" vmac=built", "built", None),
+    (" vmac=native", "native", None),
+    (" vmac=refused:hooks-taken", "refused", "hooks-taken"),
+    (" vmac=unavailable:ngctl", "unavailable", "ngctl"),
+    ("", None, None)])      # the option off: no token
+def test_parse_heartbeat_vmac_token(token, state, reason):
+    text = f"1783350773 bound=100.64.4.7 lease=1800 t1=900 t2=1575 src=server master=1 demote_ok=0{token}\n"
+    result = status.parse_heartbeat_text(text)
+    assert (result["vmac_state"], result["vmac_reason"]) == (state, reason)
+    assert result["bound"] == "100.64.4.7"     # the other tokens still parse
+
+
 @pytest.mark.parametrize("value, expected", [
     ("", ""),
     ("60:7361676d", "60 (4 bytes)"),

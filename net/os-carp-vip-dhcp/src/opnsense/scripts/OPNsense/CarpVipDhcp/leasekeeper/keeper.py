@@ -28,6 +28,7 @@ from .route import (BackupEgressReconciler, DefaultRouteMode, DefaultRouteReconc
 from .signals import _SignalFlags
 from .syscmd import ifconfig, spawn
 from .util import _UNSET, _RateLimit, _clock_at, _jittered, _sane_ipv4
+from .vmac import VmacEgress
 from .wire import _parse_reply
 
 LOG = logging.getLogger(LOGGER_NAME)
@@ -83,7 +84,7 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
                  arp_nudge=0, arp_listen_promisc=False, vlan_pcp=0,
                  send_opts=(), request_codes=(), config_error=None,
                  default_route_mode="off", backup_egress=None, vip_bits=None, wan_gateway=None,
-                 min_lease_time=0):
+                 min_lease_time=0, vmac_egress=False):
         # Fixed identity/config, immutable once set (see _Config).
         self._cfg = _Config(
             iface=iface,
@@ -175,6 +176,8 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         mode = DefaultRouteMode.coerce(default_route_mode)
         self._defroute = DefaultRouteReconciler(mode)
         self._backup = BackupEgressReconciler(mode, backup_egress=backup_egress)
+        # Source-MAC rewrite while master (experimental; vmac.py). Inert when off.
+        self._vmac = VmacEgress(iface, self._cfg.chaddr, self._cfg.vhid, enabled=vmac_egress)
 
         self.redora_wait = REDORA_MIN
         # Link-return fast path (only while UNBOUND): a carrier down->up edge
@@ -277,7 +280,7 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
             now=now, bound=self._held_address(), lease=self._dhcp.binding.lease_secs,
             t1=t1, t2=t2, src=src, master=self._role.was_master, demote_ok=self._demote_ok(now),
             nudge=nudge, pcperr=self._capture.vlan_pcp_error,
-            config_error=self._config_error is not None)))
+            config_error=self._config_error is not None, vmac=self._vmac.status())))
 
     # -- RoleWatcher compatibility surface ---------------------------------------
     # The maintain loop reaches the role state through self._role directly; these
@@ -462,6 +465,7 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         if master is _UNSET:
             master = self._probe_carp_master()
         self._role.poll(master)
+        self._vmac.reconcile(master)
         self._reconcile_default_route(master)
         return master
 
@@ -747,6 +751,7 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         # keeper restart on a master does not flap 0/0 (the rationale and the accepted
         # trade-off live in withdraw_unless_master).
         withdraw_unless_master(self._defroute, self._backup, self._probe_carp_master)
+        self._vmac.teardown_unless_master(self._probe_carp_master)
         if self._cfg.release_on_exit:
             self._dhcp.release()
         self._capture.stop()
@@ -816,6 +821,7 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         # keep publishing master=0 and could not fail-stop. Reuses the probed role (no
         # extra ifconfig); a None/unknown role is a no-op (the transmit fail-safe below).
         self._role.poll(role)
+        self._vmac.reconcile(probed)   # before a blocking acquire; the RAW probe (None stays unknown)
         if self._config_error is not None:
             self._config_error_step(role)
             return

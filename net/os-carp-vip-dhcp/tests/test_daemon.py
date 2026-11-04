@@ -3299,17 +3299,18 @@ def test_temporary_lease_is_judged_on_the_server_value(lk, lease, minimum, tempo
     # The server's own option 51, not the MIN_LEASE floor (a 30 s offer is floored to
     # 60 s once absorbed, so the floored value could never be "shorter than 60").
     c = _client(lk, min_lease_time=minimum)
-    c._rx = _reply(lk, lk.OFFER, "192.168.100.10", **{**_BOOTSTRAP, "lease": lease})
+    rx = _reply(lk, lk.OFFER, "192.168.100.10", **{**_BOOTSTRAP, "lease": lease})
+    c.feed(rx)
     got = c._wait_for_dhcp_reply(lk.OFFER, 0.2, "DORA")
-    assert got is (None if temporary else c._rx)
+    assert got is (None if temporary else rx)
 
 
 def test_temporary_lease_never_touches_the_binding_and_a_nak_still_counts(lk):
     c = _client(lk, min_lease_time=60)
-    c._rx = _reply(lk, lk.ACK, "192.168.100.10", **_BOOTSTRAP)
+    c.feed(_reply(lk, lk.ACK, "192.168.100.10", **_BOOTSTRAP))
     assert c._wait_for_dhcp_reply(lk.ACK, 0.2, "DORA") is None
     assert c.binding.yiaddr is None and c.binding.server is None   # 192.168.100.1 never kept
-    c._rx = _reply(lk, lk.NAK, server="100.64.4.1", lease=None)
+    c.feed(_reply(lk, lk.NAK, server="100.64.4.1", lease=None))
     assert c._wait_for_dhcp_reply(lk.ACK, 0.2, "DORA").mtype == lk.NAK   # a NAK is still an answer
 
 
@@ -3318,12 +3319,12 @@ def test_temporary_lease_is_logged_once_until_a_real_lease(lk, caplog):
     temp = _reply(lk, lk.OFFER, "192.168.100.10", **_BOOTSTRAP)
     with caplog.at_level("INFO", logger="lease-keeper"):
         for _ in range(3):
-            c._rx = temp
+            c.feed(temp)
             c._wait_for_dhcp_reply(lk.OFFER, 0.1, "DORA")
         assert caplog.text.count("ignoring a temporary lease") == 1
         assert "192.168.100.10 from 192.168.100.1 for 30s" in caplog.text
         c._absorb_reply(_reply(lk, lk.ACK, "100.64.4.7", lease=1800), lk.DEFAULT_LEASE)
-        c._rx = temp
+        c.feed(temp)
         c._wait_for_dhcp_reply(lk.OFFER, 0.1, "DORA")
     assert caplog.text.count("ignoring a temporary lease") == 2   # a new episode logs again
 
@@ -3408,9 +3409,19 @@ def test_init_reboot_with_only_temporary_acks_keeps_nothing(lk, monkeypatch):
     assert c.binding.yiaddr is None and c.binding.server is None
 
 
+def test_a_temporary_reply_never_replaces_a_real_one_waiting_to_be_read(lk):
+    # The ISP answers first and the modem right after, both before the waiting thread
+    # reads the reply: the real answer must still be the one returned.
+    c = _client(lk, min_lease_time=60)
+    real = _reply(lk, lk.OFFER, "100.64.4.7", **_REAL)
+    c.feed(real)
+    c.feed(_reply(lk, lk.OFFER, "192.168.100.10", **_BOOTSTRAP))
+    assert c._wait_for_dhcp_reply(lk.OFFER, 0.5, "DORA") is real
+
+
 def test_a_real_lease_later_in_the_same_wait_is_taken(lk):
     c = _client(lk, min_lease_time=60)
-    c._rx = _reply(lk, lk.OFFER, "192.168.100.10", **_BOOTSTRAP)
+    c.feed(_reply(lk, lk.OFFER, "192.168.100.10", **_BOOTSTRAP))
     real = _reply(lk, lk.OFFER, "100.64.4.7", **_REAL)
     timer = threading.Timer(0.05, c.feed, [real])
     timer.start()

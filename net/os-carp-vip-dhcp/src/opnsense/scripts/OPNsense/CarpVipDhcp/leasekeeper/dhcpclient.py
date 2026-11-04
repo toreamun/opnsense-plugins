@@ -104,7 +104,7 @@ class ClientOptions:
     raw (code, bytes) and the Request Options codes that lead the Parameter
     Request List (see wire.request_list). Also what it accepts: min_lease_time, the
     shortest lease (the server's option 51) it takes as an answer; a shorter one is
-    temporary and ignored (see DhcpClient.is_temporary). 0 = off."""
+    temporary and dropped (see DhcpClient.feed and is_temporary). 0 = off."""
     id_opts: tuple
     send_opts: tuple = ()
     request_codes: tuple = ()
@@ -179,9 +179,13 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
 
     def feed(self, rx):
         """Hand a first-party (xid-matched) DhcpReply to the waiting sequence.
-        Called on the sniffer thread; a lone ref-assign plus the event set."""
-        self._rx = rx
+        Called on the sniffer thread; a lone ref-assign plus the event set. A
+        temporary lease (see is_temporary) is no answer and is dropped here, so it
+        never replaces a real answer still waiting to be read."""
         LOG.debug("DHCP reply: %s", _fmt_reply(rx))
+        if self.is_temporary(rx):
+            return
+        self._rx = rx
         self._reply_ready.set()
 
     def _send_dhcp(self, mtype, extra, ciaddr="0.0.0.0"):
@@ -205,8 +209,6 @@ class DhcpClient:  # pylint: disable=too-many-instance-attributes
             self._reply_ready.wait(min(1.0, max(0.05, end - time.time())))
 
             rx = self._rx
-            if rx and self.is_temporary(rx):
-                continue   # a temporary lease is no answer: wait for a real one or time out
             if rx and rx.mtype == want:
                 return rx
             if rx and rx.mtype == NAK:

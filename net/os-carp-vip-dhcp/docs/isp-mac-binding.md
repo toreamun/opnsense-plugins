@@ -106,8 +106,19 @@ load, so a brief flap is not ruled out, only not seen. The second report (a fibe
 nodes on one switch together with the ONT, multicast CARP, plugin 1.18.0) confirms traffic,
 failover and failback with nothing to reset on the ISP side: only the switch relearns the
 shared MAC. The backup there sends nothing on the WAN but an occasional ARP for the
-gateway. Open question: unicast CARP (a `peer` address) sends the master's advertisements
-to the backup's MAC, which with the shared MAC is the master's own; untested.
+gateway. The third report (a Spectrum cable line with a DOCSIS modem and MaxCPE=1, the
+single-IP setup, plugin 1.18.1) holds with the virtual MAC on both nodes: traffic, and
+failover when the master is taken down for an upgrade. After a modem power cycle, pings
+from the firewall and from a LAN client resumed as soon as the modem was back online, on
+the same lease. Clients that took minutes longer were waiting on the DNS resolver
+(Unbound) catching up with the WAN change, not on the line. A device with a different MAC
+gets nothing from that modem until it is restarted, the mark of one MAC per port. The MAC
+swap script below had also seemed to work there, but only because the master's frames
+happened to reach the modem first; that is timing, not something to rely on. While it
+starts, this modem hands out its own 30-second lease (192.168.100.10 from 192.168.100.1);
+since 1.18.4 the keeper ignores such a lease instead of following the VIP onto it (#132).
+Open question: unicast CARP (a `peer` address) sends the master's advertisements to the
+backup's MAC, which with the shared MAC is the master's own; untested.
 
 ## Workaround: swap the MAC on CARP transitions (unsupported)
 

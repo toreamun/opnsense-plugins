@@ -449,7 +449,8 @@ the keeper) only need doing once.
    [Setup Virtual IPs](https://docs.opnsense.org/manual/how-tos/carp.html#setup-virtual-ips)).
    **You don't need to know the final public address:** seed the VIP with your current
    WAN's public IP (the Interfaces overview shows it), or any routable placeholder if the
-   line is fresh. With the lease policy **Follow dynamic address** (step 4) the keeper DHCPs on the
+   line is fresh. Not a private one: the keeper refuses to follow between private and
+   public addresses, as a guard against a spoofed DHCP answer. With the lease policy **Follow dynamic address** (step 4) the keeper DHCPs on the
    virtual MAC and rewrites the VIP - address, prefix and gateway - to whatever the ISP
    actually hands out ([section 6.1](#s6-1)).
 4. **Plugin** [os-carp-vip-dhcp](../README.md): a keeper on the VIP with the **IPv4 lease

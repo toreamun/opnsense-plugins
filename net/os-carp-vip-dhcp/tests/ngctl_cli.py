@@ -2,11 +2,13 @@
 
     python ngctl_cli.py <state.json> <ngctl|kldstat> [args...]
 
-Loads the netgraph state from the JSON file, runs one command through FakeNgctl (the
+Loads the netgraph state and the failure knobs (NgKnobs) from the JSON file, runs one
+command through FakeNgctl (the
 same oracle the Python tests use, printing what FreeBSD prints), saves the state and
 appends the argv to the file's call log, then prints stdout and stderr and exits with
 the command's exit status. Keeps shell and Python tests on one model of ngctl.
 """
+import dataclasses
 import importlib
 import json
 import os
@@ -26,7 +28,7 @@ def load(path):
     """The FakeNgctl a state file describes."""
     with open(path, encoding="utf-8") as f:
         data = json.load(f)
-    fake = fakes.FakeNgctl(ifaces=(), knobs=fakes.NgKnobs(patch_unloaded=data.get("patch_unloaded", False)))
+    fake = fakes.FakeNgctl(ifaces=(), knobs=fakes.NgKnobs(**data.get("knobs", {})))
     fake.nodes = {name: fakes.NgNode(n["type"], {k: tuple(p) for k, p in n["hooks"].items()}, _tuples(n["config"]))
                   for name, n in data["nodes"].items()}
     fake.calls = data.get("calls", [])
@@ -35,7 +37,7 @@ def load(path):
 
 def save(path, fake):
     """Write a FakeNgctl's nodes, knobs and call log to a state file."""
-    data = {"patch_unloaded": fake.knobs.patch_unloaded, "calls": fake.calls,
+    data = {"knobs": dataclasses.asdict(fake.knobs), "calls": fake.calls,
             "nodes": {name: {"type": n.type, "hooks": n.hooks, "config": n.config} for name, n in fake.nodes.items()}}
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f)

@@ -75,8 +75,8 @@ class _Bench:
         return ngctl_cli.load(self.state)
 
 
-def _fake(*, built=True, unnamed=False, unloaded=False, ifaces=("vtnet0", "igb0.100")):
-    fake = FakeNgctl(ifaces=ifaces, knobs=NgKnobs(patch_unloaded=unloaded))
+def _fake(*, built=True, unnamed=False, unloaded=False, ifaces=("vtnet0", "igb0.100"), **knobs):
+    fake = FakeNgctl(ifaces=ifaces, knobs=NgKnobs(patch_unloaded=unloaded, **knobs))
     if built:
         fake.add_patch(NODE, "vtnet0", config=WANTED)
     if unnamed:
@@ -164,7 +164,7 @@ def test_stop_removes_the_rewrite_everywhere_else(tmp_path, case):
         body = f'echo $$ > "{_posix(tmp_path)}/run/dhclient.vtnet0.pid"\n' + body
     res = b.run(body)
     assert NODE not in b.after().nodes and b.after().nodes["vtnet0"].hooks == {}
-    assert f"removed {NODE} at stop" in res.stdout
+    assert f"removed {NODE}: keeper stop" in res.stdout
 
 
 def test_stop_keeps_a_shared_interface_whose_option_keeper_is_master(tmp_path):
@@ -260,3 +260,72 @@ def test_an_unnamed_node_of_another_type_on_the_hooks_is_left_alone(tmp_path):
     b = _Bench(tmp_path, fake)
     b.run(f'carpvipdhcp_vmac_carp_event "{b.conf(_record())}" 149@vtnet0 BACKUP')
     assert b.after().nodes["<unnamed>"].type == "netflow"
+
+
+# ---- the failure paths (read-back, as vmac.py's teardown does) ----
+
+def test_a_lying_shutdown_is_never_reported_as_removed(tmp_path):
+    b = _Bench(tmp_path, _fake(shutdown_lies=True))
+    res = b.run(f'carpvipdhcp_vmac_carp_event "{b.conf(_record())}" 149@vtnet0 BACKUP')
+    assert NODE in b.after().nodes
+    assert "removed" not in res.stdout and f"could not remove {NODE}" in res.stdout
+    assert sum(c[1:2] == ["shutdown"] for c in b.after().calls) >= 3      # retried
+
+
+def test_a_lying_shutdown_at_stop_is_reported(tmp_path):
+    b = _Bench(tmp_path, _fake(shutdown_lies=True))
+    b.ifconfig("vtnet0", BACKUP_149)
+    res = b.run(f'carpvipdhcp_vmac_stop_rule "{b.conf(_record())}"')
+    assert f"could not remove {NODE} (keeper stop)" in res.stdout
+
+
+@pytest.mark.parametrize("show", ["fails", "garbled"])
+def test_a_wired_node_whose_name_cannot_be_read_goes_by_its_hooks(tmp_path, show):
+    # Our name cannot be read, the hooks can: the wired node is removed by hook path,
+    # and the read-back then finds no such node (a successful read), so it is confirmed.
+    b = _Bench(tmp_path, _fake(show=show))
+    res = b.run(f'carpvipdhcp_vmac_carp_event "{b.conf(_record())}" 149@vtnet0 BACKUP')
+    assert NODE not in b.after().nodes and b.after().nodes["vtnet0"].hooks == {}
+    assert f"removed {NODE}" in res.stdout
+
+
+@pytest.mark.parametrize("show", ["fails", "garbled"])
+def test_an_unreadable_name_is_never_reported_clean(tmp_path, show):
+    # A node under our name on no hook, and its name cannot be read: neither removable
+    # by name (its type is unknown) nor by a hook, so it is reported, never "clean".
+    fake = _fake(built=False, show=show)
+    fake.add_patch(NODE, "vtnet0", hooks=(), config=WANTED)
+    b = _Bench(tmp_path, fake)
+    res = b.run(f'carpvipdhcp_vmac_carp_event "{b.conf(_record())}" 149@vtnet0 BACKUP')
+    assert NODE in b.after().nodes
+    assert "removed" not in res.stdout and f"could not remove {NODE}" in res.stdout
+
+
+def test_unreadable_hooks_are_never_clean(tmp_path):
+    # An unnamed leftover on upper, and the hooks read exit 0 with no header.
+    b = _Bench(tmp_path, _fake(built=False, unnamed=True, show="garbled-ether"))
+    res = b.run(f'carpvipdhcp_vmac_carp_event "{b.conf(_record())}" 149@vtnet0 BACKUP')
+    assert "<unnamed>" in b.after().nodes and f"could not remove {NODE}" in res.stdout
+
+
+def test_nothing_there_is_silent(tmp_path):
+    b = _Bench(tmp_path, _fake(built=False))
+    res = b.run(f'carpvipdhcp_vmac_carp_event "{b.conf(_record())}" 149@vtnet0 BACKUP')
+    assert res.stdout == "" and not [c for c in b.after().calls if c[1:2] == ["shutdown"]]
+
+
+def test_the_shell_functions_leave_no_scratch_variables(tmp_path):
+    b = _Bench(tmp_path, _fake())
+    b.ifconfig("vtnet0", MASTER_149)
+    conf = b.conf(_record())
+    res = b.run(f'carpvipdhcp_vmac_carp_event "{conf}" 149@vtnet0 BACKUP\n'
+                f'carpvipdhcp_vmac_stop_rule "{conf}"\nset | grep "^_vm_" || echo CLEAN')
+    assert res.stdout.strip().endswith("CLEAN")
+
+
+def test_hooks_that_cannot_be_read_are_never_clean(tmp_path):
+    # No node under our name, but the hooks cannot be read at all (not "no such node"):
+    # an unnamed leftover there would be invisible, so this is reported, not silent.
+    b = _Bench(tmp_path, _fake(built=False, unnamed=True, ether_reads=0))
+    res = b.run(f'carpvipdhcp_vmac_carp_event "{b.conf(_record())}" 149@vtnet0 BACKUP')
+    assert f"could not remove {NODE}" in res.stdout

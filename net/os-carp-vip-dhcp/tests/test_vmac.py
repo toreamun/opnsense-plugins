@@ -47,7 +47,7 @@ def _ng(lk, monkeypatch):
     return fake
 
 
-def _egress(enabled=True, iface="vtnet0", chaddr=VMAC, vhid=VHID):
+def _egress(enabled=True, iface="vtnet0", chaddr=VMAC, vhid: "str | None" = VHID):
     return vm.VmacEgress(iface, chaddr, vhid, enabled=enabled)
 
 
@@ -700,3 +700,28 @@ def test_a_half_built_graph_that_cannot_be_removed_is_failed_teardown(lk, monkey
     e = _egress()
     e.reconcile(True)
     assert e.status() == "failed:teardown" and not fake.builds()
+
+
+# ---- PR #135 review (Copilot, third round) ----
+
+def test_an_unknown_blip_does_not_open_the_build_cooldown(lk, monkeypatch):
+    clock = _fake_clock(lk, monkeypatch)
+    fake = FakeNgctl(knobs=NgKnobs(script="fail:2"))
+    monkeypatch.setattr(lk.subprocess, "run", fake.run)
+    monkeypatch.setattr(vm, "_dhclient_running", lambda _iface: False)
+    e = _egress()
+    e.reconcile(True)                                       # build fails
+    e.reconcile(None)                                       # a probe glitch: state unknown
+    e.reconcile(True)
+    assert len(fake.builds()) == 1                          # still cooling down
+    clock[0] += vm.BUILD_RETRY_INTERVAL + 1
+    e.reconcile(True)
+    assert len(fake.builds()) == 2
+
+
+def test_a_refused_config_never_keeps_a_graph_at_a_boundary(ng):
+    # No vhid: carp_master() reads True for "nothing to gate on", but a keeper the option
+    # cannot serve must not keep a predecessor's graph as if it were a confirmed master.
+    ng.add_patch(NODE, "vtnet0", config=WANTED)
+    _egress(vhid=None).teardown_unless_master(lambda: True)
+    assert NODE not in ng.nodes and ng.nodes["vtnet0"].hooks == {}

@@ -434,8 +434,11 @@ def main():
                 DefaultRouteReconciler(args.default_route_mode),
                 BackupEgressReconciler(args.default_route_mode, backup_egress=backup_egress),
                 lambda: carp_master(args.iface, args.vhid))
-            # Same rule for the source-MAC rewrite: a crashed predecessor's graph is kept
-            # only on a confirmed master; off, only a leftover node of ours is removed.
+        # Same rule for the source-MAC rewrite, and without a vhid too (that keeper never
+        # builds, but a predecessor's node may be there): a crashed predecessor's graph is
+        # kept only on a confirmed master of a config the option can serve; off, only a
+        # leftover node of ours is removed.
+        if not args.once:
             vmac.teardown_unless_master(lambda: carp_master(args.iface, args.vhid), leftover=True)
 
         # Fail fast (with a logged reason) if the raw /dev/bpf backend cannot run

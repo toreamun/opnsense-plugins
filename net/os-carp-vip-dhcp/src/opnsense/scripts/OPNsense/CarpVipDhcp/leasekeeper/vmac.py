@@ -300,6 +300,7 @@ class _Runtime:
     gates: _Gates = field(default_factory=_Gates)
     dropped: int = 0                      # the last Dropped count seen while built
     hooks_owner: str = ""                 # who holds the hooks, for the refused:hooks-taken line
+    cooling: bool = False                 # a build failed: wait BUILD_RETRY_INTERVAL before the next
 
 
 # A read of the interface's ether node that found no such node (no hooks to hold).
@@ -390,7 +391,7 @@ class VmacEgress:
             if not self._teardown("half-built"):
                 self._set_state(VmacState.TEARDOWN)
                 return
-        if self._run.state in _ERRORS and not self._retry.ready()[0]:
+        if self._run.cooling and not self._retry.ready()[0]:
             return   # each attempt puts a node on upper for a moment: not every tick
         self._build()
 
@@ -409,8 +410,8 @@ class VmacEgress:
         if not self.enabled:
             if not leftover or self._t.shared_iface or not _patch_module_loaded():
                 return
-        elif probe() is True:
-            return
+        elif self._t.static_refusal is None and probe() is True:
+            return   # (a refused config, such as no vhid, is never a confirmed master here)
         if self._needs_teardown():
             self._teardown("not master at a keeper start or stop" if self.enabled else "option off")
 
@@ -553,6 +554,7 @@ class VmacEgress:
                  self._t.iface, self._t.node, self._t.ether, self._t.ether, self._t.mac)
         self._run.dropped = 0
         self._run.gates = _Gates()
+        self._run.cooling = False
         auto = _ngctl("msg", f"{self._t.ether}:", "getautosrc")
         if auto is not None:
             LOG.debug("vmac egress on %s: %s getautosrc: %s (want 0)", self._t.iface,
@@ -563,6 +565,7 @@ class VmacEgress:
         """A failed build or read-back: tear down at once (never leave a one-hook node),
         report a teardown that could not be confirmed as such, and wait the retry
         interval before the next attempt."""
+        self._run.cooling = True
         self._retry.reset()
         self._set_state(state if self._teardown(f"a failed {state.partition(':')[2]}") else
                         VmacState.TEARDOWN, detail)

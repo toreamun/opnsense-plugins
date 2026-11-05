@@ -3624,3 +3624,11 @@ def test_main_sees_another_keeper_on_the_same_interface(monkeypatch, tmp_path):
     for lines, shared in (([_CONF_LINE], False), ([_CONF_LINE, other], True), ([_CONF_LINE, elsewhere], False)):
         rc, built = _conf_main(monkeypatch, tmp_path, "\n".join(lines) + "\n", "--keeper-id", "100_64_4_7")
         assert rc == 0 and built["vmac"]["kwargs"]["shared_iface"] is shared
+
+
+def test_main_runs_the_vmac_startup_sweep_without_a_vhid(monkeypatch, tmp_path):
+    # The route fail-stop needs a vhid; the vmac sweep does not (a predecessor's node may
+    # be there). Not for --once.
+    rc, built = _conf_main(monkeypatch, tmp_path, _CONF_LINE.replace("vhid=254", "vhid="),
+                           "--keeper-id", "100_64_4_7")
+    assert rc == 0 and built["vmac"]["teardown"][1] == {"leftover": True}

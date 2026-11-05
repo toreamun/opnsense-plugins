@@ -25,6 +25,8 @@ log_dir="/var/log"
 # Shared keeper.conf line parser, also sourced by the CARP status hook, so the
 # two readers cannot drift (and it is unit-tested against keeperconf.py).
 . /usr/local/opnsense/scripts/OPNsense/CarpVipDhcp/keeperconf.sh
+# The source-MAC rewrite's stop rule (option E): carpvipdhcp_vmac_stop_rule.
+. /usr/local/opnsense/scripts/OPNsense/CarpVipDhcp/vmac.sh
 
 start_cmd="carpvipdhcp_start"
 stop_cmd="carpvipdhcp_stop"
@@ -128,6 +130,12 @@ carpvipdhcp_stop()
         _signal_keepers -KILL
     fi
     rm -f "${run_dir}"/carpvipdhcp-*.pid "${run_dir}"/carpvipdhcp-*.child.pid
+    # The source-MAC rewrite stays only on a confirmed master whose keeper has the
+    # option on (D1), so a restart, settings save or package upgrade there opens no
+    # window of own-MAC frames; everywhere else it goes. Only on this all-keepers
+    # path: a per-row Stop or a follow (stop_id) never tears it down. A manual stop on
+    # a master keeps it, like the default route; the next CARP event removes it.
+    carpvipdhcp_vmac_stop_rule "${conf}"
     echo "Stopped ${stopped} keeper(s)${carpvipdhcp_restarting:+ (for restart)}."
 }
 

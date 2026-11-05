@@ -4,6 +4,22 @@
 # Per-keeper logs are kept for post-mortem (remove them by hand). The script
 # directory + its __pycache__ are handled in +PRE_DEINSTALL so pkg removes the
 # empty directory itself.
+#
+# The source-MAC rewrite (option E): +PRE_DEINSTALL's rc.d stop keeps it on a master
+# (an upgrade must not flap it), so on removal sweep every node of ours here (D9),
+# before keeper.conf goes: each vmac_* patch node, and an unnamed patch node an
+# interrupted build left on a keeper's interface hooks. Inline, because the plugin's
+# scripts are already gone; ngctl is base system. Nothing runs without ng_patch.
+if /sbin/kldstat -q -m ng_patch 2>/dev/null; then
+    for n in $(/usr/sbin/ngctl list 2>/dev/null | awk '$1 == "Name:" && $4 == "patch" && $2 ~ /^vmac_/ { print $2 }'); do
+        /usr/sbin/ngctl shutdown "${n}:" >/dev/null 2>&1
+    done
+    for e in $(sed -n 's/.*|iface=\([^|]*\).*/\1/p' /usr/local/etc/carpvipdhcp/keeper.conf 2>/dev/null | tr '.' '_' | sort -u); do
+        for h in $(/usr/sbin/ngctl show "${e}:" 2>/dev/null | awk '($1 == "upper" || $1 == "lower") && $3 == "patch" && $2 == "<unnamed>" { print $1 }'); do
+            /usr/sbin/ngctl shutdown "${e}:${h}" >/dev/null 2>&1
+        done
+    done
+fi
 rm -rf /usr/local/etc/carpvipdhcp
 rm -f /var/run/carpvipdhcp-*.hb /var/run/carpvipdhcp-follow-* \
       /var/run/carpvipdhcp-follow_update.lock

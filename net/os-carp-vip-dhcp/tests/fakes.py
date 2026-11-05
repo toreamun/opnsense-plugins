@@ -207,12 +207,19 @@ class FakeNgctl:
             return _ng_reply(1 if self.knobs.kldload_fails else 0, "", "kldload: can't load")
         if cmd[0].endswith("kldstat"):
             return _ng_reply(1 if self.knobs.patch_unloaded else 0, "")
-        handlers = {"show": lambda a: self._show(a[0].rstrip(":")),
+        handlers = {"list": lambda _a: self._list(),
+                    "show": lambda a: self._show(a[0].rstrip(":")),
                     "msg": lambda a: self._msg(a[0].rstrip(":"), a[1]),
                     "shutdown": lambda a: self._shutdown(a[0].rstrip(":")),
                     "-f": lambda a: self._script(script or "")}
         handler = handlers.get(cmd[1])
         return handler(cmd[2:]) if handler else _ng_reply(1, "", f"ngctl: unknown command {cmd[1]}")
+
+    def _list(self):
+        out = f"There are {len(self.nodes)} total nodes:\n"
+        for name, node in self.nodes.items():
+            out += f"  Name: {name:<15} Type: {node.type:<15} ID: 0000000d   Num hooks: {len(node.hooks)}\n"
+        return _ng_reply(0, out)
 
     def _show(self, name):
         node = self.nodes.get(name)

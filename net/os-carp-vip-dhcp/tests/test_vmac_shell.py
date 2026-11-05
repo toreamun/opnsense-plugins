@@ -340,3 +340,17 @@ def test_deinstall_warns_when_a_node_will_not_go_and_still_finishes(tmp_path):
     assert "could not remove the source-MAC rewrite" in res.stderr
     assert sum(c[1:2] == ["shutdown"] for c in b.after().calls) == 3   # three rounds, then stop
     assert not (tmp_path / "etc").exists()                             # removal still finishes
+
+
+@pytest.mark.parametrize("stale, ether_reads, want", [
+    # An earlier read said both sides read fine; now the hooks cannot be read.
+    ("_vm_name_ok=1 _vm_hooks_ok=1 _vm_ids=''", 0, "rc=2"),
+    # An earlier read saw a node ID; now nothing is there.
+    ("_vm_name_ok=1 _vm_hooks_ok=1 _vm_ids=0000abcd", None, "rc=1"),
+])
+def test_a_removal_never_acts_on_an_earlier_scan(tmp_path, stale, ether_reads, want):
+    knobs = {} if ether_reads is None else {"ether_reads": ether_reads}
+    b = _Bench(tmp_path, _fake(built=False, unnamed=ether_reads is not None, **knobs))
+    res = b.run(f'{stale}\ncarpvipdhcp_vmac_remove {NODE}\necho "rc=$?"')
+    assert res.stdout.strip() == want
+    assert not [c for c in b.after().calls if c[1:2] == ["shutdown"]]

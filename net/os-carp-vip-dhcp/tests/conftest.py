@@ -5,6 +5,7 @@ at module load, so the suite runs without any dependency, root, or a live
 interface. status.py / logparse.py are plain-stdlib and import directly once
 their directory is on sys.path.
 """
+import importlib
 import importlib.util
 import os
 import sys
@@ -45,13 +46,12 @@ def lk():
     # needs it, after SCRIPT_DIR is on sys.path -- hence import-outside-toplevel.
     import subprocess  # pylint: disable=import-outside-toplevel
     import time  # pylint: disable=import-outside-toplevel
-    from leasekeeper import (  # pylint: disable=import-outside-toplevel
-        capture, capture_bpf, carp, codec, constants, dhcpclient, heartbeat,
-        keeper, policy, route, util, wire)
 
     ns = types.SimpleNamespace()
-    _flatten(ns, (constants, util, wire, codec, capture,
-                  capture_bpf, carp, dhcpclient, heartbeat, policy, route, keeper))
+    # In flatten order (a later module's re-export of an earlier one's name is fine).
+    _flatten(ns, [importlib.import_module(f"leasekeeper.{name}") for name in (
+        "constants", "util", "wire", "codec", "capture", "capture_bpf", "carp",
+        "dhcpclient", "heartbeat", "policy", "route", "vmac", "keeper")])
     ns.subprocess = subprocess
     ns.time = time
     return ns

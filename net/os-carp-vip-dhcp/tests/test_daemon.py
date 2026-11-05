@@ -677,8 +677,19 @@ def _spy_main(monkeypatch, *argv, iface_args=False):
         def close(self):
             pass
 
+    class _SpyVmac:   # the startup teardown_unless_master: no ngctl
+        def __init__(self, *a, **k):
+            built["vmac"] = {"args": a, "kwargs": k, "self": self}
+
+        def teardown_unless_master(self, probe, **k):
+            built["vmac"]["teardown"] = (probe, k)
+
+        def status(self):
+            return None
+
     lease_keeper = _stub_main(monkeypatch, _SpyKeeper, *argv, iface_args=iface_args)
     monkeypatch.setattr(lease_keeper, "withdraw_unless_master", lambda *_a: None)   # no route(8)
+    monkeypatch.setattr(lease_keeper, "VmacEgress", _SpyVmac)
     monkeypatch.setattr(lease_keeper.signal, "set_wakeup_fd", lambda _fd: None)
     return lease_keeper, built
 
@@ -3482,3 +3493,142 @@ def test_main_min_lease_time_from_keeper_conf(monkeypatch, tmp_path, caplog, cas
     assert rc == 0 and built["kwargs"]["min_lease_time"] == expected
     assert ("invalid minimum lease time" in caplog.text) == warns
     assert ("the default of 60s applies" in caplog.text) == warns
+
+
+# ---- option E wiring (vmac.py): the three hook points, the token, the flag ----
+
+class _RecordingVmac:
+    """A VmacEgress stand-in that records what the keeper asks of it."""
+
+    def __init__(self, order=None):
+        self.order = order if order is not None else []
+        self.enabled = True
+
+    def reconcile(self, is_master):
+        self.order.append(("vmac", is_master))
+
+    def teardown_unless_master(self, probe, *, leftover=False):
+        self.order.append(("teardown", probe(), leftover))
+
+    def status(self):
+        return "built"
+
+
+def test_keeper_takes_its_vmac_egress_and_defaults_to_an_inert_one(lk):
+    given = lk.VmacEgress("eth0", CHADDR_STR, "254", enabled=True)
+    assert _keeper(lk, vhid=254, vmac=given)._vmac is given
+    assert given._t.static_refusal is None                    # the CARP vMAC of vhid 254
+    off = _keeper(lk, vhid=254)
+    assert off._vmac.enabled is False and off._vmac.status() is None
+
+
+def test_role_tick_reconciles_the_rewrite_on_its_own_probe_only(lk):
+    keeper = _keeper(lk, vhid=254)
+    order = []
+    keeper._vmac = _RecordingVmac(order)
+    probes = iter([True, None])
+    keeper._probe_carp_master = lambda: next(probes)
+    keeper._role.poll = lambda m=None: order.append(("poll", m))
+    keeper._reconcile_default_route = lambda *a, **k: order.append(("route",))
+    keeper._role_tick()
+    keeper._role_tick()
+    keeper._role_tick(master=True)     # a role passed in: the gate already reconciled
+    assert order == [("poll", True), ("vmac", True), ("route",),
+                     ("poll", None), ("vmac", None), ("route",),
+                     ("poll", True), ("route",)]
+
+
+def test_maintain_gate_reconciles_on_the_raw_probe_before_a_blocking_acquire(lk, monkeypatch):
+    # A probe glitch (None) substitutes the last known role for the transmit gate, but
+    # the rewrite gets the RAW None: an unknown role must never build.
+    keeper = _keeper(lk, vhid=254)
+    keeper._was_master = True
+    keeper._dhcp.binding.yiaddr = None
+    order = []
+    keeper._vmac = _RecordingVmac(order)
+    monkeypatch.setattr(keeper, "_probe_carp_master", lambda: None)
+    monkeypatch.setattr(keeper, "_acquire_step", lambda: order.append(("acquire",)))
+    monkeypatch.setattr(keeper, "_reconcile_default_route", lambda *a, **kw: None)
+    keeper._maintain_step()
+    assert order[0] == ("vmac", None) and ("acquire",) in order
+
+
+@pytest.mark.parametrize("step", ["config_error", "passive_backup"])
+def test_a_substituted_role_never_reaches_the_rewrite(lk, monkeypatch, step):
+    # The config-error and passive-backup steps tick with the gate's SUBSTITUTED role
+    # (was_master). The rewrite must see only the raw None from the gate, or a master
+    # with a config error would build on an unknown role and never collect its strikes.
+    keeper = _keeper(lk, vhid=254)
+    keeper._was_master = step == "config_error"
+    if step == "config_error":
+        keeper._config_error = "bad option"
+    order = []
+    keeper._vmac = _RecordingVmac(order)
+    monkeypatch.setattr(keeper, "_probe_carp_master", lambda: None)
+    monkeypatch.setattr(keeper, "_sleep_interruptible", lambda *a, **k: None)
+    monkeypatch.setattr(keeper, "_reconcile_default_route", lambda *a, **kw: None)
+    keeper._maintain_step()
+    assert order == [("vmac", None)]
+
+
+@pytest.mark.parametrize("master", [True, False, None])
+def test_shutdown_hands_the_rewrite_to_teardown_unless_master(lk, monkeypatch, master):
+    monkeypatch.setattr(lk.time, "sleep", lambda *_a, **_k: None)
+    monkeypatch.setattr(lk.subprocess, "run", FakeRoute().run)
+    k = _keeper(lk, vhid=254)
+    order = []
+    k._vmac = _RecordingVmac(order)
+    k._probe_carp_master = lambda: master
+    k._capture.start = lambda: True
+    k._capture.stop = lambda: None
+    k._signals.request_stop()
+    assert k.run() == 0
+    k.close()
+    assert order == [("teardown", master, False)]            # not the startup leftover sweep
+
+
+def test_heartbeat_carries_the_vmac_token_only_while_the_option_is_on(lk, tmp_path):
+    hb = tmp_path / "hb"
+    keeper = _keeper(lk, vhid=254, hbfile=str(hb))
+    keeper._hb()
+    assert "vmac=" not in hb.read_text()
+    keeper._vmac = _RecordingVmac()
+    keeper._hb()
+    assert hb.read_text().rstrip().endswith(" vmac=built")
+
+
+def test_heartbeat_line_renders_the_vmac_token(lk):
+    base = {"now": 1, "bound": "100.64.4.7", "lease": 60, "t1": 30, "t2": 52, "src": "server",
+            "master": True, "demote_ok": False, "nudge": None, "pcperr": None, "config_error": False}
+    assert lk.heartbeat_line(lk.Heartbeat(**base)).rstrip().endswith("demote_ok=0")
+    line = lk.heartbeat_line(lk.Heartbeat(**base, vmac="refused:hooks-taken"))
+    assert line.rstrip().endswith(" vmac=refused:hooks-taken")
+
+
+@pytest.mark.parametrize("fields, enabled", [("|vmacegress=1", True), ("|vmacegress=0", False), ("", False)])
+def test_main_vmac_egress_from_keeper_conf_and_the_startup_sweep(monkeypatch, tmp_path, fields, enabled):
+    rc, built = _conf_main(monkeypatch, tmp_path, _CONF_LINE + fields, "--keeper-id", "100_64_4_7")
+    assert rc == 0
+    # One VmacEgress on the keeper's identity: the startup fail-stop runs its leftover
+    # sweep (kept on a master; off removes only a leftover node), then the Keeper gets it.
+    assert built["vmac"]["args"] == ("vtnet0", "00:00:5e:00:01:fe", "254")
+    assert built["vmac"]["kwargs"] == {"enabled": enabled, "shared_iface": False}
+    assert built["kwargs"]["vmac"] is built["vmac"]["self"]
+    _probe, kw = built["vmac"]["teardown"]
+    assert kw == {"leftover": True}
+
+
+def test_main_sees_another_keeper_on_the_same_interface(monkeypatch, tmp_path):
+    other = _CONF_LINE.replace("request=100.64.4.7", "request=100.64.9.9").replace("vhid=254", "vhid=7")
+    elsewhere = other.replace("iface=vtnet0", "iface=vtnet1")
+    for lines, shared in (([_CONF_LINE], False), ([_CONF_LINE, other], True), ([_CONF_LINE, elsewhere], False)):
+        rc, built = _conf_main(monkeypatch, tmp_path, "\n".join(lines) + "\n", "--keeper-id", "100_64_4_7")
+        assert rc == 0 and built["vmac"]["kwargs"]["shared_iface"] is shared
+
+
+def test_main_runs_the_vmac_startup_sweep_without_a_vhid(monkeypatch, tmp_path):
+    # The route fail-stop needs a vhid; the vmac sweep does not (a predecessor's node may
+    # be there). Not for --once.
+    rc, built = _conf_main(monkeypatch, tmp_path, _CONF_LINE.replace("vhid=254", "vhid="),
+                           "--keeper-id", "100_64_4_7")
+    assert rc == 0 and built["vmac"]["teardown"][1] == {"leftover": True}

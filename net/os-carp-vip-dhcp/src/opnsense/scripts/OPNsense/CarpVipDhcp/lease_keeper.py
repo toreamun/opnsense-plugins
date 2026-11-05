@@ -78,6 +78,7 @@ from leasekeeper.route import (
     BackupEgressConfig, BackupEgressForm, BackupEgressReconciler, DefaultRouteMode,
     DefaultRouteReconciler, withdraw_unless_master)
 from leasekeeper.util import MAC_RE
+from leasekeeper.vmac import VmacEgress
 
 LOG = logging.getLogger(LOGGER_NAME)
 
@@ -121,6 +122,7 @@ _CONF_FLAGS = {
     "follow": "follow",
     "arplistenpromisc": "arp_listen_promisc",
     "backupegress": "backup_egress",
+    "vmacegress": "vmac_egress",
 }
 # The 802.1p priorities (PCP); 0 sets none of its own.
 VLAN_PCP_VALUES = range(8)
@@ -217,6 +219,26 @@ def _find_record(conf, keeper_id):
     return None
 
 
+def _macs_valid(args):
+    """True when the chaddr and eth-src (when given) are MAC addresses; logs the first
+    invalid one (the keeper cannot start)."""
+    for label, mac in (("chaddr", args.chaddr), ("eth-src", args.eth_src)):
+        if mac and not MAC_RE.match(mac):
+            LOG.critical("invalid %s MAC address %r -- the lease keeper cannot start", label, mac)
+            return False
+    return True
+
+
+def _iface_shared(args):
+    """True when another keeper.conf record names this keeper's interface: its CARP VIP
+    would send from this keeper's lease MAC too, and the interface has room for one
+    source-MAC rewrite (vmac.py). Without --conf there is no other record to see."""
+    if not args.conf:
+        return False
+    return any(r.get("iface") == args.iface and keeperconf.keeper_id(r["request"]) != args.keeper_id
+               for r in keeperconf.keeper_records(args.conf))
+
+
 def _record_defaults(record):
     """Parser defaults from a keeper.conf record, so an option given on the command
     line still wins. An empty field means "not set" in keeper.conf and leaves the
@@ -305,6 +327,10 @@ def _build_arg_parser():
     ap.add_argument("--backup-egress", action="store_true",
                     help="while CARP backup, route this node's own internet traffic to the "
                          "master (needs default-route-mode observe/enforce); see backup-egress docs")
+    ap.add_argument("--vmac-egress", action="store_true",
+                    help="experimental: while CARP master, rewrite the source MAC of every frame "
+                         "the WAN interface sends to the keeper's lease MAC (netgraph ng_ether "
+                         "and ng_patch); see docs/isp-mac-binding.md")
     ap.add_argument("--backup-egress-form", default=BackupEgressForm.SPLIT.value,
                     help="split (0.0.0.0/1+128.0.0.0/1, the default) or prefixes")
     ap.add_argument("--backup-egress-gateway", default=None,
@@ -384,6 +410,9 @@ def main():
         # Built before the fail-stop so the startup reconciler can clean the backup-egress
         # routes this feature manages when it is enabled (else a node coming up as master
         # with a stale /1 a crashed predecessor left would loop its egress).
+        # The source-MAC rewrite (vmac.py), shared by the fail-stop below and the Keeper.
+        vmac = VmacEgress(args.iface, args.chaddr, args.vhid, enabled=args.vmac_egress,
+                          shared_iface=_iface_shared(args))
         backup_egress = BackupEgressConfig(
             enabled=args.backup_egress,
             form=args.backup_egress_form,
@@ -405,6 +434,12 @@ def main():
                 DefaultRouteReconciler(args.default_route_mode),
                 BackupEgressReconciler(args.default_route_mode, backup_egress=backup_egress),
                 lambda: carp_master(args.iface, args.vhid))
+        # Same rule for the source-MAC rewrite, and without a vhid too (that keeper never
+        # builds, but a predecessor's node may be there): a crashed predecessor's graph is
+        # kept only on a confirmed master of a config the option can serve; off, only a
+        # leftover node of ours is removed.
+        if not args.once:
+            vmac.teardown_unless_master(lambda: carp_master(args.iface, args.vhid), leftover=True)
 
         # Fail fast (with a logged reason) if the raw /dev/bpf backend cannot run
         # on this host (e.g. fcntl missing off FreeBSD).
@@ -413,10 +448,8 @@ def main():
             LOG.critical("capture backend cannot run: %s -- the lease keeper cannot start", reason)
             return 3
 
-        for label, mac in (("chaddr", args.chaddr), ("eth-src", args.eth_src)):
-            if mac and not MAC_RE.match(mac):
-                LOG.critical("invalid %s MAC address %r -- the lease keeper cannot start", label, mac)
-                return 2
+        if not _macs_valid(args):
+            return 2
 
         send_opts, request_codes, vendor_class, client_id, config_error = _dhcp_option_settings(args)
         keeper = Keeper(args.iface, args.chaddr, args.request, args.eth_src,
@@ -429,7 +462,7 @@ def main():
                         default_route_mode=args.default_route_mode,
                         backup_egress=backup_egress,
                         vip_bits=args.vip_bits, wan_gateway=args.wan_gateway,
-                        min_lease_time=args.min_lease_time)
+                        min_lease_time=args.min_lease_time, vmac=vmac)
 
         # The Keeper is constructed, so its wake socketpair is now open: guarantee
         # keeper.close() on EVERY path from here -- the --once return, a normal run,

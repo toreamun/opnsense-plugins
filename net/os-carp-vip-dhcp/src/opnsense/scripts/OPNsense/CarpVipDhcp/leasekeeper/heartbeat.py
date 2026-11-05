@@ -6,7 +6,7 @@ must be added or changed there too.
 
     <epoch> bound=<ip|-> lease=<s> t1=<s> t2=<s> src=<server|derived>
             [master=<0|1>] demote_ok=<0|1> [nudge=<epoch> arpok=<epoch> [gw=<ip>]]
-            [pcperr=<errno name>] [cfgerr=1]
+            [pcperr=<errno name>] [cfgerr=1] [vmac=<state[:reason]>]
     <epoch> MISMATCH got=<ip> want=<ip>
 """
 import logging
@@ -31,6 +31,7 @@ class Heartbeat(NamedTuple):
     nudge: tuple | None      # (last nudge epoch, last ARP reply epoch, gateway) when the nudge is on
     pcperr: str | None       # why the VLAN priority could not be set
     config_error: bool
+    vmac: str | None = None  # the source-MAC rewrite state, None when that option is off
 
 
 def heartbeat_line(hb):
@@ -46,7 +47,9 @@ def heartbeat_line(hb):
         (0 = never), and gw the nudge target when known; only while the nudge is on.
     pcperr: the VLAN priority could not be set, so frames go out without it.
     cfgerr=1: a configuration error stops all DHCP; the reason is in the log.
-        The banner shows cfgerr and pcperr first, on both nodes."""
+        The banner shows cfgerr and pcperr first, on both nodes.
+    vmac: the source-MAC rewrite (vmac.VmacState: built, native, unknown, or why it is
+        not active, such as refused:hooks-taken); only while that option is on."""
     line = f"{int(hb.now)} bound={hb.bound or '-'} lease={hb.lease} t1={hb.t1} t2={hb.t2} src={hb.src}"
     if hb.master is not None:
         line += f" master={1 if hb.master else 0}"
@@ -60,6 +63,8 @@ def heartbeat_line(hb):
         line += f" pcperr={hb.pcperr}"
     if hb.config_error:
         line += " cfgerr=1"
+    if hb.vmac:
+        line += f" vmac={hb.vmac}"
     return line + "\n"
 
 

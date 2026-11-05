@@ -84,6 +84,8 @@ _HB_TOKENS = {
     "gw": (("gw",), lambda v: (v,)),
     "pcperr": (("vlan_pcp_error",), lambda v: (v,)),
     "cfgerr": (("config_error",), lambda v: (v == "1",)),
+    # vmac=<state[:reason]>: the source-MAC rewrite, e.g. built, native, refused:hooks-taken.
+    "vmac": (("vmac_state", "vmac_reason"), lambda v: (v.partition(":")[0], v.partition(":")[2] or None)),
     "got": (("mismatch_got",), lambda v: (v,)),
     "want": (("mismatch_want",), lambda v: (v,)),
 }
@@ -97,7 +99,7 @@ def parse_heartbeat_text(raw):
               "mismatch": False, "mismatch_got": None, "mismatch_want": None,
               "hb_epoch": None, "hb_age": None, "nudge_epoch": None, "nudge_age": None, "gw": None,
               "arp_reply_epoch": None, "arp_reply_age": None, "vlan_pcp_error": None,
-              "config_error": False}
+              "config_error": False, "vmac_state": None, "vmac_reason": None}
     parts = raw.split()
     if not parts:
         return result

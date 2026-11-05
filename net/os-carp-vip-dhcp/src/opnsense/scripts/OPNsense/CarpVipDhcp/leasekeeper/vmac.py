@@ -131,7 +131,7 @@ class _Shown(NamedTuple):
     peer's netgraph ID} (8 hex digits, as `ngctl shutdown [id]:` takes it)."""
     type: str
     hooks: dict
-    ids: dict = {}
+    ids: dict
 
 
 def ether_node(iface):
@@ -307,7 +307,7 @@ class _Runtime:
 
 
 # A read of the interface's ether node that found no such node (no hooks to hold).
-_NO_ETHER = _Shown("", {})
+_NO_ETHER = _Shown("", {}, {})
 
 
 class VmacEgress:

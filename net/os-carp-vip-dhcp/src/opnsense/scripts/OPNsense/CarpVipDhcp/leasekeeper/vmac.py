@@ -18,8 +18,8 @@ fail-closed rule route.py uses for the default route.
 
 Inert when off: a disabled VmacEgress runs no command from reconcile() or at keeper
 shutdown and reports no status; only main()'s startup call removes a leftover node of
-ours (one `kldstat`, and one `ngctl show` when ng_patch is loaded at all), which is how
-a graph goes away after the option was switched off.
+ours (one `kldstat` and, when ng_patch is loaded at all, an `ngctl show` of our name and
+of the interface's hooks), which is how a graph goes away after the option was switched off.
 
 One interface has one upper hook, so one rewrite: a keeper whose interface also carries
 another keeper's CARP VIP refuses the option (that VIP would send from this MAC too), and
@@ -55,6 +55,7 @@ _HOOK_OUT = "out"                         # patch hook that feeds the ether node
 _ETHER_HOOKS = ("upper", "lower")         # the ether node's hooks the graph takes
 _UNNAMED = "<unnamed>"                    # how ngctl show names a peer without a name
 _ENOENT = "No such file or directory"     # ngctl's text (exit 71) for a node that is not there
+BUILD_RETRY_INTERVAL = 60                 # s between build attempts after a failed one
 
 
 class VmacState(StrEnum):
@@ -299,7 +300,10 @@ class _Runtime:
     gates: _Gates = field(default_factory=_Gates)
     dropped: int = 0                      # the last Dropped count seen while built
     hooks_owner: str = ""                 # who holds the hooks, for the refused:hooks-taken line
-    leftover: bool = False                # an interrupted build's unnamed node is on the hooks
+
+
+# A read of the interface's ether node that found no such node (no hooks to hold).
+_NO_ETHER = _Shown("", {})
 
 
 class VmacEgress:
@@ -314,6 +318,7 @@ class VmacEgress:
         self._run = _Runtime()
         self._unreadable = _UnreadableRole(DEFAULT_UNREADABLE_ROLE_STRIKES)
         self._heartbeat = _RateLimit(RECONCILE_HEARTBEAT_INTERVAL)
+        self._retry = _RateLimit(BUILD_RETRY_INTERVAL)   # re-armed by each failed build
 
     def status(self):
         """The heartbeat token value, or None when the feature is off (no token)."""
@@ -325,7 +330,9 @@ class VmacEgress:
         """Converge the graph on the CARP role: True builds (or confirms), False tears
         down, None (unreadable) never builds and tears down only after the strikes. Off
         is fully inert. A keeper restart on a master never rebuilds: the first tick reads
-        the graph as built and only confirms."""
+        the graph as built and only confirms. An interrupted build's unnamed node on the
+        hooks is removed on every tick, whatever else is refused (left on upper it
+        returns every frame)."""
         if not self.enabled:
             return
         if is_master is None:
@@ -333,29 +340,34 @@ class VmacEgress:
             return
         self._unreadable.reset()
         presence = self._present()
-        if presence in (_Presence.UNREADABLE, _Presence.FOREIGN):
-            if presence is _Presence.UNREADABLE:
-                self._set_state(VmacState.NGCTL)
-            else:
-                self._set_state(VmacState.FOREIGN_NODE, f"({self._t.node}: never touched)")
+        if presence is _Presence.UNREADABLE:
+            # Our name cannot be read; a backup still reaches a wired node of ours by its hooks.
+            if is_master is False and self._ours_on(self._read_ether()):
+                self._teardown("not master")
+            self._set_state(VmacState.NGCTL)
             return
-        refusal = self._refusal(presence)
-        if not self._clear_leftover():
-            self._set_state(VmacState.TEARDOWN)
-        elif not is_master or refusal is not None:
+        refusal = self._t.static_refusal or self._load_modules()
+        ether = self._read_ether()
+        if self._unnamed_in(ether):
+            LOG.warning("vmac egress on %s: removing an unnamed patch node an interrupted "
+                        "build left on %s", self._t.iface, self._t.ether)
+            if not self._teardown("an interrupted build's leftover"):
+                self._set_state(VmacState.TEARDOWN)
+                return
+            # Confirmed: nothing of ours is left (a node of another type under our name stays).
+            presence = _Presence.FOREIGN if presence is _Presence.FOREIGN else _Presence.ABSENT
+            ether = self._read_ether()
+        if presence is _Presence.FOREIGN:
+            self._set_state(VmacState.FOREIGN_NODE, f"({self._t.node}: never touched)")
+            return
+        if refusal is None and presence is not _Presence.BUILT:
+            refusal = self._hooks_refusal(ether)
+        if refusal is None and _dhclient_running(self._t.iface):
+            refusal = VmacState.DHCP_WAN
+        if not is_master or refusal is not None:
             self._stand_down(presence, refusal)
         else:
             self._converge(presence)
-
-    def _clear_leftover(self):
-        """Remove an interrupted build's unnamed node found on the hooks (on either role:
-        left on upper it returns every frame). True when there was none or it is gone."""
-        if not self._run.leftover:
-            return True
-        self._run.leftover = False
-        LOG.warning("vmac egress on %s: removing an unnamed patch node an interrupted "
-                    "build left on %s", self._t.iface, self._t.ether)
-        return self._teardown("an interrupted build's leftover")
 
     def _stand_down(self, presence, refusal):
         """Not master, or refused: no rewrite. A teardown that could not be confirmed is
@@ -375,7 +387,11 @@ class VmacEgress:
                 self._run.gates.half = True
                 LOG.warning("vmac egress on %s: %s is not the wanted graph -- rebuilding",
                             self._t.iface, self._t.node)
-            self._teardown("half-built")
+            if not self._teardown("half-built"):
+                self._set_state(VmacState.TEARDOWN)
+                return
+        if self._run.state in _ERRORS and not self._retry.ready()[0]:
+            return   # each attempt puts a node on upper for a moment: not every tick
         self._build()
 
     def teardown_unless_master(self, probe, *, leftover=False):
@@ -395,7 +411,7 @@ class VmacEgress:
                 return
         elif probe() is True:
             return
-        if self._present() in _OURS or self._unnamed_on_hooks():
+        if self._needs_teardown():
             self._teardown("not master at a keeper start or stop" if self.enabled else "option off")
 
     # ---- states ----
@@ -406,53 +422,45 @@ class VmacEgress:
         self._run.state = VmacState.UNKNOWN
         if not self._unreadable.record():
             return
-        if self._present() in _OURS or self._unnamed_on_hooks():
+        if self._needs_teardown():
             if self._unreadable.take_warning():
                 LOG.warning("vmac egress on %s: CARP role unreadable for %d probes -- removing "
                             "the source MAC rewrite (fail closed)", self._t.iface, self._unreadable.strikes)
             self._teardown("CARP role unreadable")
 
-    def _refusal(self, presence):
-        """Why the rewrite must not be active on this node, or None. Checked on the
-        backup too (pre-staging: the status page shows the would-be result before a
-        failover). The hook checks are skipped once our graph is built (it holds them)."""
-        if self._t.static_refusal is not None:
-            return self._t.static_refusal
+    def _needs_teardown(self):
+        """True when a patch node of ours is there: found by name, or on the interface's
+        hooks (an unnamed one, or ours when our name cannot be read)."""
+        return self._present() in _OURS or bool(self._ours_on(self._read_ether()))
+
+    def _load_modules(self):
+        """Load ng_ether and ng_patch once (latched); KLDLOAD while they do not load."""
         if not self._run.modules_loaded:
             loaded = [run([KLDLOAD, "-n", m], quiet=True) for m in _MODULES]
             if any(r is None or r.returncode != 0 for r in loaded):
                 return VmacState.KLDLOAD
             self._run.modules_loaded = True
-        refusal = None if presence is _Presence.BUILT else self._hooks_refusal()
-        if refusal is None and _dhclient_running(self._t.iface):
-            refusal = VmacState.DHCP_WAN
-        return refusal
+        return None
 
-    def _hooks_refusal(self):
+    def _hooks_refusal(self, ether):
         """The interface's ether node must exist and its upper and lower hooks must be
-        free (or ours): NetFlow capture holds the same hooks. An unnamed patch node there
-        is a leftover of an interrupted build (ours: mkpeer ran, `name` did not), marked
-        for the scrub, never a reason to refuse."""
-        res = _ngctl("show", f"{self._t.ether}:")
-        if res is None or (res.returncode != 0 and not _enoent(res)):
+        free, ours or an interrupted build's (cleaned before this check): NetFlow
+        capture holds the same hooks."""
+        if ether is None:
             return VmacState.NGCTL
-        shown = _parse_show(res.stdout) if res.returncode == 0 else None
-        if shown is None:
+        if ether is _NO_ETHER:
             return VmacState.NO_ETHER_NODE
         for hook in _ETHER_HOOKS:
-            peer = shown.hooks.get(hook)
-            if peer is None or peer.name == self._t.node:
-                continue
-            if peer.name == _UNNAMED and peer.type == "patch":
-                self._run.leftover = True
+            peer = ether.hooks.get(hook)
+            if peer is None or (peer.type == "patch" and peer.name in (_UNNAMED, self._t.node)):
                 continue
             self._run.hooks_owner = f"{peer.name} ({peer.type})"
             return VmacState.HOOKS_TAKEN
         return None
 
     def _set_state(self, state, detail=""):
-        """Record the token; log a change of state once (ERROR for a failed build or
-        read-back, WARNING into another problem, INFO into a healthy state), the
+        """Record the token; log a change of state once (ERROR for a failed build, read-
+        back or teardown, WARNING into another problem, INFO into a healthy state), the
         unchanged repeat at DEBUG on the heartbeat."""
         self._run.state = state
         changed = state != self._run.logged
@@ -483,7 +491,9 @@ class VmacEgress:
         if res.returncode != 0:
             return _Presence.ABSENT if _enoent(res) else _Presence.UNREADABLE
         shown = _parse_show(res.stdout)
-        if shown is None or shown.type != "patch":
+        if shown is None:
+            return _Presence.UNREADABLE   # exit 0 but no header: never taken for a verdict
+        if shown.type != "patch":
             return _Presence.FOREIGN
         want = {_HOOK_IN: _Peer(self._t.ether, "ether", "upper"),
                 _HOOK_OUT: _Peer(self._t.ether, "ether", "lower")}
@@ -500,21 +510,44 @@ class VmacEgress:
         wanted = (2, 0, 0, tuple(sorted(_patch_ops(self._t.mac))))
         return _Presence.BUILT if _parse_config(cfg.stdout) == wanted else _Presence.HALF
 
+    def _read_ether(self):
+        """The interface's ether node: _Shown when read, _NO_ETHER when there is no such
+        node, None when it could not be read (never mistaken for clean hooks)."""
+        res = _ngctl("show", f"{self._t.ether}:")
+        if res is None or (res.returncode != 0 and not _enoent(res)):
+            return None
+        if res.returncode != 0:
+            return _NO_ETHER
+        return _parse_show(res.stdout)    # None when exit 0 but unparseable: unreadable
+
+    def _ours_on(self, ether):
+        """{hook: peer name} of the hooks a patch node that is ours or unnamed holds:
+        what a teardown may shut down by hook path (never another type of node). None
+        when the ether node could not be read."""
+        if ether is None:
+            return None
+        peers = {hook: ether.hooks.get(hook) for hook in _ETHER_HOOKS}
+        return {hook: peer.name for hook, peer in peers.items()
+                if peer is not None and peer.type == "patch" and peer.name in (_UNNAMED, self._t.node)}
+
+    def _unnamed_in(self, ether):
+        """True when an unnamed patch node sits on the interface's hooks (an interrupted
+        build in this or an earlier process): `ngctl show` of our name cannot see it."""
+        return _UNNAMED in (self._ours_on(ether) or {}).values()
+
     def _build(self):
-        """Build in one session, read back, and scrub at once on any failure (never leave
-        a one-hook node). A build that did not finish (ngctl timed out or could not run:
-        run() returns None for both) may have attached the node to upper already, so it
-        is scrubbed too."""
+        """Build in one session, read back, and tear down at once on any failure (never
+        leave a one-hook node). A build that did not finish (ngctl timed out or could not
+        run: run() returns None for both) may have attached the node to upper already, so
+        it is torn down too."""
         res = _ngctl("-f", "-", stdin=_build_script(self._t.iface, self._t.mac))
         if res is None or res.returncode != 0:
-            self._scrub()
             detail = ("ngctl did not finish" if res is None
                       else (res.stderr or res.stdout or "").strip() or f"exit {res.returncode}")
-            self._set_state(VmacState.BUILD, detail)
+            self._fail(VmacState.BUILD, detail)
             return
         if self._present() is not _Presence.BUILT:
-            self._scrub()
-            self._set_state(VmacState.READBACK)
+            self._fail(VmacState.READBACK)
             return
         LOG.info("vmac egress on %s: built %s (in -> %s.upper, out -> %s.lower), source MAC %s",
                  self._t.iface, self._t.node, self._t.ether, self._t.ether, self._t.mac)
@@ -526,30 +559,13 @@ class VmacEgress:
                       self._t.ether, " ".join(auto.stdout.split()[-1:]))
         self._set_state(VmacState.BUILT)
 
-    def _scrub(self):
-        """Remove what a failed build left: our named node, and a patch node mkpeer put on
-        the interface's hooks before `name` ran. Shutting our name down cannot reach that
-        unnamed node, and left on `upper` it returns every frame the stack sends (the
-        self-demoting state). Only a patch node that is ours or unnamed is touched: the
-        hooks were checked free before the build, so nothing else can be there."""
-        _ngctl("shutdown", f"{self._t.node}:")
-        for hook in self._patch_peers():
-            _ngctl("shutdown", f"{self._t.ether}:{hook}")
-
-    def _patch_peers(self):
-        """{hook: peer name} of the interface's hooks held by a patch node that is ours
-        or unnamed (an interrupted build's): what a scrub may shut down. Empty when the
-        ether node is unreadable."""
-        res = _ngctl("show", f"{self._t.ether}:")
-        shown = _parse_show(res.stdout) if res is not None and res.returncode == 0 else None
-        peers = {hook: shown.hooks.get(hook) for hook in _ETHER_HOOKS} if shown else {}
-        return {hook: peer.name for hook, peer in peers.items()
-                if peer is not None and peer.type == "patch" and peer.name in (_UNNAMED, self._t.node)}
-
-    def _unnamed_on_hooks(self):
-        """True when an unnamed patch node sits on the interface's hooks (an interrupted
-        build in this or an earlier process): `ngctl show` of our name cannot see it."""
-        return _UNNAMED in self._patch_peers().values()
+    def _fail(self, state, detail=""):
+        """A failed build or read-back: tear down at once (never leave a one-hook node),
+        report a teardown that could not be confirmed as such, and wait the retry
+        interval before the next attempt."""
+        self._retry.reset()
+        self._set_state(state if self._teardown(f"a failed {state.partition(':')[2]}") else
+                        VmacState.TEARDOWN, detail)
 
     def _confirm_built(self):
         """A built graph: confirm, and warn once when Dropped rises (memory pressure in
@@ -566,13 +582,23 @@ class VmacEgress:
         self._set_state(VmacState.BUILT)
 
     def _teardown(self, reason):
-        """Remove the rewrite (our node and any unnamed patch node on the hooks) and
-        confirm both are gone; True when confirmed. Always safe to retry: a node still
-        present is retried on the next tick, warned once until a teardown works."""
-        self._scrub()
-        if self._present() is _Presence.ABSENT and not self._patch_peers():
+        """Remove the rewrite and confirm it is gone; True when confirmed. Shuts our node
+        down by name only when it is a patch node of ours (never a node of another type
+        under our name), and any patch node that is ours or unnamed on the interface's
+        hooks by hook path. Confirmed means our name holds no patch node of ours AND the
+        hooks were read and hold none: unreadable hooks are not confirmation. Always safe
+        to retry; a failure is retried on the next tick, warned once until one works."""
+        shut = self._present() in _OURS
+        if shut:
+            _ngctl("shutdown", f"{self._t.node}:")
+        for hook in self._ours_on(self._read_ether()) or {}:
+            shut = True
+            _ngctl("shutdown", f"{self._t.ether}:{hook}")
+        held = self._ours_on(self._read_ether())
+        if self._present() in (_Presence.ABSENT, _Presence.FOREIGN) and held == {}:
             self._run.gates.teardown = False
-            LOG.info("vmac egress on %s: removed %s (%s)", self._t.iface, self._t.node, reason)
+            if shut:   # nothing was there: nothing to report
+                LOG.info("vmac egress on %s: removed %s (%s)", self._t.iface, self._t.node, reason)
             return True
         if not self._run.gates.teardown:
             self._run.gates.teardown = True

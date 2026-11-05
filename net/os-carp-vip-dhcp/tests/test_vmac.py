@@ -51,6 +51,13 @@ def _egress(enabled=True, iface="vtnet0", chaddr=VMAC, vhid=VHID):
     return vm.VmacEgress(iface, chaddr, vhid, enabled=enabled)
 
 
+def _fake_clock(lk, monkeypatch):
+    """A monotonic clock the test moves by hand (clock[0] seconds); _RateLimit reads it."""
+    clock = [1000.0]
+    monkeypatch.setattr(lk.time, "monotonic", lambda: clock[0])
+    return clock
+
+
 def _warnings(caplog):
     return [r for r in caplog.records if r.levelno >= logging.WARNING]
 
@@ -474,13 +481,13 @@ def test_the_off_sweep_runs_no_ngctl_without_ng_patch(lk, monkeypatch):
 def test_a_transient_ngctl_error_never_rebuilds_a_working_graph(ng, caplog):
     e = _egress()
     e.reconcile(True)
-    ng.knobs.show_fails = True
+    ng.knobs.show = "fails"
     with caplog.at_level(logging.WARNING, logger="lease-keeper"):
         e.reconcile(True)
         e.reconcile(True)
     assert len(ng.builds()) == 1 and not [c for c in ng.calls if c[1:2] == ["shutdown"]]
     assert e.status() == "unavailable:ngctl" and len(_warnings(caplog)) == 1
-    ng.knobs.show_fails = False
+    ng.knobs.show = ""
     e.reconcile(True)
     assert _built(ng) and e.status() == "built" and len(ng.builds()) == 1
 
@@ -553,6 +560,7 @@ def test_a_failed_teardown_on_a_master_refusal_is_not_native(lk, monkeypatch):
 
 @pytest.mark.parametrize("hangs_after", [1, 2, 3])
 def test_a_build_that_does_not_finish_is_scrubbed_at_once(lk, monkeypatch, caplog, hangs_after):
+    clock = _fake_clock(lk, monkeypatch)
     fake = FakeNgctl(knobs=NgKnobs(script=f"hang:{hangs_after}"))
     monkeypatch.setattr(lk.subprocess, "run", fake.run)
     monkeypatch.setattr(vm, "_dhclient_running", lambda _iface: False)
@@ -561,5 +569,134 @@ def test_a_build_that_does_not_finish_is_scrubbed_at_once(lk, monkeypatch, caplo
         e.reconcile(True)
     assert set(fake.nodes) == {"vtnet0"} and fake.nodes["vtnet0"].hooks == {}
     assert e.status() == "failed:build" and "ngctl did not finish" in caplog.text
-    e.reconcile(True)                                       # the next tick builds
+    e.reconcile(True)                                       # not every tick...
+    assert not _built(fake)
+    clock[0] += vm.BUILD_RETRY_INTERVAL + 1
+    e.reconcile(True)                                       # ...but after the retry interval
     assert _built(fake) and e.status() == "built"
+
+
+# ---- PR #135 review (Copilot, second round) ----
+
+@pytest.mark.parametrize("chaddr, kldload_fails, state", [
+    ("02:11:22:33:44:55", False, "refused:mac-override"),   # a static refusal
+    (VMAC, True, "failed:kldload")])                          # modules do not load
+def test_a_refusal_does_not_skip_an_unnamed_leftover(lk, monkeypatch, chaddr, kldload_fails, state):
+    fake = FakeNgctl(knobs=NgKnobs(kldload_fails=kldload_fails))
+    monkeypatch.setattr(lk.subprocess, "run", fake.run)
+    monkeypatch.setattr(vm, "_dhclient_running", lambda _iface: False)
+    _unnamed_on_upper(fake)
+    e = _egress(chaddr=chaddr)
+    e.reconcile(True)
+    assert "<unnamed>" not in fake.nodes and fake.nodes["vtnet0"].hooks == {}
+    assert e.status() == state
+
+
+@pytest.mark.parametrize("path", ["reconcile", "startup-sweep", "strikes"])
+def test_a_foreign_node_under_our_name_survives_a_leftover_cleanup(ng, path):
+    _unnamed_on_upper(ng)
+    ng.nodes[NODE] = ng.nodes["vtnet0"].__class__("tee")       # another type under our name
+    e = _egress(enabled=path != "startup-sweep")
+    if path == "reconcile":
+        e.reconcile(False)
+    elif path == "startup-sweep":
+        e.teardown_unless_master(lambda: True, leftover=True)
+    else:
+        for _ in range(3):
+            e.reconcile(None)
+    assert "<unnamed>" not in ng.nodes and ng.nodes["vtnet0"].hooks == {}
+    assert ng.nodes[NODE].type == "tee"                        # never shut down by name
+    assert not [c for c in ng.calls if c[1:3] == ["shutdown", f"{NODE}:"]]
+
+
+def test_unreadable_hooks_are_not_a_confirmed_removal(lk, monkeypatch):
+    # The leftover is seen on the first read; every later read of the hooks fails. The
+    # teardown cannot confirm, so the token must not say native.
+    fake = FakeNgctl(knobs=NgKnobs(ether_reads=1))
+    monkeypatch.setattr(lk.subprocess, "run", fake.run)
+    monkeypatch.setattr(vm, "_dhclient_running", lambda _iface: False)
+    _unnamed_on_upper(fake)
+    e = _egress()
+    e.reconcile(False)
+    assert "<unnamed>" in fake.nodes                           # not reachable without a read
+    assert e.status() == "failed:teardown"
+
+
+def test_a_teardown_needs_readable_hooks_to_succeed(lk, monkeypatch):
+    fake = FakeNgctl(knobs=NgKnobs(ether_reads=0))
+    monkeypatch.setattr(lk.subprocess, "run", fake.run)
+    fake.add_patch(NODE, "vtnet0", config=WANTED)
+    assert _egress()._teardown("test") is False                # node gone, hooks unreadable
+
+
+# ---- own adversarial review on #135 ----
+
+def test_a_failing_build_is_retried_once_per_interval_not_every_tick(lk, monkeypatch):
+    # Each attempt puts a node on upper for a moment (frames return to the stack).
+    clock = _fake_clock(lk, monkeypatch)
+    fake = FakeNgctl(knobs=NgKnobs(script="fail:2"))
+    monkeypatch.setattr(lk.subprocess, "run", fake.run)
+    monkeypatch.setattr(vm, "_dhclient_running", lambda _iface: False)
+    e = _egress()
+    for _ in range(5):
+        e.reconcile(True)
+    assert len(fake.builds()) == 1 and e.status() == "failed:build"
+    clock[0] += vm.BUILD_RETRY_INTERVAL + 1
+    e.reconcile(True)
+    e.reconcile(True)
+    assert len(fake.builds()) == 2
+    assert set(fake.nodes) == {"vtnet0"} and fake.nodes["vtnet0"].hooks == {}
+
+
+def test_a_teardown_with_nothing_there_logs_nothing(ng, caplog):
+    with caplog.at_level(logging.INFO, logger="lease-keeper"):
+        assert _egress()._teardown("nothing there") is True
+    assert "removed" not in caplog.text and not ng.mutations()
+
+
+def test_unparseable_output_for_our_name_is_unreadable_not_absent(ng):
+    # exit 0 with no header for our name: not "no node". A backup still reaches the wired
+    # node by its hooks, and the token says unavailable, never native.
+    e = _egress()
+    e.reconcile(True)
+    ng.knobs.show = "garbled"
+    e.reconcile(False)
+    ng.knobs.show = ""
+    assert NODE not in ng.nodes and ng.nodes["vtnet0"].hooks == {}
+    assert e.status() == "unavailable:ngctl"
+
+
+def test_unparseable_output_for_the_hooks_is_unreadable_not_clean(ng):
+    # An unnamed leftover on upper, and the hooks read exit 0 with no header: neither
+    # "no ether node" nor clean hooks, so the backup must not report native.
+    _unnamed_on_upper(ng)
+    ng.knobs.show = "garbled-ether"
+    e = _egress()
+    e.reconcile(False)
+    assert e.status() == "unavailable:ngctl"
+
+
+@pytest.mark.parametrize("path", ["backup-tick", "keeper-stop", "strikes"])
+def test_a_wired_node_whose_name_cannot_be_read_is_reached_by_its_hooks(ng, path):
+    _egress().reconcile(True)
+    ng.knobs.show = "fails"                                # show of our name fails, hooks read fine
+    e = _egress()
+    if path == "backup-tick":
+        e.reconcile(False)
+    elif path == "keeper-stop":
+        e.teardown_unless_master(lambda: False)
+    else:
+        for _ in range(3):
+            e.reconcile(None)
+    ng.knobs.show = ""
+    assert NODE not in ng.nodes and ng.nodes["vtnet0"].hooks == {}
+
+
+def test_a_half_built_graph_that_cannot_be_removed_is_failed_teardown(lk, monkeypatch):
+    fake = FakeNgctl(knobs=NgKnobs(shutdown_lies=True))
+    monkeypatch.setattr(lk.subprocess, "run", fake.run)
+    monkeypatch.setattr(vm, "_dhclient_running", lambda _iface: False)
+    fake.add_patch(NODE, "vtnet0", hooks=("in",), config=WANTED)
+    e = _egress()
+    e.reconcile(True)
+    assert e.status() == "failed:teardown" and not fake.builds()

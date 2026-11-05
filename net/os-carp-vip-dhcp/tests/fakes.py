@@ -126,17 +126,21 @@ class FakeRoute:  # pylint: disable=too-many-instance-attributes
 class NgKnobs:
     """Failure knobs for FakeNgctl. missing: every command could not run (None).
     kldload_fails: kldload exits 1. patch_unloaded: kldstat finds no ng_patch.
-    show_fails: `show` of an existing patch node exits 1 with another error (not
-    ENOENT). shutdown_lies: shutdown exits 0 and leaves the node. script: how the next
+    show: "fails": `show` of an existing patch node exits 1 with another error (not
+    ENOENT); "garbled" / "garbled-ether": `show` of a patch node / of an ether node
+    exits 0 with output that has no header. shutdown_lies: shutdown exits 0 and leaves the node. script: how the next
     `-f -` build session behaves: "" normally, "lying" (exit 0, nothing changes),
     "fail:N" (applies its first N lines, then exits 1), "hang:N" (applies its first N
-    lines, then does not finish: run() returns None, as for a timeout; once)."""
+    lines, then does not finish: run() returns None, as for a timeout; once).
+    ether_reads: how many `show` calls of an ether node succeed before the rest fail
+    with another error (None: all succeed)."""
     missing: bool = False
     kldload_fails: bool = False
     patch_unloaded: bool = False
-    show_fails: bool = False
+    show: str = ""
     shutdown_lies: bool = False
     script: str = ""
+    ether_reads: "int | None" = None
 
 
 @dataclass
@@ -214,8 +218,14 @@ class FakeNgctl:
         node = self.nodes.get(name)
         if node is None:
             return _ng_reply(71, "", _NG_MISSING)
-        if self.knobs.show_fails and node.type == "patch":
+        if self.knobs.show == "fails" and node.type == "patch":
             return _ng_reply(1, "", "ngctl: send msg: No buffer space available")
+        if self.knobs.show == ("garbled" if node.type == "patch" else "garbled-ether"):
+            return _ng_reply(0, "ngctl: truncated\n")
+        if node.type == "ether" and self.knobs.ether_reads is not None:
+            if self.knobs.ether_reads <= 0:
+                return _ng_reply(1, "", "ngctl: send msg: No buffer space available")
+            self.knobs.ether_reads -= 1
         out = f"  Name: {name:<15} Type: {node.type:<15} ID: 0000000d   Num hooks: {len(node.hooks)}\n"
         if node.hooks:
             out += ("  Local hook      Peer name       Peer type    Peer ID         Peer hook      \n"

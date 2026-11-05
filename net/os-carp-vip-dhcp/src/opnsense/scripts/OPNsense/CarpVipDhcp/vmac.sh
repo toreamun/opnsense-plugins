@@ -40,56 +40,60 @@ _carpvipdhcp_vmac_log()
     logger -t carpvipdhcp "$*" 2>/dev/null || :
 }
 
-# _carpvipdhcp_vmac_scan <node>: read what of ours is there. Sets _vm_named (the type of
-# the node under our name, empty when there is none) and _vm_hooks (the interface hooks
-# held by a patch node that is ours or unnamed), each only from a successful read;
-# _vm_name_ok and _vm_hooks_ok say which reads succeeded. "No such node" (exit 71 with
-# ngctl's ENOENT text) is a successful read of nothing; any other failure, or exit 0
-# without a header, is unreadable and never taken for clean.
+# _carpvipdhcp_vmac_scan <node>: read what of ours is there, from scratch every time (a
+# result from an earlier read never authorizes a shutdown). Sets _vm_ids to the netgraph
+# IDs of what is ours: the node under our name when it is a patch node, and a patch
+# node that is ours or unnamed on the interface's upper or lower hook (an interrupted
+# build leaves one there). _vm_name_ok and _vm_hooks_ok say which reads succeeded: "no
+# such node" (exit 71 with ngctl's ENOENT text) is a successful read of nothing; any
+# other failure, or exit 0 without a header, is unreadable and never taken for clean.
+# A shutdown then addresses those IDs ([id]:), never a hook path, which could reach a
+# node that took the hook since the read.
 _carpvipdhcp_vmac_scan()
 {
-    _vm_name_ok='' _vm_hooks_ok=''
+    _vm_name_ok='' _vm_hooks_ok='' _vm_ids=''
     if _vm_out=$("${CARPVIPDHCP_NGCTL}" show "$1:" 2>&1); then
-        _vm_t=$(printf '%s\n' "${_vm_out}" | awk '$1 == "Name:" { print $4; exit }')
-        [ -n "${_vm_t}" ] && _vm_named="${_vm_t}" _vm_name_ok=1
+        _vm_t=$(printf '%s\n' "${_vm_out}" | awk '$1 == "Name:" { print $4, $6; exit }')
+        if [ -n "${_vm_t}" ]; then
+            _vm_name_ok=1
+            [ "${_vm_t%% *}" = patch ] && _vm_ids="${_vm_t#* }"
+        fi
     else
-        case "${_vm_out}" in *"No such file or directory"*) _vm_named='' _vm_name_ok=1 ;; esac
+        case "${_vm_out}" in *"No such file or directory"*) _vm_name_ok=1 ;; esac
     fi
     if _vm_out=$("${CARPVIPDHCP_NGCTL}" show "${1#vmac_}:" 2>&1); then
         if printf '%s\n' "${_vm_out}" | grep -q 'Name:'; then
-            _vm_hooks=$(printf '%s\n' "${_vm_out}" | awk -v n="$1" \
-                '($1 == "upper" || $1 == "lower") && $3 == "patch" && ($2 == "<unnamed>" || $2 == n) { print $1 }')
+            _vm_ids="${_vm_ids} $(printf '%s\n' "${_vm_out}" | awk -v n="$1" \
+                '($1 == "upper" || $1 == "lower") && $3 == "patch" && ($2 == "<unnamed>" || $2 == n) { print $4 }')"
             _vm_hooks_ok=1
         fi
     else
-        case "${_vm_out}" in *"No such file or directory"*) _vm_hooks='' _vm_hooks_ok=1 ;; esac
+        case "${_vm_out}" in *"No such file or directory"*) _vm_hooks_ok=1 ;; esac
     fi
+    _vm_ids=$(printf '%s\n' "${_vm_ids}" | tr ' ' '\n' | grep . | sort -u)
     unset _vm_out _vm_t
 }
 
-# carpvipdhcp_vmac_remove <node>: remove our node <node> (only if it is a patch node)
-# and any patch node that is ours or unnamed on its interface's upper or lower hook,
-# then read back, up to three tries a second apart. Returns 0 when something was there
-# and is confirmed gone, 1 when nothing of ours was there, 2 when it is still there or
-# could not be read (never reported as removed: a shutdown can fail or lie).
+# _carpvipdhcp_vmac_clean: true when the last scan read both sides and found nothing of ours.
+_carpvipdhcp_vmac_clean()
+{
+    [ -n "${_vm_name_ok}" ] && [ -n "${_vm_hooks_ok}" ] && [ -z "${_vm_ids}" ]
+}
+
+# carpvipdhcp_vmac_remove <node>: remove what of ours is there (see the scan), by node
+# ID, then read back, up to three tries a second apart. Returns 0 when something was
+# there and is confirmed gone, 1 when nothing of ours was there, 2 when it is still
+# there or could not be read (never reported as removed: a shutdown can fail or lie).
 carpvipdhcp_vmac_remove()
 {
-    _vm_named='' _vm_hooks=''
     _carpvipdhcp_vmac_scan "$1"
-    if [ -n "${_vm_name_ok}" ] && [ -n "${_vm_hooks_ok}" ] \
-            && [ "${_vm_named}" != patch ] && [ -z "${_vm_hooks}" ]; then
-        return 1
-    fi
+    _carpvipdhcp_vmac_clean && return 1
     for _vm_try in 1 2 3; do
-        [ "${_vm_named}" = patch ] && "${CARPVIPDHCP_NGCTL}" shutdown "$1:" >/dev/null 2>&1
-        for _vm_h in ${_vm_hooks}; do
-            "${CARPVIPDHCP_NGCTL}" shutdown "${1#vmac_}:${_vm_h}" >/dev/null 2>&1
+        for _vm_id in ${_vm_ids}; do
+            "${CARPVIPDHCP_NGCTL}" shutdown "[${_vm_id}]:" >/dev/null 2>&1
         done
         _carpvipdhcp_vmac_scan "$1"
-        if [ -n "${_vm_name_ok}" ] && [ -n "${_vm_hooks_ok}" ] \
-                && [ "${_vm_named}" != patch ] && [ -z "${_vm_hooks}" ]; then
-            return 0
-        fi
+        _carpvipdhcp_vmac_clean && return 0
         [ "${_vm_try}" = 3 ] || sleep 1
     done
     return 2
@@ -146,7 +150,7 @@ carpvipdhcp_vmac_carp_event()
         carpvipdhcp_vmac_remove "${_vm_n}"
         _carpvipdhcp_vmac_report $? "${_vm_n}" "CARP vhid ${vhid} on ${iface} is $3"
     done < "$1"
-    unset _vm_vhid _vm_if _vm_line _vm_n _vm_named _vm_hooks _vm_name_ok _vm_hooks_ok _vm_try _vm_h
+    unset _vm_vhid _vm_if _vm_line _vm_n _vm_ids _vm_name_ok _vm_hooks_ok _vm_try _vm_id
     return 0
 }
 
@@ -183,6 +187,6 @@ carpvipdhcp_vmac_stop_rule()
         carpvipdhcp_vmac_remove "${_vm_n}"
         _carpvipdhcp_vmac_report $? "${_vm_n}" "keeper stop"
     done
-    unset _vm_keep _vm_cands _vm_line _vm_n _vm_named _vm_hooks _vm_name_ok _vm_hooks_ok _vm_try _vm_h
+    unset _vm_keep _vm_cands _vm_line _vm_n _vm_ids _vm_name_ok _vm_hooks_ok _vm_try _vm_id
     return 0
 }

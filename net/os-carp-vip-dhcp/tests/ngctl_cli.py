@@ -29,7 +29,8 @@ def load(path):
     with open(path, encoding="utf-8") as f:
         data = json.load(f)
     fake = fakes.FakeNgctl(ifaces=(), knobs=fakes.NgKnobs(**data.get("knobs", {})))
-    fake.nodes = {name: fakes.NgNode(n["type"], {k: tuple(p) for k, p in n["hooks"].items()}, _tuples(n["config"]))
+    fake.nodes = {name: fakes.NgNode(n["type"], {k: tuple(p) for k, p in n["hooks"].items()},
+                                     _tuples(n["config"]), id=n.get("id", 0))
                   for name, n in data["nodes"].items()}
     fake.calls = data.get("calls", [])
     return fake
@@ -38,7 +39,8 @@ def load(path):
 def save(path, fake):
     """Write a FakeNgctl's nodes, knobs and call log to a state file."""
     data = {"knobs": dataclasses.asdict(fake.knobs), "calls": fake.calls,
-            "nodes": {name: {"type": n.type, "hooks": n.hooks, "config": n.config} for name, n in fake.nodes.items()}}
+            "nodes": {name: {"type": n.type, "hooks": n.hooks, "config": n.config, "id": n.id}
+                      for name, n in fake.nodes.items()}}
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f)
 

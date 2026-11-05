@@ -146,11 +146,13 @@ class NgKnobs:
 @dataclass
 class NgNode:
     """One netgraph node: its type, its hooks {local: (peer name, peer type, peer
-    hook)}, a patch node's config (vmac._parse_config shape) and its stats."""
+    hook)}, a patch node's config (vmac._parse_config shape), its stats, and its
+    netgraph ID (0 until FakeNgctl first shows it; kept across a rename)."""
     type: str
     hooks: dict = field(default_factory=dict)
     config: "tuple | None" = None
     stats: tuple = (0, 0, 0)
+    id: int = 0
 
 
 _NG_MISSING = "ngctl: send msg: No such file or directory"
@@ -215,10 +217,17 @@ class FakeNgctl:
         handler = handlers.get(cmd[1])
         return handler(cmd[2:]) if handler else _ng_reply(1, "", f"ngctl: unknown command {cmd[1]}")
 
+    def _id(self, name):
+        """The node's netgraph ID as ngctl prints it (8 hex digits), assigned on first use."""
+        node = self.nodes[name]
+        if not node.id:
+            node.id = max((n.id for n in self.nodes.values()), default=0) + 1
+        return f"{node.id:08x}"
+
     def _list(self):
         out = f"There are {len(self.nodes)} total nodes:\n"
-        for name, node in self.nodes.items():
-            out += f"  Name: {name:<15} Type: {node.type:<15} ID: 0000000d   Num hooks: {len(node.hooks)}\n"
+        for name, node in list(self.nodes.items()):
+            out += f"  Name: {name:<15} Type: {node.type:<15} ID: {self._id(name)}   Num hooks: {len(node.hooks)}\n"
         return _ng_reply(0, out)
 
     def _show(self, name):
@@ -233,12 +242,12 @@ class FakeNgctl:
             if self.knobs.ether_reads <= 0:
                 return _ng_reply(1, "", "ngctl: send msg: No buffer space available")
             self.knobs.ether_reads -= 1
-        out = f"  Name: {name:<15} Type: {node.type:<15} ID: 0000000d   Num hooks: {len(node.hooks)}\n"
+        out = f"  Name: {name:<15} Type: {node.type:<15} ID: {self._id(name)}   Num hooks: {len(node.hooks)}\n"
         if node.hooks:
             out += ("  Local hook      Peer name       Peer type    Peer ID         Peer hook      \n"
                     "  ----------      ---------       ---------    -------         ---------      \n")
             for local, (peer, ptype, phook) in node.hooks.items():
-                out += f"  {local:<15} {peer:<15} {ptype:<12} 00000001        {phook:<15}\n"
+                out += f"  {local:<15} {peer:<15} {ptype:<12} {self._id(peer)}        {phook:<15}\n"
         return _ng_reply(0, out)
 
     def _msg(self, name, what):
@@ -259,7 +268,10 @@ class FakeNgctl:
         return _ng_reply(1, "", f"ngctl: {what}: unknown")
 
     def _shutdown(self, name):
-        if ":" in name:                 # a path, <node>:<hook>: the peer across that hook
+        if name.startswith("[") and name.endswith("]"):     # [<hex id>]: the node with that ID
+            want = int(name[1:-1], 16)
+            name = next((n for n, node in self.nodes.items() if node.id == want), None)
+        elif ":" in name:               # a path, <node>:<hook>: the peer across that hook
             here, hook = name.split(":")
             name = self.nodes.get(here, NgNode("")).hooks.get(hook, (None,))[0]
         node = self.nodes.get(name)

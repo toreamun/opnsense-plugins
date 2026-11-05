@@ -329,3 +329,14 @@ def test_hooks_that_cannot_be_read_are_never_clean(tmp_path):
     b = _Bench(tmp_path, _fake(built=False, unnamed=True, ether_reads=0))
     res = b.run(f'carpvipdhcp_vmac_carp_event "{b.conf(_record())}" 149@vtnet0 BACKUP')
     assert f"could not remove {NODE}" in res.stdout
+
+
+def test_deinstall_warns_when_a_node_will_not_go_and_still_finishes(tmp_path):
+    b = _Bench(tmp_path, _fake(shutdown_lies=True))
+    (tmp_path / "etc").mkdir()
+    (tmp_path / "etc" / "keeper.conf").write_text(_record() + "\n")
+    res = _deinstall(tmp_path)
+    assert NODE in b.after().nodes                                     # the shutdown lied
+    assert "could not remove the source-MAC rewrite" in res.stderr
+    assert sum(c[1:2] == ["shutdown"] for c in b.after().calls) == 3   # three rounds, then stop
+    assert not (tmp_path / "etc").exists()                             # removal still finishes

@@ -342,6 +342,43 @@ def test_deinstall_warns_when_a_node_will_not_go_and_still_finishes(tmp_path):
     assert not (tmp_path / "etc").exists()                             # removal still finishes
 
 
+def test_deinstall_finds_iface_wherever_it_is_in_a_record(tmp_path):
+    # keeper.conf fields are unordered: a record that starts with iface= still counts.
+    fake = _fake(built=False)
+    fake.nodes["<unnamed>"] = fake.nodes["vtnet0"].__class__("patch")
+    fake.link("<unnamed>", "in", "vtnet0", "upper")
+    b = _Bench(tmp_path, fake)
+    (tmp_path / "etc").mkdir()
+    (tmp_path / "etc" / "keeper.conf").write_text(
+        "#request=100.64.4.9|iface=igb9|vhid=1\niface=vtnet0|request=100.64.4.102|vhid=149\n")
+    res = _deinstall(tmp_path)
+    assert "<unnamed>" not in b.after().nodes and b.after().nodes["vtnet0"].hooks == {}
+    assert not [c for c in b.after().calls if c[1:3] == ["show", "igb9:"]]
+    assert res.stderr == "" and not (tmp_path / "etc").exists()
+
+
+@pytest.mark.parametrize("knobs", [{"ether_reads": 0}, {"show": "garbled-ether"}, {"show": "list-fails"}],
+                         ids=["hooks-fail", "hooks-garbled", "list-fails"])
+def test_deinstall_never_takes_an_unreadable_scan_for_clean(tmp_path, knobs):
+    # An unnamed leftover on a keeper interface it cannot see, or a node list it cannot
+    # read: retried, then warned about; never silent. pkg removal still finishes.
+    _Bench(tmp_path, _fake(built=False, unnamed=True, **knobs))
+    (tmp_path / "etc").mkdir()
+    (tmp_path / "etc" / "keeper.conf").write_text(_record() + "\n")
+    res = _deinstall(tmp_path)
+    assert "could not remove the source-MAC rewrite" in res.stderr and "unreadable:" in res.stderr
+    assert "unreadable: none" not in res.stderr
+    assert not (tmp_path / "etc").exists()
+
+
+def test_deinstall_with_nothing_there_is_silent(tmp_path):
+    b = _Bench(tmp_path, _fake(built=False))
+    (tmp_path / "etc").mkdir()
+    (tmp_path / "etc" / "keeper.conf").write_text(_record() + "\n")
+    res = _deinstall(tmp_path)
+    assert res.stderr == "" and not [c for c in b.after().calls if c[1:2] == ["shutdown"]]
+
+
 @pytest.mark.parametrize("stale, ether_reads, want", [
     # An earlier read said both sides read fine; now the hooks cannot be read.
     ("_vm_name_ok=1 _vm_hooks_ok=1 _vm_ids=''", 0, "rc=2"),

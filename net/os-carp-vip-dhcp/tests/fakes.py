@@ -126,9 +126,10 @@ class FakeRoute:  # pylint: disable=too-many-instance-attributes
 class NgKnobs:
     """Failure knobs for FakeNgctl. missing: every command could not run (None).
     kldload_fails: kldload exits 1. patch_unloaded: kldstat finds no ng_patch.
-    show: "fails": `show` of an existing patch node exits 1 with another error (not
-    ENOENT); "garbled" / "garbled-ether": `show` of a patch node / of an ether node
-    exits 0 with output that has no header. shutdown_lies: shutdown exits 0 and leaves the node. script: how the next
+    show: how a read misbehaves: "fails": `show` of an existing patch node exits 1
+    with another error (not ENOENT); "garbled" / "garbled-ether": `show` of a patch
+    node / of an ether node exits 0 with output that has no header; "list-fails":
+    `list` exits 1 with another error. shutdown_lies: shutdown exits 0 and leaves the node. script: how the next
     `-f -` build session behaves: "" normally, "lying" (exit 0, nothing changes),
     "fail:N" (applies its first N lines, then exits 1), "hang:N" (applies its first N
     lines, then does not finish: run() returns None, as for a timeout; once).
@@ -225,6 +226,8 @@ class FakeNgctl:
         return f"{node.id:08x}"
 
     def _list(self):
+        if self.knobs.show == "list-fails":
+            return _ng_reply(1, "", "ngctl: send msg: No buffer space available")
         out = f"There are {len(self.nodes)} total nodes:\n"
         for name, node in list(self.nodes.items()):
             out += f"  Name: {name:<15} Type: {node.type:<15} ID: {self._id(name)}   Num hooks: {len(node.hooks)}\n"

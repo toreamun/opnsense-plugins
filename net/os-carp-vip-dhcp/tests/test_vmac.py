@@ -725,3 +725,20 @@ def test_a_refused_config_never_keeps_a_graph_at_a_boundary(ng):
     ng.add_patch(NODE, "vtnet0", config=WANTED)
     _egress(vhid=None).teardown_unless_master(lambda: True)
     assert NODE not in ng.nodes and ng.nodes["vtnet0"].hooks == {}
+
+
+@pytest.mark.parametrize("between", [None, False], ids=["unknown", "backup"])
+def test_the_token_keeps_the_pending_failure_during_the_cooldown(lk, monkeypatch, between):
+    clock = _fake_clock(lk, monkeypatch)
+    fake = FakeNgctl(knobs=NgKnobs(script="fail:2"))
+    monkeypatch.setattr(lk.subprocess, "run", fake.run)
+    monkeypatch.setattr(vm, "_dhclient_running", lambda _iface: False)
+    e = _egress()
+    e.reconcile(True)
+    e.reconcile(between)
+    e.reconcile(True)
+    assert e.status() == "failed:build" and len(fake.builds()) == 1
+    clock[0] += vm.BUILD_RETRY_INTERVAL + 1
+    fake.knobs.script = ""
+    e.reconcile(True)
+    assert _built(fake) and e.status() == "built"

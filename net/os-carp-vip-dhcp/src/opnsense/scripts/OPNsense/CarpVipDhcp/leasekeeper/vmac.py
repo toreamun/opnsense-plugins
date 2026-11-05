@@ -413,10 +413,18 @@ class VmacEgress:
         if not self.enabled:
             if not leftover or self._t.shared_iface or not _patch_module_loaded():
                 return
-        elif self._t.static_refusal is None and probe() is True:
-            return   # (a refused config, such as no vhid, is never a confirmed master here)
+        elif self._keeps_at_boundary(probe):
+            return
         if self._needs_teardown():
             self._teardown("not master at a keeper start or stop" if self.enabled else "option off")
+
+    def _keeps_at_boundary(self, probe):
+        """At a process boundary the graph stays only on a confirmed master of a config
+        the option can serve, and not while a DHCP client runs on the interface (the D6
+        guard: the keeper may not reach its main loop soon, for example while the
+        capture keeps failing to start, so the guard cannot wait for the first tick)."""
+        return (self._t.static_refusal is None and not _dhclient_running(self._t.iface)
+                and probe() is True)
 
     # ---- states ----
 

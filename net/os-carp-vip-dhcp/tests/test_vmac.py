@@ -742,3 +742,12 @@ def test_the_token_keeps_the_pending_failure_during_the_cooldown(lk, monkeypatch
     fake.knobs.script = ""
     e.reconcile(True)
     assert _built(fake) and e.status() == "built"
+
+
+def test_a_dhcp_wan_does_not_keep_a_graph_at_a_boundary(ng, monkeypatch):
+    # The keeper may not reach its main loop soon (the capture keeps failing to start),
+    # so the D6 guard applies at the process boundary too.
+    ng.add_patch(NODE, "vtnet0", config=WANTED)
+    monkeypatch.setattr(vm, "_dhclient_running", lambda _iface: True)
+    _egress().teardown_unless_master(lambda: True)
+    assert NODE not in ng.nodes and ng.nodes["vtnet0"].hooks == {}

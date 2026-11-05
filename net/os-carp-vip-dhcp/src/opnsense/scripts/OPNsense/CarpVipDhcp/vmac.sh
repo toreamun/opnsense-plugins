@@ -180,13 +180,27 @@ carpvipdhcp_vmac_stop_rule()
             fi
         done < "$1"
     fi
-    _vm_cands="${_vm_cands} $("${CARPVIPDHCP_NGCTL}" list 2>/dev/null \
-        | awk '$1 == "Name:" && $4 == "patch" && $2 ~ /^vmac_/ { print $2 }')"
+    # Every vmac_* patch node, such as a removed keeper's (no record names it). A list
+    # that fails or has no header is retried, then logged: never taken for "none".
+    _vm_try=0
+    while :; do
+        if _vm_out=$("${CARPVIPDHCP_NGCTL}" list 2>&1) && printf '%s\n' "${_vm_out}" | grep -q 'Name:'; then
+            _vm_cands="${_vm_cands} $(printf '%s\n' "${_vm_out}" \
+                | awk '$1 == "Name:" && $4 == "patch" && $2 ~ /^vmac_/ { print $2 }')"
+            break
+        fi
+        _vm_try=$((_vm_try + 1))
+        if [ "${_vm_try}" -ge 3 ]; then
+            _carpvipdhcp_vmac_log "could not list the netgraph nodes at keeper stop (3 tries): a removed keeper's rewrite may remain and still rewrite the source MAC; check with ngctl list"
+            break
+        fi
+        sleep 1
+    done
     for _vm_n in ${_vm_cands}; do
         case "${_vm_keep}" in *" ${_vm_n} "*) continue ;; esac
         carpvipdhcp_vmac_remove "${_vm_n}"
         _carpvipdhcp_vmac_report $? "${_vm_n}" "keeper stop"
     done
-    unset _vm_keep _vm_cands _vm_line _vm_n _vm_ids _vm_name_ok _vm_hooks_ok _vm_try _vm_id
+    unset _vm_keep _vm_cands _vm_line _vm_n _vm_ids _vm_name_ok _vm_hooks_ok _vm_try _vm_id _vm_out
     return 0
 }

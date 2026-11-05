@@ -183,6 +183,31 @@ def test_stop_never_touches_a_foreign_node_and_cleans_an_unnamed_one(tmp_path):
     assert after.nodes["vmac_tee0"].type == "tee" and "<unnamed>" not in after.nodes
 
 
+def test_stop_removes_a_removed_keepers_node(tmp_path):
+    # vmac_old0 is named by no record: only the node list finds it.
+    fake = _fake(built=False, ifaces=("vtnet0", "old0"))
+    fake.add_patch("vmac_old0", "old0", config=WANTED)
+    b = _Bench(tmp_path, fake)
+    res = b.run(f'carpvipdhcp_vmac_stop_rule "{b.conf(_record(on="0"))}"')
+    assert "vmac_old0" not in b.after().nodes and "removed vmac_old0: keeper stop" in res.stdout
+
+
+@pytest.mark.parametrize("show", ["list-fails", "garbled-list"])
+def test_stop_reports_a_node_list_it_cannot_read(tmp_path, show):
+    # The list fails or has no header every time: retried, then logged; never taken
+    # for "no other node". The records' own nodes are still handled.
+    fake = _fake(ifaces=("vtnet0", "old0"), show=show)
+    fake.add_patch("vmac_old0", "old0", config=WANTED)
+    b = _Bench(tmp_path, fake)
+    b.ifconfig("vtnet0", BACKUP_149)
+    res = b.run(f'carpvipdhcp_vmac_stop_rule "{b.conf(_record())}"')
+    after = b.after()
+    assert "could not list the netgraph nodes at keeper stop" in res.stdout
+    assert sum(c[1:2] == ["list"] for c in after.calls) == 3
+    assert "vmac_old0" in after.nodes                       # unseen, so left: but reported
+    assert NODE not in after.nodes and f"removed {NODE}: keeper stop" in res.stdout
+
+
 def test_stop_without_ng_patch_runs_no_ngctl(tmp_path):
     b = _Bench(tmp_path, _fake(built=False, unloaded=True))
     b.run(f'carpvipdhcp_vmac_stop_rule "{b.conf(_record())}"')
@@ -357,8 +382,9 @@ def test_deinstall_finds_iface_wherever_it_is_in_a_record(tmp_path):
     assert res.stderr == "" and not (tmp_path / "etc").exists()
 
 
-@pytest.mark.parametrize("knobs", [{"ether_reads": 0}, {"show": "garbled-ether"}, {"show": "list-fails"}],
-                         ids=["hooks-fail", "hooks-garbled", "list-fails"])
+@pytest.mark.parametrize("knobs", [{"ether_reads": 0}, {"show": "garbled-ether"}, {"show": "list-fails"},
+                                   {"show": "garbled-list"}],
+                         ids=["hooks-fail", "hooks-garbled", "list-fails", "list-garbled"])
 def test_deinstall_never_takes_an_unreadable_scan_for_clean(tmp_path, knobs):
     # An unnamed leftover on a keeper interface it cannot see, or a node list it cannot
     # read: retried, then warned about; never silent. pkg removal still finishes.

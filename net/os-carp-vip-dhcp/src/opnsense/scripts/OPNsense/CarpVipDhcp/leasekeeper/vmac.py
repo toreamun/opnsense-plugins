@@ -127,9 +127,11 @@ class _Peer(NamedTuple):
 
 
 class _Shown(NamedTuple):
-    """`ngctl show` parsed: the node's type and {local hook: _Peer}."""
+    """`ngctl show` parsed: the node's type, {local hook: _Peer} and {local hook: the
+    peer's netgraph ID} (8 hex digits, as `ngctl shutdown [id]:` takes it)."""
     type: str
     hooks: dict
+    ids: dict
 
 
 def ether_node(iface):
@@ -186,7 +188,7 @@ def _parse_show(text):
     header = _HEADER_RE.search(text or "")
     if header is None:
         return None
-    hooks, rows = {}, False
+    hooks, ids, rows = {}, {}, False
     for line in text.splitlines():
         if line.strip().startswith("---"):
             rows = True
@@ -194,7 +196,8 @@ def _parse_show(text):
         parts = line.split()
         if rows and len(parts) == 5:
             hooks[parts[0]] = _Peer(parts[1], parts[2], parts[4])
-    return _Shown(header.group(2), hooks)
+            ids[parts[0]] = parts[3]
+    return _Shown(header.group(2), hooks, ids)
 
 
 def _fields(text):
@@ -304,7 +307,7 @@ class _Runtime:
 
 
 # A read of the interface's ether node that found no such node (no hooks to hold).
-_NO_ETHER = _Shown("", {})
+_NO_ETHER = _Shown("", {}, {})
 
 
 class VmacEgress:
@@ -598,15 +601,18 @@ class VmacEgress:
         """Remove the rewrite and confirm it is gone; True when confirmed. Shuts our node
         down by name only when it is a patch node of ours (never a node of another type
         under our name), and any patch node that is ours or unnamed on the interface's
-        hooks by hook path. Confirmed means our name holds no patch node of ours AND the
+        hooks by the netgraph ID the read saw (a hook path could reach a node that took
+        the hook since). Confirmed means our name holds no patch node of ours AND the
         hooks were read and hold none: unreadable hooks are not confirmation. Always safe
         to retry; a failure is retried on the next tick, warned once until one works."""
         shut = self._present() in _OURS
         if shut:
             _ngctl("shutdown", f"{self._t.node}:")
-        for hook in self._ours_on(self._read_ether()) or {}:
-            shut = True
-            _ngctl("shutdown", f"{self._t.ether}:{hook}")
+        ether = self._read_ether()
+        if ether is not None:
+            for hook in self._ours_on(ether) or {}:
+                shut = True
+                _ngctl("shutdown", f"[{ether.ids[hook]}]:")
         held = self._ours_on(self._read_ether())
         if self._present() in (_Presence.ABSENT, _Presence.FOREIGN) and held == {}:
             self._run.gates.teardown = False

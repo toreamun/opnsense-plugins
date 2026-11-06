@@ -33,14 +33,14 @@ _UNDER_CI = os.environ.get("CI") == "true"
 
 # The keeper.conf keys carpvipdhcp_parse_line extracts (each into the shell
 # variable of the same name); the daemon reads the other keys itself.
-_KEYS = ["request", "iface", "chaddr", "demote", "vhid"]
+_KEYS = ["request", "iface", "chaddr", "demote", "vhid", "vmacegress"]
 
 _FIXTURES = [
     # A full record (the keys the shell parser skips must not disturb the others).
     "request=185.41.66.101|iface=lagg1|chaddr=00:00:5e:00:01:c7|demote=0|vhid=199|"
     "follow=1|cidmode=default|hostname=|arpnudge=240|arplistenpromisc=0|"
     "defaultroutemode=enforce|backupegress=1|backupegressform=split|"
-    "backupegressgateway=10.0.0.1|backupegressinterface=em0|backupegressprefixes=",
+    "backupegressgateway=10.0.0.1|backupegressinterface=em0|backupegressprefixes=|vmacegress=1",
     # Reordered, an unknown key, and a key missing.
     "vhid=42|newkey=x|request=1.2.3.4|iface=em0|chaddr=aa",
     # An empty value, and a value that itself contains '='.

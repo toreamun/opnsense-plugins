@@ -72,10 +72,16 @@ def _built(ng, name=NODE, ether="vtnet0"):
 # ---- pure helpers, on the real text ----
 
 def test_parsers_read_the_real_ngctl_text():
-    assert vm._parse_show(SHOW_BUILT) == ("patch", {"out": ("vtnet0", "ether", "lower"),
-                                                    "in": ("vtnet0", "ether", "upper")})
-    assert vm._parse_show(SHOW_HALF) == ("patch", {"in": ("vtnet0", "ether", "upper")})
-    assert vm._parse_show(SHOW_ETHER) == ("ether", {})
+    built = vm._parse_show(SHOW_BUILT)
+    assert built is not None
+    assert (built.type, built.hooks) == ("patch", {"out": ("vtnet0", "ether", "lower"),
+                                                   "in": ("vtnet0", "ether", "upper")})
+    assert built.ids == {"out": "00000001", "in": "00000001"}
+    half = vm._parse_show(SHOW_HALF)
+    assert half is not None
+    assert (half.type, half.hooks) == ("patch", {"in": ("vtnet0", "ether", "upper")})
+    ether = vm._parse_show(SHOW_ETHER)
+    assert ether is not None and (ether.type, ether.hooks) == ("ether", {})
     assert vm._parse_show("ngctl: send msg: No such file or directory") is None
     # getconfig prints decimal values in its own field order and drops zero fields.
     assert vm._parse_config(GETCONFIG) == WANTED
@@ -751,3 +757,14 @@ def test_a_dhcp_wan_does_not_keep_a_graph_at_a_boundary(ng, monkeypatch):
     monkeypatch.setattr(vm, "_dhclient_running", lambda _iface: True)
     _egress().teardown_unless_master(lambda: True)
     assert NODE not in ng.nodes and ng.nodes["vtnet0"].hooks == {}
+
+
+def test_a_hook_patch_node_is_shut_down_by_its_id_never_by_hook_path(ng):
+    # A hook path (vtnet0:upper) addresses whatever holds the hook at that moment; the
+    # ID addresses exactly the node the read saw.
+    ng.nodes["<unnamed>"] = ng.nodes["vtnet0"].__class__("patch")
+    ng.link("<unnamed>", "in", "vtnet0", "upper")
+    _egress().reconcile(False)
+    shutdowns = [c[2] for c in ng.calls if c[1:2] == ["shutdown"]]
+    assert shutdowns and all(t.startswith("[") and t.endswith("]:") for t in shutdowns)
+    assert "<unnamed>" not in ng.nodes

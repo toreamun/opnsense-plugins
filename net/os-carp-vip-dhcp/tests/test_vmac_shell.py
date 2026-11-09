@@ -354,21 +354,22 @@ def test_the_shell_functions_leave_no_scratch_variables(tmp_path):
     assert res.stdout.strip().endswith("CLEAN")
 
 
-def _noted(b):
-    path = b.dir / "run" / "carpvipdhcp-vmac.ifaces"
+def _noted(b, which="noted"):
+    path = b.dir / "run" / f"carpvipdhcp-vmac.{which}"
     return path.read_text().split() if path.exists() else None
 
 
-def test_start_notes_the_interfaces_with_the_option_on(tmp_path):
-    # Only records with the option on; replaced on the all-keepers path, added to when
-    # one keeper starts; never a duplicate.
+def test_start_notes_the_nodes_with_the_option_on(tmp_path):
+    # Only records with the option on, as node names (vmac_ + the ether node, '.' as
+    # '_'); replaced on the all-keepers path, added to when one keeper starts; never a
+    # duplicate.
     b = _Bench(tmp_path, _fake())
     b.run(f'carpvipdhcp_vmac_note "{b.conf(_record(), _record(iface="igb0.100", vhid="7", on="0"))}"')
-    assert _noted(b) == ["vtnet0"]
+    assert _noted(b) == [NODE]
     b.run(f'carpvipdhcp_vmac_note "{b.conf(_record(iface="igb0.100", vhid="7"))}" append')
-    assert _noted(b) == ["igb0.100", "vtnet0"]
+    assert _noted(b) == ["vmac_igb0_100", NODE]
     b.run(f'carpvipdhcp_vmac_note "{b.conf(_record(iface="igb0.100", vhid="7"))}" append')
-    assert _noted(b) == ["igb0.100", "vtnet0"]
+    assert _noted(b) == ["vmac_igb0_100", NODE]
     b.run(f'carpvipdhcp_vmac_note "{b.conf(_record(on="0"))}"')
     assert _noted(b) == []
     assert not [c for c in b.after().calls if c[0].endswith("ngctl") or c[0].endswith("kldstat")]
@@ -383,6 +384,26 @@ def test_stop_finds_an_unnamed_leftover_on_a_removed_keepers_interface(tmp_path)
     res = b.run(f'carpvipdhcp_vmac_stop_rule "{b.conf(_record(iface="igb0.100", vhid="7", on="0"))}"')
     assert "<unnamed>" not in b.after().nodes and b.after().nodes["vtnet0"].hooks == {}
     assert f"removed {NODE}: keeper stop" in res.stdout
+
+
+def test_an_unconfirmed_removal_survives_a_start_and_is_tried_again(tmp_path):
+    # A removed keeper's unnamed leftover whose removal cannot be confirmed (a lying
+    # shutdown) is kept for the next stop, even though the start in between no longer
+    # notes that interface. Once removal works again, the next stop removes it and the
+    # note goes.
+    b = _Bench(tmp_path, _fake(built=False, unnamed=True, shutdown_lies=True))
+    b.run(f'carpvipdhcp_vmac_note "{b.conf(_record())}"')
+    other = b.conf(_record(iface="igb0.100", vhid="7", on="0"))
+    res = b.run(f'carpvipdhcp_vmac_stop_rule "{other}"')
+    assert f"could not remove {NODE}" in res.stdout and _noted(b, "unconfirmed") == [NODE]
+    b.run(f'carpvipdhcp_vmac_note "{other}"')           # the next start: vtnet0 not noted
+    assert _noted(b) == [] and _noted(b, "unconfirmed") == [NODE]
+    fake = b.after()
+    fake.knobs.shutdown_lies = False
+    ngctl_cli.save(b.state, fake)
+    res = b.run(f'carpvipdhcp_vmac_stop_rule "{other}"')
+    assert f"removed {NODE}: keeper stop" in res.stdout
+    assert "<unnamed>" not in b.after().nodes and _noted(b, "unconfirmed") is None
 
 
 def test_a_noted_interface_still_kept_on_a_master(tmp_path):

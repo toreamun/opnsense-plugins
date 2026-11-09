@@ -154,18 +154,30 @@ carpvipdhcp_vmac_carp_event()
     return 0
 }
 
-# The interfaces where a keeper may build (a record with the option on), as noted at
-# the last start. The stop rule looks there too: when a keeper was removed or moved,
-# keeper.conf (rendered before the stop) no longer names its interface, and an unnamed
-# node from an interrupted build there is found only through the interface's hooks.
+# Two notes in the run directory keep the stop rule looking where keeper.conf no longer
+# does. When a keeper is removed or moved, keeper.conf (rendered before the stop) no
+# longer names its interface, and an unnamed node from an interrupted build there is
+# found only through that interface's hooks.
+#   carpvipdhcp-vmac.noted: our node names where a keeper may build (a record with the
+#     option on), written by rc.d start (carpvipdhcp_vmac_note).
+#   carpvipdhcp-vmac.unconfirmed: the nodes the last stop could not confirm removed,
+#     written only by the stop rule, so a start in between never drops them; each stop
+#     tries them again.
+# Node names, not interface names: vmac_<e> maps back to the ether node by dropping the
+# prefix, while the ifnet's '.' does not come back from '_'.
 _carpvipdhcp_vmac_noted()
 {
-    printf '%s/carpvipdhcp-vmac.ifaces' "${CARPVIPDHCP_RUN}"
+    printf '%s/carpvipdhcp-vmac.noted' "${CARPVIPDHCP_RUN}"
+}
+
+_carpvipdhcp_vmac_unconfirmed()
+{
+    printf '%s/carpvipdhcp-vmac.unconfirmed' "${CARPVIPDHCP_RUN}"
 }
 
 # shellcheck disable=SC2154  # iface and vmacegress are assigned by carpvipdhcp_parse_line
-# carpvipdhcp_vmac_note <keeper.conf> [append]: note the interfaces of the records with
-# the option on, for the stop rule. rc.d start calls it: replace on the all-keepers path,
+# carpvipdhcp_vmac_note <keeper.conf> [append]: note the node of every record with the
+# option on, for the stop rule. rc.d start calls it: replace on the all-keepers path,
 # append when one keeper starts. It only reads keeper.conf and writes one file in the
 # run directory: no ngctl, nothing loaded.
 carpvipdhcp_vmac_note()
@@ -176,7 +188,8 @@ carpvipdhcp_vmac_note()
         while IFS= read -r _vm_line || [ -n "${_vm_line}" ]; do
             case "${_vm_line}" in ''|\#*) continue ;; esac
             carpvipdhcp_parse_line "${_vm_line}"
-            [ -n "${iface}" ] && [ "${vmacegress}" = 1 ] && _vm_list="${_vm_list}${iface}
+            [ -n "${iface}" ] && [ "${vmacegress}" = 1 ] \
+                && _vm_list="${_vm_list}$(carpvipdhcp_vmac_node "${iface}")
 "
         done < "$1"
     fi
@@ -193,10 +206,10 @@ ${_vm_list}"
 # carpvipdhcp_vmac_stop_rule <keeper.conf>: the rc.d stop guard (D1). Keep a node only
 # when a keeper.conf record on its interface has the option on, ifconfig shows this
 # node as that vhid's CARP master, and no DHCP client runs there; remove every other
-# node of ours (a record's interface, an interface noted at the last start, or any
-# vmac_* patch node, such as one from a removed keeper). So a restart or a package upgrade on a master keeps the rewrite
-# (no window of own-MAC frames), while a keeper disabled, the option switched off or
-# a backup loses it. Runs after the keepers stopped.
+# node of ours (a record's interface, a noted or unconfirmed node, or any vmac_* patch
+# node, such as one from a removed keeper). So a restart or a package upgrade on a
+# master keeps the rewrite (no window of own-MAC frames), while a keeper disabled, the
+# option switched off or a backup loses it. Runs after the keepers stopped.
 carpvipdhcp_vmac_stop_rule()
 {
     carpvipdhcp_vmac_loaded || return 0
@@ -215,14 +228,8 @@ carpvipdhcp_vmac_stop_rule()
             fi
         done < "$1"
     fi
-    # The interfaces noted at the last start (carpvipdhcp_vmac_note): a keeper removed or
-    # moved since then is no longer in keeper.conf, and an unnamed node from an
-    # interrupted build on its interface is found only through the hooks.
-    if [ -f "$(_carpvipdhcp_vmac_noted)" ]; then
-        while IFS= read -r _vm_line || [ -n "${_vm_line}" ]; do
-            [ -n "${_vm_line}" ] && _vm_cands="${_vm_cands} $(carpvipdhcp_vmac_node "${_vm_line}")"
-        done < "$(_carpvipdhcp_vmac_noted)"
-    fi
+    # The noted and the unconfirmed nodes (see the notes above).
+    _vm_cands="${_vm_cands} $(cat "$(_carpvipdhcp_vmac_noted)" "$(_carpvipdhcp_vmac_unconfirmed)" 2>/dev/null)"
     # Every vmac_* patch node, such as a removed keeper's (no record names it). A list
     # that fails or has no header is retried, then logged: never taken for "none".
     _vm_try=0
@@ -239,11 +246,23 @@ carpvipdhcp_vmac_stop_rule()
         fi
         sleep 1
     done
-    for _vm_n in ${_vm_cands}; do
+    _vm_left=''
+    for _vm_n in $(printf '%s\n' "${_vm_cands}" | tr ' ' '\n' | grep . | sort -u); do
         case "${_vm_keep}" in *" ${_vm_n} "*) continue ;; esac
         carpvipdhcp_vmac_remove "${_vm_n}"
-        _carpvipdhcp_vmac_report $? "${_vm_n}" "keeper stop"
+        _vm_rc=$?
+        _carpvipdhcp_vmac_report "${_vm_rc}" "${_vm_n}" "keeper stop"
+        [ "${_vm_rc}" = 2 ] && _vm_left="${_vm_left}${_vm_n}
+"
     done
-    unset _vm_keep _vm_cands _vm_line _vm_n _vm_ids _vm_name_ok _vm_hooks_ok _vm_try _vm_id _vm_out
+    # What could not be confirmed is tried again at the next stop, whatever a start
+    # notes in between.
+    if [ -n "${_vm_left}" ]; then
+        printf '%s' "${_vm_left}" > "$(_carpvipdhcp_vmac_unconfirmed)" 2>/dev/null || :
+    else
+        rm -f "$(_carpvipdhcp_vmac_unconfirmed)"
+    fi
+    unset _vm_keep _vm_cands _vm_line _vm_n _vm_ids _vm_name_ok _vm_hooks_ok _vm_try _vm_id _vm_out \
+        _vm_left _vm_rc
     return 0
 }

@@ -193,5 +193,14 @@ check(VmacEgressRules::rendersStaleKeep("request=100.64.4.102|vmacegress=0|vmace
 check(!VmacEgressRules::rendersStaleKeep("request=100.64.4.102|vmacegress=1|vmacegress=0\n", []), 'the last of a key wins (off)');
 check(VmacEgressRules::rendersStaleKeep($head . $rec('100.64.4.9', '0') . "\n" . $rec('100.64.4.102', '1') . "\n", [enabled($k, '100.64.4.9', false)]), 'any stale record counts, not only the first');
 
+// unconfirmedNodes: the stop rule's list for the system status. Missing file, empty,
+// one per line, duplicates once, and nothing that is not a node name of ours.
+check(VmacEgressRules::unconfirmedNodes(false) === [], 'no file: none');
+check(VmacEgressRules::unconfirmedNodes('') === [], 'empty file: none');
+check(VmacEgressRules::unconfirmedNodes("vmac_vtnet0\nvmac_igb0_100\nvmac_vtnet0\n") === ['vmac_vtnet0', 'vmac_igb0_100'], 'one per line, duplicates once, in order');
+check(VmacEgressRules::unconfirmedNodes("  vmac_vtnet0 \r\n") === ['vmac_vtnet0'], 'whitespace trimmed');
+check(VmacEgressRules::unconfirmedNodes("vtnet0\nvmac_<b>x</b>\nvmac_a b\nvmac_\nng0\n") === [], 'anything but a node name of ours is ignored');
+check(VmacEgressRules::unconfirmedNodes('vmac_' . str_repeat('a', 27)) === [], 'a name longer than netgraph allows is ignored');
+
 echo "$checks checks, $failures failures\n";
 exit($failures ? 1 : 0);

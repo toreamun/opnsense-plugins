@@ -174,6 +174,27 @@ class VmacEgressRules
     }
 
     /**
+     * The nodes the last stop could not confirm removed, from the text of
+     * /var/run/carpvipdhcp-vmac.unconfirmed (written only by the stop rule in vmac.sh,
+     * one node name per line). Only well-formed names of ours count, so a damaged file
+     * cannot inject text into the system status message.
+     *
+     * @param string|false $text the file's content, or false when it is not there
+     * @return array               the node names, in file order, without duplicates
+     */
+    public static function unconfirmedNodes($text)
+    {
+        $nodes = [];
+        foreach (explode("\n", (string)$text) as $line) {
+            $line = trim($line);
+            if (preg_match('/^vmac_[A-Za-z0-9_]{1,26}$/', $line) && !in_array($line, $nodes, true)) {
+                $nodes[] = $line;
+            }
+        }
+        return $nodes;
+    }
+
+    /**
      * Whether a rendered keeper.conf would make the stop keep a rewrite the saved
      * settings no longer allow: a record with vmacegress=1 for which no enabled keeper
      * has that VIP with the option on. configd renders from a cached config.xml, so

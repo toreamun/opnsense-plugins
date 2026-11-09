@@ -406,6 +406,15 @@ def test_an_unconfirmed_removal_survives_a_start_and_is_tried_again(tmp_path):
     assert "<unnamed>" not in b.after().nodes and _noted(b, "unconfirmed") is None
 
 
+def test_the_system_status_reads_the_file_the_stop_rule_writes():
+    # The banner reports the unconfirmed removals from the same path vmac.sh writes.
+    vmac = _read("opnsense", "scripts", "OPNsense", "CarpVipDhcp", "vmac.sh")
+    php = _read("opnsense", "mvc", "app", "library", "OPNsense", "System", "Status", "CarpVipDhcpStatus.php")
+    assert "printf '%s/carpvipdhcp-vmac.unconfirmed' \"${CARPVIPDHCP_RUN}\"" in vmac
+    assert ': "${CARPVIPDHCP_RUN:=/var/run}"' in vmac
+    assert "VMAC_UNCONFIRMED = '/var/run/carpvipdhcp-vmac.unconfirmed'" in php
+
+
 def test_a_noted_interface_still_kept_on_a_master(tmp_path):
     # Noted at the last start and still a record with the option on, on the master: kept.
     b = _Bench(tmp_path, _fake())

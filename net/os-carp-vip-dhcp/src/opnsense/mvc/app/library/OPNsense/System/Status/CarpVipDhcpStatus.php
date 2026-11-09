@@ -24,6 +24,7 @@
 
 namespace OPNsense\System\Status;
 
+use OPNsense\CarpVipDhcp\VmacEgressRules;
 use OPNsense\System\AbstractStatus;
 use OPNsense\System\SystemStatusCode;
 
@@ -40,6 +41,8 @@ class CarpVipDhcpStatus extends AbstractStatus
     private const CONF = '/usr/local/etc/carpvipdhcp/keeper.conf';
     private const RUN_DIR = '/var/run';
     private const STATE_FILE = '/var/run/carpvipdhcp-notice.state';
+    // The source-MAC rewrites the last stop could not confirm removed (vmac.sh).
+    private const VMAC_UNCONFIRMED = '/var/run/carpvipdhcp-vmac.unconfirmed';
     // A healthy keeper rewrites its heartbeat every ~30s; the largest legitimate
     // gap is a re-acquire backoff (~300s). 600s reliably means a stalled daemon.
     private const STALE = 600;
@@ -68,6 +71,18 @@ class CarpVipDhcpStatus extends AbstractStatus
             if ($reason !== null) {
                 $problems[] = sprintf('%s (%s)', $request, $reason);
             }
+        }
+        // A source-MAC rewrite the last stop could not confirm removed (send from the
+        // lease MAC, experimental). Its keeper may be disabled or deleted, so no
+        // heartbeat above reports it; the stop rule keeps the list and every stop
+        // tries again, removing the list once all are confirmed.
+        $unconfirmed = VmacEgressRules::unconfirmedNodes(@file_get_contents(self::VMAC_UNCONFIRMED));
+        if ($unconfirmed !== []) {
+            $problems[] = sprintf(
+                gettext('source MAC rewrite %s could not be removed at the last stop and may still be active; '
+                    . 'restart the service to try again'),
+                implode(', ', $unconfirmed)
+            );
         }
 
         if (empty($problems)) {

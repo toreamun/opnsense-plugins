@@ -10,8 +10,10 @@ A different kind of line shows the same symptom but needs the opposite fix: one 
 only **one MAC per port** (cable modems with MaxCPE=1, some fiber lines). That case is covered in
 [Lines that allow only one MAC per port](#lines-that-allow-only-one-mac-per-port-cable-maxcpe1).
 
-The unsupported workaround below made traffic and failover work on a test bench; it has not
-been tested with a real ISP that checks the MAC. Use it at your own risk.
+Since 1.19.0 the plugin has an option for this, **Send from the lease MAC while master**
+(experimental, see [The plugin option](#the-plugin-option-experimental)). Neither the option
+nor the older manual workaround has been tested with a real ISP that checks the MAC yet;
+both made traffic and failover work on a test bench.
 
 ## What happens and why
 
@@ -27,8 +29,9 @@ An ISP that binds IP to MAC therefore drops everything the master sends from the
 towards the VIP still arrives (the ISP sends it to the virtual MAC, which the master
 receives), but the master's replies are dropped like everything else it sends from the VIP.
 
-Making the master send from the virtual MAC is left to you, because changing a NIC's MAC on
-every CARP transition is risky in ways a lease keeper cannot control (see the risks below).
+The plugin option makes the master send from the virtual MAC without changing the NIC's MAC
+(below). Changing the NIC's MAC on every CARP transition, as the manual workaround does, is
+risky in ways a lease keeper cannot control (see its risks further down).
 
 ## How to recognise it
 
@@ -120,8 +123,76 @@ since 1.18.4 the keeper ignores such a lease instead of following the VIP onto i
 Open question: unicast CARP (a `peer` address) sends the master's advertisements to the
 backup's MAC, which with the shared MAC is the master's own; untested.
 
-## Workaround: swap the MAC on CARP transitions (unsupported)
+## The plugin option (experimental)
 
+For a line that binds IP to MAC only (not for one MAC per port, see above). **Experimental**
+means: it works on the test bench, there is no report from a real line yet, it is off unless
+you turn it on, and we would like to hear what you see
+([issue #131](https://github.com/toreamun/opnsense-plugins/issues/131)).
+
+**What it does.** Turn on **Send from the lease MAC while master (experimental)** on the
+keeper (Interfaces, Virtual IPs DHCP, Settings, the keeper's dialog in advanced mode) on
+both nodes. While a
+node is the CARP master of the keeper's VIP, every frame its WAN interface sends leaves from
+the keeper's lease MAC, the CARP virtual MAC. The rewrite is done in the kernel by netgraph
+(`ng_ether` and `ng_patch`) between the interface and the network; the interface's own MAC
+setting is not changed, so a backup sends from its own MAC as before. The keeper builds the
+rewrite when its node becomes master and removes it when it becomes backup. Three guards
+remove it where the keeper cannot:
+
+- the CARP event hook, on every change away from master, even when the keeper is not running;
+- stopping the service, unless this node is the master and the option is on (a restart, a
+  settings save or a plugin upgrade on the master keeps it, so no frame leaves from the own
+  MAC in between);
+- removing the plugin.
+
+**Requirements.** The save refuses a keeper that does not meet them, and the keeper checks
+them again while it runs:
+
+- A static address on the WAN for the node itself, as in the
+  [single-IP setup](single-ip-wan-carp.md). With DHCP, PPPoE, PPTP or L2TP on the WAN the
+  node's own traffic would also leave from the lease MAC while master, and the ISP would drop
+  it. If a DHCP client starts on the interface later, the keeper stops rewriting and says so.
+- No Client MAC override on the keeper.
+- Only this keeper's CARP VIP on that interface: any other CARP VIP there would send from
+  this MAC too.
+- No NetFlow capture on that interface: it uses the same netgraph hooks. The keeper then
+  refuses and the Status page says why.
+- The same plugin version on both nodes before you turn it on; HA sync carries the setting.
+  A node on an older version never rewrites.
+- Remove the manual MAC swap script (below) and clear the interface's MAC field first. The
+  option and the script must never both be active.
+
+Everything the WAN interface sends is rewritten while master, not only the VIP's traffic:
+IPv6 neighbour discovery, LLDP and 802.1X frames too.
+
+**What the Status page shows.** Under the lease MAC, when the option is on: **active** on
+the master, **not while backup** on the backup, or a warning with the reason it is not
+active (for example "a DHCP client runs on this interface"). A rewrite that is not active on
+the master raises the system status banner after five minutes, as does, on any node, one
+that could not be removed. The keeper's log has a line for every build and removal.
+
+**Check it.** On the master, `ngctl show vmac_<WAN_IF>:` (a `.` in the interface name
+becomes `_`) shows a node of type `patch` connected to `lower` and `upper`; on the backup
+the node does not exist. A WAN capture on
+the master shows your traffic leaving from the virtual MAC.
+
+**Turn it off.** Untick the option and save: the keeper removes the rewrite. If you go back
+to a version before 1.19.0 on a master with the rewrite active, it stays until you remove it
+by hand with `ngctl shutdown vmac_<WAN_IF>:` (or reboot).
+
+**What has been tested.** On the test pair of OPNsense 26.7 virtual machines with virtio
+NICs, with frames captured per node: with the option on, no frame left the master from its
+own MAC; a keeper restart on the master kept the rewrite without rebuilding it; failover in
+both directions moved the rewrite with the role, also with the master's keeper killed; and
+removing the package on the master removed it. A prototype of the same netgraph graph, in the
+design tests, also ran on a VLAN WAN. Not tested: physical NICs at gigabit speed, lagg,
+netmap IPS, OPNsense 26.1, a real ISP that checks the MAC, and how long the new master sends
+from its own MAC after a failover before its keeper has built the rewrite.
+
+## Manual workaround: swap the MAC on CARP transitions (unsupported)
+
+Use [the plugin option](#the-plugin-option-experimental) instead where you can; never both.
 For a line that binds IP to MAC only (not for one MAC per port, see above). A small script,
 run by OPNsense on every CARP transition, gives the WAN interface the virtual MAC while the
 node is master and its own MAC otherwise. It is **not part of the plugin and not

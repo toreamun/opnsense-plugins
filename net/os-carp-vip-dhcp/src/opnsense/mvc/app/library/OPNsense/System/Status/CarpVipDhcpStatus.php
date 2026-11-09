@@ -160,6 +160,22 @@ class CarpVipDhcpStatus extends AbstractStatus
                 $m[1]
             );
         }
+        // Send from the lease MAC while master (experimental; the token is there only
+        // when it is on). A rewrite that could not be removed may still be active on
+        // any node; on the master it must be active, or an ISP that checks the source
+        // MAC drops the traffic. On a backup a refusal is shown on the Status page.
+        if (preg_match('/\bvmac=(refused|failed|unavailable):(\S+)/', $content, $m)) {
+            if ($m[2] === 'teardown') {
+                return gettext('source MAC rewrite could not be removed and may still be active');
+            }
+            if ($this->heartbeatIsMaster($content)) {
+                return sprintf(
+                    gettext('source MAC rewrite not active on the master (%s); '
+                        . 'an ISP that checks the MAC drops its traffic'),
+                    $m[1] . ':' . $m[2]
+                );
+            }
+        }
         if (strpos($content, 'bound=' . $request . ' ') !== false) {
             return $this->arpReachabilityReason($content);
         }

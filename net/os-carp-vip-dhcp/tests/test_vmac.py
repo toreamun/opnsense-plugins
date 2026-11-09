@@ -9,6 +9,7 @@ lying build, a lying shutdown, Dropped rising).
 # pylint: disable=protected-access, missing-function-docstring
 import logging
 import os
+import re
 
 import pytest
 
@@ -768,3 +769,30 @@ def test_a_hook_patch_node_is_shut_down_by_its_id_never_by_hook_path(ng):
     shutdowns = [c[2] for c in ng.calls if c[1:2] == ["shutdown"]]
     assert shutdowns and all(t.startswith("[") and t.endswith("]:") for t in shutdowns)
     assert "<unnamed>" not in ng.nodes
+
+
+def test_every_state_has_its_status_page_text_and_banner_category():
+    # Every reason the keeper can report (VmacState) has a text in the Status page's
+    # vmacReasons, and the system status banner's pattern covers every category; a
+    # healthy state (built, native, unknown) has neither. A new state added only here
+    # would otherwise show as its raw token, or never raise the banner on a master.
+    app = os.path.join(os.path.dirname(__file__), "..", "src", "opnsense", "mvc", "app")
+    with open(os.path.join(app, "views", "OPNsense", "CarpVipDhcp", "status.volt"), encoding="utf-8") as f:
+        volt = f.read()
+    with open(os.path.join(app, "library", "OPNsense", "System", "Status", "CarpVipDhcpStatus.php"),
+              encoding="utf-8") as f:
+        php = f.read()
+    table = volt.split("const vmacReasons = {", 1)[1].split("};", 1)[0]
+    reasons = set(re.findall(r"'([a-z-]+)':", table))
+    banner = re.search(r"vmac=\(([a-z|]+)\):", php)
+    assert banner is not None
+    categories = set(banner.group(1).split("|"))
+    healthy = {vm.VmacState.BUILT, vm.VmacState.NATIVE, vm.VmacState.UNKNOWN}
+    for state in vm.VmacState:
+        if state in healthy:
+            assert ":" not in state
+            continue
+        category, _, reason = state.partition(":")
+        assert reason in reasons, f"{state}: no Status page text"
+        assert category in categories, f"{state}: the banner never raises it"
+    assert reasons == {s.partition(":")[2] for s in vm.VmacState if s not in healthy}

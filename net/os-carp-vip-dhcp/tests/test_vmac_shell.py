@@ -406,6 +406,37 @@ def test_an_unconfirmed_removal_survives_a_start_and_is_tried_again(tmp_path):
     assert "<unnamed>" not in b.after().nodes and _noted(b, "unconfirmed") is None
 
 
+def test_a_carp_event_records_a_removal_it_cannot_confirm(tmp_path):
+    # Off master with a lying shutdown: the syshook cannot confirm the removal, so the
+    # node joins the unconfirmed list (once, however often it fails), for the system
+    # status and the next stop. A confirmed removal adds nothing.
+    b = _Bench(tmp_path, _fake(shutdown_lies=True))
+    conf = b.conf(_record())
+    for _ in range(2):
+        res = b.run(f'carpvipdhcp_vmac_carp_event "{conf}" 149@vtnet0 BACKUP')
+        assert f"could not remove {NODE}" in res.stdout
+    assert _noted(b, "unconfirmed") == [NODE]
+    (tmp_path / "ok").mkdir()
+    b2 = _Bench(tmp_path / "ok", _fake())
+    b2.run(f'carpvipdhcp_vmac_carp_event "{b2.conf(_record())}" 149@vtnet0 BACKUP')
+    assert NODE not in b2.after().nodes and _noted(b2, "unconfirmed") is None
+
+
+def test_deinstall_finds_a_removed_keepers_leftover_through_the_notes(tmp_path):
+    # The keeper on vtnet0 is gone from keeper.conf, an unnamed leftover is on vtnet0's
+    # hooks, and the last stop recorded vmac_vtnet0 as unconfirmed: the sweep looks
+    # there, removes it, and the notes go with the rest of the run files.
+    b = _Bench(tmp_path, _fake(built=False, unnamed=True))
+    (tmp_path / "etc").mkdir()
+    (tmp_path / "etc" / "keeper.conf").write_text(_record(iface="igb0.100", vhid="7") + "\n")
+    (tmp_path / "run" / "carpvipdhcp-vmac.unconfirmed").write_text(NODE + "\n")
+    (tmp_path / "run" / "carpvipdhcp-vmac.noted").write_text("vmac_igb0_100\n")
+    res = _deinstall(tmp_path)
+    assert "<unnamed>" not in b.after().nodes and b.after().nodes["vtnet0"].hooks == {}
+    assert res.stderr == ""
+    assert not list((tmp_path / "run").glob("carpvipdhcp-vmac.*"))
+
+
 def test_the_system_status_reads_the_file_the_stop_rule_writes():
     # The banner reports the unconfirmed removals from the same path vmac.sh writes.
     vmac = _read("opnsense", "scripts", "OPNsense", "CarpVipDhcp", "vmac.sh")

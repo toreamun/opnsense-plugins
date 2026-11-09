@@ -15,9 +15,14 @@
 # plugin's scripts are already gone; ngctl is base system. Nothing runs without
 # ng_patch.
 if /sbin/kldstat -q -m ng_patch 2>/dev/null; then
-    # keeper.conf fields are unordered: take iface= wherever it is in a record.
-    ethers=$(awk -F'|' '!/^#/ { for (i = 1; i <= NF; i++) if ($i ~ /^iface=./) print substr($i, 7) }' \
-                 /usr/local/etc/carpvipdhcp/keeper.conf 2>/dev/null | tr '.' '_' | sort -u)
+    # keeper.conf fields are unordered: take iface= wherever it is in a record. Also the
+    # interfaces of the nodes the last start noted and of the removals the last stop or
+    # CARP event could not confirm (vmac.sh): a removed keeper's interface is in no
+    # record, and an unnamed node on its hooks is found only there.
+    ethers=$( { awk -F'|' '!/^#/ { for (i = 1; i <= NF; i++) if ($i ~ /^iface=./) print substr($i, 7) }' \
+                    /usr/local/etc/carpvipdhcp/keeper.conf 2>/dev/null | tr '.' '_'
+                cat /var/run/carpvipdhcp-vmac.noted /var/run/carpvipdhcp-vmac.unconfirmed 2>/dev/null \
+                    | sed -n 's/^vmac_\([A-Za-z0-9_][A-Za-z0-9_]*\)$/\1/p'; } | sort -u)
     try=0
     while :; do
         ids='' unread=''
@@ -55,4 +60,4 @@ if /sbin/kldstat -q -m ng_patch 2>/dev/null; then
 fi
 rm -rf /usr/local/etc/carpvipdhcp
 rm -f /var/run/carpvipdhcp-*.hb /var/run/carpvipdhcp-follow-* \
-      /var/run/carpvipdhcp-follow_update.lock
+      /var/run/carpvipdhcp-follow_update.lock /var/run/carpvipdhcp-vmac.*

@@ -134,7 +134,10 @@ carpvipdhcp_vmac_dhcp_wan()
 # On any state but MASTER, remove the rewrite of every keeper with that interface and
 # vhid (D3: matched from keeper.conf, the option flag not required, so it also clears
 # a graph from an earlier configuration). Teardown only, never a build. Runs without
-# the keeper, so a dead or stopped keeper cannot leave the rewrite on a backup.
+# the keeper, so a dead or stopped keeper cannot leave the rewrite on a backup. A
+# removal it cannot confirm joins the stop rule's unconfirmed list (see the notes
+# below), so the system status raises it even with no keeper running, and the next
+# stop tries again.
 carpvipdhcp_vmac_carp_event()
 {
     [ "$3" = MASTER ] && return 0
@@ -148,9 +151,15 @@ carpvipdhcp_vmac_carp_event()
         [ "${iface}" = "${_vm_if}" ] && [ "${vhid}" = "${_vm_vhid}" ] || continue
         _vm_n=$(carpvipdhcp_vmac_node "${iface}")
         carpvipdhcp_vmac_remove "${_vm_n}"
-        _carpvipdhcp_vmac_report $? "${_vm_n}" "CARP vhid ${vhid} on ${iface} is $3"
+        _vm_rc=$?
+        _carpvipdhcp_vmac_report "${_vm_rc}" "${_vm_n}" "CARP vhid ${vhid} on ${iface} is $3"
+        if [ "${_vm_rc}" = 2 ]; then
+            _vm_file=$(_carpvipdhcp_vmac_unconfirmed)
+            { cat "${_vm_file}" 2>/dev/null; echo "${_vm_n}"; } | grep . | sort -u > "${_vm_file}.new" 2>/dev/null \
+                && mv -f "${_vm_file}.new" "${_vm_file}" 2>/dev/null || :
+        fi
     done < "$1"
-    unset _vm_vhid _vm_if _vm_line _vm_n _vm_ids _vm_name_ok _vm_hooks_ok _vm_try _vm_id
+    unset _vm_vhid _vm_if _vm_line _vm_n _vm_ids _vm_name_ok _vm_hooks_ok _vm_try _vm_id _vm_rc _vm_file
     return 0
 }
 

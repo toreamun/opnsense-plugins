@@ -170,9 +170,9 @@ IPv6 neighbour discovery, LLDP and 802.1X frames too.
 
 **What the Status page shows.** Under the lease MAC, when the option is on: **active** on
 the master, **not while backup** on the backup, or a warning with the reason it is not
-active (for example "a DHCP client runs on this interface"). A rewrite that is not active on
-the master raises the system status banner after five minutes, as does, on any node, one
-that could not be removed. The keeper's log has a line for every build and removal.
+active, or cannot be verified (for example "a DHCP client runs on this interface"). A
+rewrite that is not active, or cannot be verified, on the master raises the system status
+banner after five minutes, as does, on any node, one that could not be removed. The keeper's log has a line for every build and removal.
 
 **Check it.** On the master, `ngctl show vmac_<WAN_IF>:` (a `.` in the interface name
 becomes `_`) shows a node of type `patch` connected to `lower` and `upper`; on the backup

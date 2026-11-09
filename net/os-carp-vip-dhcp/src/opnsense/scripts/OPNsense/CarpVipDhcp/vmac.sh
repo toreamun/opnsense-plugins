@@ -154,12 +154,47 @@ carpvipdhcp_vmac_carp_event()
     return 0
 }
 
+# The interfaces where a keeper may build (a record with the option on), as noted at
+# the last start. The stop rule looks there too: when a keeper was removed or moved,
+# keeper.conf (rendered before the stop) no longer names its interface, and an unnamed
+# node from an interrupted build there is found only through the interface's hooks.
+_carpvipdhcp_vmac_noted()
+{
+    printf '%s/carpvipdhcp-vmac.ifaces' "${CARPVIPDHCP_RUN}"
+}
+
+# shellcheck disable=SC2154  # iface and vmacegress are assigned by carpvipdhcp_parse_line
+# carpvipdhcp_vmac_note <keeper.conf> [append]: note the interfaces of the records with
+# the option on, for the stop rule. rc.d start calls it: replace on the all-keepers path,
+# append when one keeper starts. It only reads keeper.conf and writes one file in the
+# run directory: no ngctl, nothing loaded.
+carpvipdhcp_vmac_note()
+{
+    _vm_file=$(_carpvipdhcp_vmac_noted)
+    _vm_list=''
+    if [ -f "$1" ]; then
+        while IFS= read -r _vm_line || [ -n "${_vm_line}" ]; do
+            case "${_vm_line}" in ''|\#*) continue ;; esac
+            carpvipdhcp_parse_line "${_vm_line}"
+            [ -n "${iface}" ] && [ "${vmacegress}" = 1 ] && _vm_list="${_vm_list}${iface}
+"
+        done < "$1"
+    fi
+    if [ "$2" = append ] && [ -f "${_vm_file}" ]; then
+        _vm_list="$(cat "${_vm_file}")
+${_vm_list}"
+    fi
+    printf '%s' "${_vm_list}" | grep . | sort -u > "${_vm_file}" 2>/dev/null || :
+    unset _vm_file _vm_list _vm_line
+    return 0
+}
+
 # shellcheck disable=SC2154  # iface, vhid and vmacegress are assigned by carpvipdhcp_parse_line
 # carpvipdhcp_vmac_stop_rule <keeper.conf>: the rc.d stop guard (D1). Keep a node only
 # when a keeper.conf record on its interface has the option on, ifconfig shows this
 # node as that vhid's CARP master, and no DHCP client runs there; remove every other
-# node of ours (a record's interface, or any vmac_* patch node, such as one from a
-# removed keeper). So a restart or a package upgrade on a master keeps the rewrite
+# node of ours (a record's interface, an interface noted at the last start, or any
+# vmac_* patch node, such as one from a removed keeper). So a restart or a package upgrade on a master keeps the rewrite
 # (no window of own-MAC frames), while a keeper disabled, the option switched off or
 # a backup loses it. Runs after the keepers stopped.
 carpvipdhcp_vmac_stop_rule()
@@ -179,6 +214,14 @@ carpvipdhcp_vmac_stop_rule()
                 _vm_keep="${_vm_keep}${_vm_n} "
             fi
         done < "$1"
+    fi
+    # The interfaces noted at the last start (carpvipdhcp_vmac_note): a keeper removed or
+    # moved since then is no longer in keeper.conf, and an unnamed node from an
+    # interrupted build on its interface is found only through the hooks.
+    if [ -f "$(_carpvipdhcp_vmac_noted)" ]; then
+        while IFS= read -r _vm_line || [ -n "${_vm_line}" ]; do
+            [ -n "${_vm_line}" ] && _vm_cands="${_vm_cands} $(carpvipdhcp_vmac_node "${_vm_line}")"
+        done < "$(_carpvipdhcp_vmac_noted)"
     fi
     # Every vmac_* patch node, such as a removed keeper's (no record names it). A list
     # that fails or has no header is retried, then logged: never taken for "none".

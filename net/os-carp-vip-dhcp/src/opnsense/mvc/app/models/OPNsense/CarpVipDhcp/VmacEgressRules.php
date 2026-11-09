@@ -172,4 +172,55 @@ class VmacEgressRules
         }
         return $errors;
     }
+
+    /**
+     * Whether a rendered keeper.conf would make the stop keep a rewrite the saved
+     * settings no longer allow: a record with vmacegress=1 for which no enabled keeper
+     * has that VIP with the option on. configd renders from a cached config.xml, so
+     * right after a save it can still write the old file (see follow_update.php); the
+     * stop would then keep the rewrite of a keeper just disabled or deleted, or whose
+     * option was just turned off, and no keeper would be left to remove it. The
+     * interface is not compared: the template resolves it, and a difference in how
+     * would refuse every Apply. (A VIP moved to another interface leaves the old one
+     * in the note the last start left, carpvipdhcp_vmac_note in vmac.sh.) Records are
+     * read as keeperconf.py reads them: pipe-separated KEY=VALUE fields, the last of a
+     * key wins, a line without a request is skipped.
+     *
+     * @param string $rendered the keeper.conf text
+     * @param array  $keepers  as for check(), plus 'enabled' => bool
+     * @return bool            true when the file is stale in this way
+     */
+    public static function rendersStaleKeep($rendered, array $keepers)
+    {
+        foreach (explode("\n", (string)$rendered) as $line) {
+            $line = trim($line);
+            if ($line === '' || $line[0] === '#') {
+                continue;
+            }
+            $fields = [];
+            foreach (explode('|', $line) as $field) {
+                $sep = strpos($field, '=');
+                if ($sep !== false) {
+                    $fields[substr($field, 0, $sep)] = substr($field, $sep + 1);
+                }
+            }
+            if (($fields['request'] ?? '') === '' || ($fields['vmacegress'] ?? '') !== '1') {
+                continue;
+            }
+            $allowed = false;
+            foreach ($keepers as $keeper) {
+                if (
+                    !empty($keeper['enabled']) && !empty($keeper['vmacEgress'])
+                    && (string)($keeper['carpVip'] ?? '') === $fields['request']
+                ) {
+                    $allowed = true;
+                    break;
+                }
+            }
+            if (!$allowed) {
+                return true;
+            }
+        }
+        return false;
+    }
 }

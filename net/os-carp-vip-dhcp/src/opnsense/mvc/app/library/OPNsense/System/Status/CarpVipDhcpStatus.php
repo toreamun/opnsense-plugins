@@ -168,6 +168,14 @@ class CarpVipDhcpStatus extends AbstractStatus
             if ($m[2] === 'teardown') {
                 return gettext('source MAC rewrite could not be removed and may still be active');
             }
+            // unavailable: the keeper could not read the graph, and it keeps one that
+            // worked, so the rewrite may well be active; it cannot be confirmed.
+            if ($m[1] === 'unavailable' && $this->heartbeatIsMaster($content)) {
+                return sprintf(
+                    gettext('source MAC rewrite on the master cannot be verified (%s)'),
+                    $m[1] . ':' . $m[2]
+                );
+            }
             if ($this->heartbeatIsMaster($content)) {
                 return sprintf(
                     gettext('source MAC rewrite not active on the master (%s); '

@@ -224,7 +224,7 @@
         'build': "{{ lang._('the build failed') }}",
         'readback': "{{ lang._('the build did not read back as wanted') }}",
         'teardown': "{{ lang._('it could not be removed and may still be active') }}",
-        'ngctl': "{{ lang._('ngctl not found') }}"
+        'ngctl': "{{ lang._('ngctl could not run, so whether it is active cannot be verified') }}"
     };
 
     function vmacLine(k) {

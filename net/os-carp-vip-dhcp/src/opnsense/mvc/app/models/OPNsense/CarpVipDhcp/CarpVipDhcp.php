@@ -163,6 +163,16 @@ class CarpVipDhcp extends BaseModel
     }
 
     /**
+     * Whether $rendered (keeper.conf) is stale in a way that would keep a source-MAC
+     * rewrite the saved settings no longer allow (VmacEgressRules::rendersStaleKeep).
+     * The service controller renders until it is not, before it stops the keepers.
+     */
+    public function rendersStaleVmacKeep($rendered)
+    {
+        return VmacEgressRules::rendersStaleKeep($rendered, self::vmacKeepers($this));
+    }
+
+    /**
      * Each keeper as VmacEgressRules takes it. "changed": this save changes a field the
      * rules depend on (a new keeper's fields count as changed), so only what is being
      * saved is judged.
@@ -177,6 +187,7 @@ class CarpVipDhcp extends BaseModel
             }
             $keepers[] = [
                 'ref' => $keeper->__reference,
+                'enabled' => (string)$keeper->enabled === '1',
                 'vmacEgress' => (string)$keeper->vmacEgress === '1',
                 'carpVip' => (string)$keeper->carpVip,
                 'chaddrOverride' => (string)$keeper->chaddrOverride,

@@ -269,6 +269,11 @@ def test_rcd_runs_the_stop_rule_on_the_all_keepers_path_only():
     assert stop.index('carpvipdhcp_vmac_stop_rule "${conf}"') > stop.index("_signal_keepers -TERM")
     assert "vmac" not in stop_id                    # a per-row Stop or a follow keeps it
     assert ". /usr/local/opnsense/scripts/OPNsense/CarpVipDhcp/vmac.sh" in rcd
+    # start notes where a keeper may build, after its loop: replaced, or added to for one.
+    start = rcd[rcd.index("carpvipdhcp_start()"):rcd.index("carpvipdhcp_stop()")]
+    assert start.index('carpvipdhcp_vmac_note "${conf}" ${svc_id:+append}') > start.index('done < "${conf}"')
+    fallback = rcd[rcd.index("else\n    carpvipdhcp_vmac_stop_rule()"):]
+    assert "carpvipdhcp_vmac_note() { :; }" in fallback.split("fi", 1)[0]
 
 
 def test_syshook_tears_down_before_it_wakes_the_keepers():
@@ -344,8 +349,50 @@ def test_the_shell_functions_leave_no_scratch_variables(tmp_path):
     b.ifconfig("vtnet0", MASTER_149)
     conf = b.conf(_record())
     res = b.run(f'carpvipdhcp_vmac_carp_event "{conf}" 149@vtnet0 BACKUP\n'
+                f'carpvipdhcp_vmac_note "{conf}"\ncarpvipdhcp_vmac_note "{conf}" append\n'
                 f'carpvipdhcp_vmac_stop_rule "{conf}"\nset | grep "^_vm_" || echo CLEAN')
     assert res.stdout.strip().endswith("CLEAN")
+
+
+def _noted(b):
+    path = b.dir / "run" / "carpvipdhcp-vmac.ifaces"
+    return path.read_text().split() if path.exists() else None
+
+
+def test_start_notes_the_interfaces_with_the_option_on(tmp_path):
+    # Only records with the option on; replaced on the all-keepers path, added to when
+    # one keeper starts; never a duplicate.
+    b = _Bench(tmp_path, _fake())
+    b.run(f'carpvipdhcp_vmac_note "{b.conf(_record(), _record(iface="igb0.100", vhid="7", on="0"))}"')
+    assert _noted(b) == ["vtnet0"]
+    b.run(f'carpvipdhcp_vmac_note "{b.conf(_record(iface="igb0.100", vhid="7"))}" append')
+    assert _noted(b) == ["igb0.100", "vtnet0"]
+    b.run(f'carpvipdhcp_vmac_note "{b.conf(_record(iface="igb0.100", vhid="7"))}" append')
+    assert _noted(b) == ["igb0.100", "vtnet0"]
+    b.run(f'carpvipdhcp_vmac_note "{b.conf(_record(on="0"))}"')
+    assert _noted(b) == []
+    assert not [c for c in b.after().calls if c[0].endswith("ngctl") or c[0].endswith("kldstat")]
+
+
+def test_stop_finds_an_unnamed_leftover_on_a_removed_keepers_interface(tmp_path):
+    # The keeper on vtnet0 was removed: keeper.conf (rendered before the stop) no longer
+    # names vtnet0, and an interrupted build left an unnamed patch node on its upper
+    # hook, which ngctl list cannot tell is ours. The note from the last start finds it.
+    b = _Bench(tmp_path, _fake(built=False, unnamed=True))
+    b.run(f'carpvipdhcp_vmac_note "{b.conf(_record())}"')
+    res = b.run(f'carpvipdhcp_vmac_stop_rule "{b.conf(_record(iface="igb0.100", vhid="7", on="0"))}"')
+    assert "<unnamed>" not in b.after().nodes and b.after().nodes["vtnet0"].hooks == {}
+    assert f"removed {NODE}: keeper stop" in res.stdout
+
+
+def test_a_noted_interface_still_kept_on_a_master(tmp_path):
+    # Noted at the last start and still a record with the option on, on the master: kept.
+    b = _Bench(tmp_path, _fake())
+    b.ifconfig("vtnet0", MASTER_149)
+    conf = b.conf(_record())
+    b.run(f'carpvipdhcp_vmac_note "{conf}"')
+    b.run(f'carpvipdhcp_vmac_stop_rule "{conf}"')
+    assert NODE in b.after().nodes and not [c for c in b.after().calls if c[1:2] == ["shutdown"]]
 
 
 def test_hooks_that_cannot_be_read_are_never_clean(tmp_path):

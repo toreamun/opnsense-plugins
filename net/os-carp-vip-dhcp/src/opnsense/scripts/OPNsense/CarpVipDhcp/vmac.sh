@@ -19,6 +19,8 @@
 : "${CARPVIPDHCP_KLDSTAT:=/sbin/kldstat}"
 : "${CARPVIPDHCP_IFCONFIG:=/sbin/ifconfig}"
 : "${CARPVIPDHCP_RUN:=/var/run}"
+: "${CARPVIPDHCP_LOCKF:=/usr/bin/lockf}"
+: "${CARPVIPDHCP_VMAC_UNCONFIRMED:=/usr/local/opnsense/scripts/OPNsense/CarpVipDhcp/vmac_unconfirmed.sh}"
 
 # carpvipdhcp_vmac_node <ifnet>: our patch node's name (vmac_ + the ether node name,
 # the ifnet with '.' as '_'). An ifnet name is at most 15 characters, so this stays
@@ -153,13 +155,9 @@ carpvipdhcp_vmac_carp_event()
         carpvipdhcp_vmac_remove "${_vm_n}"
         _vm_rc=$?
         _carpvipdhcp_vmac_report "${_vm_rc}" "${_vm_n}" "CARP vhid ${vhid} on ${iface} is $3"
-        if [ "${_vm_rc}" = 2 ]; then
-            _vm_file=$(_carpvipdhcp_vmac_unconfirmed)
-            { cat "${_vm_file}" 2>/dev/null; echo "${_vm_n}"; } | grep . | sort -u > "${_vm_file}.new" 2>/dev/null \
-                && mv -f "${_vm_file}.new" "${_vm_file}" 2>/dev/null || :
-        fi
+        [ "${_vm_rc}" = 2 ] && _carpvipdhcp_vmac_unconfirmed_update "${_vm_n}" ""
     done < "$1"
-    unset _vm_vhid _vm_if _vm_line _vm_n _vm_ids _vm_name_ok _vm_hooks_ok _vm_try _vm_id _vm_rc _vm_file
+    unset _vm_vhid _vm_if _vm_line _vm_n _vm_ids _vm_name_ok _vm_hooks_ok _vm_try _vm_id _vm_rc
     return 0
 }
 
@@ -169,9 +167,11 @@ carpvipdhcp_vmac_carp_event()
 # found only through that interface's hooks.
 #   carpvipdhcp-vmac.noted: our node names where a keeper may build (a record with the
 #     option on), written by rc.d start (carpvipdhcp_vmac_note).
-#   carpvipdhcp-vmac.unconfirmed: the nodes the last stop could not confirm removed,
-#     written only by the stop rule, so a start in between never drops them; each stop
-#     tries them again.
+#   carpvipdhcp-vmac.unconfirmed: the nodes a stop or a CARP event could not confirm
+#     removed. A start never writes it, so it never drops them; each stop tries them
+#     again, and the system status raises them. Updated only through
+#     _carpvipdhcp_vmac_unconfirmed_update, which adds and drops names under a lock and
+#     keeps every other entry, so a CARP event and a stop do not lose each other's.
 # Node names, not interface names: vmac_<e> maps back to the ether node by dropping the
 # prefix, while the ifnet's '.' does not come back from '_'.
 _carpvipdhcp_vmac_noted()
@@ -182,6 +182,21 @@ _carpvipdhcp_vmac_noted()
 _carpvipdhcp_vmac_unconfirmed()
 {
     printf '%s/carpvipdhcp-vmac.unconfirmed' "${CARPVIPDHCP_RUN}"
+}
+
+# _carpvipdhcp_vmac_unconfirmed_update <add> <drop>: add and drop node names
+# (space-separated) in the unconfirmed list, under lockf held only for the update (a
+# stop's removals take seconds, and a CARP hook must not wait on them). If the lock is
+# not had in 10 s, update without it rather than lose the entry.
+_carpvipdhcp_vmac_unconfirmed_update()
+{
+    set -- "$(_carpvipdhcp_vmac_unconfirmed)" "$1" "$2"
+    if [ -x "${CARPVIPDHCP_LOCKF}" ]; then
+        "${CARPVIPDHCP_LOCKF}" -k -t 10 "$1.lock" /bin/sh "${CARPVIPDHCP_VMAC_UNCONFIRMED}" "$@" 2>/dev/null
+        [ $? = 75 ] || return 0
+    fi
+    /bin/sh "${CARPVIPDHCP_VMAC_UNCONFIRMED}" "$@" 2>/dev/null || :
+    return 0
 }
 
 # shellcheck disable=SC2154  # iface and vmacegress are assigned by carpvipdhcp_parse_line
@@ -237,8 +252,10 @@ carpvipdhcp_vmac_stop_rule()
             fi
         done < "$1"
     fi
-    # The noted and the unconfirmed nodes (see the notes above).
-    _vm_cands="${_vm_cands} $(cat "$(_carpvipdhcp_vmac_noted)" "$(_carpvipdhcp_vmac_unconfirmed)" 2>/dev/null)"
+    # The noted and the unconfirmed nodes (see the notes above). Only what this stop read
+    # here may leave the unconfirmed list: an entry a CARP event adds meanwhile stays.
+    _vm_snap=" $(cat "$(_carpvipdhcp_vmac_unconfirmed)" 2>/dev/null | tr '\n' ' ') "
+    _vm_cands="${_vm_cands} $(cat "$(_carpvipdhcp_vmac_noted)" 2>/dev/null) ${_vm_snap}"
     # Every vmac_* patch node, such as a removed keeper's (no record names it). A list
     # that fails or has no header is retried, then logged: never taken for "none".
     _vm_try=0
@@ -255,23 +272,28 @@ carpvipdhcp_vmac_stop_rule()
         fi
         sleep 1
     done
-    _vm_left=''
+    _vm_left='' _vm_done=''
     for _vm_n in $(printf '%s\n' "${_vm_cands}" | tr ' ' '\n' | grep . | sort -u); do
-        case "${_vm_keep}" in *" ${_vm_n} "*) continue ;; esac
-        carpvipdhcp_vmac_remove "${_vm_n}"
-        _vm_rc=$?
-        _carpvipdhcp_vmac_report "${_vm_rc}" "${_vm_n}" "keeper stop"
-        [ "${_vm_rc}" = 2 ] && _vm_left="${_vm_left}${_vm_n}
-"
+        case "${_vm_keep}" in
+            *" ${_vm_n} "*) _vm_rc=1 ;;             # kept on purpose: not left over
+            *)
+                carpvipdhcp_vmac_remove "${_vm_n}"
+                _vm_rc=$?
+                _carpvipdhcp_vmac_report "${_vm_rc}" "${_vm_n}" "keeper stop"
+                ;;
+        esac
+        if [ "${_vm_rc}" = 2 ]; then
+            _vm_left="${_vm_left} ${_vm_n}"
+        else
+            case "${_vm_snap}" in *" ${_vm_n} "*) _vm_done="${_vm_done} ${_vm_n}" ;; esac
+        fi
     done
     # What could not be confirmed is tried again at the next stop, whatever a start
-    # notes in between.
-    if [ -n "${_vm_left}" ]; then
-        printf '%s' "${_vm_left}" > "$(_carpvipdhcp_vmac_unconfirmed)" 2>/dev/null || :
-    else
-        rm -f "$(_carpvipdhcp_vmac_unconfirmed)"
+    # notes in between; what this stop confirmed, from what it read, leaves the list.
+    if [ -n "${_vm_left}${_vm_done}" ]; then
+        _carpvipdhcp_vmac_unconfirmed_update "${_vm_left}" "${_vm_done}"
     fi
     unset _vm_keep _vm_cands _vm_line _vm_n _vm_ids _vm_name_ok _vm_hooks_ok _vm_try _vm_id _vm_out \
-        _vm_left _vm_rc
+        _vm_left _vm_rc _vm_snap _vm_done
     return 0
 }

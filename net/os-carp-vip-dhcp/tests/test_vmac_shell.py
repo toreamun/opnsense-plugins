@@ -50,6 +50,14 @@ class _Bench:
         for prog in ("ngctl", "kldstat"):
             self._script(prog, f'exec "{py}" "{cli}" "{_posix(self.state)}" {prog} "$@"')
         self._script("ifconfig", f'cat "{_posix(tmp_path)}/ifconfig.$1" 2>/dev/null')
+        # lockf as FreeBSD's takes it (-k, -t N, the lock file, the command). lockf.busy:
+        # the lock is never had (exit 75); lockf.inject: another writer adds its lines to
+        # the locked list first, as a CARP event during a stop would.
+        d = _posix(tmp_path)
+        self._script("lockf", 'while :; do case "$1" in -k) shift ;; -t) shift 2 ;; *) break ;; esac; done\n'
+                              f'lock=$1; shift\n[ -f "{d}/lockf.busy" ] && exit 75\n'
+                              f'[ -f "{d}/lockf.inject" ] && cat "{d}/lockf.inject" >> "${{lock%.lock}}"\n'
+                              'exec "$@"')
 
     def _script(self, name, body):
         path = self.dir / name
@@ -67,7 +75,9 @@ class _Bench:
     def run(self, body):
         d = _posix(self.dir)
         script = (f'CARPVIPDHCP_NGCTL="{d}/ngctl" CARPVIPDHCP_KLDSTAT="{d}/kldstat" '
-                  f'CARPVIPDHCP_IFCONFIG="{d}/ifconfig" CARPVIPDHCP_RUN="{d}/run"\n'
+                  f'CARPVIPDHCP_IFCONFIG="{d}/ifconfig" CARPVIPDHCP_RUN="{d}/run" '
+                  f'CARPVIPDHCP_LOCKF="{d}/lockf" '
+                  f'CARPVIPDHCP_VMAC_UNCONFIRMED="{_posix(_SCRIPTS)}/vmac_unconfirmed.sh"\n'
                   f'. "{_posix(_SCRIPTS)}/keeperconf.sh"\n. "{_posix(_SCRIPTS)}/vmac.sh"\n{body}\n')
         return subprocess.run(["sh", "-c", script], capture_output=True, text=True, check=False)
 
@@ -422,6 +432,60 @@ def test_a_carp_event_records_a_removal_it_cannot_confirm(tmp_path):
     assert NODE not in b2.after().nodes and _noted(b2, "unconfirmed") is None
 
 
+def test_a_stop_keeps_an_entry_a_carp_event_adds_meanwhile(tmp_path):
+    # The stop read vmac_vtnet0 from the list and confirmed it removed; meanwhile a CARP
+    # event recorded vmac_igb0_100. Only what the stop read and confirmed leaves.
+    b = _Bench(tmp_path, _fake(built=False, unnamed=True))
+    (tmp_path / "run" / "carpvipdhcp-vmac.unconfirmed").write_text(NODE + "\n", newline="\n")
+    (tmp_path / "lockf.inject").write_text("vmac_igb0_100\n", newline="\n")
+    b.run(f'carpvipdhcp_vmac_stop_rule "{b.conf(_record(iface="igb0.100", vhid="7", on="0"))}"')
+    assert "<unnamed>" not in b.after().nodes
+    assert _noted(b, "unconfirmed") == ["vmac_igb0_100"]
+
+
+def test_a_node_kept_on_the_master_leaves_the_unconfirmed_list(tmp_path):
+    # An earlier failure left vmac_vtnet0 listed; now it is the master's rewrite and the
+    # stop keeps it on purpose, so it is no longer a leftover to warn about.
+    b = _Bench(tmp_path, _fake())
+    b.ifconfig("vtnet0", MASTER_149)
+    (tmp_path / "run" / "carpvipdhcp-vmac.unconfirmed").write_text(NODE + "\n", newline="\n")
+    b.run(f'carpvipdhcp_vmac_stop_rule "{b.conf(_record())}"')
+    assert NODE in b.after().nodes and _noted(b, "unconfirmed") is None
+
+
+def test_the_list_is_updated_even_when_the_lock_is_not_had(tmp_path):
+    # lockf gives up (exit 75): the entry is still recorded, rather than lost.
+    b = _Bench(tmp_path, _fake(shutdown_lies=True))
+    (tmp_path / "lockf.busy").write_text("")
+    b.run(f'carpvipdhcp_vmac_carp_event "{b.conf(_record())}" 149@vtnet0 BACKUP')
+    assert _noted(b, "unconfirmed") == [NODE]
+
+
+@pytest.mark.parametrize("start, add, drop, want", [
+    (None, "vmac_a", "", ["vmac_a"]),
+    ("vmac_a\n", "vmac_b vmac_a", "", ["vmac_a", "vmac_b"]),
+    ("vmac_a\nvmac_b\n", "", "vmac_a", ["vmac_b"]),
+    ("vmac_a\n", "", "vmac_a", None),                    # empty: the file goes
+    ("vmac_ab\n", "", "vmac_a", ["vmac_ab"]),            # whole names only
+    ("vmac_a\n", "", "vmac_ab", ["vmac_a"]),             # ... both ways
+])
+def test_the_unconfirmed_list_updater(tmp_path, start, add, drop, want):
+    path = tmp_path / "list"
+    if start is not None:
+        path.write_text(start, newline="\n")
+    script = os.path.join(_SCRIPTS, "vmac_unconfirmed.sh")
+    subprocess.run(["sh", _posix(script), _posix(path), add, drop], check=True)
+    assert (path.read_text().split() if path.exists() else None) == want
+    assert [p.name for p in tmp_path.iterdir()] == (["list"] if want else [])   # no temp file left
+
+
+def test_vmac_sh_runs_the_updater_where_the_package_installs_it():
+    vmac = _read("opnsense", "scripts", "OPNsense", "CarpVipDhcp", "vmac.sh")
+    assert os.path.exists(os.path.join(_SCRIPTS, "vmac_unconfirmed.sh"))
+    installed = "/usr/local/opnsense/scripts/OPNsense/CarpVipDhcp/vmac_unconfirmed.sh"
+    assert ': "${CARPVIPDHCP_VMAC_UNCONFIRMED:=' + installed + '}"' in vmac
+
+
 def test_deinstall_finds_a_removed_keepers_leftover_through_the_notes(tmp_path):
     # The keeper on vtnet0 is gone from keeper.conf, an unnamed leftover is on vtnet0's
     # hooks, and the last stop recorded vmac_vtnet0 as unconfirmed: the sweep looks
@@ -429,8 +493,8 @@ def test_deinstall_finds_a_removed_keepers_leftover_through_the_notes(tmp_path):
     b = _Bench(tmp_path, _fake(built=False, unnamed=True))
     (tmp_path / "etc").mkdir()
     (tmp_path / "etc" / "keeper.conf").write_text(_record(iface="igb0.100", vhid="7") + "\n")
-    (tmp_path / "run" / "carpvipdhcp-vmac.unconfirmed").write_text(NODE + "\n")
-    (tmp_path / "run" / "carpvipdhcp-vmac.noted").write_text("vmac_igb0_100\n")
+    (tmp_path / "run" / "carpvipdhcp-vmac.unconfirmed").write_text(NODE + "\n", newline="\n")
+    (tmp_path / "run" / "carpvipdhcp-vmac.noted").write_text("vmac_igb0_100\n", newline="\n")
     res = _deinstall(tmp_path)
     assert "<unnamed>" not in b.after().nodes and b.after().nodes["vtnet0"].hooks == {}
     assert res.stderr == ""

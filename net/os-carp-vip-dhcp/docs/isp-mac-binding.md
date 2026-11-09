@@ -146,22 +146,24 @@ remove it where the keeper cannot:
   MAC in between);
 - removing the plugin.
 
-**Requirements.** The save refuses a keeper that does not meet them, and the keeper checks
-them again while it runs:
+**Requirements.** Saving the keeper checks the first three; the keeper itself checks the
+ones marked "while it runs" too, and the Status page then says why it does not rewrite:
 
 - A static address on the WAN for the node itself, as in the
-  [single-IP setup](single-ip-wan-carp.md). With DHCP, PPPoE, PPTP or L2TP on the WAN the
-  node's own traffic would also leave from the lease MAC while master, and the ISP would drop
-  it. If a DHCP client starts on the interface later, the keeper stops rewriting and says so.
-- No Client MAC override on the keeper.
+  [single-IP setup](single-ip-wan-carp.md), for IPv4 and for IPv6 if it has one. With DHCP,
+  PPPoE, PPTP or L2TP (or DHCPv6 or SLAAC) on the WAN the node's own traffic would also leave
+  from the lease MAC while master, and the ISP would drop it. While it runs, the keeper
+  stops rewriting when an IPv4 DHCP client starts on the interface (not for IPv6).
+- No Client MAC override on the keeper (also while it runs).
 - Only this keeper's CARP VIP on that interface: any other CARP VIP there would send from
-  this MAC too.
-- No NetFlow capture on that interface: it uses the same netgraph hooks. The keeper then
-  refuses and the Status page says why.
+  this MAC too. While it runs, the keeper checks for other keepers on the interface, not for
+  other CARP VIPs; one added later on Interfaces, Virtual IPs is not caught.
+- No NetFlow capture on that interface: it uses the same netgraph hooks. Only the keeper
+  checks this, while it runs.
 - The same plugin version on both nodes before you turn it on; HA sync carries the setting.
-  A node on an older version never rewrites.
+  A node on an older version never rewrites. Nothing checks this.
 - Remove the manual MAC swap script (below) and clear the interface's MAC field first. The
-  option and the script must never both be active.
+  option and the script must never both be active. Nothing checks this either.
 
 Everything the WAN interface sends is rewritten while master, not only the VIP's traffic:
 IPv6 neighbour discovery, LLDP and 802.1X frames too.
@@ -177,9 +179,11 @@ becomes `_`) shows a node of type `patch` connected to `lower` and `upper`; on t
 the node does not exist. A WAN capture on
 the master shows your traffic leaving from the virtual MAC.
 
-**Turn it off.** Untick the option and save: the keeper removes the rewrite. If you go back
-to a version before 1.19.0 on a master with the rewrite active, it stays until you remove it
-by hand with `ngctl shutdown vmac_<WAN_IF>:` (or reboot).
+**Turn it off.** Untick the option, save and press **Apply**: the rewrite is removed.
+Disabling or deleting the keeper and applying removes it too. Turn the option off before you
+go back to an older version. Versions 1.18.5 and 1.18.6 still act on the setting but have
+no field to turn it off; 1.18.4 and earlier leave an active rewrite in place until you
+remove it with `ngctl shutdown vmac_<WAN_IF>:` or reboot.
 
 **What has been tested.** On the test pair of OPNsense 26.7 virtual machines with virtio
 NICs, with frames captured per node: with the option on, no frame left the master from its

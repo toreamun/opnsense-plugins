@@ -26,25 +26,36 @@ namespace OPNsense\CarpVipDhcp;
 
 /**
  * The save-time requirements of "Send from the lease MAC while master" (vmacEgress,
- * experimental, #131). The keeper checks the same things at run time and refuses
- * with a reason on the Status page (leasekeeper/vmac.py); this catches them when
- * the keeper is saved. Plain data in and out, so it is tested without the
- * framework (tests/php/test_vmac_egress_rules.php); CarpVipDhcp::performValidation
- * gathers the data.
+ * experimental, #131). The keeper refuses most of the same things at run time, with
+ * the reason on the Status page (leasekeeper/vmac.py); this catches them when a
+ * keeper is saved. Plain data in and out, so it is tested without the framework
+ * (tests/php/test_vmac_egress_rules.php); CarpVipDhcp::performValidation gathers the
+ * data.
  *
- * Every keeper with the option on is checked, enabled or not, and the other
- * keepers count enabled or not, like the model's other cross-keeper invariants:
- * the conflict shows when it is edited, not later when a keeper is enabled.
+ * Only what is being saved is judged: a keeper with the option on when it changed,
+ * and another keeper on the same device when that one changed (the message then sits
+ * on its own VIP field, where its dialog shows it). The other keepers count enabled
+ * or not, like the model's other cross-keeper invariants. A requirement broken later
+ * outside this model (a WAN switched to DHCP, a CARP VIP added on Interfaces: Virtual
+ * IPs) does not block saving an unrelated keeper; the keeper's run-time checks cover
+ * a DHCP WAN and another keeper on the interface.
  */
 class VmacEgressRules
 {
     /**
-     * Interface address types where the node's own WAN address is leased (D6). The
-     * node's own traffic would also leave from the lease MAC while master, and an
-     * ISP that binds the MAC drops it; the keeper also refuses at run time when a
-     * DHCP client runs on the interface.
+     * IPv4 address types where the node's own WAN address is leased (D6). The node's
+     * own traffic would also leave from the lease MAC while master, and an ISP that
+     * binds the MAC drops it; the keeper also refuses at run time when a DHCP client
+     * runs on the interface.
      */
     public const DYNAMIC_TYPES = ['dhcp', 'pppoe', 'pptp', 'l2tp'];
+
+    /**
+     * The same for IPv6: an address from DHCPv6 or SLAAC is the node's own too, and
+     * dhcp6c's own packets would also leave from the lease MAC. Not checked at run
+     * time.
+     */
+    public const DYNAMIC_TYPES_V6 = ['dhcp6', 'slaac'];
 
     /**
      * The device a CARP VIP's interface key maps to (what the template's
@@ -57,23 +68,27 @@ class VmacEgressRules
 
     /**
      * The CARP VIP a keeper's carpVip names: [interface key, device, vhid], or null.
+     * The last match wins, as in the keeper.conf template (its loop never breaks).
      */
     private static function resolve($address, array $vips, array $ifaces)
     {
+        $found = null;
         foreach ($vips as $vip) {
             if (($vip['mode'] ?? '') === 'carp' && ($vip['subnet'] ?? '') === $address) {
                 $key = (string)($vip['interface'] ?? '');
-                return [$key, self::device($key, $ifaces), (string)($vip['vhid'] ?? '')];
+                $found = [$key, self::device($key, $ifaces), (string)($vip['vhid'] ?? '')];
             }
         }
-        return null;
+        return $found;
     }
 
     /**
      * @param array $keepers each ['ref' => model reference, 'vmacEgress' => bool,
-     *                       'carpVip' => address, 'chaddrOverride' => MAC or '']
+     *                       'carpVip' => address, 'chaddrOverride' => MAC or '',
+     *                       'changed' => whether this save changes the keeper]
      * @param array $vips    the virtualip.vip entries: 'mode', 'subnet', 'interface', 'vhid'
-     * @param array $ifaces  interface key => ['if' => device, 'ipaddr' => type or address]
+     * @param array $ifaces  interface key => ['if' => device, 'ipaddr' => IPv4 type or
+     *                       address, 'ipaddrv6' => IPv6 type or address]
      * @return array         [field reference, message] for every requirement not met
      */
     public static function check(array $keepers, array $vips, array $ifaces)
@@ -89,12 +104,13 @@ class VmacEgressRules
                 continue;
             }
             $field = $keeper['ref'] . '.vmacEgress';
+            $changed = !empty($keeper['changed']);
             // D4: rewriting to the CARP virtual MAC would send the VIP's traffic from a
             // MAC the ISP never leased to; rewriting to the override would make CARP's
             // ARP replies carry the virtual MAC inside and the override outside (gear
             // with dynamic ARP inspection may drop them). If ever needed: rewrite to
             // the override after a bench round that checks both.
-            if ((string)($keeper['chaddrOverride'] ?? '') !== '') {
+            if ($changed && (string)($keeper['chaddrOverride'] ?? '') !== '') {
                 $errors[] = [$field, gettext(
                     'Sending from the lease MAC does not work with a Client MAC override. Clear the override.'
                 )];
@@ -106,16 +122,27 @@ class VmacEgressRules
             list($key, $device, $vhid) = $vip;
             $shared = false;
             foreach ($keepers as $j => $other) {
-                if ($j !== $i && $devices[$j] === $device) {
+                if ($j === $i || $devices[$j] !== $device) {
+                    continue;
+                }
+                $shared = true;
+                if ($changed) {
                     $errors[] = [$field, sprintf(gettext(
                         'Another keeper\'s CARP VIP is on %s. It would send from this MAC too, '
                         . 'and an interface has room for one rewrite.'
                     ), $device)];
-                    $shared = true;
-                    break;
+                }
+                if (!empty($other['changed'])) {
+                    $errors[] = [$other['ref'] . '.carpVip', sprintf(gettext(
+                        'The keeper for %s sends from its lease MAC on %s (experimental option), so no other '
+                        . 'keeper may use a CARP VIP on that interface.'
+                    ), (string)($keeper['carpVip'] ?? ''), $device)];
                 }
             }
-            // Any other CARP group on the device (a keeper's is reported above).
+            if (!$changed) {
+                continue;
+            }
+            // Any other CARP group on the device (another keeper's is reported above).
             foreach ($shared ? [] : $vips as $other) {
                 if (
                     ($other['mode'] ?? '') === 'carp'
@@ -130,11 +157,17 @@ class VmacEgressRules
                 }
             }
             $type = (string)($ifaces[$key]['ipaddr'] ?? '');
+            $type6 = (string)($ifaces[$key]['ipaddrv6'] ?? '');
             if (in_array($type, self::DYNAMIC_TYPES, true)) {
                 $errors[] = [$field, sprintf(gettext(
                     'Sending from the lease MAC needs a static address on this node\'s WAN (%s uses %s). '
                     . 'Its own traffic would leave from the lease MAC too.'
                 ), $device, strtoupper($type))];
+            } elseif (in_array($type6, self::DYNAMIC_TYPES_V6, true)) {
+                $errors[] = [$field, sprintf(gettext(
+                    'Sending from the lease MAC needs a static IPv6 address, or none, on this node\'s WAN '
+                    . '(%s uses %s). Its own IPv6 traffic would leave from the lease MAC too.'
+                ), $device, strtoupper($type6))];
             }
         }
         return $errors;

@@ -163,17 +163,24 @@ class CarpVipDhcp extends BaseModel
     }
 
     /**
-     * Each keeper as VmacEgressRules takes it.
+     * Each keeper as VmacEgressRules takes it. "changed": this save changes a field the
+     * rules depend on (a new keeper's fields count as changed), so only what is being
+     * saved is judged.
      */
     private static function vmacKeepers($model)
     {
         $keepers = [];
         foreach ($model->keepers->keeper->iterateItems() as $keeper) {
+            $changed = false;
+            foreach (['enabled', 'carpVip', 'chaddrOverride', 'vmacEgress'] as $name) {
+                $changed = $changed || $keeper->$name->isFieldChanged();
+            }
             $keepers[] = [
                 'ref' => $keeper->__reference,
                 'vmacEgress' => (string)$keeper->vmacEgress === '1',
                 'carpVip' => (string)$keeper->carpVip,
                 'chaddrOverride' => (string)$keeper->chaddrOverride,
+                'changed' => $changed,
             ];
         }
         return $keepers;
@@ -200,7 +207,11 @@ class CarpVipDhcp extends BaseModel
         $ifaces = [];
         if (isset($config->interfaces)) {
             foreach ($config->interfaces->children() as $key => $iface) {
-                $ifaces[$key] = ['if' => (string)$iface->if, 'ipaddr' => (string)$iface->ipaddr];
+                $ifaces[$key] = [
+                    'if' => (string)$iface->if,
+                    'ipaddr' => (string)$iface->ipaddr,
+                    'ipaddrv6' => (string)$iface->ipaddrv6,
+                ];
             }
         }
         return [$vips, $ifaces];

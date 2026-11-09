@@ -234,8 +234,13 @@
         }
         let line = '<br><small class="text-muted">' + "{{ lang._('sends from the lease MAC') }}" + ': ';
         let state = k.vmac_state;
-        if (k.running !== true || !state) {
+        if (k.running !== true) {
             return line + "{{ lang._('keeper not running') }}" + '</small>';
+        }
+        // Running, but its heartbeat has no state for it yet (just turned on, or a
+        // heartbeat line from before the restart).
+        if (!state) {
+            return line + "{{ lang._('no state yet') }}" + '</small>';
         }
         if (state === 'built') {
             return line + '</small><small class="text-success">' + "{{ lang._('active') }}" + '</small>';

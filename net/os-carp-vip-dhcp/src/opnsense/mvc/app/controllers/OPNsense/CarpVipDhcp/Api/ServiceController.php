@@ -43,9 +43,18 @@ class ServiceController extends ApiMutableServiceControllerBase
     /**
      * Reconfigure as usual, then create/refresh the firewall aliases that mirror
      * each keeper's VIP address, so rules pointed at them are ready to use.
+     *
+     * keeper.conf is rendered first. The base stops the service before it renders
+     * the template, and the stop decides from keeper.conf which source-MAC rewrite
+     * (send from the lease MAC, experimental) may stay on a master. From the old file
+     * it would keep the rewrite of a keeper just disabled, deleted or moved to
+     * another VIP, with no keeper left to remove it.
      */
     public function reconfigureAction()
     {
+        if ($this->request->isPost()) {
+            (new \OPNsense\Core\Backend())->configdpRun('template reload', [static::$internalServiceTemplate]);
+        }
         $response = parent::reconfigureAction();
         // Only sync aliases when the reconfigure actually ran. The base guards
         // itself behind POST and returns status 'ok' on success; on a GET (or a

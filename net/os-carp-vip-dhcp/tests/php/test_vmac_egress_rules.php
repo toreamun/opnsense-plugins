@@ -33,9 +33,11 @@ function check($cond, $what)
     }
 }
 
-function keeper($ref, $vip, $on = true, $override = '')
+/* A keeper as the model gives it; "changed": this save changes it. */
+function keeper($ref, $vip, $on = true, $override = '', $changed = true)
 {
-    return ['ref' => $ref, 'vmacEgress' => $on, 'carpVip' => $vip, 'chaddrOverride' => $override];
+    return ['ref' => $ref, 'vmacEgress' => $on, 'carpVip' => $vip, 'chaddrOverride' => $override,
+            'changed' => $changed];
 }
 
 function vip($subnet, $iface, $vhid, $mode = 'carp')
@@ -84,20 +86,36 @@ foreach (VmacEgressRules::DYNAMIC_TYPES as $type) {
     $ifaces['wan']['ipaddr'] = $type;
     refused("$type WAN", errors([keeper($k, '100.64.4.102')], $oneVip, $ifaces), "$k.vmacEgress", 'static address');
 }
-foreach (['', 'track6', '100.64.4.2'] as $type) {
+foreach (['', '100.64.4.2'] as $type) {
     $ifaces = $wanStatic;
     $ifaces['wan']['ipaddr'] = $type;
     check(errors([keeper($k, '100.64.4.102')], $oneVip, $ifaces) === [], "ipaddr '$type': accepted");
 }
 
 // Another keeper's VIP on the same device, on or off, enabled or not: the keeper refuses
-// at run time (shared-iface), so the save does too. The other keeper itself, with the
-// option off, gets no error.
+// at run time (shared-iface), so the save does too, on the keeper being saved.
 $twoOnWan = [vip('100.64.4.102', 'wan', '149'), vip('100.64.4.103', 'wan', '149')];
 $k2 = 'carpvipdhcp.keepers.keeper.b';
-refused('another keeper on the device', errors([keeper($k, '100.64.4.102'), keeper($k2, '100.64.4.103', false)], $twoOnWan, $wanStatic), "$k.vmacEgress", 'Another keeper');
+refused('another keeper on the device, saving the option', errors([keeper($k, '100.64.4.102'), keeper($k2, '100.64.4.103', false, '', false)], $twoOnWan, $wanStatic), "$k.vmacEgress", 'Another keeper');
+// Saving the other keeper (added, or its VIP moved there): the message is on its own VIP
+// field, which its dialog shows, not on a field of the keeper it does not edit.
+refused('another keeper on the device, saving that one', errors([keeper($k, '100.64.4.102', true, '', false), keeper($k2, '100.64.4.103', false)], $twoOnWan, $wanStatic), "$k2.carpVip", 'sends from its lease MAC');
+// Both saved with the option on: each refused on its own option and on its VIP.
 $both = errors([keeper($k, '100.64.4.102'), keeper($k2, '100.64.4.103')], $twoOnWan, $wanStatic);
-check(count($both) === 2, 'both keepers on: one error each, got ' . count($both));
+check(count($both) === 4, 'both keepers on and saved: four errors, got ' . count($both) . ': ' . implode(' | ', $both));
+foreach (["$k.vmacEgress", "$k2.vmacEgress", "$k.carpVip", "$k2.carpVip"] as $f) {
+    check(count(array_filter($both, function ($e) use ($f) {
+        return strpos($e, "$f: ") === 0;
+    })) === 1, "both saved: one error on $f");
+}
+
+// Only what is saved is judged: a keeper with the option on that this save does not
+// change is not refused for what changed elsewhere (a WAN switched to DHCP, a CARP VIP
+// added, an override), so an unrelated keeper can still be saved.
+$ifaces = $wanStatic;
+$ifaces['wan']['ipaddr'] = 'dhcp';
+check(errors([keeper($k, '100.64.4.102', true, '02:00:00:00:00:01', false)], [vip('100.64.4.102', 'wan', '149'), vip('100.64.4.50', 'wan', '150')], $ifaces) === [], 'unchanged keeper: not judged');
+check(errors([keeper($k, '100.64.4.102', true, '', false), keeper($k2, '10.0.0.1')], [vip('100.64.4.102', 'wan', '149'), vip('10.0.0.1', 'lan', '1')], $ifaces) === [], 'saving a keeper on another device: accepted');
 
 // A keeper on another device does not count.
 $otherDev = [vip('100.64.4.102', 'wan', '149'), vip('10.0.0.1', 'lan', '1')];
@@ -105,7 +123,7 @@ check(errors([keeper($k, '100.64.4.102'), keeper($k2, '10.0.0.1')], $otherDev, $
 
 // Two interface keys on the same device (assignments that share a device) count as one.
 $sameDev = $wanStatic + ['opt1' => ['if' => 'vtnet0', 'ipaddr' => '100.64.5.2']];
-refused('another keeper via another key, same device', errors([keeper($k, '100.64.4.102'), keeper($k2, '100.64.5.9', false)], [vip('100.64.4.102', 'wan', '149'), vip('100.64.5.9', 'opt1', '150')], $sameDev), "$k.vmacEgress", 'Another keeper');
+refused('another keeper via another key, same device', errors([keeper($k, '100.64.4.102'), keeper($k2, '100.64.5.9', false, '', false)], [vip('100.64.4.102', 'wan', '149'), vip('100.64.5.9', 'opt1', '150')], $sameDev), "$k.vmacEgress", 'Another keeper');
 
 // Another CARP VIP (not a keeper's) with a different vhid on the device.
 refused('another vhid on the device', errors([keeper($k, '100.64.4.102')], [vip('100.64.4.102', 'wan', '149'), vip('100.64.4.50', 'wan', '150')], $wanStatic), "$k.vmacEgress", 'vhid 150');
@@ -122,6 +140,27 @@ refused('unresolved VIP with an override', errors([keeper($k, '100.64.9.9', true
 check(errors([keeper($k, '100.64.4.102')], $oneVip, ['lan' => $wanStatic['lan']]) === [], 'VIP on an unknown interface key: no error');
 // Two keepers whose VIPs both resolve to no device are not "on the same device".
 check(errors([keeper($k, '100.64.4.102'), keeper($k2, '100.64.4.103')], $twoOnWan, ['lan' => $wanStatic['lan']]) === [], 'two VIPs on unknown keys: no error');
+
+// IPv6: an address from DHCPv6 or SLAAC is the node's own too; static, none and
+// tracking another interface are fine. A dynamic IPv4 type is reported first.
+foreach (VmacEgressRules::DYNAMIC_TYPES_V6 as $type) {
+    $ifaces = $wanStatic;
+    $ifaces['wan']['ipaddrv6'] = $type;
+    refused("$type IPv6 WAN", errors([keeper($k, '100.64.4.102')], $oneVip, $ifaces), "$k.vmacEgress", 'static IPv6 address');
+}
+foreach (['', 'track6', '2001:db8::2'] as $type) {
+    $ifaces = $wanStatic;
+    $ifaces['wan']['ipaddrv6'] = $type;
+    check(errors([keeper($k, '100.64.4.102')], $oneVip, $ifaces) === [], "ipaddrv6 '$type': accepted");
+}
+$ifaces = $wanStatic;
+$ifaces['wan']['ipaddr'] = 'dhcp';
+$ifaces['wan']['ipaddrv6'] = 'dhcp6';
+refused('DHCP and DHCPv6', errors([keeper($k, '100.64.4.102')], $oneVip, $ifaces), "$k.vmacEgress", 'static address on');
+
+// Two CARP VIPs with the same address (a broken config): the last one counts, as in the
+// keeper.conf template.
+refused('duplicate VIP address: the last one counts', errors([keeper($k, '100.64.4.102')], [vip('100.64.4.102', 'lan', '1'), vip('100.64.4.102', 'wan', '149')], ['wan' => ['if' => 'vtnet0', 'ipaddr' => 'dhcp'], 'lan' => $wanStatic['lan']]), "$k.vmacEgress", 'vtnet0 uses DHCP');
 
 // Several requirements at once each get their own message.
 $ifaces = $wanStatic;

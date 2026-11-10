@@ -244,6 +244,20 @@ def test_stop_reports_a_node_list_it_cannot_read_and_still_tries_the_marked(tmp_
     assert NODE not in after.nodes and not _marker(b)
 
 
+@pytest.mark.parametrize("ether_reads, confirmed", [(None, True), (0, False)])
+def test_an_unlisted_stop_tries_every_interface_ifconfig_lists(tmp_path, ether_reads, confirmed):
+    # No marker and no node list: the interfaces ifconfig lists stand in. A removal there
+    # that is confirmed leaves nothing; one whose hooks cannot be read leaves a marker.
+    knobs = {} if ether_reads is None else {"ether_reads": ether_reads}
+    b = _Bench(tmp_path, _fake(show="list-fails", **knobs))
+    b.ifconfig("-l", "lo0 vtnet0 igb0.100\n")
+    res = b.run('carpvipdhcp_vmac_stop_rule')
+    assert "trying every interface ifconfig lists instead" in res.stdout
+    assert NODE not in b.after().nodes and _marker(b) is not confirmed
+    # No ether node: nothing to read. igb0.100's hooks are as readable as vtnet0's.
+    assert not _marker(b, "vmac_lo0") and _marker(b, "vmac_igb0_100") is not confirmed
+
+
 def test_stop_without_ng_patch_runs_no_ngctl_and_clears_the_markers(tmp_path):
     b = _Bench(tmp_path, _fake(unloaded=True))
     (tmp_path / "run" / f"carpvipdhcp-vmac.left.{NODE}").write_text("")

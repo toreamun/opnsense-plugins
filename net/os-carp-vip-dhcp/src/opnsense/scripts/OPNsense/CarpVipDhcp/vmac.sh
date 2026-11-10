@@ -27,6 +27,7 @@
 
 : "${CARPVIPDHCP_NGCTL:=/usr/sbin/ngctl}"
 : "${CARPVIPDHCP_KLDSTAT:=/sbin/kldstat}"
+: "${CARPVIPDHCP_IFCONFIG:=/sbin/ifconfig}"
 : "${CARPVIPDHCP_RUN:=/var/run}"
 
 # carpvipdhcp_vmac_node <ifnet>: our patch node's name (vmac_ + the ether node name,
@@ -164,7 +165,9 @@ carpvipdhcp_vmac_carp_event()
 # ours: every vmac_* patch node, and what of ours is on every ether node's hooks. Runs
 # after the keepers stopped; the next start rebuilds where the option is on and the
 # node is master. A list that fails or has no header is retried, then logged, never
-# taken for "none"; the nodes with a marker are tried in any case.
+# taken for "none": the node of every interface ifconfig lists is tried instead, so one
+# that cannot be read or removed there leaves a marker. The nodes with a marker are
+# tried in any case.
 carpvipdhcp_vmac_stop_rule()
 {
     if ! carpvipdhcp_vmac_loaded; then
@@ -185,7 +188,10 @@ carpvipdhcp_vmac_stop_rule()
         fi
         _vm_try=$((_vm_try + 1))
         if [ "${_vm_try}" -ge 3 ]; then
-            _carpvipdhcp_vmac_log "could not list the netgraph nodes at keeper stop (3 tries): a rewrite may remain and still rewrite the source MAC; check with ngctl list"
+            _carpvipdhcp_vmac_log "could not list the netgraph nodes at keeper stop (3 tries): trying every interface ifconfig lists instead; a rewrite whose interface is gone may remain, check with ngctl list"
+            for _vm_n in $("${CARPVIPDHCP_IFCONFIG}" -l 2>/dev/null); do
+                _vm_cands="${_vm_cands} $(carpvipdhcp_vmac_node "${_vm_n}")"
+            done
             break
         fi
         sleep 1

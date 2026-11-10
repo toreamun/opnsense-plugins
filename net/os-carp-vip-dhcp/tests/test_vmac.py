@@ -41,10 +41,12 @@ GETSTATS = 'Rec\'d response "getstats" (3) from "[d]:":\nArgs:\t{ Received=5 Pat
 
 
 @pytest.fixture(name="ng")
-def _ng(lk, monkeypatch):
+def _ng(lk, monkeypatch, tmp_path):
     fake = FakeNgctl(ifaces=("vtnet0", "igb0.100"))
     monkeypatch.setattr(lk.subprocess, "run", fake.run)
     monkeypatch.setattr(vm, "_dhclient_running", lambda _iface: False)
+    monkeypatch.setattr(vm, "_other_carp_vhid", lambda _iface, _vhid: None)
+    monkeypatch.setattr(vm, "_LEFT_MARKER", str(tmp_path / "carpvipdhcp-vmac.left.{}"))
     return fake
 
 
@@ -796,3 +798,83 @@ def test_every_state_has_its_status_page_text_and_banner_category():
         assert reason in reasons, f"{state}: no Status page text"
         assert category in categories, f"{state}: the banner never raises it"
     assert reasons == {s.partition(":")[2] for s in vm.VmacState if s not in healthy}
+
+
+# ---- ownership by signature, removal by ID, another CARP group, markers ----
+
+@pytest.mark.parametrize("hook, peer_hook, ours", [
+    ("upper", "in", True), ("lower", "out", True), ("upper", "out", False), ("lower", "in", False)])
+def test_an_unnamed_patch_node_is_ours_only_with_our_signature(ng, hook, peer_hook, ours):
+    # Ours: removed even on a backup. Not ours: never shut down; on a master it holds
+    # the hooks like any other node, so the option is refused rather than built over it.
+    ng.nodes["<unnamed>"] = vm_node("patch")
+    ng.link("<unnamed>", peer_hook, "vtnet0", hook)
+    e = _egress()
+    e.reconcile(False)
+    assert ("<unnamed>" not in ng.nodes) is ours
+    if not ours:
+        assert not [c for c in ng.calls if c[1:2] == ["shutdown"]]
+        e.reconcile(True)
+        assert "<unnamed>" in ng.nodes and e.status() == vm.VmacState.HOOKS_TAKEN
+
+
+def vm_node(ntype):
+    return FakeNgctl(ifaces=("x",)).nodes["x"].__class__(ntype)
+
+
+def test_our_named_node_is_shut_down_by_its_id(ng):
+    ng.add_patch(NODE, "vtnet0", config=WANTED)
+    _egress().reconcile(False)
+    shutdowns = [c[2] for c in ng.calls if c[1:2] == ["shutdown"]]
+    assert NODE not in ng.nodes
+    assert shutdowns and all(t.startswith("[") and t.endswith("]:") for t in shutdowns)
+
+
+def test_the_header_id_is_parsed():
+    built, bare = vm._parse_show(SHOW_BUILT), vm._parse_show("  Name: x  Type: patch\n")
+    assert built is not None and built.id == "0000000d"
+    assert bare is not None and bare.id == ""
+
+
+def test_another_carp_group_on_the_interface_is_refused_on_the_master(ng, monkeypatch):
+    monkeypatch.setattr(vm, "_other_carp_vhid", lambda _iface, _vhid: "150")
+    ng.add_patch(NODE, "vtnet0", config=WANTED)
+    e = _egress()
+    e.reconcile(True)
+    assert NODE not in ng.nodes and e.status() == vm.VmacState.OTHER_CARP
+    e.teardown_unless_master(lambda: True)          # nor kept across a keeper stop
+    assert NODE not in ng.nodes
+
+
+def test_other_carp_vhid_reads_ifconfig(lk, monkeypatch):
+    text = ("vtnet0: flags=8843\n\tcarp: MASTER vhid 149 advbase 1 advskew 0\n"
+            "\tcarp: BACKUP vhid 150 advbase 1 advskew 100\n")
+    replies = {"ok": (0, text), "own": (0, "\tcarp: MASTER vhid 149 advbase 1\n"), "fail": (1, "")}
+    for case, (rc, out) in replies.items():
+        monkeypatch.setattr(lk.subprocess, "run",
+                            lambda cmd, rc=rc, out=out, **_k: lk.subprocess.CompletedProcess(cmd, rc, out, ""))
+        assert vm._other_carp_vhid("vtnet0", "149") == {"ok": "150", "own": None, "fail": None}[case]
+
+
+def test_a_healthy_state_clears_the_shell_sides_marker(ng, tmp_path):
+    marker = tmp_path / f"carpvipdhcp-vmac.left.{NODE}"
+    marker.write_text("")
+    e = _egress()
+    e.reconcile(True)                    # built: the rewrite is there on purpose
+    assert _built(ng) and not marker.exists()
+    marker.write_text("")
+    e.reconcile(False)                   # torn down and confirmed: native
+    assert NODE not in ng.nodes and not marker.exists()
+
+
+def test_a_failed_teardown_leaves_the_marker(lk, monkeypatch, tmp_path):
+    fake = FakeNgctl(knobs=NgKnobs(shutdown_lies=True))
+    monkeypatch.setattr(lk.subprocess, "run", fake.run)
+    monkeypatch.setattr(vm, "_dhclient_running", lambda _iface: False)
+    monkeypatch.setattr(vm, "_LEFT_MARKER", str(tmp_path / "carpvipdhcp-vmac.left.{}"))
+    fake.add_patch(NODE, "vtnet0", config=WANTED)
+    marker = tmp_path / f"carpvipdhcp-vmac.left.{NODE}"
+    marker.write_text("")
+    e = _egress()
+    e.reconcile(False)
+    assert e.status() == vm.VmacState.TEARDOWN and marker.exists()

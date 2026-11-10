@@ -173,75 +173,33 @@ class VmacEgressRules
         return $errors;
     }
 
-    /**
-     * The nodes the last stop could not confirm removed, from the text of
-     * /var/run/carpvipdhcp-vmac.unconfirmed (written only by the stop rule in vmac.sh,
-     * one node name per line). Only well-formed names of ours count, so a damaged file
-     * cannot inject text into the system status message.
-     *
-     * @param string|false $text the file's content, or false when it is not there
-     * @return array               the node names, in file order, without duplicates
-     */
-    public static function unconfirmedNodes($text)
-    {
-        $nodes = [];
-        foreach (explode("\n", (string)$text) as $line) {
-            $line = trim($line);
-            if (preg_match('/^vmac_[A-Za-z0-9_]{1,26}$/', $line) && !in_array($line, $nodes, true)) {
-                $nodes[] = $line;
-            }
-        }
-        return $nodes;
-    }
+    /** The marker file the shell side leaves for a removal it could not confirm (vmac.sh). */
+    public const LEFT_PREFIX = 'carpvipdhcp-vmac.left.';
 
     /**
-     * Whether a rendered keeper.conf would make the stop keep a rewrite the saved
-     * settings no longer allow: a record with vmacegress=1 for which no enabled keeper
-     * has that VIP with the option on. configd renders from a cached config.xml, so
-     * right after a save it can still write the old file (see follow_update.php); the
-     * stop would then keep the rewrite of a keeper just disabled or deleted, or whose
-     * option was just turned off, and no keeper would be left to remove it. The
-     * interface is not compared: the template resolves it, and a difference in how
-     * would refuse every Apply. (A VIP moved to another interface leaves the old one
-     * in the note the last start left, carpvipdhcp_vmac_note in vmac.sh.) Records are
-     * read as keeperconf.py reads them: pipe-separated KEY=VALUE fields, the last of a
-     * key wins, a line without a request is skipped.
+     * The nodes whose removal could not be confirmed, from the paths of the marker files
+     * the shell side leaves (vmac.sh: one empty file per node, created when a removal
+     * fails, removed when one is confirmed). Only well-formed names of ours count, so a
+     * stray file cannot inject text into the system status message.
      *
-     * @param string $rendered the keeper.conf text
-     * @param array  $keepers  as for check(), plus 'enabled' => bool
-     * @return bool            true when the file is stale in this way
+     * @param array $paths the marker file paths (a glob of LEFT_PREFIX in the run directory)
+     * @return array       the node names, sorted, without duplicates
      */
-    public static function rendersStaleKeep($rendered, array $keepers)
+    public static function leftoverNodes(array $paths)
     {
-        foreach (explode("\n", (string)$rendered) as $line) {
-            $line = trim($line);
-            if ($line === '' || $line[0] === '#') {
+        $nodes = [];
+        foreach ($paths as $path) {
+            $name = basename((string)$path);
+            if (strncmp($name, self::LEFT_PREFIX, strlen(self::LEFT_PREFIX)) !== 0) {
                 continue;
             }
-            $fields = [];
-            foreach (explode('|', $line) as $field) {
-                $sep = strpos($field, '=');
-                if ($sep !== false) {
-                    $fields[substr($field, 0, $sep)] = substr($field, $sep + 1);
-                }
-            }
-            if (($fields['request'] ?? '') === '' || ($fields['vmacegress'] ?? '') !== '1') {
-                continue;
-            }
-            $allowed = false;
-            foreach ($keepers as $keeper) {
-                if (
-                    !empty($keeper['enabled']) && !empty($keeper['vmacEgress'])
-                    && (string)($keeper['carpVip'] ?? '') === $fields['request']
-                ) {
-                    $allowed = true;
-                    break;
-                }
-            }
-            if (!$allowed) {
-                return true;
+            $node = substr($name, strlen(self::LEFT_PREFIX));
+            if (preg_match('/^vmac_[A-Za-z0-9_]{1,26}$/', $node)) {
+                $nodes[$node] = true;
             }
         }
-        return false;
+        $nodes = array_keys($nodes);
+        sort($nodes);
+        return $nodes;
     }
 }

@@ -25,15 +25,13 @@ log_dir="/var/log"
 # Shared keeper.conf line parser, also sourced by the CARP status hook, so the
 # two readers cannot drift (and it is unit-tested against keeperconf.py).
 . /usr/local/opnsense/scripts/OPNsense/CarpVipDhcp/keeperconf.sh
-# The source-MAC rewrite's stop rule (option E): carpvipdhcp_vmac_stop_rule, and the
-# note start leaves for it (carpvipdhcp_vmac_note). Guarded: during an upgrade from a
-# version without vmac.sh the new rc.d can land first, and a failed `.` would abort
-# start, stop and status alike.
+# The source-MAC rewrite's stop guard (option E): carpvipdhcp_vmac_stop_rule. Guarded:
+# during an upgrade from a version without vmac.sh the new rc.d can land first, and a
+# failed `.` would abort start, stop and status alike.
 if [ -f /usr/local/opnsense/scripts/OPNsense/CarpVipDhcp/vmac.sh ]; then
     . /usr/local/opnsense/scripts/OPNsense/CarpVipDhcp/vmac.sh
 else
     carpvipdhcp_vmac_stop_rule() { :; }
-    carpvipdhcp_vmac_note() { :; }
 fi
 
 start_cmd="carpvipdhcp_start"
@@ -93,9 +91,6 @@ carpvipdhcp_start()
             --logfile "${log_dir}/carpvipdhcp-${id}.log"
         count=$((count + 1))
     done < "${conf}"
-    # Where a keeper may now build the source-MAC rewrite, for the next stop (replaced
-    # on the all-keepers path, added to when one keeper starts).
-    carpvipdhcp_vmac_note "${conf}" ${svc_id:+append}
     echo "Started ${count} keeper(s)."
 }
 
@@ -141,12 +136,11 @@ carpvipdhcp_stop()
         _signal_keepers -KILL
     fi
     rm -f "${run_dir}"/carpvipdhcp-*.pid "${run_dir}"/carpvipdhcp-*.child.pid
-    # The source-MAC rewrite stays only on a confirmed master whose keeper has the
-    # option on (D1), so a restart, settings save or package upgrade there opens no
-    # window of own-MAC frames; everywhere else it goes. Only on this all-keepers
-    # path: a per-row Stop or a follow (stop_id) never tears it down. A manual stop on
-    # a master keeps it, like the default route; the next CARP event removes it.
-    carpvipdhcp_vmac_stop_rule "${conf}"
+    # Remove every source-MAC rewrite (option E), decided from netgraph alone: the next
+    # start rebuilds it on the master, so a restart, an Apply or a package upgrade
+    # there opens a short window of own-MAC frames. Only on this all-keepers path: a
+    # per-row Stop or a follow (stop_id) leaves it to the keeper and the CARP syshook.
+    carpvipdhcp_vmac_stop_rule
     echo "Stopped ${stopped} keeper(s)${carpvipdhcp_restarting:+ (for restart)}."
 }
 

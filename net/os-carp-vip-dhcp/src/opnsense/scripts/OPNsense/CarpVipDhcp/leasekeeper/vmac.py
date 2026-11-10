@@ -11,8 +11,9 @@ ng_patch overwrites bytes 6 to 11 of every frame the kernel sends (the Ethernet 
 with the keeper's lease MAC. Nothing on the interface changes; the backup is untouched.
 
 Failure mode: the behaviour of today (frames leave from the own MAC). The graph is torn
-down on demotion by three independent guards: this module (every role tick), the CARP
-syshook and rc.d stop (both in the shell side). An unknown CARP role never builds and
+down by three independent guards: this module (every role tick), the CARP syshook (any
+state but MASTER, on that interface) and rc.d stop (everything of ours, rebuilt at start);
+the two in the shell side decide from netgraph alone, never from keeper.conf. An unknown CARP role never builds and
 tears down only after DEFAULT_UNREADABLE_ROLE_STRIKES consecutive unreadable probes, the
 fail-closed rule route.py uses for the default route.
 
@@ -22,8 +23,15 @@ ours (one `kldstat` and, when ng_patch is loaded at all, an `ngctl show` of our 
 of the interface's hooks), which is how a graph goes away after the option was switched off.
 
 One interface has one upper hook, so one rewrite: a keeper whose interface also carries
-another keeper's CARP VIP refuses the option (that VIP would send from this MAC too), and
-an off keeper there leaves the node alone at startup (it may be the other keeper's).
+another keeper's CARP VIP, or any other CARP group, refuses the option (that traffic
+would send from this MAC too), and an off keeper there leaves the node alone at startup
+(it may be the other keeper's).
+
+Ours, here and in the shell side (vmac.sh, +POST_DEINSTALL): the patch node named
+vmac_<e>, and an unnamed patch node on <e>'s hooks with our build's signature (its "in"
+hook on upper, or its "out" hook on lower; an interrupted build leaves one on upper, where
+it returns every frame). An unnamed patch node hooked any other way is not ours: it holds
+the hooks like any other node.
 
 Concurrency: main loop thread only (Keeper._role_tick, the _maintain_step gate, the
 process boundaries). Never kldload or build from the capture thread or a signal handler.
@@ -37,6 +45,7 @@ from enum import StrEnum
 from typing import NamedTuple
 
 from .constants import LOGGER_NAME, RECONCILE_HEARTBEAT_INTERVAL
+from .ifprobe import carp_roles
 from .route import DEFAULT_UNREADABLE_ROLE_STRIKES, _UnreadableRole, _log_at
 from .syscmd import run
 from .util import MAC_RE, _RateLimit
@@ -46,14 +55,17 @@ LOG = logging.getLogger(LOGGER_NAME)
 NGCTL = "/usr/sbin/ngctl"
 KLDLOAD = "/sbin/kldload"
 KLDSTAT = "/sbin/kldstat"
+IFCONFIG = "/sbin/ifconfig"
 _MODULES = ("ng_ether", "ng_patch")
 _NODE_PREFIX = "vmac_"
 _NODE_NAME_MAX = 31                       # NG_NODESIZ (32) less the terminating NUL
 _DHCLIENT_PID = "/var/run/dhclient.{}.pid"
+_LEFT_MARKER = "/var/run/carpvipdhcp-vmac.left.{}"   # a removal the shell side could not confirm
 _HOOK_IN = "in"                           # patch hook fed by the ether node's upper
 _HOOK_OUT = "out"                         # patch hook that feeds the ether node's lower
 _ETHER_HOOKS = ("upper", "lower")         # the ether node's hooks the graph takes
 _UNNAMED = "<unnamed>"                    # how ngctl show names a peer without a name
+_SIGNATURE = {"upper": _HOOK_IN, "lower": _HOOK_OUT}   # our patch hook on each ether hook
 _ENOENT = "No such file or directory"     # ngctl's text (exit 71) for a node that is not there
 BUILD_RETRY_INTERVAL = 60                 # s between build attempts after a failed one
 
@@ -71,6 +83,7 @@ class VmacState(StrEnum):
     BAD_MAC = "refused:bad-mac"
     SHARED_IFACE = "refused:shared-iface"
     DHCP_WAN = "refused:dhcp-wan"
+    OTHER_CARP = "refused:other-carp"
     NO_ETHER_NODE = "refused:no-ether-node"
     HOOKS_TAKEN = "refused:hooks-taken"
     FOREIGN_NODE = "refused:foreign-node"
@@ -91,6 +104,8 @@ _WHY = {
                             "this MAC too, and an interface has room for one rewrite",
     VmacState.DHCP_WAN: "a DHCP client runs on the interface; the node's own traffic would "
                         "also leave from the lease MAC (the option needs a static WAN address)",
+    VmacState.OTHER_CARP: "another CARP group is on the interface; its traffic would also leave "
+                          "from the lease MAC",
     VmacState.NO_ETHER_NODE: "the interface has no netgraph ether node (not an Ethernet interface)",
     VmacState.HOOKS_TAKEN: "another netgraph node holds the interface's hooks",
     VmacState.FOREIGN_NODE: "a node of another type already uses the name",
@@ -127,11 +142,13 @@ class _Peer(NamedTuple):
 
 
 class _Shown(NamedTuple):
-    """`ngctl show` parsed: the node's type, {local hook: _Peer} and {local hook: the
-    peer's netgraph ID} (8 hex digits, as `ngctl shutdown [id]:` takes it)."""
+    """`ngctl show` parsed: the node's type, {local hook: _Peer}, {local hook: the
+    peer's netgraph ID} and the node's own ID (8 hex digits, as `ngctl shutdown [id]:`
+    takes them; "" when the header has none)."""
     type: str
     hooks: dict
     ids: dict
+    id: str = ""
 
 
 def ether_node(iface):
@@ -177,7 +194,7 @@ def _build_script(iface, mac):
             f"msg {node}: setconfig {_setconfig(mac)}\n")
 
 
-_HEADER_RE = re.compile(r"Name:\s+(\S+)\s+Type:\s+(\S+)")
+_HEADER_RE = re.compile(r"Name:\s+(\S+)\s+Type:\s+(\S+)(?:\s+ID:\s+([0-9A-Fa-f]+))?")
 _FIELD_RE = re.compile(r"(\w+)=(0x[0-9A-Fa-f]+|-?\d+)")
 
 
@@ -197,7 +214,7 @@ def _parse_show(text):
         if rows and len(parts) == 5:
             hooks[parts[0]] = _Peer(parts[1], parts[2], parts[4])
             ids[parts[0]] = parts[3]
-    return _Shown(header.group(2), hooks, ids)
+    return _Shown(header.group(2), hooks, ids, header.group(3) or "")
 
 
 def _fields(text):
@@ -251,6 +268,26 @@ def _dhclient_running(iface):
     return True
 
 
+def _other_carp_vhid(iface, vhid):
+    """Another CARP vhid on `iface` (its traffic would also leave from the lease MAC), or
+    None: none there, or ifconfig could not be read (the keeper's role probe reads the
+    same output and reports an unreadable one)."""
+    res = run([IFCONFIG, iface], quiet=True)
+    if res is None or res.returncode != 0:
+        return None
+    others = sorted(v for v in carp_roles(res.stdout) if v != str(vhid))
+    return others[0] if others else None
+
+
+def _clear_marker(node):
+    """Clear the shell side's marker for `node`: a confirmed build or a confirmed absence
+    by this keeper settles what the marker warns about."""
+    try:
+        os.remove(_LEFT_MARKER.format(node))
+    except OSError:
+        pass
+
+
 def _static_refusal(chaddr, vhid, shared_iface):
     """Why the configuration itself rules the option out, or None."""
     if not vhid:
@@ -279,6 +316,7 @@ class _Target:
     """The fixed wiring: interface, node names, the rewrite MAC, whether another keeper
     shares the interface, and any reason the configuration rules the option out."""
     iface: str
+    vhid: str
     ether: str
     node: str
     mac: str
@@ -317,7 +355,7 @@ class VmacEgress:
     def __init__(self, iface, chaddr, vhid, *, enabled=False, shared_iface=False):
         mac = (chaddr or "").lower()
         self.enabled = enabled
-        self._t = _Target(iface, ether_node(iface), vmac_node(iface), mac, shared_iface,
+        self._t = _Target(iface, str(vhid or ""), ether_node(iface), vmac_node(iface), mac, shared_iface,
                           _static_refusal(mac, vhid, shared_iface))
         self._run = _Runtime()
         self._unreadable = _UnreadableRole(DEFAULT_UNREADABLE_ROLE_STRIKES)
@@ -368,6 +406,8 @@ class VmacEgress:
             refusal = self._hooks_refusal(ether)
         if refusal is None and _dhclient_running(self._t.iface):
             refusal = VmacState.DHCP_WAN
+        if refusal is None and is_master and _other_carp_vhid(self._t.iface, self._t.vhid) is not None:
+            refusal = VmacState.OTHER_CARP
         if not is_master or refusal is not None:
             self._stand_down(presence, refusal)
         else:
@@ -427,7 +467,7 @@ class VmacEgress:
         guard: the keeper may not reach its main loop soon, for example while the
         capture keeps failing to start, so the guard cannot wait for the first tick)."""
         return (self._t.static_refusal is None and not _dhclient_running(self._t.iface)
-                and probe() is True)
+                and probe() is True and _other_carp_vhid(self._t.iface, self._t.vhid) is None)
 
     # ---- states ----
 
@@ -467,7 +507,7 @@ class VmacEgress:
             return VmacState.NO_ETHER_NODE
         for hook in _ETHER_HOOKS:
             peer = ether.hooks.get(hook)
-            if peer is None or (peer.type == "patch" and peer.name in (_UNNAMED, self._t.node)):
+            if peer is None or self._is_ours(hook, peer):
                 continue
             self._run.hooks_owner = f"{peer.name} ({peer.type})"
             return VmacState.HOOKS_TAKEN
@@ -481,6 +521,7 @@ class VmacEgress:
         changed = state != self._run.logged
         self._run.logged = state
         if state in _HEALTHY:
+            _clear_marker(self._t.node)
             what = "rewriting the source MAC to " + self._t.mac if state is VmacState.BUILT else "native"
             _log_at(changed, self._heartbeat)("vmac egress on %s: %s", self._t.iface, what)
             return
@@ -535,15 +576,22 @@ class VmacEgress:
             return _NO_ETHER
         return _parse_show(res.stdout)    # None when exit 0 but unparseable: unreadable
 
+    def _is_ours(self, hook, peer):
+        """True when the node on the ether node's `hook` is ours (see the module
+        docstring): the patch node under our name, or an unnamed patch node with our
+        build's signature on that hook."""
+        return peer.type == "patch" and (
+            peer.name == self._t.node or (peer.name == _UNNAMED and peer.hook == _SIGNATURE[hook]))
+
     def _ours_on(self, ether):
-        """{hook: peer name} of the hooks a patch node that is ours or unnamed holds:
-        what a teardown may shut down by hook path (never another type of node). None
-        when the ether node could not be read."""
+        """{hook: peer name} of the hooks a patch node of ours holds: what a teardown may
+        shut down by ID (never another type of node, never an unnamed one hooked another
+        way). None when the ether node could not be read."""
         if ether is None:
             return None
         peers = {hook: ether.hooks.get(hook) for hook in _ETHER_HOOKS}
         return {hook: peer.name for hook, peer in peers.items()
-                if peer is not None and peer.type == "patch" and peer.name in (_UNNAMED, self._t.node)}
+                if peer is not None and self._is_ours(hook, peer)}
 
     def _unnamed_in(self, ether):
         """True when an unnamed patch node sits on the interface's hooks (an interrupted
@@ -597,17 +645,27 @@ class VmacEgress:
             self._run.dropped = dropped
         self._set_state(VmacState.BUILT)
 
+    def _own_patch_id(self):
+        """The netgraph ID of the patch node under our name, or None (no such node, of
+        another type, or unreadable: the hooks still reach a wired one)."""
+        res = _ngctl("show", f"{self._t.node}:")
+        if res is None or res.returncode != 0:
+            return None
+        shown = _parse_show(res.stdout)
+        return shown.id if shown is not None and shown.type == "patch" and shown.id else None
+
     def _teardown(self, reason):
-        """Remove the rewrite and confirm it is gone; True when confirmed. Shuts our node
-        down by name only when it is a patch node of ours (never a node of another type
-        under our name), and any patch node that is ours or unnamed on the interface's
-        hooks by the netgraph ID the read saw (a hook path could reach a node that took
-        the hook since). Confirmed means our name holds no patch node of ours AND the
-        hooks were read and hold none: unreadable hooks are not confirmation. Always safe
-        to retry; a failure is retried on the next tick, warned once until one works."""
-        shut = self._present() in _OURS
+        """Remove the rewrite and confirm it is gone; True when confirmed. Shuts down, by
+        the netgraph ID a read saw (a name or hook path could reach a node that took it
+        since), our node when it is a patch node (never a node of another type under our
+        name) and any patch node of ours on the interface's hooks. Confirmed means our
+        name holds no patch node of ours AND the hooks were read and hold none: unreadable
+        hooks are not confirmation. Always safe to retry; a failure is retried on the next
+        tick, warned once until one works."""
+        own = self._own_patch_id()
+        shut = own is not None
         if shut:
-            _ngctl("shutdown", f"{self._t.node}:")
+            _ngctl("shutdown", f"[{own}]:")
         ether = self._read_ether()
         if ether is not None:
             for hook in self._ours_on(ether) or {}:

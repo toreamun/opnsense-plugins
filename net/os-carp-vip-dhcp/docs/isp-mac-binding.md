@@ -138,12 +138,14 @@ the keeper's lease MAC, the CARP virtual MAC. The rewrite is done in the kernel 
 (`ng_ether` and `ng_patch`) between the interface and the network; the interface's own MAC
 setting is not changed, so a backup sends from its own MAC as before. The keeper builds the
 rewrite when its node becomes master and removes it when it becomes backup. Three guards
-remove it where the keeper cannot:
+remove it where the keeper cannot, from what is in the kernel, whatever the settings say now:
 
-- the CARP event hook, on every change away from master, even when the keeper is not running;
-- stopping the service, unless this node is the master and the option is on (a restart, a
-  settings save or a plugin upgrade on the master keeps it, so no frame leaves from the own
-  MAC in between);
+- the CARP event hook, on every change away from master on that interface, even when the
+  keeper is not running, disabled or deleted;
+- stopping the service: every rewrite goes, and the keeper rebuilds it when it starts on
+  the master. So an **Apply** on the Settings page, a service restart or a plugin upgrade on
+  the master leaves a few seconds in which its traffic goes out from its own MAC, and the
+  ISP drops it until the keeper has rebuilt the rewrite;
 - removing the plugin.
 
 **Requirements.** Saving the keeper checks the first three; the keeper itself checks the
@@ -156,8 +158,8 @@ ones marked "while it runs" too, and the Status page then says why it does not r
   stops rewriting when an IPv4 DHCP client starts on the interface (not for IPv6).
 - No Client MAC override on the keeper (also while it runs).
 - Only this keeper's CARP VIP on that interface: any other CARP VIP there would send from
-  this MAC too. While it runs, the keeper checks for other keepers on the interface, not for
-  other CARP VIPs; one added later on Interfaces, Virtual IPs is not caught.
+  this MAC too. Also while it runs: the keeper stops rewriting when ifconfig shows another
+  CARP group on the interface.
 - No NetFlow capture on that interface: it uses the same netgraph hooks. Only the keeper
   checks this, while it runs.
 - The same plugin version on both nodes before you turn it on; HA sync carries the setting.
@@ -172,7 +174,10 @@ IPv6 neighbour discovery, LLDP and 802.1X frames too.
 the master, **not while backup** on the backup, or a warning with the reason it is not
 active, or cannot be verified (for example "a DHCP client runs on this interface"). A
 rewrite that is not active, or cannot be verified, on the master raises the system status
-banner after five minutes, as does, on any node, one that could not be removed. The keeper's log has a line for every build and removal.
+banner after five minutes, as does, on any node, one that could not be removed (an
+**Apply** on the Settings page tries every removal again). The keeper's log has a line for
+every build and removal, and the system log one for every removal by the CARP event hook or
+the service stop.
 
 **Check it.** On the master, `ngctl show vmac_<WAN_IF>:` (a `.` in the interface name
 becomes `_`) shows a node of type `patch` connected to `lower` and `upper`; on the backup
@@ -187,12 +192,13 @@ remove it with `ngctl shutdown vmac_<WAN_IF>:` or reboot.
 
 **What has been tested.** On the test pair of OPNsense 26.7 virtual machines with virtio
 NICs, with frames captured per node: with the option on, no frame left the master from its
-own MAC; a keeper restart on the master kept the rewrite without rebuilding it; failover in
-both directions moved the rewrite with the role, also with the master's keeper killed; and
-removing the package on the master removed it. A prototype of the same netgraph graph, in the
+own MAC; failover in both directions moved the rewrite with the role, also with the
+master's keeper killed; a keeper disabled on the master and applied, and the option turned
+off, removed it; and removing the package on the master removed it. A prototype of the same netgraph graph, in the
 design tests, also ran on a VLAN WAN. Not tested: physical NICs at gigabit speed, lagg,
 netmap IPS, OPNsense 26.1, a real ISP that checks the MAC, and how long the new master sends
-from its own MAC after a failover before its keeper has built the rewrite.
+from its own MAC after a failover, an Apply or an upgrade before its keeper has built the
+rewrite.
 
 ## Manual workaround: swap the MAC on CARP transitions (unsupported)
 

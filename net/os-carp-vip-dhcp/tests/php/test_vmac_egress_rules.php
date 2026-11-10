@@ -167,40 +167,15 @@ $ifaces = $wanStatic;
 $ifaces['wan']['ipaddr'] = 'dhcp';
 check(count(errors([keeper($k, '100.64.4.102', true, '02:00:00:00:00:01')], [vip('100.64.4.102', 'wan', '149'), vip('100.64.4.50', 'wan', '150')], $ifaces)) === 3, 'override, other vhid and DHCP: three errors');
 
-// rendersStaleKeep: a keeper.conf the stop would read is stale when a record keeps the
-// rewrite (vmacegress=1) that no enabled keeper with the option on asks for. A fresh
-// render never is, so Apply is never refused for a current file.
-function enabled($ref, $vip, $on = true, $isEnabled = true)
-{
-    return ['ref' => $ref, 'enabled' => $isEnabled, 'vmacEgress' => $on, 'carpVip' => $vip];
-}
-$rec = function ($request, $on, $iface = 'vtnet0') {
-    return "request=$request|iface=$iface|chaddr=00:00:5e:00:01:95|vhid=149|vmacegress=$on";
-};
-$head = "# rendered keeper.conf\n";
-check(!VmacEgressRules::rendersStaleKeep($head . $rec('100.64.4.102', '1') . "\n", [enabled($k, '100.64.4.102')]), 'fresh render with the option on: not stale');
-check(!VmacEgressRules::rendersStaleKeep($head . $rec('100.64.4.102', '0') . "\n", [enabled($k, '100.64.4.102', false)]), 'option off in both: not stale');
-check(!VmacEgressRules::rendersStaleKeep($head, []), 'no keepers, empty render: not stale');
-check(!VmacEgressRules::rendersStaleKeep($head . $rec('100.64.4.102', '0') . "\n", []), 'a stale record with the option off keeps nothing: not stale');
-check(VmacEgressRules::rendersStaleKeep($head . $rec('100.64.4.102', '1') . "\n", []), 'keeper deleted, old record keeps: stale');
-check(VmacEgressRules::rendersStaleKeep($head . $rec('100.64.4.102', '1') . "\n", [enabled($k, '100.64.4.102', true, false)]), 'keeper disabled: stale');
-check(VmacEgressRules::rendersStaleKeep($head . $rec('100.64.4.102', '1') . "\n", [enabled($k, '100.64.4.102', false)]), 'option turned off: stale');
-check(VmacEgressRules::rendersStaleKeep($head . $rec('100.64.4.102', '1') . "\n", [enabled($k, '100.64.4.103')]), 'VIP changed: stale');
-check(VmacEgressRules::rendersStaleKeep("  " . $rec('100.64.4.102', '1') . "  \r\n", []), 'whitespace around a record is ignored, as keeperconf.py does');
-check(!VmacEgressRules::rendersStaleKeep("# was: |" . $rec('100.64.4.102', '1') . "\n", []), 'a comment line is not a record');
-check(!VmacEgressRules::rendersStaleKeep("iface=vtnet0|vmacegress=1\n", []), 'a line without a request is skipped');
-check(VmacEgressRules::rendersStaleKeep("request=100.64.4.102|vmacegress=0|vmacegress=1\n", []), 'the last of a key wins');
-check(!VmacEgressRules::rendersStaleKeep("request=100.64.4.102|vmacegress=1|vmacegress=0\n", []), 'the last of a key wins (off)');
-check(VmacEgressRules::rendersStaleKeep($head . $rec('100.64.4.9', '0') . "\n" . $rec('100.64.4.102', '1') . "\n", [enabled($k, '100.64.4.9', false)]), 'any stale record counts, not only the first');
-
-// unconfirmedNodes: the stop rule's list for the system status. Missing file, empty,
-// one per line, duplicates once, and nothing that is not a node name of ours.
-check(VmacEgressRules::unconfirmedNodes(false) === [], 'no file: none');
-check(VmacEgressRules::unconfirmedNodes('') === [], 'empty file: none');
-check(VmacEgressRules::unconfirmedNodes("vmac_vtnet0\nvmac_igb0_100\nvmac_vtnet0\n") === ['vmac_vtnet0', 'vmac_igb0_100'], 'one per line, duplicates once, in order');
-check(VmacEgressRules::unconfirmedNodes("  vmac_vtnet0 \r\n") === ['vmac_vtnet0'], 'whitespace trimmed');
-check(VmacEgressRules::unconfirmedNodes("vtnet0\nvmac_<b>x</b>\nvmac_a b\nvmac_\nng0\n") === [], 'anything but a node name of ours is ignored');
-check(VmacEgressRules::unconfirmedNodes('vmac_' . str_repeat('a', 27)) === [], 'a name longer than netgraph allows is ignored');
+// leftoverNodes: the marker files the shell side leaves for removals it could not confirm,
+// as the system status reads them. Sorted, once each, and nothing that is not a marker
+// of a node name of ours.
+$p = '/var/run/carpvipdhcp-vmac.left.';
+check(VmacEgressRules::leftoverNodes([]) === [], 'no markers: none');
+check(VmacEgressRules::leftoverNodes([$p . 'vmac_vtnet0', $p . 'vmac_igb0_100', $p . 'vmac_vtnet0']) === ['vmac_igb0_100', 'vmac_vtnet0'], 'sorted, once each');
+check(VmacEgressRules::leftoverNodes(['carpvipdhcp-vmac.left.vmac_vtnet0']) === ['vmac_vtnet0'], 'a bare file name counts too');
+check(VmacEgressRules::leftoverNodes([$p . 'vtnet0', $p . 'vmac_<b>x</b>', $p . 'vmac_a b', $p . 'vmac_', '/var/run/other.vmac_vtnet0', '/var/run/x/carpvipdhcp-vmac.leftvmac_a']) === [], 'anything else is ignored');
+check(VmacEgressRules::leftoverNodes([$p . 'vmac_' . str_repeat('a', 27)]) === [], 'a name longer than netgraph allows is ignored');
 
 echo "$checks checks, $failures failures\n";
 exit($failures ? 1 : 0);

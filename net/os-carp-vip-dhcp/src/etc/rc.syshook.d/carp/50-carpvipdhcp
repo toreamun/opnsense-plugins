@@ -13,16 +13,15 @@
 # and CARP transitions are rare. The keeper's own poll remains the fallback if
 # this signal is ever missed.
 #
-# First, on any state but MASTER, remove the source-MAC rewrite (option E, vmac.sh)
-# of the keepers with this interface and vhid: guard 1, independent of the keeper,
-# so a dead or stopped keeper cannot leave its rewrite on a backup. Teardown only,
-# never a build; inert when ng_patch is not loaded.
+# First, on any state but MASTER, remove the source-MAC rewrite (option E, vmac.sh) on
+# this interface: guard 1, independent of the keeper and of keeper.conf, so a keeper
+# that is dead, stopped, disabled or deleted cannot leave its rewrite on a backup.
+# Teardown only, never a build; inert when ng_patch is not loaded.
 
 scripts=/usr/local/opnsense/scripts/OPNsense/CarpVipDhcp
 if [ -f "${scripts}/vmac.sh" ]; then
-    . "${scripts}/keeperconf.sh"
     . "${scripts}/vmac.sh"
-    carpvipdhcp_vmac_carp_event /usr/local/etc/carpvipdhcp/keeper.conf "$1" "$2"
+    carpvipdhcp_vmac_carp_event "$1" "$2"
 fi
 
 for pf in /var/run/carpvipdhcp-*.child.pid; do

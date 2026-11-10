@@ -50,14 +50,6 @@ class _Bench:
         for prog in ("ngctl", "kldstat"):
             self._script(prog, f'exec "{py}" "{cli}" "{_posix(self.state)}" {prog} "$@"')
         self._script("ifconfig", f'cat "{_posix(tmp_path)}/ifconfig.$1" 2>/dev/null')
-        # lockf as FreeBSD's takes it (-k, -t N, the lock file, the command). lockf.busy:
-        # the lock is never had (exit 75); lockf.inject: another writer adds its lines to
-        # the locked list first, as a CARP event during a stop would.
-        d = _posix(tmp_path)
-        self._script("lockf", 'while :; do case "$1" in -k) shift ;; -t) shift 2 ;; *) break ;; esac; done\n'
-                              f'lock=$1; shift\n[ -f "{d}/lockf.busy" ] && exit 75\n'
-                              f'[ -f "{d}/lockf.inject" ] && cat "{d}/lockf.inject" >> "${{lock%.lock}}"\n'
-                              'exec "$@"')
 
     def _script(self, name, body):
         path = self.dir / name
@@ -75,10 +67,8 @@ class _Bench:
     def run(self, body):
         d = _posix(self.dir)
         script = (f'CARPVIPDHCP_NGCTL="{d}/ngctl" CARPVIPDHCP_KLDSTAT="{d}/kldstat" '
-                  f'CARPVIPDHCP_IFCONFIG="{d}/ifconfig" CARPVIPDHCP_RUN="{d}/run" '
-                  f'CARPVIPDHCP_LOCKF="{d}/lockf" '
-                  f'CARPVIPDHCP_VMAC_UNCONFIRMED="{_posix(_SCRIPTS)}/vmac_unconfirmed.sh"\n'
-                  f'. "{_posix(_SCRIPTS)}/keeperconf.sh"\n. "{_posix(_SCRIPTS)}/vmac.sh"\n{body}\n')
+                  f'CARPVIPDHCP_IFCONFIG="{d}/ifconfig" CARPVIPDHCP_RUN="{d}/run"\n'
+                  f'. "{_posix(_SCRIPTS)}/vmac.sh"\n{body}\n')
         return subprocess.run(["sh", "-c", script], capture_output=True, text=True, check=False)
 
     def after(self):
@@ -99,138 +89,6 @@ def _ngctl_calls(fake):
     return [c for c in fake.calls if c[0].endswith("ngctl")]
 
 
-# ---- the CARP syshook guard ----
-
-@pytest.mark.parametrize("state", ["BACKUP", "INIT"])
-def test_carp_event_removes_the_rewrite_off_master(tmp_path, state):
-    b = _Bench(tmp_path, _fake())
-    res = b.run(f'carpvipdhcp_vmac_carp_event "{b.conf(_record())}" 149@vtnet0 {state}')
-    assert NODE not in b.after().nodes and b.after().nodes["vtnet0"].hooks == {}
-    assert f"removed {NODE}: CARP vhid 149 on vtnet0 is {state}" in res.stdout
-
-
-def test_carp_event_on_master_does_nothing_at_all(tmp_path):
-    b = _Bench(tmp_path, _fake())
-    b.run(f'carpvipdhcp_vmac_carp_event "{b.conf(_record())}" 149@vtnet0 MASTER')
-    assert NODE in b.after().nodes and not b.after().calls        # not even kldstat
-
-
-@pytest.mark.parametrize("event", ["150@vtnet0", "149@igb0.100"])
-def test_carp_event_for_another_vhid_or_interface_leaves_it(tmp_path, event):
-    b = _Bench(tmp_path, _fake())
-    b.run(f'carpvipdhcp_vmac_carp_event "{b.conf(_record())}" {event} BACKUP')
-    assert NODE in b.after().nodes
-
-
-def test_carp_event_does_not_need_the_option_flag(tmp_path):
-    # D3: matched from keeper.conf by interface and vhid only, so a graph from an
-    # earlier configuration (option since switched off) goes too.
-    b = _Bench(tmp_path, _fake())
-    b.run(f'carpvipdhcp_vmac_carp_event "{b.conf(_record(on="0"))}" 149@vtnet0 BACKUP')
-    assert NODE not in b.after().nodes
-
-
-def test_carp_event_removes_an_unnamed_leftover_and_never_a_foreign_node(tmp_path):
-    fake = _fake(built=False, unnamed=True)
-    fake.nodes[NODE] = fake.nodes["vtnet0"].__class__("tee")       # another type under our name
-    b = _Bench(tmp_path, fake)
-    b.run(f'carpvipdhcp_vmac_carp_event "{b.conf(_record())}" 149@vtnet0 BACKUP')
-    after = b.after()
-    assert "<unnamed>" not in after.nodes and after.nodes["vtnet0"].hooks == {}
-    assert after.nodes[NODE].type == "tee"
-    assert not [c for c in after.calls if c[1:3] == ["shutdown", f"{NODE}:"]]
-
-
-def test_carp_event_without_ng_patch_runs_no_ngctl(tmp_path):
-    b = _Bench(tmp_path, _fake(built=False, unloaded=True))
-    b.run(f'carpvipdhcp_vmac_carp_event "{b.conf(_record())}" 149@vtnet0 BACKUP')
-    assert [c[0] for c in b.after().calls] == ["/fake/kldstat"]
-
-
-def test_carp_event_without_keeper_conf_does_nothing(tmp_path):
-    b = _Bench(tmp_path, _fake())
-    b.run(f'carpvipdhcp_vmac_carp_event "{_posix(tmp_path)}/missing.conf" 149@vtnet0 BACKUP')
-    assert NODE in b.after().nodes and not b.after().calls
-
-
-# ---- the rc.d stop rule ----
-
-def test_stop_keeps_the_rewrite_on_a_master_with_the_option_on(tmp_path):
-    b = _Bench(tmp_path, _fake())
-    b.ifconfig("vtnet0", MASTER_149)
-    b.run(f'carpvipdhcp_vmac_stop_rule "{b.conf(_record())}"')
-    after = b.after()
-    assert NODE in after.nodes and not [c for c in after.calls if c[1:2] == ["shutdown"]]
-
-
-@pytest.mark.parametrize("case", ["backup", "option-off", "dhcp-wan", "no-record"])
-def test_stop_removes_the_rewrite_everywhere_else(tmp_path, case):
-    b = _Bench(tmp_path, _fake())
-    b.ifconfig("vtnet0", BACKUP_149 if case == "backup" else MASTER_149)
-    records = {"backup": [_record()], "option-off": [_record(on="0")], "dhcp-wan": [_record()],
-               "no-record": [_record(iface="igb0.100")]}[case]
-    body = f'carpvipdhcp_vmac_stop_rule "{b.conf(*records)}"'
-    if case == "dhcp-wan":       # a live pid in dhclient.<ifnet>.pid: this shell's own
-        body = f'echo $$ > "{_posix(tmp_path)}/run/dhclient.vtnet0.pid"\n' + body
-    res = b.run(body)
-    assert NODE not in b.after().nodes and b.after().nodes["vtnet0"].hooks == {}
-    assert f"removed {NODE}: keeper stop" in res.stdout
-
-
-def test_stop_keeps_a_shared_interface_whose_option_keeper_is_master(tmp_path):
-    b = _Bench(tmp_path, _fake())
-    b.ifconfig("vtnet0", MASTER_149)
-    b.run(f'carpvipdhcp_vmac_stop_rule "{b.conf(_record(), _record(vhid="150", on="0", request="100.64.4.9"))}"')
-    assert NODE in b.after().nodes
-
-
-def test_stop_never_touches_a_foreign_node_and_cleans_an_unnamed_one(tmp_path):
-    fake = _fake(built=False, unnamed=True)
-    fake.nodes["vmac_tee0"] = fake.nodes["vtnet0"].__class__("tee")
-    b = _Bench(tmp_path, fake)
-    b.run(f'carpvipdhcp_vmac_stop_rule "{b.conf(_record(on="0"))}"')
-    after = b.after()
-    assert after.nodes["vmac_tee0"].type == "tee" and "<unnamed>" not in after.nodes
-
-
-def test_stop_removes_a_removed_keepers_node(tmp_path):
-    # vmac_old0 is named by no record: only the node list finds it.
-    fake = _fake(built=False, ifaces=("vtnet0", "old0"))
-    fake.add_patch("vmac_old0", "old0", config=WANTED)
-    b = _Bench(tmp_path, fake)
-    res = b.run(f'carpvipdhcp_vmac_stop_rule "{b.conf(_record(on="0"))}"')
-    assert "vmac_old0" not in b.after().nodes and "removed vmac_old0: keeper stop" in res.stdout
-
-
-@pytest.mark.parametrize("show", ["list-fails", "garbled-list"])
-def test_stop_reports_a_node_list_it_cannot_read(tmp_path, show):
-    # The list fails or has no header every time: retried, then logged; never taken
-    # for "no other node". The records' own nodes are still handled.
-    fake = _fake(ifaces=("vtnet0", "old0"), show=show)
-    fake.add_patch("vmac_old0", "old0", config=WANTED)
-    b = _Bench(tmp_path, fake)
-    b.ifconfig("vtnet0", BACKUP_149)
-    res = b.run(f'carpvipdhcp_vmac_stop_rule "{b.conf(_record())}"')
-    after = b.after()
-    assert "could not list the netgraph nodes at keeper stop" in res.stdout
-    assert sum(c[1:2] == ["list"] for c in after.calls) == 3
-    assert "vmac_old0" in after.nodes                       # unseen, so left: but reported
-    assert NODE not in after.nodes and f"removed {NODE}: keeper stop" in res.stdout
-
-
-def test_stop_without_ng_patch_runs_no_ngctl(tmp_path):
-    b = _Bench(tmp_path, _fake(built=False, unloaded=True))
-    b.run(f'carpvipdhcp_vmac_stop_rule "{b.conf(_record())}"')
-    assert [c[0] for c in b.after().calls] == ["/fake/kldstat"]
-
-
-def test_node_name_of_a_vlan_interface(tmp_path):
-    b = _Bench(tmp_path, _fake(built=False))
-    assert b.run("carpvipdhcp_vmac_node igb0.100").stdout == "vmac_igb0_100"
-
-
-# ---- +POST_DEINSTALL ----
-
 def _deinstall(tmp_path):
     d = _posix(tmp_path)
     with open(os.path.join(_PLUGIN, "+POST_DEINSTALL.post"), encoding="utf-8") as f:
@@ -242,339 +100,228 @@ def _deinstall(tmp_path):
     return subprocess.run(["sh", "-c", text], capture_output=True, text=True, check=False)
 
 
-def test_deinstall_sweeps_every_node_of_ours_and_nothing_else(tmp_path):
-    fake = _fake(unnamed=False)
-    fake.nodes["<unnamed>"] = fake.nodes["vtnet0"].__class__("patch")
-    fake.link("<unnamed>", "in", "igb0_100", "upper")                  # a leftover on a keeper iface
-    fake.add_patch("vmac_old0", "igb0_100", hooks=(), config=WANTED)  # a removed keeper's node
-    fake.nodes["vmac_tee0"] = fake.nodes["vtnet0"].__class__("tee")
-    b = _Bench(tmp_path, fake)
-    (tmp_path / "etc").mkdir()
-    (tmp_path / "etc" / "keeper.conf").write_text(_record() + "\n" + _record(iface="igb0.100", vhid="7") + "\n")
-    _deinstall(tmp_path)
-    after = b.after()
-    assert set(after.nodes) == {"vtnet0", "igb0_100", "vmac_tee0"}
-    assert after.nodes["vtnet0"].hooks == {} and after.nodes["igb0_100"].hooks == {}
-    assert not (tmp_path / "etc").exists()                             # the script's own rm still runs
-
-
-def test_deinstall_without_ng_patch_runs_no_ngctl(tmp_path):
-    b = _Bench(tmp_path, _fake(built=False, unloaded=True))
-    (tmp_path / "etc").mkdir()
-    _deinstall(tmp_path)
-    assert [c[0] for c in b.after().calls] == ["/fake/kldstat"]
-
-
-# ---- where the guards are wired ----
-
 def _read(*parts):
     with open(os.path.join(_PLUGIN, "src", *parts), encoding="utf-8") as f:
         return f.read()
 
 
-def test_rcd_runs_the_stop_rule_on_the_all_keepers_path_only():
-    rcd = _read("etc", "rc.d", "carpvipdhcp")
-    stop = rcd[rcd.index("carpvipdhcp_stop()"):rcd.index("carpvipdhcp_restart()")]
-    stop_id = rcd[rcd.index("carpvipdhcp_stop_id()"):rcd.index("carpvipdhcp_status()")]
-    assert stop.index('carpvipdhcp_vmac_stop_rule "${conf}"') > stop.index("_signal_keepers -TERM")
-    assert "vmac" not in stop_id                    # a per-row Stop or a follow keeps it
-    assert ". /usr/local/opnsense/scripts/OPNsense/CarpVipDhcp/vmac.sh" in rcd
-    # start notes where a keeper may build, after its loop: replaced, or added to for one.
-    start = rcd[rcd.index("carpvipdhcp_start()"):rcd.index("carpvipdhcp_stop()")]
-    assert start.index('carpvipdhcp_vmac_note "${conf}" ${svc_id:+append}') > start.index('done < "${conf}"')
-    fallback = rcd[rcd.index("else\n    carpvipdhcp_vmac_stop_rule()"):]
-    assert "carpvipdhcp_vmac_note() { :; }" in fallback.split("fi", 1)[0]
+def _marker(b, node=NODE):
+    return (b.dir / "run" / f"carpvipdhcp-vmac.left.{node}").exists()
 
 
-def test_syshook_tears_down_before_it_wakes_the_keepers():
-    hook = _read("etc", "rc.syshook.d", "carp", "50-carpvipdhcp")
-    assert hook.index("carpvipdhcp_vmac_carp_event") < hook.index("kill -USR2")
+def _unnamed(fake, ether="vtnet0", hook="upper", peer_hook="in", ntype="patch"):
+    """An unnamed node of `ntype` on `ether`'s `hook`, attached by its `peer_hook`."""
+    fake.nodes["<unnamed>"] = fake.nodes[ether].__class__(ntype)
+    fake.link("<unnamed>", peer_hook, ether, hook)
+    return fake
 
 
-def test_an_unnamed_node_of_another_type_on_the_hooks_is_left_alone(tmp_path):
-    # Only a patch node is ours to remove by hook path (an interrupted build's); an
-    # unnamed node of any other type on upper belongs to someone else.
-    fake = _fake(built=False)
-    fake.nodes["<unnamed>"] = fake.nodes["vtnet0"].__class__("netflow")
-    fake.link("<unnamed>", "iface0", "vtnet0", "upper")
+def _shutdowns(b):
+    return [c for c in b.after().calls if c[1:2] == ["shutdown"]]
+
+
+# ---- the CARP syshook guard: what of ours is on the event's interface ----
+
+@pytest.mark.parametrize("state", ["BACKUP", "INIT"])
+def test_carp_event_removes_the_rewrite_off_master(tmp_path, state):
+    b = _Bench(tmp_path, _fake())
+    res = b.run(f'carpvipdhcp_vmac_carp_event 149@vtnet0 {state}')
+    assert NODE not in b.after().nodes and b.after().nodes["vtnet0"].hooks == {}
+    assert f"removed {NODE}: CARP vhid 149 on vtnet0 is {state}" in res.stdout and not _marker(b)
+
+
+def test_carp_event_on_master_does_nothing_at_all(tmp_path):
+    b = _Bench(tmp_path, _fake())
+    b.run('carpvipdhcp_vmac_carp_event 149@vtnet0 MASTER')
+    assert NODE in b.after().nodes and not b.after().calls
+
+
+def test_carp_event_never_reads_keeper_conf(tmp_path):
+    # A keeper disabled, deleted or moved since it built is not in keeper.conf any more
+    # (or there is none): its rewrite still goes when the interface leaves master.
+    b = _Bench(tmp_path, _fake())
+    b.run('carpvipdhcp_vmac_carp_event 149@vtnet0 BACKUP')
+    assert NODE not in b.after().nodes
+    assert "parse_line" not in _read("opnsense", "scripts", "OPNsense", "CarpVipDhcp", "vmac.sh")
+
+
+def test_carp_event_acts_on_its_interface_only(tmp_path):
+    # Another interface's event leaves it; any CARP group on its own interface leaving
+    # master removes it (the keeper of a group still master rebuilds it at once).
+    b = _Bench(tmp_path, _fake())
+    b.run('carpvipdhcp_vmac_carp_event 149@igb0.100 BACKUP')
+    assert NODE in b.after().nodes and not _shutdowns(b)
+    b.run('carpvipdhcp_vmac_carp_event 150@vtnet0 BACKUP')
+    assert NODE not in b.after().nodes
+
+
+def test_carp_event_removes_an_unnamed_leftover_and_never_a_foreign_node(tmp_path):
+    fake = _unnamed(_fake(built=False))
+    fake.nodes["vmac_tee0"] = fake.nodes["vtnet0"].__class__("tee")
     b = _Bench(tmp_path, fake)
-    b.run(f'carpvipdhcp_vmac_carp_event "{b.conf(_record())}" 149@vtnet0 BACKUP')
-    assert b.after().nodes["<unnamed>"].type == "netflow"
+    b.run('carpvipdhcp_vmac_carp_event 149@vtnet0 BACKUP')
+    assert "<unnamed>" not in b.after().nodes and b.after().nodes["vtnet0"].hooks == {}
+    b.run('carpvipdhcp_vmac_carp_event 149@tee0 BACKUP')
+    assert b.after().nodes["vmac_tee0"].type == "tee"
 
 
-# ---- the failure paths (read-back, as vmac.py's teardown does) ----
+def test_carp_event_without_ng_patch_runs_no_ngctl(tmp_path):
+    b = _Bench(tmp_path, _fake(unloaded=True))
+    b.run('carpvipdhcp_vmac_carp_event 149@vtnet0 BACKUP')
+    assert not _ngctl_calls(b.after())
+
+
+def test_a_carp_event_marks_a_removal_it_cannot_confirm(tmp_path):
+    # Not confirmed: a marker for the system status and the next stop; confirmed later:
+    # the marker goes.
+    b = _Bench(tmp_path, _fake(shutdown_lies=True))
+    res = b.run('carpvipdhcp_vmac_carp_event 149@vtnet0 BACKUP')
+    assert f"could not remove {NODE}" in res.stdout and _marker(b)
+    fake = b.after()
+    fake.knobs.shutdown_lies = False
+    ngctl_cli.save(b.state, fake)
+    b.run('carpvipdhcp_vmac_carp_event 149@vtnet0 BACKUP')
+    assert NODE not in b.after().nodes and not _marker(b)
+
+
+# ---- ownership: an unnamed patch node is ours only with our build's signature ----
+
+@pytest.mark.parametrize("hook, peer_hook, ntype, ours", [
+    ("upper", "in", "patch", True),         # an interrupted build: mkpeer upper in
+    ("lower", "out", "patch", True),
+    ("upper", "out", "patch", False),       # hooked another way: not ours
+    ("lower", "in", "patch", False),
+    ("upper", "in", "tee", False),          # another type: never
+])
+def test_an_unnamed_node_is_ours_only_with_our_signature(tmp_path, hook, peer_hook, ntype, ours):
+    b = _Bench(tmp_path, _unnamed(_fake(built=False), hook=hook, peer_hook=peer_hook, ntype=ntype))
+    b.run('carpvipdhcp_vmac_carp_event 149@vtnet0 BACKUP')
+    assert ("<unnamed>" not in b.after().nodes) is ours
+    if not ours:
+        assert not _shutdowns(b)
+
+
+# ---- the rc.d stop guard: everything of ours, on every interface ----
+
+def test_stop_removes_everything_of_ours_and_nothing_else(tmp_path):
+    fake = _fake(ifaces=("vtnet0", "igb0_100", "old0"))
+    _unnamed(fake, ether="igb0_100")                                # an interrupted build
+    fake.add_patch("vmac_old0", "old0", config=WANTED)              # a removed keeper's
+    fake.nodes["vmac_tee0"] = fake.nodes["vtnet0"].__class__("tee")  # foreign, our prefix
+    b = _Bench(tmp_path, fake)
+    b.ifconfig("vtnet0", MASTER_149)                                # master: removed anyway
+    res = b.run('carpvipdhcp_vmac_stop_rule')
+    after = b.after()
+    assert set(after.nodes) == {"vtnet0", "igb0_100", "old0", "vmac_tee0"}
+    assert all(after.nodes[e].hooks == {} for e in ("vtnet0", "igb0_100", "old0"))
+    assert f"removed {NODE}: keeper stop" in res.stdout and "removed vmac_old0: keeper stop" in res.stdout
+
+
+def test_stop_leaves_an_unnamed_node_without_our_signature(tmp_path):
+    b = _Bench(tmp_path, _unnamed(_fake(built=False), peer_hook="out"))
+    b.run('carpvipdhcp_vmac_stop_rule')
+    assert "<unnamed>" in b.after().nodes and not _shutdowns(b)
+
+
+@pytest.mark.parametrize("show", ["list-fails", "garbled-list"])
+def test_stop_reports_a_node_list_it_cannot_read_and_still_tries_the_marked(tmp_path, show):
+    b = _Bench(tmp_path, _fake(show=show))
+    (tmp_path / "run" / f"carpvipdhcp-vmac.left.{NODE}").write_text("")
+    res = b.run('carpvipdhcp_vmac_stop_rule')
+    after = b.after()
+    assert "could not list the netgraph nodes at keeper stop" in res.stdout
+    assert sum(c[1:2] == ["list"] for c in after.calls) == 3
+    assert NODE not in after.nodes and not _marker(b)
+
+
+def test_stop_without_ng_patch_runs_no_ngctl_and_clears_the_markers(tmp_path):
+    b = _Bench(tmp_path, _fake(unloaded=True))
+    (tmp_path / "run" / f"carpvipdhcp-vmac.left.{NODE}").write_text("")
+    b.run('carpvipdhcp_vmac_stop_rule')
+    assert not _ngctl_calls(b.after()) and not _marker(b)
+
+
+def test_a_lying_shutdown_at_stop_is_marked_and_tried_again(tmp_path):
+    b = _Bench(tmp_path, _fake(shutdown_lies=True))
+    res = b.run('carpvipdhcp_vmac_stop_rule')
+    assert f"could not remove {NODE}" in res.stdout and _marker(b)
+    fake = b.after()
+    fake.knobs.shutdown_lies = False
+    ngctl_cli.save(b.state, fake)
+    res = b.run('carpvipdhcp_vmac_stop_rule')
+    assert f"removed {NODE}: keeper stop" in res.stdout and not _marker(b)
+
+
+def test_a_marker_whose_node_is_gone_clears_without_a_word(tmp_path):
+    b = _Bench(tmp_path, _fake(built=False))
+    (tmp_path / "run" / "carpvipdhcp-vmac.left.vmac_gone0").write_text("")
+    res = b.run('carpvipdhcp_vmac_stop_rule')
+    assert not _marker(b, "vmac_gone0") and res.stdout == ""
+
+
+def test_markers_need_no_lock_one_file_per_node(tmp_path):
+    # Two nodes fail in two separate runs: both markers stay, neither overwrites the other.
+    fake = _fake(ifaces=("vtnet0", "old0"), shutdown_lies=True)
+    fake.add_patch("vmac_old0", "old0", config=WANTED)
+    b = _Bench(tmp_path, fake)
+    b.run('carpvipdhcp_vmac_carp_event 149@vtnet0 BACKUP')
+    b.run('carpvipdhcp_vmac_carp_event 7@old0 BACKUP')
+    assert _marker(b) and _marker(b, "vmac_old0")
+
+
+# ---- scan and removal semantics ----
+
+def test_node_name_of_a_vlan_interface(tmp_path):
+    b = _Bench(tmp_path, _fake())
+    res = b.run('carpvipdhcp_vmac_node igb0.100; echo; carpvipdhcp_vmac_node vtnet0')
+    assert res.stdout.split() == ["vmac_igb0_100", "vmac_vtnet0"]
+
 
 def test_a_lying_shutdown_is_never_reported_as_removed(tmp_path):
     b = _Bench(tmp_path, _fake(shutdown_lies=True))
-    res = b.run(f'carpvipdhcp_vmac_carp_event "{b.conf(_record())}" 149@vtnet0 BACKUP')
-    assert NODE in b.after().nodes
-    assert "removed" not in res.stdout and f"could not remove {NODE}" in res.stdout
-    assert sum(c[1:2] == ["shutdown"] for c in b.after().calls) >= 3      # retried
-
-
-def test_a_lying_shutdown_at_stop_is_reported(tmp_path):
-    b = _Bench(tmp_path, _fake(shutdown_lies=True))
-    b.ifconfig("vtnet0", BACKUP_149)
-    res = b.run(f'carpvipdhcp_vmac_stop_rule "{b.conf(_record())}"')
-    assert f"could not remove {NODE} (keeper stop)" in res.stdout
+    res = b.run(f'carpvipdhcp_vmac_remove {NODE}; echo "rc=$?"')
+    assert res.stdout.strip() == "rc=2" and NODE in b.after().nodes
 
 
 @pytest.mark.parametrize("show", ["fails", "garbled"])
 def test_a_wired_node_whose_name_cannot_be_read_goes_by_its_hooks(tmp_path, show):
-    # Our name cannot be read, the hooks can: the wired node is removed by hook path,
-    # and the read-back then finds no such node (a successful read), so it is confirmed.
     b = _Bench(tmp_path, _fake(show=show))
-    res = b.run(f'carpvipdhcp_vmac_carp_event "{b.conf(_record())}" 149@vtnet0 BACKUP')
+    res = b.run('carpvipdhcp_vmac_carp_event 149@vtnet0 BACKUP')
+    # Found through the ether node's hooks, shut down by that ID; then the name reads
+    # "no such node", so the removal is confirmed.
     assert NODE not in b.after().nodes and b.after().nodes["vtnet0"].hooks == {}
-    assert f"removed {NODE}" in res.stdout
+    assert f"removed {NODE}" in res.stdout and not _marker(b)
 
 
 @pytest.mark.parametrize("show", ["fails", "garbled"])
 def test_an_unreadable_name_is_never_reported_clean(tmp_path, show):
-    # A node under our name on no hook, and its name cannot be read: neither removable
-    # by name (its type is unknown) nor by a hook, so it is reported, never "clean".
-    fake = _fake(built=False, show=show)
-    fake.add_patch(NODE, "vtnet0", hooks=(), config=WANTED)
+    fake = _fake(show=show)
+    fake.nodes["vtnet0"].hooks.clear()
+    fake.nodes[NODE].hooks.clear()
     b = _Bench(tmp_path, fake)
-    res = b.run(f'carpvipdhcp_vmac_carp_event "{b.conf(_record())}" 149@vtnet0 BACKUP')
-    assert NODE in b.after().nodes
-    assert "removed" not in res.stdout and f"could not remove {NODE}" in res.stdout
+    res = b.run('carpvipdhcp_vmac_carp_event 149@vtnet0 BACKUP')
+    assert NODE in b.after().nodes and "removed" not in res.stdout
+    assert f"could not remove {NODE}" in res.stdout and _marker(b)
 
 
-def test_unreadable_hooks_are_never_clean(tmp_path):
-    # An unnamed leftover on upper, and the hooks read exit 0 with no header.
-    b = _Bench(tmp_path, _fake(built=False, unnamed=True, show="garbled-ether"))
-    res = b.run(f'carpvipdhcp_vmac_carp_event "{b.conf(_record())}" 149@vtnet0 BACKUP')
+@pytest.mark.parametrize("knobs", [{"ether_reads": 0}, {"show": "garbled-ether"}])
+def test_hooks_that_cannot_be_read_are_never_clean(tmp_path, knobs):
+    b = _Bench(tmp_path, _unnamed(_fake(built=False, **knobs)))
+    res = b.run('carpvipdhcp_vmac_carp_event 149@vtnet0 BACKUP')
     assert "<unnamed>" in b.after().nodes and f"could not remove {NODE}" in res.stdout
 
 
 def test_nothing_there_is_silent(tmp_path):
     b = _Bench(tmp_path, _fake(built=False))
-    res = b.run(f'carpvipdhcp_vmac_carp_event "{b.conf(_record())}" 149@vtnet0 BACKUP')
-    assert res.stdout == "" and not [c for c in b.after().calls if c[1:2] == ["shutdown"]]
+    res = b.run('carpvipdhcp_vmac_carp_event 149@vtnet0 BACKUP')
+    assert res.stdout == "" and not _shutdowns(b) and not _marker(b)
 
 
 def test_the_shell_functions_leave_no_scratch_variables(tmp_path):
-    b = _Bench(tmp_path, _fake())
-    b.ifconfig("vtnet0", MASTER_149)
-    conf = b.conf(_record())
-    res = b.run(f'carpvipdhcp_vmac_carp_event "{conf}" 149@vtnet0 BACKUP\n'
-                f'carpvipdhcp_vmac_note "{conf}"\ncarpvipdhcp_vmac_note "{conf}" append\n'
-                f'carpvipdhcp_vmac_stop_rule "{conf}"\nset | grep "^_vm_" || echo CLEAN')
+    b = _Bench(tmp_path, _fake(shutdown_lies=True))
+    res = b.run('carpvipdhcp_vmac_carp_event 149@vtnet0 BACKUP\n'
+                'carpvipdhcp_vmac_stop_rule\nset | grep "^_vm_" || echo CLEAN')
     assert res.stdout.strip().endswith("CLEAN")
-
-
-def _noted(b, which="noted"):
-    path = b.dir / "run" / f"carpvipdhcp-vmac.{which}"
-    return path.read_text().split() if path.exists() else None
-
-
-def test_start_notes_the_nodes_with_the_option_on(tmp_path):
-    # Only records with the option on, as node names (vmac_ + the ether node, '.' as
-    # '_'); replaced on the all-keepers path, added to when one keeper starts; never a
-    # duplicate.
-    b = _Bench(tmp_path, _fake())
-    b.run(f'carpvipdhcp_vmac_note "{b.conf(_record(), _record(iface="igb0.100", vhid="7", on="0"))}"')
-    assert _noted(b) == [NODE]
-    b.run(f'carpvipdhcp_vmac_note "{b.conf(_record(iface="igb0.100", vhid="7"))}" append')
-    assert _noted(b) == ["vmac_igb0_100", NODE]
-    b.run(f'carpvipdhcp_vmac_note "{b.conf(_record(iface="igb0.100", vhid="7"))}" append')
-    assert _noted(b) == ["vmac_igb0_100", NODE]
-    b.run(f'carpvipdhcp_vmac_note "{b.conf(_record(on="0"))}"')
-    assert _noted(b) == []
-    assert not [c for c in b.after().calls if c[0].endswith("ngctl") or c[0].endswith("kldstat")]
-
-
-def test_stop_finds_an_unnamed_leftover_on_a_removed_keepers_interface(tmp_path):
-    # The keeper on vtnet0 was removed: keeper.conf (rendered before the stop) no longer
-    # names vtnet0, and an interrupted build left an unnamed patch node on its upper
-    # hook, which ngctl list cannot tell is ours. The note from the last start finds it.
-    b = _Bench(tmp_path, _fake(built=False, unnamed=True))
-    b.run(f'carpvipdhcp_vmac_note "{b.conf(_record())}"')
-    res = b.run(f'carpvipdhcp_vmac_stop_rule "{b.conf(_record(iface="igb0.100", vhid="7", on="0"))}"')
-    assert "<unnamed>" not in b.after().nodes and b.after().nodes["vtnet0"].hooks == {}
-    assert f"removed {NODE}: keeper stop" in res.stdout
-
-
-def test_an_unconfirmed_removal_survives_a_start_and_is_tried_again(tmp_path):
-    # A removed keeper's unnamed leftover whose removal cannot be confirmed (a lying
-    # shutdown) is kept for the next stop, even though the start in between no longer
-    # notes that interface. Once removal works again, the next stop removes it and the
-    # note goes.
-    b = _Bench(tmp_path, _fake(built=False, unnamed=True, shutdown_lies=True))
-    b.run(f'carpvipdhcp_vmac_note "{b.conf(_record())}"')
-    other = b.conf(_record(iface="igb0.100", vhid="7", on="0"))
-    res = b.run(f'carpvipdhcp_vmac_stop_rule "{other}"')
-    assert f"could not remove {NODE}" in res.stdout and _noted(b, "unconfirmed") == [NODE]
-    b.run(f'carpvipdhcp_vmac_note "{other}"')           # the next start: vtnet0 not noted
-    assert _noted(b) == [] and _noted(b, "unconfirmed") == [NODE]
-    fake = b.after()
-    fake.knobs.shutdown_lies = False
-    ngctl_cli.save(b.state, fake)
-    res = b.run(f'carpvipdhcp_vmac_stop_rule "{other}"')
-    assert f"removed {NODE}: keeper stop" in res.stdout
-    assert "<unnamed>" not in b.after().nodes and _noted(b, "unconfirmed") is None
-
-
-def test_a_carp_event_records_a_removal_it_cannot_confirm(tmp_path):
-    # Off master with a lying shutdown: the syshook cannot confirm the removal, so the
-    # node joins the unconfirmed list (once, however often it fails), for the system
-    # status and the next stop. A confirmed removal adds nothing.
-    b = _Bench(tmp_path, _fake(shutdown_lies=True))
-    conf = b.conf(_record())
-    for _ in range(2):
-        res = b.run(f'carpvipdhcp_vmac_carp_event "{conf}" 149@vtnet0 BACKUP')
-        assert f"could not remove {NODE}" in res.stdout
-    assert _noted(b, "unconfirmed") == [NODE]
-    (tmp_path / "ok").mkdir()
-    b2 = _Bench(tmp_path / "ok", _fake())
-    b2.run(f'carpvipdhcp_vmac_carp_event "{b2.conf(_record())}" 149@vtnet0 BACKUP')
-    assert NODE not in b2.after().nodes and _noted(b2, "unconfirmed") is None
-
-
-def test_a_stop_keeps_an_entry_a_carp_event_adds_meanwhile(tmp_path):
-    # The stop read vmac_vtnet0 from the list and confirmed it removed; meanwhile a CARP
-    # event recorded vmac_igb0_100. Only what the stop read and confirmed leaves.
-    b = _Bench(tmp_path, _fake(built=False, unnamed=True))
-    (tmp_path / "run" / "carpvipdhcp-vmac.unconfirmed").write_text(NODE + "\n", newline="\n")
-    (tmp_path / "lockf.inject").write_text("vmac_igb0_100\n", newline="\n")
-    b.run(f'carpvipdhcp_vmac_stop_rule "{b.conf(_record(iface="igb0.100", vhid="7", on="0"))}"')
-    assert "<unnamed>" not in b.after().nodes
-    assert _noted(b, "unconfirmed") == ["vmac_igb0_100"]
-
-
-def test_a_node_kept_on_the_master_leaves_the_unconfirmed_list(tmp_path):
-    # An earlier failure left vmac_vtnet0 listed; now it is the master's rewrite and the
-    # stop keeps it on purpose, so it is no longer a leftover to warn about.
-    b = _Bench(tmp_path, _fake())
-    b.ifconfig("vtnet0", MASTER_149)
-    (tmp_path / "run" / "carpvipdhcp-vmac.unconfirmed").write_text(NODE + "\n", newline="\n")
-    b.run(f'carpvipdhcp_vmac_stop_rule "{b.conf(_record())}"')
-    assert NODE in b.after().nodes and _noted(b, "unconfirmed") is None
-
-
-def test_the_list_is_updated_even_when_the_lock_is_not_had(tmp_path):
-    # lockf gives up (exit 75): the entry is still recorded, rather than lost.
-    b = _Bench(tmp_path, _fake(shutdown_lies=True))
-    (tmp_path / "lockf.busy").write_text("")
-    b.run(f'carpvipdhcp_vmac_carp_event "{b.conf(_record())}" 149@vtnet0 BACKUP')
-    assert _noted(b, "unconfirmed") == [NODE]
-
-
-@pytest.mark.parametrize("start, add, drop, want", [
-    (None, "vmac_a", "", ["vmac_a"]),
-    ("vmac_a\n", "vmac_b vmac_a", "", ["vmac_a", "vmac_b"]),
-    ("vmac_a\nvmac_b\n", "", "vmac_a", ["vmac_b"]),
-    ("vmac_a\n", "", "vmac_a", None),                    # empty: the file goes
-    ("vmac_ab\n", "", "vmac_a", ["vmac_ab"]),            # whole names only
-    ("vmac_a\n", "", "vmac_ab", ["vmac_a"]),             # ... both ways
-])
-def test_the_unconfirmed_list_updater(tmp_path, start, add, drop, want):
-    path = tmp_path / "list"
-    if start is not None:
-        path.write_text(start, newline="\n")
-    script = os.path.join(_SCRIPTS, "vmac_unconfirmed.sh")
-    subprocess.run(["sh", _posix(script), _posix(path), add, drop], check=True)
-    assert (path.read_text().split() if path.exists() else None) == want
-    assert [p.name for p in tmp_path.iterdir()] == (["list"] if want else [])   # no temp file left
-
-
-def test_vmac_sh_runs_the_updater_where_the_package_installs_it():
-    vmac = _read("opnsense", "scripts", "OPNsense", "CarpVipDhcp", "vmac.sh")
-    assert os.path.exists(os.path.join(_SCRIPTS, "vmac_unconfirmed.sh"))
-    installed = "/usr/local/opnsense/scripts/OPNsense/CarpVipDhcp/vmac_unconfirmed.sh"
-    assert ': "${CARPVIPDHCP_VMAC_UNCONFIRMED:=' + installed + '}"' in vmac
-
-
-def test_deinstall_finds_a_removed_keepers_leftover_through_the_notes(tmp_path):
-    # The keeper on vtnet0 is gone from keeper.conf, an unnamed leftover is on vtnet0's
-    # hooks, and the last stop recorded vmac_vtnet0 as unconfirmed: the sweep looks
-    # there, removes it, and the notes go with the rest of the run files.
-    b = _Bench(tmp_path, _fake(built=False, unnamed=True))
-    (tmp_path / "etc").mkdir()
-    (tmp_path / "etc" / "keeper.conf").write_text(_record(iface="igb0.100", vhid="7") + "\n")
-    (tmp_path / "run" / "carpvipdhcp-vmac.unconfirmed").write_text(NODE + "\n", newline="\n")
-    (tmp_path / "run" / "carpvipdhcp-vmac.noted").write_text("vmac_igb0_100\n", newline="\n")
-    res = _deinstall(tmp_path)
-    assert "<unnamed>" not in b.after().nodes and b.after().nodes["vtnet0"].hooks == {}
-    assert res.stderr == ""
-    assert not list((tmp_path / "run").glob("carpvipdhcp-vmac.*"))
-
-
-def test_the_system_status_reads_the_file_the_stop_rule_writes():
-    # The banner reports the unconfirmed removals from the same path vmac.sh writes.
-    vmac = _read("opnsense", "scripts", "OPNsense", "CarpVipDhcp", "vmac.sh")
-    php = _read("opnsense", "mvc", "app", "library", "OPNsense", "System", "Status", "CarpVipDhcpStatus.php")
-    assert "printf '%s/carpvipdhcp-vmac.unconfirmed' \"${CARPVIPDHCP_RUN}\"" in vmac
-    assert ': "${CARPVIPDHCP_RUN:=/var/run}"' in vmac
-    assert "VMAC_UNCONFIRMED = '/var/run/carpvipdhcp-vmac.unconfirmed'" in php
-
-
-def test_a_noted_interface_still_kept_on_a_master(tmp_path):
-    # Noted at the last start and still a record with the option on, on the master: kept.
-    b = _Bench(tmp_path, _fake())
-    b.ifconfig("vtnet0", MASTER_149)
-    conf = b.conf(_record())
-    b.run(f'carpvipdhcp_vmac_note "{conf}"')
-    b.run(f'carpvipdhcp_vmac_stop_rule "{conf}"')
-    assert NODE in b.after().nodes and not [c for c in b.after().calls if c[1:2] == ["shutdown"]]
-
-
-def test_hooks_that_cannot_be_read_are_never_clean(tmp_path):
-    # No node under our name, but the hooks cannot be read at all (not "no such node"):
-    # an unnamed leftover there would be invisible, so this is reported, not silent.
-    b = _Bench(tmp_path, _fake(built=False, unnamed=True, ether_reads=0))
-    res = b.run(f'carpvipdhcp_vmac_carp_event "{b.conf(_record())}" 149@vtnet0 BACKUP')
-    assert f"could not remove {NODE}" in res.stdout
-
-
-def test_deinstall_warns_when_a_node_will_not_go_and_still_finishes(tmp_path):
-    b = _Bench(tmp_path, _fake(shutdown_lies=True))
-    (tmp_path / "etc").mkdir()
-    (tmp_path / "etc" / "keeper.conf").write_text(_record() + "\n")
-    res = _deinstall(tmp_path)
-    assert NODE in b.after().nodes                                     # the shutdown lied
-    assert "could not remove the source-MAC rewrite" in res.stderr
-    assert sum(c[1:2] == ["shutdown"] for c in b.after().calls) == 3   # three rounds, then stop
-    assert not (tmp_path / "etc").exists()                             # removal still finishes
-
-
-def test_deinstall_finds_iface_wherever_it_is_in_a_record(tmp_path):
-    # keeper.conf fields are unordered: a record that starts with iface= still counts.
-    fake = _fake(built=False)
-    fake.nodes["<unnamed>"] = fake.nodes["vtnet0"].__class__("patch")
-    fake.link("<unnamed>", "in", "vtnet0", "upper")
-    b = _Bench(tmp_path, fake)
-    (tmp_path / "etc").mkdir()
-    (tmp_path / "etc" / "keeper.conf").write_text(
-        "#request=100.64.4.9|iface=igb9|vhid=1\niface=vtnet0|request=100.64.4.102|vhid=149\n")
-    res = _deinstall(tmp_path)
-    assert "<unnamed>" not in b.after().nodes and b.after().nodes["vtnet0"].hooks == {}
-    assert not [c for c in b.after().calls if c[1:3] == ["show", "igb9:"]]
-    assert res.stderr == "" and not (tmp_path / "etc").exists()
-
-
-@pytest.mark.parametrize("knobs", [{"ether_reads": 0}, {"show": "garbled-ether"}, {"show": "list-fails"},
-                                   {"show": "garbled-list"}],
-                         ids=["hooks-fail", "hooks-garbled", "list-fails", "list-garbled"])
-def test_deinstall_never_takes_an_unreadable_scan_for_clean(tmp_path, knobs):
-    # An unnamed leftover on a keeper interface it cannot see, or a node list it cannot
-    # read: retried, then warned about; never silent. pkg removal still finishes.
-    _Bench(tmp_path, _fake(built=False, unnamed=True, **knobs))
-    (tmp_path / "etc").mkdir()
-    (tmp_path / "etc" / "keeper.conf").write_text(_record() + "\n")
-    res = _deinstall(tmp_path)
-    assert "could not remove the source-MAC rewrite" in res.stderr and "unreadable:" in res.stderr
-    assert "unreadable: none" not in res.stderr
-    assert not (tmp_path / "etc").exists()
-
-
-def test_deinstall_with_nothing_there_is_silent(tmp_path):
-    b = _Bench(tmp_path, _fake(built=False))
-    (tmp_path / "etc").mkdir()
-    (tmp_path / "etc" / "keeper.conf").write_text(_record() + "\n")
-    res = _deinstall(tmp_path)
-    assert res.stderr == "" and not [c for c in b.after().calls if c[1:2] == ["shutdown"]]
 
 
 @pytest.mark.parametrize("stale, ether_reads, want", [
@@ -585,7 +332,102 @@ def test_deinstall_with_nothing_there_is_silent(tmp_path):
 ])
 def test_a_removal_never_acts_on_an_earlier_scan(tmp_path, stale, ether_reads, want):
     knobs = {} if ether_reads is None else {"ether_reads": ether_reads}
-    b = _Bench(tmp_path, _fake(built=False, unnamed=ether_reads is not None, **knobs))
+    fake = _fake(built=False, **knobs)
+    if ether_reads is not None:
+        _unnamed(fake)
+    b = _Bench(tmp_path, fake)
     res = b.run(f'{stale}\ncarpvipdhcp_vmac_remove {NODE}\necho "rc=$?"')
     assert res.stdout.strip() == want
-    assert not [c for c in b.after().calls if c[1:2] == ["shutdown"]]
+    assert not _shutdowns(b)
+
+
+# ---- where rc.d and the syshook call the guards ----
+
+def test_rcd_runs_the_stop_rule_on_the_all_keepers_path_only():
+    rcd = _read("etc", "rc.d", "carpvipdhcp")
+    stop = rcd[rcd.index("carpvipdhcp_stop()"):rcd.index("carpvipdhcp_restart()")]
+    stop_id = rcd[rcd.index("carpvipdhcp_stop_id()"):rcd.index("carpvipdhcp_status()")]
+    start = rcd[rcd.index("carpvipdhcp_start()"):rcd.index("carpvipdhcp_stop()")]
+    assert stop.index("carpvipdhcp_vmac_stop_rule") > stop.index("_signal_keepers -TERM")
+    assert "vmac" not in stop_id and "vmac" not in start
+    assert ". /usr/local/opnsense/scripts/OPNsense/CarpVipDhcp/vmac.sh" in rcd
+    assert "carpvipdhcp_vmac_stop_rule() { :; }" in rcd     # an upgrade where vmac.sh lands later
+
+
+def test_syshook_tears_down_before_it_wakes_the_keepers():
+    hook = _read("etc", "rc.syshook.d", "carp", "50-carpvipdhcp")
+    assert 'carpvipdhcp_vmac_carp_event "$1" "$2"' in hook
+    assert hook.index("carpvipdhcp_vmac_carp_event") < hook.index("kill -USR2")
+
+
+def test_the_system_status_reads_the_markers_vmac_sh_writes():
+    vmac = _read("opnsense", "scripts", "OPNsense", "CarpVipDhcp", "vmac.sh")
+    php = _read("opnsense", "mvc", "app", "library", "OPNsense", "System", "Status", "CarpVipDhcpStatus.php")
+    rules = _read("opnsense", "mvc", "app", "models", "OPNsense", "CarpVipDhcp", "VmacEgressRules.php")
+    assert '"${CARPVIPDHCP_RUN}/carpvipdhcp-vmac.left.$1"' in vmac
+    assert ': "${CARPVIPDHCP_RUN:=/var/run}"' in vmac
+    assert "LEFT_PREFIX = 'carpvipdhcp-vmac.left.'" in rules
+    assert "RUN_DIR = '/var/run'" in php and "self::RUN_DIR . '/' . VmacEgressRules::LEFT_PREFIX" in php
+
+
+# ---- +POST_DEINSTALL: the backstop after the plugin's scripts are gone ----
+
+def test_deinstall_sweeps_every_node_of_ours_and_nothing_else(tmp_path):
+    fake = _fake(ifaces=("vtnet0", "igb0_100", "old0"))
+    _unnamed(fake, ether="igb0_100")                                # an interface no keeper names
+    fake.add_patch("vmac_old0", "old0", hooks=(), config=WANTED)    # a removed keeper's node
+    fake.nodes["vmac_tee0"] = fake.nodes["vtnet0"].__class__("tee")
+    b = _Bench(tmp_path, fake)
+    (tmp_path / "etc").mkdir()
+    (tmp_path / "etc" / "keeper.conf").write_text(_record() + "\n")
+    (tmp_path / "run" / f"carpvipdhcp-vmac.left.{NODE}").write_text("")
+    res = _deinstall(tmp_path)
+    after = b.after()
+    assert set(after.nodes) == {"vtnet0", "igb0_100", "old0", "vmac_tee0"}
+    assert after.nodes["vtnet0"].hooks == {} and after.nodes["igb0_100"].hooks == {}
+    assert res.stderr == ""
+    assert not (tmp_path / "etc").exists() and not list((tmp_path / "run").glob("carpvipdhcp-vmac.*"))
+
+
+def test_deinstall_leaves_an_unnamed_node_without_our_signature(tmp_path):
+    b = _Bench(tmp_path, _unnamed(_fake(built=False), peer_hook="out"))
+    _deinstall(tmp_path)
+    assert "<unnamed>" in b.after().nodes
+
+
+def test_deinstall_without_ng_patch_runs_no_ngctl(tmp_path):
+    b = _Bench(tmp_path, _fake(unloaded=True))
+    (tmp_path / "etc").mkdir()
+    _deinstall(tmp_path)
+    assert not _ngctl_calls(b.after()) and not (tmp_path / "etc").exists()
+
+
+def test_deinstall_warns_when_a_node_will_not_go_and_still_finishes(tmp_path):
+    b = _Bench(tmp_path, _fake(shutdown_lies=True))
+    (tmp_path / "etc").mkdir()
+    res = _deinstall(tmp_path)
+    assert NODE in b.after().nodes                                     # the shutdown lied
+    assert "could not remove the source-MAC rewrite" in res.stderr
+    assert sum(c[1:2] == ["shutdown"] for c in b.after().calls) == 3   # three rounds, then stop
+    assert not (tmp_path / "etc").exists()                             # removal still finishes
+    with open(os.path.join(_PLUGIN, "+POST_DEINSTALL.post"), encoding="utf-8") as f:
+        assert "logger -t carpvipdhcp" in f.read()                     # and the system log
+
+
+@pytest.mark.parametrize("knobs", [{"ether_reads": 0}, {"show": "garbled-ether"}, {"show": "list-fails"},
+                                   {"show": "garbled-list"}],
+                         ids=["hooks-fail", "hooks-garbled", "list-fails", "list-garbled"])
+def test_deinstall_never_takes_an_unreadable_scan_for_clean(tmp_path, knobs):
+    _Bench(tmp_path, _unnamed(_fake(built=False, **knobs)))
+    (tmp_path / "etc").mkdir()
+    res = _deinstall(tmp_path)
+    assert "could not remove the source-MAC rewrite" in res.stderr and "unreadable:" in res.stderr
+    assert "unreadable: none" not in res.stderr
+    assert not (tmp_path / "etc").exists()
+
+
+def test_deinstall_with_nothing_there_is_silent(tmp_path):
+    b = _Bench(tmp_path, _fake(built=False))
+    (tmp_path / "etc").mkdir()
+    res = _deinstall(tmp_path)
+    assert res.stderr == "" and not _shutdowns(b)

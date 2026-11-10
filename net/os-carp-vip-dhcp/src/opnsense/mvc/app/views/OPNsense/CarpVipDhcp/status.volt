@@ -217,6 +217,7 @@
         'bad-mac': "{{ lang._('the lease MAC is not valid') }}",
         'shared-iface': "{{ lang._('another keeper has a CARP VIP on this interface') }}",
         'dhcp-wan': "{{ lang._('a DHCP client runs on this interface (it needs a static WAN address)') }}",
+        'other-carp': "{{ lang._('another CARP group is on this interface') }}",
         'no-ether-node': "{{ lang._('not an Ethernet interface') }}",
         'hooks-taken': "{{ lang._('another netgraph node (such as a NetFlow capture) holds this interface') }}",
         'foreign-node': "{{ lang._('a netgraph node of another type uses the name') }}",

@@ -40,42 +40,12 @@ class ServiceController extends ApiMutableServiceControllerBase
     protected static $internalServiceTemplate = 'OPNsense/CarpVipDhcp';
     protected static $internalServiceName = 'carpvipdhcp';
 
-    /** The file the template renders, and how often to render it before giving up. */
-    private const KEEPER_CONF = '/usr/local/etc/carpvipdhcp/keeper.conf';
-    private const RENDER_TRIES = 10;
-
     /**
      * Reconfigure as usual, then create/refresh the firewall aliases that mirror
      * each keeper's VIP address, so rules pointed at them are ready to use.
-     *
-     * keeper.conf is rendered first. The base stops the service before it renders
-     * the template, and the stop decides from keeper.conf which source-MAC rewrite
-     * (send from the lease MAC, experimental) may stay on a master. From the old file
-     * it would keep the rewrite of a keeper just disabled, deleted or moved to
-     * another VIP, with no keeper left to remove it. configd renders from a cached
-     * config.xml, so right after a save the file can still be the old one: render
-     * until it allows no rewrite the saved settings do not, and stop nothing if it
-     * never does.
      */
     public function reconfigureAction()
     {
-        if ($this->request->isPost()) {
-            $backend = new \OPNsense\Core\Backend();
-            for ($try = 1;; $try++) {
-                $backend->configdpRun('template reload', [static::$internalServiceTemplate]);
-                $rendered = @file_get_contents(self::KEEPER_CONF);
-                if ($rendered !== false && !$this->getModel()->rendersStaleVmacKeep($rendered)) {
-                    break;
-                }
-                if ($try >= self::RENDER_TRIES) {
-                    return ['status' => 'failed', 'status_msg' => gettext(
-                        'keeper.conf did not reflect the saved settings, so nothing was stopped or restarted. '
-                        . 'Apply again.'
-                    )];
-                }
-                sleep(1);
-            }
-        }
         $response = parent::reconfigureAction();
         // Only sync aliases when the reconfigure actually ran. The base guards
         // itself behind POST and returns status 'ok' on success; on a GET (or a

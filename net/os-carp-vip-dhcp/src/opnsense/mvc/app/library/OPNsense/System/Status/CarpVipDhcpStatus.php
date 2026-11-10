@@ -71,7 +71,7 @@ class CarpVipDhcpStatus extends AbstractStatus
             }
         }
         // A source-MAC rewrite whose removal could not be confirmed (send from the lease
-        // MAC, experimental): the shell side leaves one marker file per node (vmac.sh).
+        // MAC, experimental): the shell side and the keeper leave one marker file per node.
         // Its keeper may be disabled or deleted, so no heartbeat above reports it. The
         // next removal that is confirmed, or a confirmed build by its keeper, clears it;
         // an Apply on the Settings page tries every node of ours again.

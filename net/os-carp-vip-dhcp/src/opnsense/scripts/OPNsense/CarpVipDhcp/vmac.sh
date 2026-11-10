@@ -196,7 +196,7 @@ carpvipdhcp_vmac_stop_rule()
         fi
         sleep 1
     done
-    for _vm_n in $(printf '%s\n' "${_vm_cands}" | tr ' ' '\n' | grep '^vmac_[A-Za-z0-9_]*$' | sort -u); do
+    for _vm_n in $(printf '%s\n' "${_vm_cands}" | tr ' ' '\n' | grep '^vmac_[A-Za-z0-9_-]*$' | sort -u); do
         _carpvipdhcp_vmac_settle "${_vm_n}" "keeper stop"
     done
     unset _vm_cands _vm_n _vm_try _vm_out

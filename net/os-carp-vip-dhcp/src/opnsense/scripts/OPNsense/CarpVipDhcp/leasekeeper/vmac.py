@@ -60,7 +60,7 @@ _MODULES = ("ng_ether", "ng_patch")
 _NODE_PREFIX = "vmac_"
 _NODE_NAME_MAX = 31                       # NG_NODESIZ (32) less the terminating NUL
 _DHCLIENT_PID = "/var/run/dhclient.{}.pid"
-_LEFT_MARKER = "/var/run/carpvipdhcp-vmac.left.{}"   # a removal the shell side could not confirm
+_LEFT_MARKER = "/var/run/carpvipdhcp-vmac.left.{}"   # a removal not confirmed (here or vmac.sh)
 _HOOK_IN = "in"                           # patch hook fed by the ether node's upper
 _HOOK_OUT = "out"                         # patch hook that feeds the ether node's lower
 _ETHER_HOOKS = ("upper", "lower")         # the ether node's hooks the graph takes
@@ -280,12 +280,23 @@ def _other_carp_vhid(iface, vhid):
 
 
 def _clear_marker(node):
-    """Clear the shell side's marker for `node`: a confirmed build, a confirmed absence or
-    a confirmed teardown by this keeper settles what the marker warns about."""
+    """Clear the marker for `node`: a confirmed build, a confirmed absence or a confirmed
+    teardown by this keeper settles what the marker warns about."""
     try:
         os.remove(_LEFT_MARKER.format(node))
     except OSError:
         pass
+
+
+def _set_marker(node):
+    """Leave the marker for `node` (the same file vmac.sh leaves): a teardown this keeper
+    could not confirm stays raised in the system status after the keeper is gone (a
+    keeper removed by a per-keeper restart has no heartbeat the status reads)."""
+    try:
+        with open(_LEFT_MARKER.format(node), "a", encoding="ascii"):
+            pass
+    except OSError as err:
+        LOG.debug("vmac egress: could not leave the marker for %s: %s", node, err)
 
 
 def _static_refusal(chaddr, vhid, shared_iface):
@@ -660,9 +671,9 @@ class VmacEgress:
         since), our node when it is a patch node (never a node of another type under our
         name) and any patch node of ours on the interface's hooks. Confirmed means our
         name holds no patch node of ours AND the hooks were read and hold none: unreadable
-        hooks are not confirmation. A confirmed teardown clears the shell side's marker
-        (also on paths that never reach a healthy state: off at startup, a refusal); a
-        failed one leaves it. Always safe to retry; a failure is retried on the next tick,
+        hooks are not confirmation. A confirmed teardown clears the marker (also on paths
+        that never reach a healthy state: off at startup, a refusal); a failed one leaves
+        it. Always safe to retry; a failure is retried on the next tick,
         warned once until one works."""
         own = self._own_patch_id()
         shut = own is not None
@@ -680,6 +691,7 @@ class VmacEgress:
             if shut:   # nothing was there: nothing to report
                 LOG.info("vmac egress on %s: removed %s (%s)", self._t.iface, self._t.node, reason)
             return True
+        _set_marker(self._t.node)
         if not self._run.gates.teardown:
             self._run.gates.teardown = True
             LOG.warning("vmac egress on %s: %s still present after shutdown (%s) -- retrying "

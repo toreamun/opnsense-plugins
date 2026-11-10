@@ -173,14 +173,15 @@ class VmacEgressRules
         return $errors;
     }
 
-    /** The marker file the shell side leaves for a removal it could not confirm (vmac.sh). */
+    /** The marker file left for a removal that could not be confirmed (vmac.sh, vmac.py). */
     public const LEFT_PREFIX = 'carpvipdhcp-vmac.left.';
 
     /**
      * The nodes whose removal could not be confirmed, from the paths of the marker files
-     * the shell side leaves (vmac.sh: one empty file per node, created when a removal
-     * fails, removed when one is confirmed). Only well-formed names of ours count, so a
-     * stray file cannot inject text into the system status message.
+     * the shell side and the keeper leave (vmac.sh, vmac.py: one empty file per node,
+     * created when a removal fails, removed when one is confirmed). Only well-formed
+     * names of ours count (an interface name may hold '-'), so a stray file cannot
+     * inject text into the system status message.
      *
      * @param array $paths the marker file paths (a glob of LEFT_PREFIX in the run directory)
      * @return array       the node names, sorted, without duplicates
@@ -194,7 +195,7 @@ class VmacEgressRules
                 continue;
             }
             $node = substr($name, strlen(self::LEFT_PREFIX));
-            if (preg_match('/^vmac_[A-Za-z0-9_]{1,26}$/', $node)) {
+            if (preg_match('/^vmac_[A-Za-z0-9_-]{1,26}$/', $node)) {
                 $nodes[$node] = true;
             }
         }

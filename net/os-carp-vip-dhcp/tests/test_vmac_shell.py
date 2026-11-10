@@ -227,6 +227,15 @@ def test_stop_removes_a_named_node_whose_interface_is_gone(tmp_path):
     assert "vmac_lone0" not in b.after().nodes and "removed vmac_lone0: keeper stop" in res.stdout
 
 
+def test_stop_removes_the_node_of_an_interface_named_with_a_hyphen(tmp_path):
+    # FreeBSD allows '-' in an interface name (ifconfig name), and netgraph in a node name.
+    fake = _fake(built=False, ifaces=("vtnet0", "wan-a0"))
+    fake.add_patch("vmac_wan-a0", "wan-a0", config=WANTED)
+    b = _Bench(tmp_path, fake)
+    res = b.run('carpvipdhcp_vmac_stop_rule')
+    assert "vmac_wan-a0" not in b.after().nodes and "removed vmac_wan-a0: keeper stop" in res.stdout
+
+
 def test_stop_leaves_an_unnamed_node_without_our_signature(tmp_path):
     b = _Bench(tmp_path, _unnamed(_fake(built=False), peer_hook="out"))
     b.run('carpvipdhcp_vmac_stop_rule')

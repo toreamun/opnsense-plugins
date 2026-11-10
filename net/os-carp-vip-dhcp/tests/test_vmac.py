@@ -899,7 +899,20 @@ def test_a_failed_teardown_leaves_the_marker(lk, monkeypatch, tmp_path):
     monkeypatch.setattr(vm, "_LEFT_MARKER", str(tmp_path / "carpvipdhcp-vmac.left.{}"))
     fake.add_patch(NODE, "vtnet0", config=WANTED)
     marker = tmp_path / f"carpvipdhcp-vmac.left.{NODE}"
-    marker.write_text("")
     e = _egress()
     e.reconcile(False)
+    # The keeper leaves the marker itself: it outlives the keeper (a per-keeper restart
+    # that removed it leaves no heartbeat), and the system status raises it.
     assert e.status() == vm.VmacState.TEARDOWN and marker.exists()
+    e.reconcile(False)                   # still failing: the marker stays
+    assert marker.exists()
+    fake.knobs.shutdown_lies = False
+    e.reconcile(False)                   # confirmed at last: it goes
+    assert NODE not in fake.nodes and not marker.exists()
+
+
+def test_a_marker_that_cannot_be_written_never_raises(monkeypatch, tmp_path):
+    monkeypatch.setattr(vm, "_LEFT_MARKER", str(tmp_path / "missing" / "m.{}"))
+    vm._set_marker(NODE)                 # no such directory: logged at debug, no raise
+    vm._clear_marker(NODE)
+    assert not (tmp_path / "missing").exists()

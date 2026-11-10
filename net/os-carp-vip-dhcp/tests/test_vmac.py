@@ -846,6 +846,17 @@ def test_another_carp_group_on_the_interface_is_refused_on_the_master(ng, monkey
     assert NODE not in ng.nodes
 
 
+def test_another_carp_group_is_not_kept_across_a_keeper_stop(ng, monkeypatch):
+    # Built while alone on the interface; another CARP group appears before the keeper
+    # stops on the master: the boundary does not keep the rewrite.
+    e = _egress()
+    e.reconcile(True)
+    assert _built(ng)
+    monkeypatch.setattr(vm, "_other_carp_vhid", lambda _iface, _vhid: "150")
+    e.teardown_unless_master(lambda: True)
+    assert NODE not in ng.nodes
+
+
 def test_other_carp_vhid_reads_ifconfig(lk, monkeypatch):
     text = ("vtnet0: flags=8843\n\tcarp: MASTER vhid 149 advbase 1 advskew 0\n"
             "\tcarp: BACKUP vhid 150 advbase 1 advskew 100\n")

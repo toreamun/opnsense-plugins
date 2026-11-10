@@ -217,6 +217,16 @@ def test_stop_removes_everything_of_ours_and_nothing_else(tmp_path):
     assert f"removed {NODE}: keeper stop" in res.stdout and "removed vmac_old0: keeper stop" in res.stdout
 
 
+def test_stop_removes_a_named_node_whose_interface_is_gone(tmp_path):
+    # vmac_lone0 hooked to nothing and with no ether node lone0 (the interface was
+    # removed): only the node list finds it.
+    fake = _fake(built=False)
+    fake.nodes["vmac_lone0"] = fake.nodes["vtnet0"].__class__("patch", config=WANTED)
+    b = _Bench(tmp_path, fake)
+    res = b.run('carpvipdhcp_vmac_stop_rule')
+    assert "vmac_lone0" not in b.after().nodes and "removed vmac_lone0: keeper stop" in res.stdout
+
+
 def test_stop_leaves_an_unnamed_node_without_our_signature(tmp_path):
     b = _Bench(tmp_path, _unnamed(_fake(built=False), peer_hook="out"))
     b.run('carpvipdhcp_vmac_stop_rule')

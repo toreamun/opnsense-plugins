@@ -176,6 +176,7 @@ check(VmacEgressRules::leftoverNodes([$p . 'vmac_vtnet0', $p . 'vmac_igb0_100', 
 check(VmacEgressRules::leftoverNodes(['carpvipdhcp-vmac.left.vmac_vtnet0']) === ['vmac_vtnet0'], 'a bare file name counts too');
 check(VmacEgressRules::leftoverNodes([$p . 'vtnet0', $p . 'vmac_<b>x</b>', $p . 'vmac_a b', $p . 'vmac_', '/var/run/other.vmac_vtnet0', '/var/run/x/carpvipdhcp-vmac.leftvmac_a']) === [], 'anything else is ignored');
 check(VmacEgressRules::leftoverNodes([$p . 'vmac_' . str_repeat('a', 27)]) === [], 'a name longer than netgraph allows is ignored');
+check(VmacEgressRules::leftoverNodes(['/var/run/carpvipdhcp-vmac.LEFT.vmac_vtnet0', '/var/run/carpvipdhcp-xxxx.left.vmac_vtnet0']) === [], 'another prefix of the same length is not a marker');
 
 echo "$checks checks, $failures failures\n";
 exit($failures ? 1 : 0);

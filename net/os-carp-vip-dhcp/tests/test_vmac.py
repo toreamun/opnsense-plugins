@@ -878,6 +878,20 @@ def test_a_healthy_state_clears_the_shell_sides_marker(ng, tmp_path):
     assert NODE not in ng.nodes and not marker.exists()
 
 
+def test_a_confirmed_teardown_clears_the_marker_without_a_healthy_state(ng, monkeypatch, tmp_path):
+    marker = tmp_path / f"carpvipdhcp-vmac.left.{NODE}"
+    e = _egress()
+    e.reconcile(True)
+    marker.write_text("")
+    monkeypatch.setattr(vm, "_dhclient_running", lambda _iface: True)
+    e.reconcile(True)                    # torn down, then refused: never healthy
+    assert NODE not in ng.nodes and e.status() == "refused:dhcp-wan" and not marker.exists()
+    ng.add_patch(NODE, "vtnet0", config=WANTED)
+    marker.write_text("")
+    _egress(enabled=False).teardown_unless_master(lambda: True, leftover=True)   # off at startup
+    assert NODE not in ng.nodes and not marker.exists()
+
+
 def test_a_failed_teardown_leaves_the_marker(lk, monkeypatch, tmp_path):
     fake = FakeNgctl(knobs=NgKnobs(shutdown_lies=True))
     monkeypatch.setattr(lk.subprocess, "run", fake.run)

@@ -280,8 +280,8 @@ def _other_carp_vhid(iface, vhid):
 
 
 def _clear_marker(node):
-    """Clear the shell side's marker for `node`: a confirmed build or a confirmed absence
-    by this keeper settles what the marker warns about."""
+    """Clear the shell side's marker for `node`: a confirmed build, a confirmed absence or
+    a confirmed teardown by this keeper settles what the marker warns about."""
     try:
         os.remove(_LEFT_MARKER.format(node))
     except OSError:
@@ -660,8 +660,10 @@ class VmacEgress:
         since), our node when it is a patch node (never a node of another type under our
         name) and any patch node of ours on the interface's hooks. Confirmed means our
         name holds no patch node of ours AND the hooks were read and hold none: unreadable
-        hooks are not confirmation. Always safe to retry; a failure is retried on the next
-        tick, warned once until one works."""
+        hooks are not confirmation. A confirmed teardown clears the shell side's marker
+        (also on paths that never reach a healthy state: off at startup, a refusal); a
+        failed one leaves it. Always safe to retry; a failure is retried on the next tick,
+        warned once until one works."""
         own = self._own_patch_id()
         shut = own is not None
         if shut:
@@ -674,6 +676,7 @@ class VmacEgress:
         held = self._ours_on(self._read_ether())
         if self._present() in (_Presence.ABSENT, _Presence.FOREIGN) and held == {}:
             self._run.gates.teardown = False
+            _clear_marker(self._t.node)
             if shut:   # nothing was there: nothing to report
                 LOG.info("vmac egress on %s: removed %s (%s)", self._t.iface, self._t.node, reason)
             return True

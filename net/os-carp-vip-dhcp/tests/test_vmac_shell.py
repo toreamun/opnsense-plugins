@@ -269,6 +269,18 @@ def test_a_marker_whose_node_is_gone_clears_without_a_word(tmp_path):
     assert not _marker(b, "vmac_gone0") and res.stdout == ""
 
 
+@pytest.mark.parametrize("rc", [0, 1])
+def test_an_earlier_success_never_clears_a_later_failure(tmp_path, rc):
+    # This guard's removal succeeded (0) or found nothing (1); meanwhile the keeper rebuilt
+    # and another guard failed and marked. A read right before the unlink sees the node:
+    # the marker stays.
+    b = _Bench(tmp_path, _fake())
+    (tmp_path / "run" / f"carpvipdhcp-vmac.left.{NODE}").write_text("")
+    b.run(f'carpvipdhcp_vmac_remove() {{ return {rc}; }}\n'
+          'carpvipdhcp_vmac_carp_event 149@vtnet0 BACKUP')
+    assert _marker(b) and NODE in b.after().nodes
+
+
 def test_markers_need_no_lock_one_file_per_node(tmp_path):
     # Two nodes fail in two separate runs: both markers stay, neither overwrites the other.
     fake = _fake(ifaces=("vtnet0", "old0"), shutdown_lies=True)

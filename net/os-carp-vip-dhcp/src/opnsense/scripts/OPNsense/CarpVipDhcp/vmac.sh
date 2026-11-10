@@ -20,7 +20,8 @@
 # other type, or an unnamed patch node hooked any other way, is never shut down.
 #
 # A removal that cannot be confirmed leaves a marker file, carpvipdhcp-vmac.left.<node>,
-# in the run directory; a removal confirmed (or nothing found) clears it. The system
+# in the run directory; a removal confirmed (or nothing found) clears it, after one more
+# read right before (an earlier success never clears a later failure). The system
 # status raises the markers (CarpVipDhcpStatus.php). One file per node: creating or
 # removing it is atomic, so overlapping CARP events and stops need no lock.
 
@@ -110,6 +111,20 @@ carpvipdhcp_vmac_remove()
     return 2
 }
 
+# _carpvipdhcp_vmac_unmark <node>: clear <node>'s marker only if a fresh read still finds
+# nothing of ours, right before the unlink. A removal confirmed earlier must not clear the
+# marker of a later one that failed: the keeper may have rebuilt in between (master
+# again), and another guard then failed to remove it. What is left to race is this read
+# and the unlink right after it, not a whole removal and its log; and the other guard
+# reads for 2 s before it marks.
+_carpvipdhcp_vmac_unmark()
+{
+    [ -e "${CARPVIPDHCP_RUN}/carpvipdhcp-vmac.left.$1" ] || return 0
+    _carpvipdhcp_vmac_scan "$1"
+    _carpvipdhcp_vmac_clean && rm -f "${CARPVIPDHCP_RUN}/carpvipdhcp-vmac.left.$1"
+    return 0
+}
+
 # _carpvipdhcp_vmac_settle <node> <why>: remove <node>, log the outcome, and set or clear
 # its marker (see the header).
 _carpvipdhcp_vmac_settle()
@@ -118,10 +133,10 @@ _carpvipdhcp_vmac_settle()
     case "$?" in
         0)
             _carpvipdhcp_vmac_log "removed $1: $2"
-            rm -f "${CARPVIPDHCP_RUN}/carpvipdhcp-vmac.left.$1"
+            _carpvipdhcp_vmac_unmark "$1"
             ;;
         1)
-            rm -f "${CARPVIPDHCP_RUN}/carpvipdhcp-vmac.left.$1"
+            _carpvipdhcp_vmac_unmark "$1"
             ;;
         *)
             _carpvipdhcp_vmac_log "could not remove $1 ($2): still present or unreadable after 3 tries; it may still rewrite the source MAC"

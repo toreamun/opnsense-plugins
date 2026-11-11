@@ -243,6 +243,12 @@
         if (!state) {
             return line + "{{ lang._('no state yet') }}" + '</small>';
         }
+        // A stalled keeper's last word is not the state now: the CARP event hook or a
+        // stop may have removed the rewrite since. Never show it as active.
+        if (k.hb_age > STALE_MAX_AGE) {
+            return line + '</small><small class="text-warning">'
+                + "{{ lang._('not known, the keeper has stalled') }}" + '</small>';
+        }
         if (state === 'built') {
             return line + '</small><small class="text-success">' + "{{ lang._('active') }}" + '</small>';
         }

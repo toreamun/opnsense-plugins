@@ -807,6 +807,9 @@ def test_every_state_has_its_status_page_text_and_banner_category():
         assert reason in reasons, f"{state}: no Status page text"
         assert category in categories, f"{state}: the banner never raises it"
     assert reasons == {s.partition(":")[2] for s in vm.VmacState if s not in healthy}
+    # A stalled keeper's last state is never shown as active: the stale check comes first.
+    line = volt.split("function vmacLine(k) {", 1)[1]
+    assert 0 < line.index("k.hb_age > STALE_MAX_AGE") < line.index("state === 'built'")
     # unknown on a confirmed master (the CARP groups could not be read) is raised too.
     assert f"vmac={vm.VmacState.UNKNOWN}\\b" in php
 

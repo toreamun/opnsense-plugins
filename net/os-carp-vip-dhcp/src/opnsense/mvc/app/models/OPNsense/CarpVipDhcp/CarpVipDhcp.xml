@@ -1,6 +1,6 @@
 <model>
     <mount>//OPNsense/CarpVipDhcp</mount>
-    <version>1.4.1</version>
+    <version>1.5.0</version>
     <description>CARP-VIP DHCP lease keeper</description>
     <items>
         <keepers>
@@ -239,6 +239,20 @@
                     <ValidationMessage>Backup egress prefixes: IPv4 CIDR destinations (CIDR notation like 10.0.0.0/24).</ValidationMessage>
                     <Required>N</Required>
                 </backupEgressPrefixes>
+
+                <!--
+                    Experimental, default off (#131). While this node is the CARP master
+                    of the keeper's VIP, every frame the WAN interface sends leaves from
+                    the keeper's lease MAC (the CARP virtual MAC), rewritten in the kernel
+                    by netgraph (leasekeeper/vmac.py); a backup sends from its own MAC.
+                    For ISPs that only forward traffic from the MAC the lease is bound
+                    to. The save checks the requirements (performValidation in
+                    CarpVipDhcp.php); the keeper checks them again at run time. A config
+                    from before model 1.5.0 fills in the default.
+                -->
+                <vmacEgress type="BooleanField">
+                    <Default>0</Default>
+                </vmacEgress>
 
                 <description type="DescriptionField"/>
             </keeper>

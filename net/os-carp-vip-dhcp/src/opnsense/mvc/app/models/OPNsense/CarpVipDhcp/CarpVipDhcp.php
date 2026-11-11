@@ -26,6 +26,7 @@ namespace OPNsense\CarpVipDhcp;
 
 use OPNsense\Base\BaseModel;
 use OPNsense\Base\Messages\Message;
+use OPNsense\Core\Config;
 
 /**
  * Model for the CARP-VIP DHCP lease keeper.
@@ -68,6 +69,7 @@ class CarpVipDhcp extends BaseModel
      * The daemon is IPv4 DHCP only, so a keeper must reference an IPv4 CARP VIP.
      * Send Options and Request Options must parse (DhcpOptions), and a Client
      * identifier From Send Options needs its dhcp-client-identifier line there.
+     * Sending from the lease MAC has its requirements (VmacEgressRules).
      * {@inheritdoc}
      */
     public function performValidation($validateFullModel = false)
@@ -151,7 +153,71 @@ class CarpVipDhcp extends BaseModel
             }
         }
 
+        // Send from the lease MAC while master (experimental): its requirements.
+        list($vips, $ifaces) = self::vipsAndInterfaces();
+        foreach (VmacEgressRules::check(self::vmacKeepers($this), $vips, $ifaces) as $error) {
+            $messages->appendMessage(new Message($error[1], $error[0]));
+        }
+
         return $messages;
+    }
+
+    /**
+     * Each keeper as VmacEgressRules takes it. "changed": the fields the rules depend
+     * on that this save changes (a new keeper's fields count as changed), so only what
+     * is being saved is judged.
+     */
+    private static function vmacKeepers($model)
+    {
+        $keepers = [];
+        foreach ($model->keepers->keeper->iterateItems() as $keeper) {
+            $changed = [];
+            foreach (['enabled', 'carpVip', 'chaddrOverride', 'vmacEgress'] as $name) {
+                if ($keeper->$name->isFieldChanged()) {
+                    $changed[] = $name;
+                }
+            }
+            $keepers[] = [
+                'ref' => $keeper->__reference,
+                'vmacEgress' => (string)$keeper->vmacEgress === '1',
+                'enabled' => (string)$keeper->enabled === '1',
+                'carpVip' => (string)$keeper->carpVip,
+                'chaddrOverride' => (string)$keeper->chaddrOverride,
+                'changed' => $changed,
+            ];
+        }
+        return $keepers;
+    }
+
+    /**
+     * The configured virtual IPs and interfaces (key => device and address type), as
+     * the keeper.conf template reads them, for VmacEgressRules.
+     */
+    private static function vipsAndInterfaces()
+    {
+        $config = Config::getInstance()->object();
+        $vips = [];
+        if (isset($config->virtualip->vip)) {
+            foreach ($config->virtualip->vip as $vip) {
+                $vips[] = [
+                    'mode' => (string)$vip->mode,
+                    'subnet' => (string)$vip->subnet,
+                    'interface' => (string)$vip->interface,
+                    'vhid' => (string)$vip->vhid,
+                ];
+            }
+        }
+        $ifaces = [];
+        if (isset($config->interfaces)) {
+            foreach ($config->interfaces->children() as $key => $iface) {
+                $ifaces[$key] = [
+                    'if' => (string)$iface->if,
+                    'ipaddr' => (string)$iface->ipaddr,
+                    'ipaddrv6' => (string)$iface->ipaddrv6,
+                ];
+            }
+        }
+        return [$vips, $ifaces];
     }
 
     /**

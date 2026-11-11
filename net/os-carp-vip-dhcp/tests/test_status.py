@@ -369,3 +369,13 @@ def test_vlan_mtag_pcp_reads_the_sysctl(monkeypatch):
     monkeypatch.setattr(syscmd.subprocess, "run", fake_run)
     assert status.vlan_mtag_pcp() == 1
     assert seen[0][-1] == "net.link.vlan.mtag_pcp"
+
+
+@pytest.mark.parametrize("field, expected", [("", False), ("|vmacegress=0", False), ("|vmacegress=1", True),
+                                             ("|vmacegress=yes", False)])
+def test_read_keepers_vmac_egress(tmp_path, field, expected):
+    # Only "1" turns it on, as lease_keeper.py reads the flag; a missing key (a
+    # keeper.conf from before 1.19.0) is off.
+    conf = tmp_path / "keeper.conf"
+    conf.write_text(f"request=100.64.4.7|iface=igb0|chaddr=aa{field}\n")
+    assert status.read_keepers({}, {}, str(conf), str(tmp_path))[0]["vmac_egress"] is expected

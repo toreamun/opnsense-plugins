@@ -9,6 +9,7 @@ lying build, a lying shutdown, Dropped rising).
 # pylint: disable=protected-access, missing-function-docstring
 import logging
 import os
+import re
 
 import pytest
 
@@ -39,11 +40,22 @@ GETCONFIG = ('Rec\'d response "getconfig" (2) from "[d]:":\n'
 GETSTATS = 'Rec\'d response "getstats" (3) from "[d]:":\nArgs:\t{ Received=5 Patched=5 }\n'
 
 
+_real_other_carp_vhid = vm._other_carp_vhid
+
+
+@pytest.fixture(autouse=True)
+def _alone_on_the_interface(monkeypatch):
+    """No other CARP group unless a test says so: the fakes answer no ifconfig, and an
+    unreadable one is (rightly) never taken for 'none'."""
+    monkeypatch.setattr(vm, "_other_carp_vhid", lambda _iface, _vhid: None)
+
+
 @pytest.fixture(name="ng")
-def _ng(lk, monkeypatch):
+def _ng(lk, monkeypatch, tmp_path):
     fake = FakeNgctl(ifaces=("vtnet0", "igb0.100"))
     monkeypatch.setattr(lk.subprocess, "run", fake.run)
     monkeypatch.setattr(vm, "_dhclient_running", lambda _iface: False)
+    monkeypatch.setattr(vm, "_LEFT_MARKER", str(tmp_path / "carpvipdhcp-vmac.left.{}"))
     return fake
 
 
@@ -768,3 +780,209 @@ def test_a_hook_patch_node_is_shut_down_by_its_id_never_by_hook_path(ng):
     shutdowns = [c[2] for c in ng.calls if c[1:2] == ["shutdown"]]
     assert shutdowns and all(t.startswith("[") and t.endswith("]:") for t in shutdowns)
     assert "<unnamed>" not in ng.nodes
+
+
+def test_every_state_has_its_status_page_text_and_banner_category():
+    # Every reason the keeper can report (VmacState) has a text in the Status page's
+    # vmacReasons, and the system status banner's pattern covers every category; a
+    # healthy state (built, native, unknown) has neither. A new state added only here
+    # would otherwise show as its raw token, or never raise the banner on a master.
+    app = os.path.join(os.path.dirname(__file__), "..", "src", "opnsense", "mvc", "app")
+    with open(os.path.join(app, "views", "OPNsense", "CarpVipDhcp", "status.volt"), encoding="utf-8") as f:
+        volt = f.read()
+    with open(os.path.join(app, "library", "OPNsense", "System", "Status", "CarpVipDhcpStatus.php"),
+              encoding="utf-8") as f:
+        php = f.read()
+    table = volt.split("const vmacReasons = {", 1)[1].split("};", 1)[0]
+    reasons = set(re.findall(r"'([a-z-]+)':", table))
+    banner = re.search(r"vmac=\(([a-z|]+)\):", php)
+    assert banner is not None
+    categories = set(banner.group(1).split("|"))
+    healthy = {vm.VmacState.BUILT, vm.VmacState.NATIVE, vm.VmacState.UNKNOWN}
+    for state in vm.VmacState:
+        if state in healthy:
+            assert ":" not in state
+            continue
+        category, _, reason = state.partition(":")
+        assert reason in reasons, f"{state}: no Status page text"
+        assert category in categories, f"{state}: the banner never raises it"
+    assert reasons == {s.partition(":")[2] for s in vm.VmacState if s not in healthy}
+    # A stalled keeper's last state is never shown as active: the stale check comes first.
+    line = volt.split("function vmacLine(k) {", 1)[1]
+    assert 0 < line.index("k.hb_age > STALE_MAX_AGE") < line.index("state === 'built'")
+    # unknown on a confirmed master (the CARP groups could not be read) is raised too.
+    assert f"vmac={vm.VmacState.UNKNOWN}\\b" in php
+
+
+# ---- ownership by signature, removal by ID, another CARP group, markers ----
+
+@pytest.mark.parametrize("hook, peer_hook, ours", [
+    ("upper", "in", True), ("lower", "out", True), ("upper", "out", False), ("lower", "in", False)])
+def test_an_unnamed_patch_node_is_ours_only_with_our_signature(ng, hook, peer_hook, ours):
+    # Ours: removed even on a backup. Not ours: never shut down; on a master it holds
+    # the hooks like any other node, so the option is refused rather than built over it.
+    ng.nodes["<unnamed>"] = vm_node("patch")
+    ng.link("<unnamed>", peer_hook, "vtnet0", hook)
+    e = _egress()
+    e.reconcile(False)
+    assert ("<unnamed>" not in ng.nodes) is ours
+    if not ours:
+        assert not [c for c in ng.calls if c[1:2] == ["shutdown"]]
+        e.reconcile(True)
+        assert "<unnamed>" in ng.nodes and e.status() == vm.VmacState.HOOKS_TAKEN
+
+
+def vm_node(ntype):
+    return FakeNgctl(ifaces=("x",)).nodes["x"].__class__(ntype)
+
+
+def test_our_named_node_is_shut_down_by_its_id(ng):
+    ng.add_patch(NODE, "vtnet0", config=WANTED)
+    _egress().reconcile(False)
+    shutdowns = [c[2] for c in ng.calls if c[1:2] == ["shutdown"]]
+    assert NODE not in ng.nodes
+    assert shutdowns and all(t.startswith("[") and t.endswith("]:") for t in shutdowns)
+
+
+def test_the_header_id_is_parsed():
+    built, bare = vm._parse_show(SHOW_BUILT), vm._parse_show("  Name: x  Type: patch\n")
+    assert built is not None and built.id == "0000000d"
+    assert bare is not None and bare.id == ""
+
+
+@pytest.mark.parametrize("role", [True, False], ids=["master", "backup"])
+def test_another_carp_group_on_the_interface_is_refused_on_both_roles(ng, monkeypatch, role):
+    # A backup reports it too: the Status page shows it before a failover finds out.
+    monkeypatch.setattr(vm, "_other_carp_vhid", lambda _iface, _vhid: "150")
+    ng.add_patch(NODE, "vtnet0", config=WANTED)
+    e = _egress()
+    e.reconcile(role)
+    assert NODE not in ng.nodes and e.status() == vm.VmacState.OTHER_CARP
+    e.teardown_unless_master(lambda: True)          # nor kept across a keeper stop
+    assert NODE not in ng.nodes
+
+
+def test_another_carp_group_is_not_kept_across_a_keeper_stop(ng, monkeypatch):
+    # Built while alone on the interface; another CARP group appears before the keeper
+    # stops on the master: the boundary does not keep the rewrite.
+    e = _egress()
+    e.reconcile(True)
+    assert _built(ng)
+    monkeypatch.setattr(vm, "_other_carp_vhid", lambda _iface, _vhid: "150")
+    e.teardown_unless_master(lambda: True)
+    assert NODE not in ng.nodes
+
+
+def test_an_unreadable_carp_list_never_builds_on_a_master(ng, monkeypatch):
+    # Unknown is never taken for "no other group": a master handles it as an unreadable
+    # role (no build; an existing graph goes after the strikes), a backup stands down.
+    monkeypatch.setattr(vm, "_other_carp_vhid", lambda _iface, _vhid: vm._CARP_UNREADABLE)
+    e = _egress()
+    e.reconcile(True)
+    assert NODE not in ng.nodes and e.status() == vm.VmacState.UNKNOWN and not ng.mutations()
+    ng.add_patch(NODE, "vtnet0", config=WANTED)
+    e.reconcile(True)                    # one more unreadable tick: kept (transient)
+    assert _built(ng)
+    for _ in range(vm.DEFAULT_UNREADABLE_ROLE_STRIKES):
+        e.reconcile(True)
+    assert NODE not in ng.nodes          # fail closed after the strikes
+    ng.add_patch(NODE, "vtnet0", config=WANTED)
+    e.reconcile(False)                   # a backup never waits for the strikes
+    assert NODE not in ng.nodes and e.status() == vm.VmacState.NATIVE
+    ng.add_patch(NODE, "vtnet0", config=WANTED)
+    e.teardown_unless_master(lambda: True)   # nor is it kept across a keeper stop
+    assert NODE not in ng.nodes
+
+
+@pytest.mark.usefixtures("ng")
+def test_nothing_of_ours_clears_a_stale_marker_in_a_refused_state_and_when_off(monkeypatch, tmp_path):
+    # A guard that could not read left a marker; nothing is there. A refused state is not
+    # a healthy one and the option may be off: the confirmed absence clears it.
+    marker = tmp_path / f"carpvipdhcp-vmac.left.{NODE}"
+    monkeypatch.setattr(vm, "_dhclient_running", lambda _iface: True)
+    marker.write_text("")
+    e = _egress()
+    e.reconcile(True)
+    assert e.status() == "refused:dhcp-wan" and not marker.exists()
+    marker.write_text("")
+    _egress(enabled=False).teardown_unless_master(lambda: True, leftover=True)
+    assert not marker.exists()
+    marker.write_text("")
+    e.teardown_unless_master(lambda: False)
+    assert not marker.exists()
+
+
+def test_an_unreadable_graph_keeps_the_marker(lk, monkeypatch, tmp_path):
+    fake = FakeNgctl(knobs=NgKnobs(ether_reads=0))
+    monkeypatch.setattr(lk.subprocess, "run", fake.run)
+    monkeypatch.setattr(vm, "_dhclient_running", lambda _iface: True)
+    monkeypatch.setattr(vm, "_LEFT_MARKER", str(tmp_path / "carpvipdhcp-vmac.left.{}"))
+    marker = tmp_path / f"carpvipdhcp-vmac.left.{NODE}"
+    marker.write_text("")
+    e = _egress()
+    e.reconcile(True)                    # refused, and the hooks cannot be read
+    _egress(enabled=False).teardown_unless_master(lambda: True, leftover=True)
+    e.teardown_unless_master(lambda: False)
+    assert marker.exists()
+
+
+def test_other_carp_vhid_reads_ifconfig(lk, monkeypatch):
+    text = ("vtnet0: flags=8843\n\tcarp: MASTER vhid 149 advbase 1 advskew 0\n"
+            "\tcarp: BACKUP vhid 150 advbase 1 advskew 100\n")
+    replies = {"ok": (0, text), "own": (0, "\tcarp: MASTER vhid 149 advbase 1\n"), "fail": (1, "")}
+    for case, (rc, out) in replies.items():
+        monkeypatch.setattr(lk.subprocess, "run",
+                            lambda cmd, rc=rc, out=out, **_k: lk.subprocess.CompletedProcess(cmd, rc, out, ""))
+        want = {"ok": "150", "own": None, "fail": vm._CARP_UNREADABLE}[case]
+        assert _real_other_carp_vhid("vtnet0", "149") == want
+
+
+def test_a_healthy_state_clears_the_shell_sides_marker(ng, tmp_path):
+    marker = tmp_path / f"carpvipdhcp-vmac.left.{NODE}"
+    marker.write_text("")
+    e = _egress()
+    e.reconcile(True)                    # built: the rewrite is there on purpose
+    assert _built(ng) and not marker.exists()
+    marker.write_text("")
+    e.reconcile(False)                   # torn down and confirmed: native
+    assert NODE not in ng.nodes and not marker.exists()
+
+
+def test_a_confirmed_teardown_clears_the_marker_without_a_healthy_state(ng, monkeypatch, tmp_path):
+    marker = tmp_path / f"carpvipdhcp-vmac.left.{NODE}"
+    e = _egress()
+    e.reconcile(True)
+    marker.write_text("")
+    monkeypatch.setattr(vm, "_dhclient_running", lambda _iface: True)
+    e.reconcile(True)                    # torn down, then refused: never healthy
+    assert NODE not in ng.nodes and e.status() == "refused:dhcp-wan" and not marker.exists()
+    ng.add_patch(NODE, "vtnet0", config=WANTED)
+    marker.write_text("")
+    _egress(enabled=False).teardown_unless_master(lambda: True, leftover=True)   # off at startup
+    assert NODE not in ng.nodes and not marker.exists()
+
+
+def test_a_failed_teardown_leaves_the_marker(lk, monkeypatch, tmp_path):
+    fake = FakeNgctl(knobs=NgKnobs(shutdown_lies=True))
+    monkeypatch.setattr(lk.subprocess, "run", fake.run)
+    monkeypatch.setattr(vm, "_dhclient_running", lambda _iface: False)
+    monkeypatch.setattr(vm, "_LEFT_MARKER", str(tmp_path / "carpvipdhcp-vmac.left.{}"))
+    fake.add_patch(NODE, "vtnet0", config=WANTED)
+    marker = tmp_path / f"carpvipdhcp-vmac.left.{NODE}"
+    e = _egress()
+    e.reconcile(False)
+    # The keeper leaves the marker itself: it outlives the keeper (a per-keeper restart
+    # that removed it leaves no heartbeat), and the system status raises it.
+    assert e.status() == vm.VmacState.TEARDOWN and marker.exists()
+    e.reconcile(False)                   # still failing: the marker stays
+    assert marker.exists()
+    fake.knobs.shutdown_lies = False
+    e.reconcile(False)                   # confirmed at last: it goes
+    assert NODE not in fake.nodes and not marker.exists()
+
+
+def test_a_marker_that_cannot_be_written_never_raises(monkeypatch, tmp_path):
+    monkeypatch.setattr(vm, "_LEFT_MARKER", str(tmp_path / "missing" / "m.{}"))
+    vm._set_marker(NODE)                 # no such directory: logged at debug, no raise
+    vm._clear_marker(NODE)
+    assert not (tmp_path / "missing").exists()

@@ -208,6 +208,62 @@
         return line;
     }
 
+    // Why "Send from the lease MAC while master" is not active, by the reason in the
+    // heartbeat's vmac token (leasekeeper/vmac.py VmacState).
+    const vmacReasons = {
+        'no-vhid': "{{ lang._('the keeper has no CARP vhid') }}",
+        'bad-vhid': "{{ lang._('the CARP vhid is not 1 to 255') }}",
+        'mac-override': "{{ lang._('a Client MAC override is set') }}",
+        'bad-mac': "{{ lang._('the lease MAC is not valid') }}",
+        'shared-iface': "{{ lang._('another keeper has a CARP VIP on this interface') }}",
+        'dhcp-wan': "{{ lang._('a DHCP client runs on this interface (it needs a static WAN address)') }}",
+        'other-carp': "{{ lang._('another CARP group is on this interface') }}",
+        'no-ether-node': "{{ lang._('not an Ethernet interface') }}",
+        'hooks-taken': "{{ lang._('another netgraph node (such as a NetFlow capture) holds this interface') }}",
+        'foreign-node': "{{ lang._('a netgraph node of another type uses the name') }}",
+        'kldload': "{{ lang._('the kernel modules could not load') }}",
+        'build': "{{ lang._('the build failed') }}",
+        'readback': "{{ lang._('the build did not read back as wanted') }}",
+        'teardown': "{{ lang._('it could not be removed and may still be active') }}",
+        'ngctl': "{{ lang._('ngctl could not run, so whether it is active cannot be verified') }}"
+    };
+
+    function vmacLine(k) {
+        // Only when the option is on; the keeper's log has the detail.
+        if (k.vmac_egress !== true) {
+            return '';
+        }
+        let line = '<br><small class="text-muted">' + "{{ lang._('sends from the lease MAC') }}" + ': ';
+        let state = k.vmac_state;
+        if (k.running !== true) {
+            return line + "{{ lang._('keeper not running') }}" + '</small>';
+        }
+        // Running, but its heartbeat has no state for it yet (just turned on, or a
+        // heartbeat line from before the restart).
+        if (!state) {
+            return line + "{{ lang._('no state yet') }}" + '</small>';
+        }
+        // A stalled keeper's last word is not the state now: the CARP event hook or a
+        // stop may have removed the rewrite since. Never show it as active.
+        if (k.hb_age > STALE_MAX_AGE) {
+            return line + '</small><small class="text-warning">'
+                + "{{ lang._('not known, the keeper has stalled') }}" + '</small>';
+        }
+        if (state === 'built') {
+            return line + '</small><small class="text-success">' + "{{ lang._('active') }}" + '</small>';
+        }
+        if (state === 'native') {
+            return line + "{{ lang._('not while backup') }}" + '</small>';
+        }
+        if (state === 'unknown') {
+            return line + "{{ lang._('CARP role unknown') }}" + '</small>';
+        }
+        let why = vmacReasons[k.vmac_reason] || dash(k.vmac_reason);
+        return line + '</small><small class="text-warning" title="' + why + '">'
+            + '<i class="fa fa-exclamation-triangle fa-fw" aria-hidden="true"></i>'
+            + state + ': ' + why + '</small>';
+    }
+
     function dhcpOptionsLines(k) {
         // Codes and byte counts only: a value may hold a credential.
         let lines = '';
@@ -250,7 +306,8 @@
                     + '<td>' + nudgeCell(k) + '</td>'
                     + '<td>' + dash(k.chaddr)
                     + '<br><small class="text-muted">' + "{{ lang._('client identifier') }}" + ': '
-                    + dash(k.client_id) + '</small>' + vlanPcpLine(k, data.vlan_mtag_pcp) + dhcpOptionsLines(k) + '</td>'
+                    + dash(k.client_id) + '</small>' + vmacLine(k) + vlanPcpLine(k, data.vlan_mtag_pcp)
+                    + dhcpOptionsLines(k) + '</td>'
                     + '</tr>';
             });
             $('#keeper_rows').html(rows);

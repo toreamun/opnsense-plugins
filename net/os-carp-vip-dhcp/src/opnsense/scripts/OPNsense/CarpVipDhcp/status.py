@@ -247,6 +247,9 @@ def read_keepers(states, names, conffile=CONFFILE, run_dir=RUN_DIR):
             "vlan_pcp": vlan_pcp_label(rec.get("vlanpcp", "")),
             "send_options": send_options_label(rec),
             "request_options": request_options_label(rec.get("reqopts", "")),
+            # Send from the lease MAC while master (experimental): whether it is on; its
+            # state is the heartbeat's vmac token (vmac_state, vmac_reason).
+            "vmac_egress": rec.get("vmacegress", "0") == "1",
             "running": pid is not None,
             "pid": pid,
         }

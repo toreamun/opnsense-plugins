@@ -5,32 +5,35 @@
 # directory + its __pycache__ are handled in +PRE_DEINSTALL so pkg removes the
 # empty directory itself.
 #
-# The source-MAC rewrite (option E): +PRE_DEINSTALL's rc.d stop keeps it on a master
-# (an upgrade must not flap it), so on removal sweep every node of ours here (D9),
-# before keeper.conf goes: each vmac_* patch node, and a patch node that is ours or
-# unnamed on a keeper's interface hooks (an interrupted build's). By the netgraph ID a
-# read saw, never a hook path; read back up to three times; say so when something is
-# left. A read that fails (other than "no such node") or has no header is unreadable,
-# never taken for clean: it is retried, then warned about. Inline, because the
-# plugin's scripts are already gone; ngctl is base system. Nothing runs without
-# ng_patch.
+# The source-MAC rewrite (option E): +PRE_DEINSTALL's rc.d stop already removes every
+# node of ours; this is the backstop, after the plugin's scripts (and its CARP hook)
+# are gone. The same ownership as vmac.sh, from netgraph alone: every vmac_* patch
+# node, and on the upper or lower hook of every ether node with a hook in use (the
+# list says how many) a patch node under our name or
+# an unnamed one with our build's signature ("in" on upper, "out" on lower). By the
+# netgraph ID a read saw, never a hook path; read back up to three times. A read that
+# fails (other than "no such node") or has no header is unreadable, never taken for
+# clean: it is retried, then warned about on stderr and in the system log. Inline,
+# because the plugin's scripts are already gone; ngctl is base system. Nothing runs
+# without ng_patch.
 if /sbin/kldstat -q -m ng_patch 2>/dev/null; then
-    # keeper.conf fields are unordered: take iface= wherever it is in a record.
-    ethers=$(awk -F'|' '!/^#/ { for (i = 1; i <= NF; i++) if ($i ~ /^iface=./) print substr($i, 7) }' \
-                 /usr/local/etc/carpvipdhcp/keeper.conf 2>/dev/null | tr '.' '_' | sort -u)
     try=0
     while :; do
-        ids='' unread=''
+        ids='' unread='' ethers=''
         if out=$(/usr/sbin/ngctl list 2>&1) && printf '%s\n' "${out}" | grep -q 'Name:'; then
             ids=$(printf '%s\n' "${out}" | awk '$1 == "Name:" && $4 == "patch" && $2 ~ /^vmac_/ { print $6 }')
+            ethers=$(printf '%s\n' "${out}" | awk '$1 == "Name:" && $4 == "ether" && $NF + 0 > 0 { print $2 }')
         else
             unread='the node list'
         fi
         for e in ${ethers}; do
             if out=$(/usr/sbin/ngctl show "${e}:" 2>&1); then
                 if printf '%s\n' "${out}" | grep -q 'Name:'; then
-                    ids="${ids} $(printf '%s\n' "${out}" | awk -v n="vmac_${e}" \
-                        '($1 == "upper" || $1 == "lower") && $3 == "patch" && ($2 == "<unnamed>" || $2 == n) { print $4 }')"
+                    ids="${ids} $(printf '%s\n' "${out}" | awk -v n="vmac_${e}" '
+                        ($1 == "upper" || $1 == "lower") && $3 == "patch" && ($2 == n ||
+                            ($2 == "<unnamed>" && (($1 == "upper" && $5 == "in") || ($1 == "lower" && $5 == "out")))) {
+                            print $4
+                        }')"
                 else
                     unread="${unread} ${e}:"
                 fi
@@ -44,7 +47,9 @@ if /sbin/kldstat -q -m ng_patch 2>/dev/null; then
         if [ "${try}" -gt 3 ]; then
             ids=$(printf '%s' "${ids}" | tr '\n' ' ')
             unread="${unread# }"
-            echo "carpvipdhcp: could not remove the source-MAC rewrite (netgraph node ID(s): ${ids:-none}; unreadable: ${unread:-none}): it may still rewrite the source MAC; check with ngctl list and remove it by hand with: ngctl shutdown '[<id>]:'" >&2
+            msg="could not remove the source-MAC rewrite (netgraph node ID(s): ${ids:-none}; unreadable: ${unread:-none}): it may still rewrite the source MAC; check with ngctl list and remove it by hand with: ngctl shutdown '[<id>]:'"
+            echo "carpvipdhcp: ${msg}" >&2
+            logger -t carpvipdhcp "${msg}" 2>/dev/null || :
             break
         fi
         for id in ${ids}; do
@@ -55,4 +60,4 @@ if /sbin/kldstat -q -m ng_patch 2>/dev/null; then
 fi
 rm -rf /usr/local/etc/carpvipdhcp
 rm -f /var/run/carpvipdhcp-*.hb /var/run/carpvipdhcp-follow-* \
-      /var/run/carpvipdhcp-follow_update.lock
+      /var/run/carpvipdhcp-follow_update.lock /var/run/carpvipdhcp-vmac.*

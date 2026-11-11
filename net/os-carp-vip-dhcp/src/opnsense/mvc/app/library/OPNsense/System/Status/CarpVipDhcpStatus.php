@@ -24,6 +24,7 @@
 
 namespace OPNsense\System\Status;
 
+use OPNsense\CarpVipDhcp\VmacEgressRules;
 use OPNsense\System\AbstractStatus;
 use OPNsense\System\SystemStatusCode;
 
@@ -62,12 +63,27 @@ class CarpVipDhcpStatus extends AbstractStatus
 
     public function collectStatus()
     {
+        // A source-MAC rewrite whose removal could not be confirmed (send from the lease
+        // MAC, experimental): the shell side and the keeper leave one marker file per node.
+        // Its keeper may be disabled or deleted, so no heartbeat reports it. The next
+        // removal that is confirmed, or a confirmed build or absence seen by its keeper,
+        // clears it; an Apply on the Settings page tries every node of ours again.
+        $left = VmacEgressRules::leftoverNodes(
+            glob(self::RUN_DIR . '/' . VmacEgressRules::LEFT_PREFIX . '*') ?: []
+        );
         $problems = [];
         foreach ($this->keeperAddresses() as $request) {
-            $reason = $this->unhealthyReason($request);
+            $reason = $this->unhealthyReason($request, $left !== []);
             if ($reason !== null) {
                 $problems[] = sprintf('%s (%s)', $request, $reason);
             }
+        }
+        if ($left !== []) {
+            $problems[] = sprintf(
+                gettext('source MAC rewrite %s could not be removed and may still be active; '
+                    . 'Apply on the Settings page tries again'),
+                implode(', ', $left)
+            );
         }
 
         if (empty($problems)) {
@@ -134,7 +150,7 @@ class CarpVipDhcpStatus extends AbstractStatus
      * service-status hook's heartbeat semantics (MISMATCH / bound==)
      * and adds staleness detection for a dead or stuck daemon.
      */
-    private function unhealthyReason(string $request): ?string
+    private function unhealthyReason(string $request, bool $leftReported = false): ?string
     {
         $hb = self::RUN_DIR . '/carpvipdhcp-' . preg_replace('/[^A-Za-z0-9]/', '_', $request) . '.hb';
         $content = trim((string)@file_get_contents($hb));   // missing file -> ''
@@ -159,6 +175,38 @@ class CarpVipDhcpStatus extends AbstractStatus
                 gettext('VLAN priority not applied (%s), DHCP is sent without it'),
                 $m[1]
             );
+        }
+        // Send from the lease MAC while master (experimental; the token is there only
+        // when it is on). A rewrite that could not be removed may still be active on
+        // any node; on the master it must be active, or an ISP that checks the source
+        // MAC drops the traffic. On a backup a refusal is shown on the Status page.
+        // unknown on a confirmed master: the role was read but the CARP groups on the
+        // interface were not, so the keeper builds nothing and removes the rewrite after a
+        // few probes. (With an unreadable role the heartbeat has no master=1.)
+        if (preg_match('/\bvmac=unknown\b/', $content) && $this->heartbeatIsMaster($content)) {
+            return sprintf(gettext('source MAC rewrite on the master cannot be verified (%s)'), 'unknown');
+        }
+        if (preg_match('/\bvmac=(refused|failed|unavailable):(\S+)/', $content, $m)) {
+            if ($m[2] === 'teardown') {
+                // The keeper leaves a marker too, and the marker's line names the node:
+                // say it once. This line is for a marker that could not be written.
+                if (!$leftReported) {
+                    return gettext('source MAC rewrite could not be removed and may still be active');
+                }
+            } elseif ($m[1] === 'unavailable' && $this->heartbeatIsMaster($content)) {
+                // unavailable: the keeper could not read the graph, and it keeps one that
+                // worked, so the rewrite may well be active; it cannot be confirmed.
+                return sprintf(
+                    gettext('source MAC rewrite on the master cannot be verified (%s)'),
+                    $m[1] . ':' . $m[2]
+                );
+            } elseif ($this->heartbeatIsMaster($content)) {
+                return sprintf(
+                    gettext('source MAC rewrite not active on the master (%s); '
+                        . 'an ISP that checks the MAC drops its traffic'),
+                    $m[1] . ':' . $m[2]
+                );
+            }
         }
         if (strpos($content, 'bound=' . $request . ' ') !== false) {
             return $this->arpReachabilityReason($content);

@@ -807,6 +807,8 @@ def test_every_state_has_its_status_page_text_and_banner_category():
         assert reason in reasons, f"{state}: no Status page text"
         assert category in categories, f"{state}: the banner never raises it"
     assert reasons == {s.partition(":")[2] for s in vm.VmacState if s not in healthy}
+    # unknown on a confirmed master (the CARP groups could not be read) is raised too.
+    assert f"vmac={vm.VmacState.UNKNOWN}\\b" in php
 
 
 # ---- ownership by signature, removal by ID, another CARP group, markers ----

@@ -180,6 +180,12 @@ class CarpVipDhcpStatus extends AbstractStatus
         // when it is on). A rewrite that could not be removed may still be active on
         // any node; on the master it must be active, or an ISP that checks the source
         // MAC drops the traffic. On a backup a refusal is shown on the Status page.
+        // unknown on a confirmed master: the role was read but the CARP groups on the
+        // interface were not, so the keeper builds nothing and removes the rewrite after a
+        // few probes. (With an unreadable role the heartbeat has no master=1.)
+        if (preg_match('/\bvmac=unknown\b/', $content) && $this->heartbeatIsMaster($content)) {
+            return sprintf(gettext('source MAC rewrite on the master cannot be verified (%s)'), 'unknown');
+        }
         if (preg_match('/\bvmac=(refused|failed|unavailable):(\S+)/', $content, $m)) {
             if ($m[2] === 'teardown') {
                 // The keeper leaves a marker too, and the marker's line names the node:

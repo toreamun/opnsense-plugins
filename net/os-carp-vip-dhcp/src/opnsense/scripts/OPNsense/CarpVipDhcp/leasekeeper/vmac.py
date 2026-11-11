@@ -268,13 +268,16 @@ def _dhclient_running(iface):
     return True
 
 
+_CARP_UNREADABLE = object()   # _other_carp_vhid: ifconfig could not be read
+
+
 def _other_carp_vhid(iface, vhid):
-    """Another CARP vhid on `iface` (its traffic would also leave from the lease MAC), or
-    None: none there, or ifconfig could not be read (the keeper's role probe reads the
-    same output and reports an unreadable one)."""
+    """Another CARP vhid on `iface` (its traffic would also leave from the lease MAC),
+    None when there is none, _CARP_UNREADABLE when ifconfig could not be read (never
+    taken for none: a master then handles it as an unreadable role)."""
     res = run([IFCONFIG, iface], quiet=True)
     if res is None or res.returncode != 0:
-        return None
+        return _CARP_UNREADABLE
     others = sorted(v for v in carp_roles(res.stdout) if v != str(vhid))
     return others[0] if others else None
 
@@ -382,13 +385,21 @@ class VmacEgress:
     def reconcile(self, is_master):
         """Converge the graph on the CARP role: True builds (or confirms), False tears
         down, None (unreadable) never builds and tears down only after the strikes. Off
-        is fully inert. A keeper restart on a master never rebuilds: the first tick reads
-        the graph as built and only confirms. An interrupted build's unnamed node on the
-        hooks is removed on every tick, whatever else is refused (left on upper it
-        returns every frame)."""
+        is fully inert. A restart of this keeper alone on a master never rebuilds: the
+        first tick reads the graph as built and only confirms (a stop of all keepers, as
+        at an Apply, removes it in rc.d stop and the next start rebuilds). An interrupted
+        build's unnamed node on the hooks is removed on every tick, whatever else is
+        refused (left on upper it returns every frame). Another CARP group on the
+        interface is refused on both roles, so a backup shows it before a failover; when
+        that cannot be read, a master handles it as an unreadable role (never builds),
+        and a backup stands down as always."""
         if not self.enabled:
             return
         if is_master is None:
+            self._on_unknown_role()
+            return
+        other = self._other_carp(is_master)
+        if other is _CARP_UNREADABLE:
             self._on_unknown_role()
             return
         self._unreadable.reset()
@@ -413,23 +424,43 @@ class VmacEgress:
         if presence is _Presence.FOREIGN:
             self._set_state(VmacState.FOREIGN_NODE, f"({self._t.node}: never touched)")
             return
-        if refusal is None and presence is not _Presence.BUILT:
-            refusal = self._hooks_refusal(ether)
-        if refusal is None and _dhclient_running(self._t.iface):
-            refusal = VmacState.DHCP_WAN
-        if refusal is None and is_master and _other_carp_vhid(self._t.iface, self._t.vhid) is not None:
-            refusal = VmacState.OTHER_CARP
+        refusal = refusal or self._runtime_refusal(presence, ether, other)
         if not is_master or refusal is not None:
-            self._stand_down(presence, refusal)
+            self._stand_down(presence, refusal, ether)
         else:
             self._converge(presence)
 
-    def _stand_down(self, presence, refusal):
+    def _other_carp(self, is_master):
+        """Another CARP vhid on the interface, or None. _CARP_UNREADABLE only on a
+        master: a backup stands down whatever is there, and a config that is refused
+        anyway is not probed."""
+        if self._t.static_refusal is not None:
+            return None
+        other = _other_carp_vhid(self._t.iface, self._t.vhid)
+        return None if other is _CARP_UNREADABLE and not is_master else other
+
+    def _runtime_refusal(self, presence, ether, other):
+        """What rules the rewrite out right now, or None: the interface's hooks held by
+        another node (not asked of a built graph, which holds them), a DHCP client on
+        the interface, another CARP group there."""
+        refusal = None if presence is _Presence.BUILT else self._hooks_refusal(ether)
+        if refusal is None and _dhclient_running(self._t.iface):
+            refusal = VmacState.DHCP_WAN
+        if refusal is None and other is not None:
+            refusal = VmacState.OTHER_CARP
+        return refusal
+
+    def _stand_down(self, presence, refusal, ether):
         """Not master, or refused: no rewrite. A teardown that could not be confirmed is
-        reported as such, never as native (the node may still be rewriting)."""
-        if presence in _OURS and not self._teardown("not master" if refusal is None else str(refusal)):
-            self._set_state(VmacState.TEARDOWN)   # never "native" while it may still rewrite
-            return
+        reported as such, never as native (the node may still be rewriting). Nothing of
+        ours by name or on the hooks (both read) clears a marker a guard left when it
+        could not read: a refused state is not a healthy one, and would keep it."""
+        if presence in _OURS:
+            if not self._teardown("not master" if refusal is None else str(refusal)):
+                self._set_state(VmacState.TEARDOWN)   # never "native" while it may still rewrite
+                return
+        elif self._ours_on(ether) == {}:
+            _clear_marker(self._t.node)
         self._set_state(refusal or VmacState.NATIVE)
 
     def _converge(self, presence):
@@ -463,14 +494,19 @@ class VmacEgress:
         Trade-off (as for the default route): a keeper stopped for good while its node
         is still master keeps the rewrite with nothing managing it, until the next CARP
         event (the syshook) or rc.d stop. Telling a stop from a restart here would need a
-        fragile signal, and a restart must not open a window of own-MAC frames."""
+        fragile signal, and a restart of this keeper alone must not open a window of
+        own-MAC frames (rc.d stop of all keepers removes the rewrite whatever this
+        keeps). Nothing of ours there, with both sides read, clears a stale marker."""
         if not self.enabled:
             if not leftover or self._t.shared_iface or not _patch_module_loaded():
                 return
         elif self._keeps_at_boundary(probe):
             return
-        if self._needs_teardown():
+        needs = self._needs_teardown()
+        if needs:
             self._teardown("not master at a keeper start or stop" if self.enabled else "option off")
+        elif needs is False:
+            _clear_marker(self._t.node)
 
     def _keeps_at_boundary(self, probe):
         """At a process boundary the graph stays only on a confirmed master of a config
@@ -496,8 +532,15 @@ class VmacEgress:
 
     def _needs_teardown(self):
         """True when a patch node of ours is there: found by name, or on the interface's
-        hooks (an unnamed one, or ours when our name cannot be read)."""
-        return self._present() in _OURS or bool(self._ours_on(self._read_ether()))
+        hooks (an unnamed one, or ours when our name cannot be read). False when both
+        were read and hold none; None when that could not be read."""
+        presence = self._present()
+        if presence in _OURS:
+            return True
+        held = self._ours_on(self._read_ether())
+        if held:
+            return True
+        return None if presence is _Presence.UNREADABLE or held is None else False
 
     def _load_modules(self):
         """Load ng_ether and ng_patch once (latched); KLDLOAD while they do not load."""

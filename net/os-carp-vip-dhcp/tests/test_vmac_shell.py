@@ -261,10 +261,30 @@ def test_an_unlisted_stop_tries_every_interface_ifconfig_lists(tmp_path, ether_r
     b = _Bench(tmp_path, _fake(show="list-fails", **knobs))
     b.ifconfig("-l", "lo0 vtnet0 igb0.100\n")
     res = b.run('carpvipdhcp_vmac_stop_rule')
-    assert "trying every interface ifconfig lists instead" in res.stdout
+    assert "reading every Ethernet interface ifconfig lists instead" in res.stdout
     assert NODE not in b.after().nodes and _marker(b) is not confirmed
+    # Unreadable with nothing found: marked at once and named in one log line, without
+    # the removal's retries (the keepers wait for this stop).
+    assert ("could not read vmac_igb0_100 at keeper stop" in res.stdout) is not confirmed
     # No ether node: nothing to read. igb0.100's hooks are as readable as vtnet0's.
     assert not _marker(b, "vmac_lo0") and _marker(b, "vmac_igb0_100") is not confirmed
+
+
+def test_stop_reads_no_ether_node_without_a_hook_in_use(tmp_path):
+    # The list says how many hooks each node has: one with none holds nothing of ours, so
+    # a box with many VLANs costs no ngctl call per VLAN at every stop.
+    b = _Bench(tmp_path, _fake(built=False, ifaces=("vtnet0", "igb0.100", "igb0.200")))
+    b.run('carpvipdhcp_vmac_stop_rule')
+    assert [c[1:] for c in _ngctl_calls(b.after())] == [["list"]]
+
+
+@pytest.mark.parametrize("call", ["carpvipdhcp_vmac_carp_event 149@vtnet0 BACKUP", "carpvipdhcp_vmac_stop_rule"])
+def test_a_marker_that_cannot_be_written_never_ends_the_caller(tmp_path, call):
+    # ':' is a special builtin: a failed redirection on it ends a POSIX sh, which would be
+    # the rc.d script (no keeper starts again) or the syshook (no keeper is woken).
+    b = _Bench(tmp_path, _fake(shutdown_lies=True))
+    res = b.run(f'CARPVIPDHCP_RUN="{_posix(tmp_path)}/missing"\n{call}\necho "AFTER rc=$?"')
+    assert f"could not remove {NODE}" in res.stdout and res.stdout.strip().endswith("AFTER rc=0")
 
 
 def test_stop_without_ng_patch_runs_no_ngctl_and_clears_the_markers(tmp_path):

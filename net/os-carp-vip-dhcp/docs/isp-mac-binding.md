@@ -148,6 +148,11 @@ remove it where the keeper cannot, from what is in the kernel, whatever the sett
   ISP drops it until the keeper has rebuilt the rewrite;
 - removing the plugin.
 
+The guards go by what the node looks like, on every interface, not only a keeper's: a
+`ng_patch` node named `vmac_<interface>`, or an unnamed one attached with its `in` hook to
+an interface's `upper` hook (or `out` to `lower`). If you use `ng_patch` for something of
+your own, name the node something else and it is left alone.
+
 **Requirements.** Saving the keeper checks the first three; the keeper itself checks the
 ones marked "while it runs" too, and the Status page then says why it does not rewrite:
 
@@ -159,7 +164,7 @@ ones marked "while it runs" too, and the Status page then says why it does not r
 - No Client MAC override on the keeper (also while it runs).
 - Only this keeper's CARP VIP on that interface: any other CARP VIP there would send from
   this MAC too. Also while it runs: the keeper stops rewriting when ifconfig shows another
-  CARP group on the interface.
+  CARP group on the interface, and the backup's Status page says so too, before a failover.
 - No NetFlow capture on that interface: it uses the same netgraph hooks. Only the keeper
   checks this, while it runs.
 - The same plugin version on both nodes before you turn it on; HA sync carries the setting.

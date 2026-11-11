@@ -34,7 +34,11 @@ namespace OPNsense\CarpVipDhcp;
  *
  * Only what is being saved is judged: a keeper with the option on when it changed,
  * and another keeper on the same device when that one changed (the message then sits
- * on its own VIP field, where its dialog shows it). The other keepers count enabled
+ * on its own VIP field, where its dialog shows it). Switching a keeper off is not a
+ * change to judge (it must always be possible); switching it on is. A keeper's own
+ * refusal sits on the option's field when the save changed the option, else on the
+ * field the save did change: the option's row is advanced-only, and a message on a
+ * hidden row would not be seen. The other keepers count enabled
  * or not, like the model's other cross-keeper invariants. A requirement broken later
  * outside this model (a WAN switched to DHCP, a CARP VIP added on Interfaces: Virtual
  * IPs) does not block saving an unrelated keeper; the keeper's run-time checks cover
@@ -82,10 +86,29 @@ class VmacEgressRules
         return $found;
     }
 
+    /** The fields a keeper's own refusal may sit on, the first one the save changed. */
+    private const MESSAGE_FIELDS = ['vmacEgress', 'carpVip', 'enabled', 'chaddrOverride'];
+
+    /**
+     * The fields of a keeper this save changes that are judged: all of 'changed',
+     * less 'enabled' when the keeper is now disabled (switching it off is never
+     * refused).
+     */
+    private static function changedFields(array $keeper)
+    {
+        $fields = (array)($keeper['changed'] ?? []);
+        if (empty($keeper['enabled'])) {
+            $fields = array_diff($fields, ['enabled']);
+        }
+        return array_values(array_intersect(self::MESSAGE_FIELDS, $fields));
+    }
+
     /**
      * @param array $keepers each ['ref' => model reference, 'vmacEgress' => bool,
-     *                       'carpVip' => address, 'chaddrOverride' => MAC or '',
-     *                       'changed' => whether this save changes the keeper]
+     *                       'enabled' => bool, 'carpVip' => address,
+     *                       'chaddrOverride' => MAC or '', 'changed' => the names of
+     *                       the fields this save changes (of enabled, carpVip,
+     *                       chaddrOverride, vmacEgress)]
      * @param array $vips    the virtualip.vip entries: 'mode', 'subnet', 'interface', 'vhid'
      * @param array $ifaces  interface key => ['if' => device, 'ipaddr' => IPv4 type or
      *                       address, 'ipaddrv6' => IPv6 type or address]
@@ -103,8 +126,9 @@ class VmacEgressRules
             if (empty($keeper['vmacEgress'])) {
                 continue;
             }
-            $field = $keeper['ref'] . '.vmacEgress';
-            $changed = !empty($keeper['changed']);
+            $fields = self::changedFields($keeper);
+            $changed = $fields !== [];
+            $field = $keeper['ref'] . '.' . ($fields[0] ?? 'vmacEgress');
             // D4: rewriting to the CARP virtual MAC would send the VIP's traffic from a
             // MAC the ISP never leased to; rewriting to the override would make CARP's
             // ARP replies carry the virtual MAC inside and the override outside (gear
@@ -132,7 +156,7 @@ class VmacEgressRules
                         . 'and an interface has room for one rewrite.'
                     ), $device)];
                 }
-                if (!empty($other['changed'])) {
+                if (self::changedFields($other) !== []) {
                     $errors[] = [$other['ref'] . '.carpVip', sprintf(gettext(
                         'The keeper for %s sends from its lease MAC on %s (experimental option), so no other '
                         . 'keeper may use a CARP VIP on that interface.'

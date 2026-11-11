@@ -33,11 +33,15 @@ function check($cond, $what)
     }
 }
 
-/* A keeper as the model gives it; "changed": this save changes it. */
-function keeper($ref, $vip, $on = true, $override = '', $changed = true)
+/*
+ * A keeper as the model gives it; "changed": the fields this save changes (true: the
+ * option itself, false: none).
+ */
+function keeper($ref, $vip, $on = true, $override = '', $changed = true, $enabled = true)
 {
-    return ['ref' => $ref, 'vmacEgress' => $on, 'carpVip' => $vip, 'chaddrOverride' => $override,
-            'changed' => $changed];
+    $changed = $changed === true ? ['vmacEgress'] : ($changed === false ? [] : $changed);
+    return ['ref' => $ref, 'vmacEgress' => $on, 'enabled' => $enabled, 'carpVip' => $vip,
+            'chaddrOverride' => $override, 'changed' => $changed];
 }
 
 function vip($subnet, $iface, $vhid, $mode = 'carp')
@@ -116,6 +120,22 @@ $ifaces = $wanStatic;
 $ifaces['wan']['ipaddr'] = 'dhcp';
 check(errors([keeper($k, '100.64.4.102', true, '02:00:00:00:00:01', false)], [vip('100.64.4.102', 'wan', '149'), vip('100.64.4.50', 'wan', '150')], $ifaces) === [], 'unchanged keeper: not judged');
 check(errors([keeper($k, '100.64.4.102', true, '', false), keeper($k2, '10.0.0.1')], [vip('100.64.4.102', 'wan', '149'), vip('10.0.0.1', 'lan', '1')], $ifaces) === [], 'saving a keeper on another device: accepted');
+
+// Switching a keeper off is never refused, whatever broke since it was saved; switching
+// it on is judged, with the message on the Enabled field (the option's row is
+// advanced-only, so a message there would not be seen in basic mode).
+$broken = [vip('100.64.4.102', 'wan', '149'), vip('100.64.4.50', 'wan', '150')];
+check(errors([keeper($k, '100.64.4.102', true, '02:00:00:00:00:01', ['enabled'], false)], $broken, $ifaces) === [], 'switching a keeper off: accepted');
+refused('switching a keeper on', errors([keeper($k, '100.64.4.102', true, '', ['enabled'], true)], $oneVip, $ifaces), "$k.enabled", 'static address');
+// Off and another judged field changed in the same save: judged, on that field.
+refused('off, and the VIP changed', errors([keeper($k, '100.64.4.102', true, '', ['enabled', 'carpVip'], false)], $oneVip, $ifaces), "$k.carpVip", 'static address');
+// The message sits on the field the save changed; on the option when it changed too.
+refused('only the VIP changed', errors([keeper($k, '100.64.4.102', true, '', ['carpVip'])], $oneVip, $ifaces), "$k.carpVip", 'static address');
+refused('only the override changed', errors([keeper($k, '100.64.4.102', true, '02:00:00:00:00:01', ['chaddrOverride'])], $oneVip, $wanStatic), "$k.chaddrOverride", 'Client MAC override');
+refused('the VIP and the option changed', errors([keeper($k, '100.64.4.102', true, '', ['carpVip', 'vmacEgress'])], $oneVip, $ifaces), "$k.vmacEgress", 'static address');
+// Another keeper on the device that is only switched off is not refused either.
+check(errors([keeper($k, '100.64.4.102', true, '', false), keeper($k2, '100.64.4.103', false, '', ['enabled'], false)], $twoOnWan, $wanStatic) === [], 'switching the other keeper off: accepted');
+refused('switching the other keeper on', errors([keeper($k, '100.64.4.102', true, '', false), keeper($k2, '100.64.4.103', false, '', ['enabled'], true)], $twoOnWan, $wanStatic), "$k2.carpVip", 'sends from its lease MAC');
 
 // A keeper on another device does not count.
 $otherDev = [vip('100.64.4.102', 'wan', '149'), vip('10.0.0.1', 'lan', '1')];

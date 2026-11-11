@@ -40,12 +40,21 @@ GETCONFIG = ('Rec\'d response "getconfig" (2) from "[d]:":\n'
 GETSTATS = 'Rec\'d response "getstats" (3) from "[d]:":\nArgs:\t{ Received=5 Patched=5 }\n'
 
 
+_real_other_carp_vhid = vm._other_carp_vhid
+
+
+@pytest.fixture(autouse=True)
+def _alone_on_the_interface(monkeypatch):
+    """No other CARP group unless a test says so: the fakes answer no ifconfig, and an
+    unreadable one is (rightly) never taken for 'none'."""
+    monkeypatch.setattr(vm, "_other_carp_vhid", lambda _iface, _vhid: None)
+
+
 @pytest.fixture(name="ng")
 def _ng(lk, monkeypatch, tmp_path):
     fake = FakeNgctl(ifaces=("vtnet0", "igb0.100"))
     monkeypatch.setattr(lk.subprocess, "run", fake.run)
     monkeypatch.setattr(vm, "_dhclient_running", lambda _iface: False)
-    monkeypatch.setattr(vm, "_other_carp_vhid", lambda _iface, _vhid: None)
     monkeypatch.setattr(vm, "_LEFT_MARKER", str(tmp_path / "carpvipdhcp-vmac.left.{}"))
     return fake
 
@@ -836,11 +845,13 @@ def test_the_header_id_is_parsed():
     assert bare is not None and bare.id == ""
 
 
-def test_another_carp_group_on_the_interface_is_refused_on_the_master(ng, monkeypatch):
+@pytest.mark.parametrize("role", [True, False], ids=["master", "backup"])
+def test_another_carp_group_on_the_interface_is_refused_on_both_roles(ng, monkeypatch, role):
+    # A backup reports it too: the Status page shows it before a failover finds out.
     monkeypatch.setattr(vm, "_other_carp_vhid", lambda _iface, _vhid: "150")
     ng.add_patch(NODE, "vtnet0", config=WANTED)
     e = _egress()
-    e.reconcile(True)
+    e.reconcile(role)
     assert NODE not in ng.nodes and e.status() == vm.VmacState.OTHER_CARP
     e.teardown_unless_master(lambda: True)          # nor kept across a keeper stop
     assert NODE not in ng.nodes
@@ -857,6 +868,59 @@ def test_another_carp_group_is_not_kept_across_a_keeper_stop(ng, monkeypatch):
     assert NODE not in ng.nodes
 
 
+def test_an_unreadable_carp_list_never_builds_on_a_master(ng, monkeypatch):
+    # Unknown is never taken for "no other group": a master handles it as an unreadable
+    # role (no build; an existing graph goes after the strikes), a backup stands down.
+    monkeypatch.setattr(vm, "_other_carp_vhid", lambda _iface, _vhid: vm._CARP_UNREADABLE)
+    e = _egress()
+    e.reconcile(True)
+    assert NODE not in ng.nodes and e.status() == vm.VmacState.UNKNOWN and not ng.mutations()
+    ng.add_patch(NODE, "vtnet0", config=WANTED)
+    e.reconcile(True)                    # one more unreadable tick: kept (transient)
+    assert _built(ng)
+    for _ in range(vm.DEFAULT_UNREADABLE_ROLE_STRIKES):
+        e.reconcile(True)
+    assert NODE not in ng.nodes          # fail closed after the strikes
+    ng.add_patch(NODE, "vtnet0", config=WANTED)
+    e.reconcile(False)                   # a backup never waits for the strikes
+    assert NODE not in ng.nodes and e.status() == vm.VmacState.NATIVE
+    ng.add_patch(NODE, "vtnet0", config=WANTED)
+    e.teardown_unless_master(lambda: True)   # nor is it kept across a keeper stop
+    assert NODE not in ng.nodes
+
+
+@pytest.mark.usefixtures("ng")
+def test_nothing_of_ours_clears_a_stale_marker_in_a_refused_state_and_when_off(monkeypatch, tmp_path):
+    # A guard that could not read left a marker; nothing is there. A refused state is not
+    # a healthy one and the option may be off: the confirmed absence clears it.
+    marker = tmp_path / f"carpvipdhcp-vmac.left.{NODE}"
+    monkeypatch.setattr(vm, "_dhclient_running", lambda _iface: True)
+    marker.write_text("")
+    e = _egress()
+    e.reconcile(True)
+    assert e.status() == "refused:dhcp-wan" and not marker.exists()
+    marker.write_text("")
+    _egress(enabled=False).teardown_unless_master(lambda: True, leftover=True)
+    assert not marker.exists()
+    marker.write_text("")
+    e.teardown_unless_master(lambda: False)
+    assert not marker.exists()
+
+
+def test_an_unreadable_graph_keeps_the_marker(lk, monkeypatch, tmp_path):
+    fake = FakeNgctl(knobs=NgKnobs(ether_reads=0))
+    monkeypatch.setattr(lk.subprocess, "run", fake.run)
+    monkeypatch.setattr(vm, "_dhclient_running", lambda _iface: True)
+    monkeypatch.setattr(vm, "_LEFT_MARKER", str(tmp_path / "carpvipdhcp-vmac.left.{}"))
+    marker = tmp_path / f"carpvipdhcp-vmac.left.{NODE}"
+    marker.write_text("")
+    e = _egress()
+    e.reconcile(True)                    # refused, and the hooks cannot be read
+    _egress(enabled=False).teardown_unless_master(lambda: True, leftover=True)
+    e.teardown_unless_master(lambda: False)
+    assert marker.exists()
+
+
 def test_other_carp_vhid_reads_ifconfig(lk, monkeypatch):
     text = ("vtnet0: flags=8843\n\tcarp: MASTER vhid 149 advbase 1 advskew 0\n"
             "\tcarp: BACKUP vhid 150 advbase 1 advskew 100\n")
@@ -864,7 +928,8 @@ def test_other_carp_vhid_reads_ifconfig(lk, monkeypatch):
     for case, (rc, out) in replies.items():
         monkeypatch.setattr(lk.subprocess, "run",
                             lambda cmd, rc=rc, out=out, **_k: lk.subprocess.CompletedProcess(cmd, rc, out, ""))
-        assert vm._other_carp_vhid("vtnet0", "149") == {"ok": "150", "own": None, "fail": None}[case]
+        want = {"ok": "150", "own": None, "fail": vm._CARP_UNREADABLE}[case]
+        assert _real_other_carp_vhid("vtnet0", "149") == want
 
 
 def test_a_healthy_state_clears_the_shell_sides_marker(ng, tmp_path):

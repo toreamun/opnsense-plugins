@@ -8,7 +8,8 @@
 # The source-MAC rewrite (option E): +PRE_DEINSTALL's rc.d stop already removes every
 # node of ours; this is the backstop, after the plugin's scripts (and its CARP hook)
 # are gone. The same ownership as vmac.sh, from netgraph alone: every vmac_* patch
-# node, and on every ether node's upper or lower hook a patch node under our name or
+# node, and on the upper or lower hook of every ether node with a hook in use (the
+# list says how many) a patch node under our name or
 # an unnamed one with our build's signature ("in" on upper, "out" on lower). By the
 # netgraph ID a read saw, never a hook path; read back up to three times. A read that
 # fails (other than "no such node") or has no header is unreadable, never taken for
@@ -21,7 +22,7 @@ if /sbin/kldstat -q -m ng_patch 2>/dev/null; then
         ids='' unread='' ethers=''
         if out=$(/usr/sbin/ngctl list 2>&1) && printf '%s\n' "${out}" | grep -q 'Name:'; then
             ids=$(printf '%s\n' "${out}" | awk '$1 == "Name:" && $4 == "patch" && $2 ~ /^vmac_/ { print $6 }')
-            ethers=$(printf '%s\n' "${out}" | awk '$1 == "Name:" && $4 == "ether" { print $2 }')
+            ethers=$(printf '%s\n' "${out}" | awk '$1 == "Name:" && $4 == "ether" && $NF + 0 > 0 { print $2 }')
         else
             unread='the node list'
         fi

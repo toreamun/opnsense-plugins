@@ -126,6 +126,14 @@ _carpvipdhcp_vmac_unmark()
     return 0
 }
 
+# _carpvipdhcp_vmac_mark <node>: leave <node>'s marker. In a subshell: ':' is a special
+# builtin, and a redirection that fails on one (a full or read-only run directory) ends a
+# POSIX sh, which here is the rc.d script or the syshook that sourced this file.
+_carpvipdhcp_vmac_mark()
+{
+    ( : > "${CARPVIPDHCP_RUN}/carpvipdhcp-vmac.left.$1" ) 2>/dev/null || :
+}
+
 # _carpvipdhcp_vmac_settle <node> <why>: remove <node>, log the outcome, and set or clear
 # its marker (see the header).
 _carpvipdhcp_vmac_settle()
@@ -141,7 +149,7 @@ _carpvipdhcp_vmac_settle()
             ;;
         *)
             _carpvipdhcp_vmac_log "could not remove $1 ($2): still present or unreadable after 3 tries; it may still rewrite the source MAC"
-            : > "${CARPVIPDHCP_RUN}/carpvipdhcp-vmac.left.$1" 2>/dev/null || :
+            _carpvipdhcp_vmac_mark "$1"
             ;;
     esac
     unset _vm_ids _vm_name_ok _vm_hooks_ok _vm_try _vm_id
@@ -162,11 +170,14 @@ carpvipdhcp_vmac_carp_event()
 }
 
 # carpvipdhcp_vmac_stop_rule: the rc.d stop guard (all keepers). Remove everything of
-# ours: every vmac_* patch node, and what of ours is on every ether node's hooks. Runs
-# after the keepers stopped; the next start rebuilds where the option is on and the
-# node is master. A list that fails or has no header is retried, then logged, never
-# taken for "none": the node of every interface ifconfig lists is tried instead, so one
-# that cannot be read or removed there leaves a marker. The nodes with a marker are
+# ours: every vmac_* patch node, and what of ours is on the hooks of every ether node
+# that has a hook in use (the list says how many; one with none holds nothing of ours,
+# so a box with many VLANs costs no ngctl call per VLAN). Runs after the keepers
+# stopped; the next start rebuilds where the option is on and the node is master. A list
+# that fails or has no header is retried, then logged, never taken for "none": the node
+# of every Ethernet interface ifconfig lists is read once instead. What is found there
+# is removed; one that cannot be read is marked at once, without the removal's retries
+# (ngctl is failing, and the keepers wait for this stop). The nodes with a marker are
 # tried in any case.
 carpvipdhcp_vmac_stop_rule()
 {
@@ -174,7 +185,7 @@ carpvipdhcp_vmac_stop_rule()
         rm -f "${CARPVIPDHCP_RUN}"/carpvipdhcp-vmac.left.*    # no patch node can exist
         return 0
     fi
-    _vm_cands=''
+    _vm_cands='' _vm_fallback='' _vm_unread=''
     for _vm_n in "${CARPVIPDHCP_RUN}"/carpvipdhcp-vmac.left.*; do
         [ -e "${_vm_n}" ] && _vm_cands="${_vm_cands} ${_vm_n##*/carpvipdhcp-vmac.left.}"
     done
@@ -183,14 +194,14 @@ carpvipdhcp_vmac_stop_rule()
         if _vm_out=$("${CARPVIPDHCP_NGCTL}" list 2>&1) && printf '%s\n' "${_vm_out}" | grep -q 'Name:'; then
             _vm_cands="${_vm_cands} $(printf '%s\n' "${_vm_out}" | awk '
                 $1 == "Name:" && $4 == "patch" && $2 ~ /^vmac_/ { print $2 }
-                $1 == "Name:" && $4 == "ether" { print "vmac_" $2 }')"
+                $1 == "Name:" && $4 == "ether" && $NF + 0 > 0 { print "vmac_" $2 }')"
             break
         fi
         _vm_try=$((_vm_try + 1))
         if [ "${_vm_try}" -ge 3 ]; then
-            _carpvipdhcp_vmac_log "could not list the netgraph nodes at keeper stop (3 tries): trying every interface ifconfig lists instead; a rewrite whose interface is gone may remain, check with ngctl list"
-            for _vm_n in $("${CARPVIPDHCP_IFCONFIG}" -l 2>/dev/null); do
-                _vm_cands="${_vm_cands} $(carpvipdhcp_vmac_node "${_vm_n}")"
+            _carpvipdhcp_vmac_log "could not list the netgraph nodes at keeper stop (3 tries): reading every Ethernet interface ifconfig lists instead; a rewrite whose interface is gone may remain, check with ngctl list"
+            for _vm_n in $("${CARPVIPDHCP_IFCONFIG}" -l ether 2>/dev/null || "${CARPVIPDHCP_IFCONFIG}" -l 2>/dev/null); do
+                _vm_fallback="${_vm_fallback} $(carpvipdhcp_vmac_node "${_vm_n}")"
             done
             break
         fi
@@ -199,6 +210,17 @@ carpvipdhcp_vmac_stop_rule()
     for _vm_n in $(printf '%s\n' "${_vm_cands}" | tr ' ' '\n' | grep '^vmac_[A-Za-z0-9_-]*$' | sort -u); do
         _carpvipdhcp_vmac_settle "${_vm_n}" "keeper stop"
     done
-    unset _vm_cands _vm_n _vm_try _vm_out
+    for _vm_n in $(printf '%s\n' "${_vm_fallback}" | tr ' ' '\n' | grep '^vmac_[A-Za-z0-9_-]*$' | sort -u); do
+        _carpvipdhcp_vmac_scan "${_vm_n}"
+        _carpvipdhcp_vmac_clean && continue
+        if [ -n "${_vm_ids}" ]; then
+            _carpvipdhcp_vmac_settle "${_vm_n}" "keeper stop"
+        else
+            _carpvipdhcp_vmac_mark "${_vm_n}"
+            _vm_unread="${_vm_unread} ${_vm_n}"
+        fi
+    done
+    [ -z "${_vm_unread}" ] || _carpvipdhcp_vmac_log "could not read${_vm_unread} at keeper stop: a rewrite there may still be active"
+    unset _vm_cands _vm_fallback _vm_unread _vm_n _vm_try _vm_out _vm_ids _vm_name_ok _vm_hooks_ok
     return 0
 }

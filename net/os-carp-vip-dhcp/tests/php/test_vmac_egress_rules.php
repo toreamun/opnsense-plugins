@@ -103,9 +103,10 @@ $k2 = 'carpvipdhcp.keepers.keeper.b';
 refused('another keeper on the device, saving the option', errors([keeper($k, '100.64.4.102'), keeper($k2, '100.64.4.103', false, '', false)], $twoOnWan, $wanStatic), "$k.vmacEgress", 'Another keeper');
 // Saving the other keeper (added, or its VIP moved there): the message is on its own VIP
 // field, which its dialog shows, not on a field of the keeper it does not edit.
-refused('another keeper on the device, saving that one', errors([keeper($k, '100.64.4.102', true, '', false), keeper($k2, '100.64.4.103', false)], $twoOnWan, $wanStatic), "$k2.carpVip", 'sends from its lease MAC');
-// Both saved with the option on: each refused on its own option and on its VIP.
-$both = errors([keeper($k, '100.64.4.102'), keeper($k2, '100.64.4.103')], $twoOnWan, $wanStatic);
+refused('another keeper on the device, saving that one', errors([keeper($k, '100.64.4.102', true, '', false), keeper($k2, '100.64.4.103', false, '', ['carpVip'])], $twoOnWan, $wanStatic), "$k2.carpVip", 'sends from its lease MAC');
+// Both saved as new keepers with the option on: each refused on its own option and on its VIP.
+$new = ['enabled', 'carpVip', 'chaddrOverride', 'vmacEgress'];
+$both = errors([keeper($k, '100.64.4.102', true, '', $new), keeper($k2, '100.64.4.103', true, '', $new)], $twoOnWan, $wanStatic);
 check(count($both) === 4, 'both keepers on and saved: four errors, got ' . count($both) . ': ' . implode(' | ', $both));
 foreach (["$k.vmacEgress", "$k2.vmacEgress", "$k.carpVip", "$k2.carpVip"] as $f) {
     check(count(array_filter($both, function ($e) use ($f) {
@@ -136,6 +137,12 @@ refused('the VIP and the option changed', errors([keeper($k, '100.64.4.102', tru
 // Another keeper on the device that is only switched off is not refused either.
 check(errors([keeper($k, '100.64.4.102', true, '', false), keeper($k2, '100.64.4.103', false, '', ['enabled'], false)], $twoOnWan, $wanStatic) === [], 'switching the other keeper off: accepted');
 refused('switching the other keeper on', errors([keeper($k, '100.64.4.102', true, '', false), keeper($k2, '100.64.4.103', false, '', ['enabled'], true)], $twoOnWan, $wanStatic), "$k2.carpVip", 'sends from its lease MAC');
+
+// Two keepers that ended up on one device with the option on (a VIP moved on Interfaces:
+// Virtual IPs): switching the option off on one of them, or clearing its override, is
+// not refused, so the setup can be untangled.
+check(errors([keeper($k, '100.64.4.102', true, '', false), keeper($k2, '100.64.4.103', false, '', ['vmacEgress'])], $twoOnWan, $wanStatic) === [], 'option switched off on a keeper sharing the device: accepted');
+check(errors([keeper($k, '100.64.4.102', true, '', false), keeper($k2, '100.64.4.103', false, '', ['chaddrOverride'])], $twoOnWan, $wanStatic) === [], 'override changed on a keeper sharing the device: accepted');
 
 // A keeper on another device does not count.
 $otherDev = [vip('100.64.4.102', 'wan', '149'), vip('10.0.0.1', 'lan', '1')];

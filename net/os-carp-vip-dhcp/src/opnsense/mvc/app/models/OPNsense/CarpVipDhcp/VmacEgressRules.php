@@ -33,8 +33,8 @@ namespace OPNsense\CarpVipDhcp;
  * data.
  *
  * Only what is being saved is judged: a keeper with the option on when it changed,
- * and another keeper on the same device when that one changed (the message then sits
- * on its own VIP field, where its dialog shows it). Switching a keeper off is not a
+ * and another keeper on the same device when its VIP changed or it was switched on
+ * (the message then sits on its own VIP field, where its dialog shows it). Switching a keeper off is not a
  * change to judge (it must always be possible); switching it on is. A keeper's own
  * refusal sits on the option's field when the save changed the option, else on the
  * field the save did change: the option's row is advanced-only, and a message on a
@@ -156,7 +156,11 @@ class VmacEgressRules
                         . 'and an interface has room for one rewrite.'
                     ), $device)];
                 }
-                if (self::changedFields($other) !== []) {
+                // Only a change that puts the other keeper there (its VIP, or switching
+                // it on): switching its own option off, or its override, must stay
+                // possible, or two keepers that ended up sharing a device (a VIP moved
+                // on Interfaces: Virtual IPs) could never be untangled.
+                if (array_intersect(self::changedFields($other), ['carpVip', 'enabled']) !== []) {
                     $errors[] = [$other['ref'] . '.carpVip', sprintf(gettext(
                         'The keeper for %s sends from its lease MAC on %s (experimental option), so no other '
                         . 'keeper may use a CARP VIP on that interface.'

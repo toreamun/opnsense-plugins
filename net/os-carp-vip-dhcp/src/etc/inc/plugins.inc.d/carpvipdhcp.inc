@@ -58,9 +58,9 @@ function carpvipdhcp_services()
  *    the backup, and it reads the backup's service list BEFORE syncing, so a
  *    keeper added or enabled on the master is not started; start it from its
  *    own row afterwards.
- *  - the cron job: syncs and reloads the templates, but restarts services with
- *    the service NAME passed as the id, which never matches a keeper's id, so
- *    the keepers keep running their previous settings until restarted.
+ *  - the cron job: runs only while this node is master on every CARP VIP,
+ *    then syncs, reloads the templates and restarts each backup service by
+ *    its id, the keepers included, so they pick up the new config.
  *
  * The CARP virtual IPs themselves are intentionally NOT synced (advskew differs
  * per node); with follow mode each node also updates its own VIP independently

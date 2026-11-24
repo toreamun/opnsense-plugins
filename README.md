@@ -250,6 +250,10 @@ cd opnsense-plugins            # inspect the source you're about to run
 
 </details>
 
+## Related projects
+
+- **[os-ha-helpers](https://github.com/kawaconnect/os-ha-helpers)** by KawaConnect: the rest of an HA pair around the keeper, built for pairs with several WANs. Routing that picks the WAN by gateway priority and, on the master, by which gateway answers a ping; internet for the backup node; services that run on the master only; an Unbound restart on takeover; Tailscale route handover. It installs this package unchanged. Use either its routing or the keeper's own (*Own default route by CARP role* and *Backup egress*), not both.
+
 ## Project status
 
 This is an independent plugin by [@toreamun](https://github.com/toreamun), not (yet) part of OPNsense. **If enough people find it useful, I intend to propose it for the official OPNsense community plugins** - ⭐ [star the repo](https://github.com/toreamun/opnsense-plugins) if you'd like to see that happen, and open an issue with what worked and what did not on your ISP. Sources live in [`net/os-carp-vip-dhcp/`](net/os-carp-vip-dhcp/); the repo mirrors the [opnsense/plugins](https://github.com/opnsense/plugins) ports-tree layout so it builds with the standard tooling.

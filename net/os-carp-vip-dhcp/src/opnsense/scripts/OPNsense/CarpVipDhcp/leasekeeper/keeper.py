@@ -915,6 +915,8 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
             # jittered step that overshoots it sends no further REBIND.
             if not self._sleep_interruptible(_jittered(min(REBIND_POLL_STEP, remaining))):
                 break
+            if time.monotonic() >= rebind_deadline:
+                break   # before the tick: no ARP nudge for a lease at its end
             # Still holding the lease, for hours on a long one: the same upkeep as
             # _hold_lease (heartbeat, role + route, follow watchdog, ARP nudge) through
             # the one shared tick, minus the "lease healthy" pulse.

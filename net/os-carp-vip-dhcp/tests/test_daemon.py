@@ -3054,6 +3054,18 @@ def test_rebind_window_is_wall_time_not_the_sum_of_sleeps(lk, monkeypatch):
     assert clock["now"] <= t1_at + 200 + exchange           # at most one exchange in flight
 
 
+def test_rebind_sends_no_nudge_once_the_window_has_ended(lk, monkeypatch):
+    # A last sleep that ends on the deadline must not run the tick: when T2 is clamped
+    # to the lease length, that tick's due nudge would ARP for an address at its expiry.
+    # 50 s window, 9 s per unanswered exchange, 10 s steps: the last sleep is 3 s and
+    # ends exactly on the deadline, with a nudge due (the previous one 31 s earlier).
+    k, clock, sends, _rebinds = _rebind_window_keeper(lk, monkeypatch, window=50)
+    t1_at = clock["now"]
+    k._maintain_step()
+    assert sends                                            # it did nudge inside the window
+    assert all(at < t1_at + 50 for at in sends)
+
+
 def test_rebind_loop_runs_the_follow_watchdog_but_no_healthy_pulse(lk, monkeypatch):
     # The same shared tick re-drives a stalled follow during REBIND, but does not log
     # "lease healthy": a lease that nobody renews is not healthy.

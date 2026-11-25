@@ -16,6 +16,7 @@ reviews are static.
 | 6 | **Functional / integration** | every feature works end-to-end on a live node; GUI pages load; configd actions succeed |
 | 7 | **Docs / UX** | README complete and accurate; GUI help text clear; no dead links; no hard-coded release numbers in user docs; LICENSE present |
 | 8 | **Release artifact** (sign gate) | version consistent (`__version__` == tag; the README pins no version); build from a **clean `git archive` checkout**, not the working tree; artifact has no cruft; `SHA256SUMS` + `SHA256SUMS.sig` verify with `keys/release.pub`; maintainer correct |
+| 9 | **Duty matrix** ([REVIEW-MATRIX.md](REVIEW-MATRIX.md)) | every state or wait of a changed component against every duty it must run; each cell yes, no on purpose (with the reason at the site) or n/a; a gap is a finding; comments and code are both checked against the intended behaviour; cells confirmed by a test are marked |
 
 ## Cutting a release
 

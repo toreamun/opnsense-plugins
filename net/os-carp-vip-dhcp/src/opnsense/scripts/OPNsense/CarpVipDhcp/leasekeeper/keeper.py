@@ -892,6 +892,9 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         # Demoted during the wait: a renew now would move the shared vMAC; stay passive.
         if self._role.was_master is False:
             return
+        # The REBIND window is T2 - T1 of wall time from here, not a sum of sleeps: each
+        # unanswered exchange takes time too, which stretched the window past expiry.
+        rebind_deadline = time.monotonic() + (t2 - t1)
         prior = self._lease_facts()   # snapshot to report what a renew changed
         if self._dhcp.renew():
             self._on_lease_extended(Phase.RENEW, prior)
@@ -901,27 +904,28 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
             return
         LOG.warning("DHCP %s failed at T1 -- trying %s until T2", Phase.RENEW, Phase.REBIND)
 
-        elapsed = t1
         ok = False
-        while elapsed < t2 and not self._signals.stopping:
+        while not self._signals.stopping:
+            remaining = rebind_deadline - time.monotonic()
+            if remaining <= 0:
+                break
             # Jitter the REBIND retransmit cadence: both nodes hit T2 together
             # (identical lease timers), so an un-jittered step would broadcast
-            # REBIND in lockstep. Overshooting t2 slightly is harmless (the guard
-            # re-checks). Account the actual jittered wait so elapsed tracks it.
-            step = _jittered(min(REBIND_POLL_STEP, t2 - elapsed))
-            if not self._sleep_interruptible(step):
+            # REBIND in lockstep. The deadline is re-checked after the sleep, so a
+            # jittered step that overshoots it sends no further REBIND.
+            if not self._sleep_interruptible(_jittered(min(REBIND_POLL_STEP, remaining))):
                 break
-            elapsed += step
-            # Still holding the lease until T2, and REBIND can span the whole T1..T2
-            # window (hours on a long lease): run the same upkeep as _hold_lease, so
-            # the heartbeat stays fresh, a failover converges even if its SIGUSR2 edge
-            # is missed, a stalled follow is re-driven and the gateway keeps getting
-            # its ARP nudge. One shared tick, so this loop cannot drift from the
-            # others again. No "lease healthy" pulse: the lease is not healthy here.
-            if self._maintenance_tick(pulse=False) is False:
-                # Demoted mid-REBIND: stop transmitting and let the passive path
-                # take over on the next _maintain_step.
+            # Still holding the lease, for hours on a long one: the same upkeep as
+            # _hold_lease (heartbeat, role + route, follow watchdog, ARP nudge) through
+            # the one shared tick, minus the "lease healthy" pulse.
+            role = self._maintenance_tick(pulse=False)
+            # Demoted: stop transmitting. An unreadable probe (None) keeps the last known
+            # role, as the _maintain_step gate does, so one failed probe cannot undo a
+            # demotion the sleep already committed from SIGUSR2.
+            if role is False or (role is None and self._role.was_master is False):
                 return
+            if time.monotonic() >= rebind_deadline:
+                break
             if self._dhcp.renew(rebind=True):
                 ok = True
                 break

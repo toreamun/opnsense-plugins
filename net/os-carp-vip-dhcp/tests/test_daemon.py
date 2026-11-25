@@ -8,6 +8,7 @@ import os
 import re
 import select
 import struct
+import sys
 import threading
 import time
 import types
@@ -3000,23 +3001,32 @@ def test_rebind_loop_drives_default_route_reconcile(lk):
 
 def _rebind_window_keeper(lk, monkeypatch, window=60):
     # A master whose T1 RENEW fails and whose every REBIND goes unanswered (an ISP
-    # that ignores them, #128), driven through the real loop on a fake clock: each
-    # REBIND step advances the clock by the step, so the nudge's own pacing decides.
+    # that ignores them, #128), driven through the real loop on a fake clock that
+    # moves for the sleeps AND for each unanswered exchange (RENEW_ATTEMPTS x
+    # RENEW_TIMEOUT), as on a real line. Jitter off, so the cadence is exact.
     k = _nudge_keeper(lk, arp_nudge=30, vhid=254, default_route_mode="off")
     clock = {"now": 1_000_000.0}
     monkeypatch.setattr(time, "time", lambda: clock["now"])
-    sends = []
+    monkeypatch.setattr(time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(sys.modules["leasekeeper.keeper"], "_jittered", lambda base: base)
+    sends, rebinds = [], []
     monkeypatch.setattr(k._nudge._capture, "send_arp_request",
                         lambda *a, **kw: sends.append(clock["now"]))
 
     def sleep(secs, **_kw):
         clock["now"] += secs
         return True
+
+    def renew(rebind=False):
+        if rebind:
+            rebinds.append(clock["now"])
+        clock["now"] += lk.RENEW_ATTEMPTS * lk.RENEW_TIMEOUT   # no answer to any attempt
+        return False
     monkeypatch.setattr(k, "_sleep_interruptible", sleep)
     monkeypatch.setattr(k, "_hold_lease", lambda _secs: True)   # T1 reached
     monkeypatch.setattr(k._dhcp, "timing", lambda: (0, window, "test"))
-    monkeypatch.setattr(k._dhcp, "renew", lambda rebind=False: False)
-    return k, sends
+    monkeypatch.setattr(k._dhcp, "renew", renew)
+    return k, clock, sends, rebinds
 
 
 def test_rebind_loop_keeps_nudging_the_gateway(lk, monkeypatch):
@@ -3024,16 +3034,30 @@ def test_rebind_loop_keeps_nudging_the_gateway(lk, monkeypatch):
     # role poll but never the ARP nudge, so a master stuck in REBIND sent no periodic
     # nudges at all; only the manual button reached the gateway. The loop now runs the
     # shared maintenance tick: nudges go out at the configured interval, no faster.
-    k, sends = _rebind_window_keeper(lk, monkeypatch, window=95)
+    k, _clock, sends, _rebinds = _rebind_window_keeper(lk, monkeypatch, window=120)
     k._maintain_step()
-    assert len(sends) >= 3                                   # ~every 30 s over 95 s
+    assert len(sends) >= 3                                     # ~every 30 s over 120 s
     assert all(b - a >= 30 for a, b in zip(sends, sends[1:]))  # paced, not per step
+
+
+def test_rebind_window_is_wall_time_not_the_sum_of_sleeps(lk, monkeypatch):
+    # Each unanswered exchange takes time too. Counting only the sleeps stretched the
+    # T1..T2 window to nearly twice its length, past the lease's expiry, and with the
+    # nudge running there, ARP for an address that was no longer ours.
+    k, clock, _sends, rebinds = _rebind_window_keeper(lk, monkeypatch, window=200)
+    t1_at = clock["now"]
+    k._maintain_step()
+    assert rebinds                                          # it did REBIND
+    assert all(at < t1_at + 200 for at in rebinds)          # never after T2
+    assert k._dhcp.binding.yiaddr is None                   # and gave the lease up at T2
+    exchange = lk.RENEW_ATTEMPTS * lk.RENEW_TIMEOUT
+    assert clock["now"] <= t1_at + 200 + exchange           # at most one exchange in flight
 
 
 def test_rebind_loop_runs_the_follow_watchdog_but_no_healthy_pulse(lk, monkeypatch):
     # The same shared tick re-drives a stalled follow during REBIND, but does not log
     # "lease healthy": a lease that nobody renews is not healthy.
-    k, _sends = _rebind_window_keeper(lk, monkeypatch, window=40)
+    k, _clock, _sends, _rebinds = _rebind_window_keeper(lk, monkeypatch, window=40)
     watchdog, pulses = [], []
     monkeypatch.setattr(k._follow, "watchdog", lambda: watchdog.append(1))
     monkeypatch.setattr(k, "_maybe_pulse", lambda: pulses.append(1))
@@ -3045,13 +3069,28 @@ def test_rebind_loop_runs_the_follow_watchdog_but_no_healthy_pulse(lk, monkeypat
 def test_rebind_loop_sends_no_nudge_after_a_demotion(lk, monkeypatch):
     # A demotion seen by the REBIND tick stops the loop, and that tick's nudge is
     # gated on the role it just read: a backup never sends from the shared MAC.
-    k, sends = _rebind_window_keeper(lk, monkeypatch, window=60)
-    roles = iter([True])                            # master at the step's gate ...
+    k, _clock, sends, rebinds = _rebind_window_keeper(lk, monkeypatch, window=60)
+    roles = iter([True])                                # master at the step's gate ...
     k._probe_carp_master = lambda: next(roles, False)   # ... backup from the first REBIND tick
-    renews = []
-    monkeypatch.setattr(k._dhcp, "renew", lambda rebind=False: renews.append(rebind) or False)
     k._maintain_step()
-    assert renews == [False]                        # the T1 RENEW only: no REBIND after the demotion
+    assert not rebinds                                  # the T1 RENEW only, no REBIND after it
+    assert not sends
+
+
+def test_rebind_stops_on_a_committed_demotion_despite_a_failed_probe(lk, monkeypatch):
+    # SIGUSR2 during the REBIND sleep commits the demotion (was_master=False); if the
+    # tick's own probe then fails (None), the loop must keep the last known role, as
+    # the _maintain_step gate does, and not REBIND from the backup.
+    k, _clock, sends, rebinds = _rebind_window_keeper(lk, monkeypatch, window=60)
+    k._probe_carp_master = lambda: True                 # master at the step's gate
+
+    def sleep(_secs, **_kw):
+        k._role.poll(False)                             # the SIGUSR2 re-check saw backup
+        k._probe_carp_master = lambda: None             # ... then the next probe fails
+        return True
+    monkeypatch.setattr(k, "_sleep_interruptible", sleep)
+    k._maintain_step()
+    assert not rebinds
     assert not sends
 
 

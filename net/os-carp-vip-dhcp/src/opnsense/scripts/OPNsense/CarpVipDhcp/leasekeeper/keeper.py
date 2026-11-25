@@ -907,13 +907,11 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
         ok = False
         while not self._signals.stopping:
             remaining = rebind_deadline - time.monotonic()
-            if remaining <= 0:
-                break
             # Jitter the REBIND retransmit cadence: both nodes hit T2 together
             # (identical lease timers), so an un-jittered step would broadcast
             # REBIND in lockstep. The deadline is re-checked after the sleep, so a
             # jittered step that overshoots it sends no further REBIND.
-            if not self._sleep_interruptible(_jittered(min(REBIND_POLL_STEP, remaining))):
+            if remaining <= 0 or not self._sleep_interruptible(_jittered(min(REBIND_POLL_STEP, remaining))):
                 break
             if time.monotonic() >= rebind_deadline:
                 break   # before the tick: no ARP nudge for a lease at its end

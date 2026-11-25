@@ -2998,6 +2998,63 @@ def test_rebind_loop_drives_default_route_reconcile(lk):
     assert (True, True, "100.64.4.1") in rec.calls   # reconciled inside the REBIND loop
 
 
+def _rebind_window_keeper(lk, monkeypatch, window=60):
+    # A master whose T1 RENEW fails and whose every REBIND goes unanswered (an ISP
+    # that ignores them, #128), driven through the real loop on a fake clock: each
+    # REBIND step advances the clock by the step, so the nudge's own pacing decides.
+    k = _nudge_keeper(lk, arp_nudge=30, vhid=254, default_route_mode="off")
+    clock = {"now": 1_000_000.0}
+    monkeypatch.setattr(time, "time", lambda: clock["now"])
+    sends = []
+    monkeypatch.setattr(k._nudge._capture, "send_arp_request",
+                        lambda *a, **kw: sends.append(clock["now"]))
+
+    def sleep(secs, **_kw):
+        clock["now"] += secs
+        return True
+    monkeypatch.setattr(k, "_sleep_interruptible", sleep)
+    monkeypatch.setattr(k, "_hold_lease", lambda _secs: True)   # T1 reached
+    monkeypatch.setattr(k._dhcp, "timing", lambda: (0, window, "test"))
+    monkeypatch.setattr(k._dhcp, "renew", lambda rebind=False: False)
+    return k, sends
+
+
+def test_rebind_loop_keeps_nudging_the_gateway(lk, monkeypatch):
+    # #128: the REBIND loop (T1..T2, hours on a long lease) ran the heartbeat and the
+    # role poll but never the ARP nudge, so a master stuck in REBIND sent no periodic
+    # nudges at all; only the manual button reached the gateway. The loop now runs the
+    # shared maintenance tick: nudges go out at the configured interval, no faster.
+    k, sends = _rebind_window_keeper(lk, monkeypatch, window=95)
+    k._maintain_step()
+    assert len(sends) >= 3                                   # ~every 30 s over 95 s
+    assert all(b - a >= 30 for a, b in zip(sends, sends[1:]))  # paced, not per step
+
+
+def test_rebind_loop_runs_the_follow_watchdog_but_no_healthy_pulse(lk, monkeypatch):
+    # The same shared tick re-drives a stalled follow during REBIND, but does not log
+    # "lease healthy": a lease that nobody renews is not healthy.
+    k, _sends = _rebind_window_keeper(lk, monkeypatch, window=40)
+    watchdog, pulses = [], []
+    monkeypatch.setattr(k._follow, "watchdog", lambda: watchdog.append(1))
+    monkeypatch.setattr(k, "_maybe_pulse", lambda: pulses.append(1))
+    k._maintain_step()
+    assert watchdog                                         # ran inside the REBIND loop
+    assert not pulses
+
+
+def test_rebind_loop_sends_no_nudge_after_a_demotion(lk, monkeypatch):
+    # A demotion seen by the REBIND tick stops the loop, and that tick's nudge is
+    # gated on the role it just read: a backup never sends from the shared MAC.
+    k, sends = _rebind_window_keeper(lk, monkeypatch, window=60)
+    roles = iter([True])                            # master at the step's gate ...
+    k._probe_carp_master = lambda: next(roles, False)   # ... backup from the first REBIND tick
+    renews = []
+    monkeypatch.setattr(k._dhcp, "renew", lambda rebind=False: renews.append(rebind) or False)
+    k._maintain_step()
+    assert renews == [False]                        # the T1 RENEW only: no REBIND after the demotion
+    assert not sends
+
+
 def test_renew_nak_forgets_binding(lk):
     # A DHCPNAK on renew revokes the lease (RFC 2131 4.4.5 -> INIT): the binding is
     # forgotten so the caller withdraws the default and re-acquires, rather than

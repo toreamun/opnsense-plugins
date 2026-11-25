@@ -653,20 +653,25 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
             slept += 1
         return not self._signals.stopping
 
-    def _maintenance_tick(self, master=_UNSET):
-        """One round of steady-state upkeep, shared by _hold_lease (a master
-        waiting out T1) and the passive-backup hold: refresh the heartbeat and the
-        health pulse, re-drive a stalled follow, poll the CARP role + reconcile the
-        default route (via _role_tick), and run the ARP nudge. Transmits NO DHCP --
-        the caller owns when (and whether) to renew. Pass an already-probed role to
-        skip the ifconfig."""
+    def _maintenance_tick(self, master=_UNSET, pulse=True):
+        """One round of steady-state upkeep, shared by every wait that holds the
+        keeper between DHCP transmits: _hold_lease (a master waiting out T1), the
+        REBIND loop (T1..T2), the passive-backup hold and the config-error hold.
+        Refresh the heartbeat, re-drive a stalled follow, poll the CARP role +
+        reconcile the default route (via _role_tick), log the health pulse, and run
+        the ARP nudge. Transmits NO DHCP -- the caller owns when (and whether) to
+        renew. Pass an already-probed role to skip the ifconfig; pulse=False skips
+        the "lease healthy" line (the REBIND loop's lease is not healthy). Returns
+        the role, so a caller can stop transmitting on a demotion."""
         self._hb()
         self._follow.watchdog()   # re-drive a follow whose apply stalled
         # One CARP-role probe per tick, shared by the role poll, the route
         # reconcile (both via _role_tick) and the nudge below.
         master = self._role_tick(master)
-        self._maybe_pulse()       # ~1/h "lease healthy", after the role poll: silent on a backup
+        if pulse:
+            self._maybe_pulse()   # ~1/h "lease healthy", after the role poll: silent on a backup
         self._arp_nudge(master=master)
+        return master
 
     def _hold_lease(self, secs):
         """Sleep up to secs while holding a lease, rewriting the heartbeat every
@@ -907,13 +912,13 @@ class Keeper:  # pylint: disable=too-many-instance-attributes
             if not self._sleep_interruptible(step):
                 break
             elapsed += step
-            self._hb()   # still holding the lease until T2 -- keep the heartbeat fresh
-            # REBIND can span the whole T1..T2 window; keep the CARP-role
-            # bookkeeping and the default route reconciled here too, exactly as
-            # _hold_lease does per tick. Otherwise a failover during this degraded
-            # path relies solely on the SIGUSR2 edge, with no periodic fallback
-            # for a missed one until REBIND exits.
-            if self._role_tick() is False:
+            # Still holding the lease until T2, and REBIND can span the whole T1..T2
+            # window (hours on a long lease): run the same upkeep as _hold_lease, so
+            # the heartbeat stays fresh, a failover converges even if its SIGUSR2 edge
+            # is missed, a stalled follow is re-driven and the gateway keeps getting
+            # its ARP nudge. One shared tick, so this loop cannot drift from the
+            # others again. No "lease healthy" pulse: the lease is not healthy here.
+            if self._maintenance_tick(pulse=False) is False:
                 # Demoted mid-REBIND: stop transmitting and let the passive path
                 # take over on the next _maintain_step.
                 return
